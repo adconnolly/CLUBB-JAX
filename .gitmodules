@@ -1,6 +1,4 @@
-[submodule "TransJAX"]
-	path = TransJAX
-	url = https://github.com/AyaLahlou/TransJAX/
-[submodule "CLUBB-Fortran"]
-	path = CLUBB-Fortran
+[submodule "clubb_release"]
+	path = clubb_release
 	url = https://github.com/larson-group/clubb_release
+	branch = master

@@ -1,95 +1,85 @@
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# CLUBB-JAX Changelog
 
-## Project Overview
+Append-only record of work completed. For project design, conventions, and what's next, see `DESIGN.md`.
 
-## Architecture 
+---
 
+### 2026-05-29 — Directory restructure: CLUBB-JAX repo
 
-## Critical Conventions
+- Moved `clubb_jax/` out of `clubb_release/` into the top-level `CLUBB-JAX/` directory
+- `clubb_release/` is now a git submodule pointing to `larson-group/clubb_release` master
+- Test scripts (`run_scm.py`, `compare_runs.py`) moved into `clubb_jax/run_scripts/`; `clubb_release/` is unmodified upstream
+- `clubb_jax/src/clubb_standalone.py`: uses `_CLUBB_RELEASE_ROOT` to locate Fortran input files from the sibling submodule
+- Verified tests pass against a fresh clone of `clubb_release` master
 
-### CRITICAL: HPC environment rules
-### Filesystem
-- **NEVER** use `find /`, `find /ocean`, or scan outside the project directory.
-  The HPC filesystem has millions of files and these commands will hang forever.
-- **GPU diagnostic scripts**: `diags/` — write reusable standalone scripts for targeted investigations (Differentiability, GPU speed up, performance optimization). 
-### GPU access
-You are running **directly on a GPU compute node** with cuda.
-Run python and pytest directly — no wrapper needed. 
+### 2026-05-29 — `clubb_jax/src/` mirrors Fortran `src/` layout (Refactor Iters 1–3)
 
-### load CUDA and other modules for GPU model runs 
-Always run simulations and test on GPU for faster execution and to catch GPU-specific issues. Use the following module commands to set up the environment:
+- Restructured `clubb_jax/` so every JAX module sits at the same relative path as its Fortran oracle
+- Removed backward-compat shim directories (`jax_core/`, `benchmark_cases/`, `io/`)
+- All primary consumers updated to import from canonical `src/` paths
 
-## Commit and Push Policy
+### 2026-05-29 — Port check_clubb_settings and check_parameters to Python (Iter 72)
 
-Commit and push often after every meaningful unit of work. Keep commits focused: one logical change per commit. This creates a recoverable history if something goes wrong, makes progress visible, and prevents work from being lost if a compute allocation runs out mid-session.
+- `numerical_check.py`: `check_clubb_settings_jax` (10 validation checks, fatal + warning), `check_parameters_jax` (all range checks)
+- `src/clubb_standalone.py` now has **zero `from clubb_python import clubb_api` imports**
 
-***Rules***
-- Each commit implements one thing (one function, one module, one bugfix).
-- Avoid large commits that change multiple modules at once.
+### 2026-05-29 — Port parameterization_check and init routines (Iters 69–70)
 
+- `numerical_check.py`: `parameterization_check_jax` (NaN/Inf + negativity checks, 35 arrays)
+- `parameters_tunable.py`: `init_clubb_params_jax`, `calc_derrived_params_jax` — bit-exact
+- `model_flags.py`: `get_default_config_flags_jax` — all 88 flags
 
-```bash
-git add <specific files>
-git commit -m "<short description>"
-git push origin main
-```
+### 2026-05-28 — Pure-Python stats writer (Iter 67)
 
-Use descriptive commit messages. Prefix with the affected module or feature (e.g. `MLCanopyFluxes: fix stomatal conductance under low PAR`).
+- `io/stats_writer.py`: `StatsWriter` mirrors `stats_netcdf.F90` (begin/update/budget/end_timestep, accumulation, NetCDF output)
+- All `clubb_api.stats_*` calls removed; ARM per-timestep Fortran calls: **ZERO**
 
-## keep CHANGELOG.md current (agent orientation)
+### 2026-05-28 — Bug fix: ice_supersat_frac (Iter 68)
 
-Maintain a `CHANGELOG.md` at the project root to preserve cross-session context. Update it at the end of any session that makes meaningful progress — or immediately when a dead end is identified. `CHANGELOG.md` is the shared memory. Without it, agents waste time re-discovering what's done and what's broken.
+- Missing `ice_supersat_frac = cloud_frac.copy()` after Block U PDF closure caused cascade failure at timestep 214 in 225-step runs
 
-**Rules:**
-- Update `CHANGELOG.md` after every meaningful unit of work.
-- Check off completed items with dates.
-- Note what worked, what didn't, what's blocked.
-- **Record failed approaches** so they aren't re-attempted. E.g.:
-  "Tried ... failed because ... Switched to ..."
-- Add new tasks discovered during implementation.
-- When stuck, maintain a running doc of attempts in PROGRESS.md.
+### 2026-05-28 — Port ARM forcings to pure Python (Iter 66)
 
-Keep entries in reverse-chronological order (newest first). Do not delete old entries — they are the record of what has been tried.
+- `Benchmark_cases/arm.py`: `prescribe_forcings_arm`, `load_arm_forcings_data`, `_diag_ustar` (Monin-Obukhov, 4 iterations)
+- Last per-timestep Fortran call removed from `advance_clubb_to_end.py` for ARM
 
+### 2026-05-28 — Initialization ports: hydrostatic, rcm_sat_adj, calculate_thvm (Iters 62–65)
 
-## Structure work for parallelism
-Parallelism is easy when there are many independent failing tests (each agent picks a different one), but hard when
-there's one giant failing task (all agents hit the same bug and overwrite each other). Break the problem into sub-tests.
+- `calc_pressure.py`: `hydrostatic_jax`, `init_pressure_jax` (sequential upward integration via `jax.lax.scan`)
+- `saturation.py`: `rcm_sat_adj_jax` (bisection, 100 iterations, vectorized over `(ngrdcol, nzt)`)
+- `advance_clubb_to_end.py`: `calculate_thvm` now uses `calculate_thvm_jax`
 
-**Task claiming:** When working in parallel, note your task in CHANGELOG.md
-(e.g., "IN PROGRESS: background.py (@agent-1)"). Check CHANGELOG.md before
-starting to avoid duplicate work.
+### 2026-05-28 — Remove all Fortran calls from advance loop (Iters 56–65)
 
-### Specialized agent roles: 
-- **Implementer agents**: Write module code.
-- **Test quality agent**: Reviews and improves the test harness. Adds edge
-  cases, improves error messages, catches gaps in coverage.
-- **Performance agent**: Profiles the code, identifies bottlenecks, optimizes
-  JIT compilation time, reduces memory usage.
-- **Code quality agent**: Looks for duplicated code, inconsistent patterns,
-  missing type hints, unclear variable names. Refactors.
-- **Documentation agent**: Keeps CHANGELOG.md, docstrings, and CLAUDE.md
-  in sync with actual code.
+- Replaced `set_lscale_max`, upwind TA terms, `pdf_params` Fortran object, `sat_mixrat_liq`, `thlm2t_in_k`, `calc_lscale_directly`, and all non-ARM conditional Fortran paths
+- ARM state path: **ZERO Fortran calls** after Iter 59
 
-## Agent teams (use liberally)
-Agent teams are enabled. Use them to parallelize independent work:
-Each teammate gets its own context window and can read/write files independently.
-Assign different files to different teammates to avoid conflicts.
-Teams are especially valuable for this project because:
-- GPU diagnostic runs take a long time — use that time for parallel investigation
-- Multiple failing tests can be worked on simultaneously
-- Different agents can focus on different roles (implementer, tester, performance, documentation)
+### 2026-05-27 — Remove Fortran oracle calls from advance loop (Iters 46–55)
 
-## Orientation (read this first when starting a session )
-When you start a new session, orient yourself:
-1. Read `CHANGELOG.md` to see what's done and what's next.
-2. Pick the next failing test or unchecked item from CHANGELOG.md.
-3. When you finish a unit of work, update CHANGELOG.md before stopping.
+- Removed Fortran `advance_xm_wpxp`, `advance_xp2_xpyp`, `advance_wp2_wp3`, `advance_windm_edsclrm`, `pdf_closure_driver` calls
+- Removed all shadow comparison infrastructure; JAX values primary
+- compare_runs.py: PASS (100 timesteps, 0 prognostic failures)
 
-## Testing workflow
+### 2026-05-27 — JAX drives all prognostic state (Iters 34–45)
 
-Each module gets two types of tests:
-1. **Value tests**: compare output arrays against clm-ml-fortran reference data
-2. **Gradient tests**: compare `jax.grad` output against finite differences
+- All 16 prognostic variables carried forward from JAX each timestep
+- Replaced Fortran clip/fill_holes calls with JAX equivalents; cross-timestep ADG1 state passing
+- compare_runs.py: PASS (30 timesteps, 0 prognostic failures)
 
-Always write the test first, then make it pass.
+### 2026-05-27 — ADG1 PDF closure (Iters 25–33)
+
+- `adg1_adg2_3d_luhar_pdf.py`: full ADG1 closure — w-closure, responder params, all higher-order moments (wp2xp, wpxp2, wp2xp2, wp4, wprtp2, wpthlp2, wprtpthlp), virtual temperature fluxes
+
+### 2026-05-27 — Pre-advance diagnostics (Iters 15–24)
+
+- Ported: Skw, thvm, BV, Ri, Cx, Lscale/tau, splat, sfc_varnce, sigma_sqd_w, clip functions, fill_holes
+- All overriding Fortran from Iter 38
+
+### 2026-05-27 — Full advance functions (Iters 10–14)
+
+- `advance_xp2_xpyp`, `advance_xm_wpxp`, `advance_wp2_wp3`, `advance_windm_edsclrm`, `advance_xp3` — all machine epsilon vs Fortran
+
+### 2026-05-27 — Core operators and LHS/RHS terms (Iters 1–9)
+
+- Grid interpolation, diffusion LHS, tridiagonal solver, MA/DP1/xp2_xpyp/TA LHS and RHS terms
+- Unit test suite established (solver, diffusion, penta-solver, Fortran oracle)
