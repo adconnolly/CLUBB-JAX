@@ -4,6 +4,32 @@ Append-only record of work completed. For project design, conventions, and what'
 
 ---
 
+### 2026-06-02 — Documentation & repo-structure cleanup (no physics touched)
+
+A session of docs/structure tidying. Verified throughout: `compare_runs --case arm` PASS (0 prognostic failures),
+13-case `test_standalone_jax` PASS, `-jax` smoke runs OK.
+
+- **Output-directory convention.** `run_scm.py <case> -jax` now defaults to `clubb_jax/output/<case>_stats.nc`
+  (was the shared `clubb_release/output/<case>_stats.nc`), so a bare `-jax` run can no longer clobber the Fortran
+  oracle — the old "always pass `-out_dir`" discipline is retired. `-legacy`/`-exe` still default to
+  `clubb_release/output/`; `-out_dir` overrides either. `compare_runs.py` JAX side moved to
+  `clubb_jax/output/<case>_compare_jax/` (Fortran stays `…_compare_fort/`); `diagnose_divergence.py` follows.
+  Added `clubb_jax/output/` to `.gitignore`.
+- **Standalone/driver files realigned with the Fortran oracle.** Renamed `src/clubb_standalone.py` →
+  `src/clubb_driver.py` (↔ `clubb_driver.F90`: `run_clubb`/`init_clubb_case`/`clean_up_clubb`); added a new thin
+  `src/clubb_standalone.py` argv frontend (↔ the 88-line `clubb_standalone.F90`); deleted the root
+  `clubb_jax/clubb_standalone.py` launcher (no Fortran counterpart, name-collided with the src file). Entry point
+  is now `python -m clubb_jax.src.clubb_standalone`; `run_scm.py -jax`, the test import, and `__init__.py` updated.
+- **DESIGN.md compressed** 1361 → 408 lines: the worklog-style iteration narrative (the testing-conventions
+  megablock, per-case diagnostic journeys, bloated module-table cells) distilled into durable reference text;
+  kept verbatim the Repository Structure, test-command block, Critical Conventions, both tables, and Agent Working
+  Rules. No info lost (full version in git; iteration detail remains in this CHANGELOG's 221 Iter entries).
+- **clubb_jax/README.md rewritten** as an accurate human-readable install/run guide, replacing stale
+  "scaffold/clone of clubb_python_driver, still depends on the Python API" framing and dead harness references.
+  Dropped the link to the now-orphaned `JAX_CONVERSION_PLAN.md`.
+- Doc edits propagated to CLAUDE.md/DESIGN.md (execution-flow diagrams, module table). `clubb_release/` submodule
+  scaffold copies left untouched.
+
 ### 2026-06-02 — Iter 323: ROOT-CAUSED the Morrison per-step-stats OOM — a JAX/XLA-backend leak of ~85 diagnostic arrays/step (NOT recompilation); exhaustively ruled out 4 hypotheses
 
 - **Definitively ruled out jit recompilation** (the worst-case): `JAX_LOG_COMPILES=1` on mpace_a → **2140 compiles ALL at

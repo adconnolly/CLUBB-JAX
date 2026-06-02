@@ -1,109 +1,87 @@
-# CLUBB JAX Driver
+# CLUBB-JAX
 
-This directory is the staging area for a JAX-based CLUBB SCM driver.
+A JAX translation of the CLUBB single-column turbulence model, for differentiable,
+composable use in ML and autodiff workflows.
 
-At the moment, `clubb_jax/` is mostly a package-local clone of
-[clubb_python_driver/](../clubb_python_driver/). Its current purpose is not to
-provide a distinct JAX implementation yet, but to create a separate place where
-the driver can be rewritten incrementally without destabilizing the existing
-Python-driver path.
+This is a genuine JAX/Python implementation — **not** a wrapper around the Fortran. The
+physics runs entirely in JAX: 18 benchmark cases are bit-for-bit faithful to the Fortran
+reference and execute with **zero Fortran calls per timestep**. The original Fortran
+(`../clubb_release/`) is kept only as (a) the bit-comparison oracle and (b) the porting
+source reference.
 
-The intended long-term direction is different from
-[clubb_python_driver/](../clubb_python_driver/):
+> For the full design, the per-case status table, testing strategy, and conventions, see
+> [`../DESIGN.md`](../DESIGN.md). This file is just install-and-run.
 
-- replace the timestep-loop internals with JAX code
-- move the main timestep path away from `clubb_python_api/`
-- possibly remove the Python API dependency entirely if the JAX path becomes
-  self-sufficient
+## Layout
 
-Because that transition has not happened yet, the current `clubb_jax/` code
-should be understood as a scaffold rather than a finished driver.
-
-The recommended conversion workflow for the eventual Fortran-to-JAX port is
-documented in [JAX_CONVERSION_PLAN.md](./JAX_CONVERSION_PLAN.md).
-
-## Current Status
-
-Right now, the package is still functionally close to
-[clubb_python_driver/](../clubb_python_driver/):
-
-- the package structure is the same
-- the SCM entry point is present at [clubb_standalone.py](./clubb_standalone.py)
-- much of the execution path still depends on the compiled Python API in
-  [clubb_python_api/](../clubb_python_api/)
-
-If you need the detailed explanation of the existing driver structure, feature
-coverage, and current implementation style, start with
-[clubb_python_driver/README.md](../clubb_python_driver/README.md). That
-documentation remains the best reference for how the cloned code currently
-behaves.
-
-## Build
-
-From the repo root:
-
-```bash
-./compile.py [-debug] -python
+```
+clubb_jax/
+├── src/
+│   ├── clubb_standalone.py   ← CLI entry point (thin frontend ↔ clubb_standalone.F90)
+│   ├── clubb_driver.py       ← run_clubb / init_clubb_case / clean_up_clubb ↔ clubb_driver.F90
+│   ├── advance_clubb_to_end.py  ← the timestep loop
+│   ├── CLUBB_core/           ← physics modules, one file per Fortran oracle
+│   ├── Benchmark_cases/      ← per-case forcings & surface
+│   ├── Radiation/            ← simple radiation + BUGSrad
+│   └── io/                   ← NetCDF stats output
+├── run_scripts/              ← run + comparison + test harnesses
+└── tests/                    ← unit tests
 ```
 
-The `-python` flag is still required today because the current `clubb_jax/`
-path continues to rely on the compiled `clubb_f2py` extension provided by
-[clubb_python_api/](../clubb_python_api/).
+Each `src/CLUBB_core/<name>.py` mirrors `../clubb_release/src/CLUBB_core/<name>.F90` at the
+same relative path.
 
-## Run
+## Requirements
 
-The normal SCM entry point is the existing runner script, now with `-jax`:
+- **Python with JAX** (x64 mode is enabled by the code). NumPy and netCDF4. This is all the
+  pure-JAX driver needs to run a case.
+- **A sibling `clubb_release/` checkout** (`CLUBB-JAX/clubb_release/`). The run scripts read
+  case namelists, soundings, and tunable parameters from `clubb_release/input/`.
+- **Compiled Fortran artifacts in `clubb_release/`** — `bin/clubb_standalone` and
+  `clubb_python_api/*.so` — are needed to (a) generate/compare against the Fortran oracle and
+  (b) for the launcher's environment setup. They are build outputs, not in git; build them
+  from the repo root with:
+  ```bash
+  ./compile.py [-debug] -python
+  ```
+  Note: the compiled API is the *oracle* for comparison — the JAX physics does not call it
+  per timestep.
 
-```bash
-./run_scripts/run_scm.py -jax arm
-```
+## Run a case
 
-This keeps the standard namelist aggregation and SCM workflow, but launches:
-
-```bash
-python -m clubb_jax.clubb_standalone
-```
-
-instead of the Fortran standalone or the Python-driver standalone.
-
-You can also run the module directly if you already have an aggregate case
-namelist:
-
-```bash
-python -m clubb_jax.clubb_standalone output/arm.in
-```
-
-## Test and Compare
-
-The main comparison harness for this directory is:
+From the repository root:
 
 ```bash
-./run_scripts/run_jax_vs_fortran_cases.py
+# Run ARM in pure JAX for 30 steps:
+python clubb_jax/run_scripts/run_scm.py arm -jax -max_iters 30
 ```
 
-That script runs a curated set of SCM cases through both:
+`-jax` writes stats to **`clubb_jax/output/<case>_stats.nc`** (the Fortran oracle lives
+separately in `clubb_release/output/`, so a JAX run never clobbers it). Drop `-jax` to run
+the compiled Fortran instead (`-legacy`).
 
-- the `clubb_jax` standalone path
-- the normal Fortran standalone path
-
-and compares the outputs with `run_bindiff_all.py`. Results are written under
-`jax_driver_test_results/`.
-
-You can also run individual SCM cases through the regular SCM entry point:
+You can also invoke the driver module directly on an already-aggregated namelist:
 
 ```bash
-./run_scripts/run_scm.py -jax bomex
+python -m clubb_jax.src.clubb_standalone clubb_jax/output/arm.in
 ```
 
-## Near-Term Plan
+## Compare against Fortran & run tests
 
-The practical plan for this directory is:
+```bash
+# Single case: run Fortran and JAX, diff the prognostic stats (must be 0 failures):
+python clubb_jax/run_scripts/compare_runs.py --case arm --max-iters 30
 
-1. keep the top-level SCM workflow usable through `-jax`
-2. replace cloned driver internals with JAX implementations incrementally
-3. reduce reliance on `clubb_python_api/`, especially inside the timestep loop
-4. eventually make `clubb_jax/` a genuinely separate execution path rather than
-   a renamed clone of the Python driver
+# All bit-faithful cases, one pass/fail line each:
+python clubb_jax/run_scripts/compare_cases.py --max-iters 30
 
-Until that work is done, this directory should be treated as an active
-development branch for a future JAX driver, not as a separate mature backend.
+# Diagnose where/how a failing case diverges:
+python clubb_jax/run_scripts/diagnose_divergence.py <case>
+
+# Unit-test suite (pure JAX; oracle-dependent tests skip cleanly if unbuilt):
+python clubb_jax/run_scripts/run_all_tests.py
+```
+
+The comparison scripts require the compiled Fortran artifacts above; the unit tests need only
+JAX. See [`../DESIGN.md`](../DESIGN.md) for the testing rationale, durability gates, and the
+list of which cases are bit-faithful.
