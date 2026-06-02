@@ -340,6 +340,9 @@ def advance_wp2_wp3_jax(
     nu1: float,       # background diffusivity for wp2
     nu8: float,       # background diffusivity for wp3
     gr,
+    l_ho_nontrad_coriolis: bool = False,
+    fcor_y=None,
+    wp2up=None,
 ) -> tuple:
     """Full JAX solve for wp2 (zm-level) and wp3 (zt-level).
 
@@ -349,7 +352,12 @@ def advance_wp2_wp3_jax(
       l_use_tke_in_wp3_pr_turb_term=True, l_damp_wp3_Skw_squared=True,
       l_use_C11_Richardson=False, l_tke_aniso=True,
       l_crank_nich_diff=False, l_use_tke_in_wp2_wp3_K_dfsn=False,
-      l_ho_nontrad_coriolis=False, l_lmm_stepping=False.
+      l_lmm_stepping=False.
+
+    Non-traditional Coriolis (Iter103): when l_ho_nontrad_coriolis=True, add the
+    explicit RHS contributions wp2 += 2·fcor_y·upwp and wp3 += 3·fcor_y·wp2up
+    (fcor_y the meridional Coriolis parameter, wp2up = <w'^2 u'> on zt). It is a
+    no-op for the 15 faithful cases + rico (flag False); only coriolis_test uses it.
 
     Returns (wp2_new, wp3_new) as JAX arrays (raw solve result,
     before fill_holes and clip_variance/skewness).
@@ -525,6 +533,16 @@ def advance_wp2_wp3_jax(
             - lhs_ta_wp3[4, :, 1:-1] * wp3[:, :-2]  # wp3[k_py-1]
         )
     )
+
+    # --- Non-traditional Coriolis (Iter103); no-op for the 15 cases + rico ---
+    if l_ho_nontrad_coriolis:
+        _fy = jnp.asarray(fcor_y)
+        if _fy.ndim == 1:
+            _fy = _fy[:, None]
+        # wp2 RHS += 2*fcor_y*upwp   (upwp on zm levels, interior)
+        rhs = rhs.at[:, 2:-1:2].add(2.0 * _fy * upwp[:, 1:-1])
+        # wp3 RHS += 3*fcor_y*wp2up  (wp2up on zt levels, interior)
+        rhs = rhs.at[:, 3:-2:2].add(3.0 * _fy * jnp.asarray(wp2up)[:, 1:-1])
 
     # --- Boundary conditions ---
     # Lower wp2: global 0

@@ -4,7 +4,10 @@ Provides get_default_config_flags_jax to replace the Fortran API call.
 """
 from __future__ import annotations
 
-from clubb_python.derived_types.config_flags import ConfigFlags
+# Pure-JAX ConfigFlags (field-identical to the Fortran derived type) — keeps the JAX driver
+# import-clean of clubb_python so it runs standalone ("entirely in JAX"). The driver's
+# ConfigFlags._fields round-trip in clubb_standalone then becomes a no-op same-type copy.
+from clubb_jax.src.derived_types.config_flags import ConfigFlags
 
 
 def get_default_config_flags_jax() -> ConfigFlags:

@@ -198,15 +198,22 @@ class StatsWriter:
         """Accumulate a sample for the named variable (mirrors stats_update_2d).
 
         value shape: (ngrdcol, nz) for profile vars, (ngrdcol,) or scalar for sfc.
+
+        ★ The `np.asarray(value)` is done BEFORE the registry check, even for variables
+        not in this case's registry (Iter324). The diagnostic `value` is a JAX array
+        returned by the jitted core; if it is dropped WITHOUT being materialised, XLA
+        retains its device buffer (a per-call leak of ~85 arrays/step → OOM on long
+        per-step-stats runs of large-var-set Morrison cases, ~step 150-250). Forcing the
+        host transfer here lets the buffer be freed. update_col takes a Python float, no leak.
         """
         if not self.l_sample:
             return
+        val = np.asarray(value, dtype=np.float64)   # materialise FIRST — frees the JAX device buffer (Iter324 leak fix)
         if name not in self._buffer:
             return  # variable not in registry — silently ignore
 
         buf = self._buffer[name]
         cnt = self._nsamples[name]
-        val = np.asarray(value, dtype=np.float64)
 
         if buf.ndim == 2 and buf.shape[1] > 1:
             # Profile variable: value is (ngrdcol, nz)
@@ -237,10 +244,10 @@ class StatsWriter:
         """Start a budget window by subtracting the current state from the buffer."""
         if not self.l_sample:
             return
+        val = np.asarray(val_before, dtype=np.float64)   # materialise FIRST (frees the JAX device buffer)
         if name not in self._buffer:
             return
         buf = self._buffer[name]
-        val = np.asarray(val_before, dtype=np.float64)
         if buf.ndim == 2 and buf.shape[1] > 1:
             buf[:, :] -= val
         else:
@@ -259,11 +266,11 @@ class StatsWriter:
         """
         if not self.l_sample:
             return
+        val = np.asarray(val_after, dtype=np.float64)   # materialise FIRST (frees the JAX device buffer)
         if name not in self._buffer:
             return
         buf = self._buffer[name]
         cnt = self._nsamples[name]
-        val = np.asarray(val_after, dtype=np.float64)
         if buf.ndim == 2 and buf.shape[1] > 1:
             buf[:, :] += val
             if l_count_sample:
@@ -307,6 +314,15 @@ class StatsWriter:
             else:
                 # sfc: avg shape (ngrdcol, 1) → write as (ngrdcol,)
                 varid[t, :] = avg[:, 0]
+
+        # Periodically flush dirty HDF5 chunks to disk so the cache does not grow
+        # unbounded over a long run. Without this, a per-step-stats run of a case with
+        # a large variable set (e.g. Morrison: ~500 vars × many levels) accumulates
+        # hundreds of records' worth of un-flushed chunks and OOMs the process mid-write
+        # (→ a truncated/corrupt NetCDF). Every-20-records bounds the dirty cache while
+        # keeping the sync I/O negligible next to the physics. (Iter322 — mpace_a OOM.)
+        if self._time_index % 20 == 0:
+            self._ncid.sync()
 
         # Reset flags
         self.l_sample = False

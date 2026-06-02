@@ -45,6 +45,7 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
     iz_displace,
     iLscale_mu_coef,
     iLscale_pert_coef,
+    imu,
 )
 from clubb_jax.src.CLUBB_core.grid_class import (
     zt2zm_jax,

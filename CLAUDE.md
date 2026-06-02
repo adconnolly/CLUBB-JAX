@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Full Fortran-vs-JAX regression (the primary correctness gate):
 python clubb_jax/run_scripts/compare_runs.py --case arm --max-iters 30
 
-# Quick smoke test — JAX only, no comparison (3 timesteps, ~20s):
+# Quick smoke test — JAX driver, no Fortran comparison run (~20s):
 python clubb_jax/run_scripts/run_scm.py arm -jax -max_iters 3
 
 # Run a single unit test file:
@@ -26,7 +26,7 @@ python clubb_jax/tests/test_diffusion.py
 python clubb_jax/tests/test_penta_solver.py
 ```
 
-`compare_runs.py` requires compiled artifacts in `clubb_release/` — see DESIGN.md. Unit tests require only JAX.
+`compare_runs.py` and `run_scm.py -jax` both require compiled artifacts in `clubb_release/` — see DESIGN.md. Unit tests require only JAX.
 
 ---
 

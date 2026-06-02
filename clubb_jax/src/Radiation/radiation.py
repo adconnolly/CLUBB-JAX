@@ -4,19 +4,26 @@ Supported schemes:
 - none
 - simplified
 - simplified_bomex
-
-The BUGSrad and LBA branches from Fortran radiation_module are intentionally
-excluded; those schemes are handled by the Fortran driver.
+- bugsrad (correlated-k; via clubb_jax/src/Radiation/bugsrad_driver.py)
 """
 
+import math
 import numpy as np
 
-from clubb_python import clubb_api
-
+from clubb_jax.src.CLUBB_core.constants_clubb import sec_per_hr, radians_per_deg, rho_lw
 
 _CP = 1004.67
 _EPS = np.finfo(np.float64).eps
 _LS_DIV = 3.75e-6
+
+# Liou coefficients for cos_solar_zen (cos_solar_zen_module.F90)
+_CSZ_C0 =  0.006918
+_CSZ_C1 = -0.399912
+_CSZ_C2 = -0.006758
+_CSZ_C3 = -0.002697
+_CSZ_D1 =  0.070257
+_CSZ_D2 =  0.000907
+_CSZ_D3 =  0.000148
 
 
 def simple_rad_bomex(zt: np.ndarray):
@@ -35,6 +42,14 @@ def simple_rad_bomex(zt: np.ndarray):
 def advance_radiation(state: dict, time_current: float, l_sample: bool = False):
     """Advance radiation tendencies for the current timestep."""
     scheme = str(state['rad_scheme']).strip().lower()
+    sw = state.get('stats_writer')
+
+    # Interactive soil/vegetation (gabls3): runs in the radiation wrapper BEFORE the radiation advance
+    # (radiation_module.F90:148-157), using the previous step's surface radiative fluxes. The Fortran runs
+    # it every step; this lives inside advance_radiation, which is exact when dt_rad==dt_main (true for
+    # gabls3). A future l_soil_veg case with dt_rad>dt_main would need it lifted out of the radiation gate.
+    if bool(state['cfg'].get('l_soil_veg', False)):
+        _advance_soil_veg_step(state, l_sample=l_sample)
 
     if scheme == "none":
         state['radht'].fill(0.0)
@@ -42,14 +57,16 @@ def advance_radiation(state: dict, time_current: float, l_sample: bool = False):
         state['radht'][:] = simple_rad_bomex(state['gr'].zt)
     elif scheme == "simplified":
         _advance_simplified_radiation(state, time_current, l_sample=l_sample)
+    elif scheme == "bugsrad":
+        _advance_bugsrad_radiation(state, time_current, l_sample=l_sample)
     else:
         raise ValueError(
             f"Unsupported rad_scheme={scheme!r} in Python radiation driver. "
-            "Supported: none, simplified, simplified_bomex."
+            "Supported: none, simplified, simplified_bomex, bugsrad."
         )
 
-    if l_sample:
-        clubb_api.stats_update("radht", state['radht'])
+    if l_sample and sw is not None:
+        sw.update("radht", state['radht'])
 
 
 def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bool = False):
@@ -57,31 +74,37 @@ def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bo
     cfg = state['cfg']
     gr = state['gr']
     ngrdcol = state['ngrdcol']
-    nzm = state['nzm']
-    nzt = state['nzt']
+    sw = state.get('stats_writer')
 
     l_sw_radiation = bool(cfg.get('l_sw_radiation', False))
 
-    frad_sw = np.zeros((ngrdcol, nzm), dtype=np.float64)
-    radht_sw = np.zeros((ngrdcol, nzt), dtype=np.float64)
+    frad_sw = np.zeros((ngrdcol, gr.nzm), dtype=np.float64)
+    radht_sw = np.zeros((ngrdcol, gr.nzt), dtype=np.float64)
 
     amu0 = _compute_amu0(state, time_current)
     if l_sw_radiation and amu0 > 0.0:
         fs0 = _compute_fs0(cfg, amu0)
-
-        # Call sunray_sw to get Frad_SW on momentum levels (ngrdcol, nzm).
-        frad_sw = clubb_api.sunray_sw(
-            gr=gr,
+        frad_sw = sunray_sw(
             ngrdcol=ngrdcol,
-            nzt=nzt,
-            fs0=fs0,
-            amu0=amu0,
-            rho=state['rho'],
+            nzt=gr.nzt,
             rcm=state['rcm'],
+            rho=state['rho'],
+            xi_abs=amu0,
+            dzt=1.0 / gr.invrs_dzt,
+            zm=gr.zm,
+            zt=gr.zt,
+            # sunray_sw gets radius=eff_drop_radius and A=alvdr (radiation_module.F90:507). The JAX was
+            # reading the wrong namelist keys (default radius / 0 albedo) — invisible until an active-SW
+            # case (nov11: amu0=0.62, alvdr=0.1; jun25's SW is inactive so it never exercised the albedo).
+            radius=float(cfg.get('eff_drop_radius', cfg.get('radius', 10.0e-6))),
+            A=float(cfg.get('alvdr', cfg.get('A_surface_albedo', 0.0))),
+            gc=float(cfg.get('gc', 0.85)),
+            Fs0=fs0,
+            # the namelist key is `omega` (radiation_module.F90); the JAX read `omega_sw` → default 0.999.
+            # The SW absorption ∝ (1−omega), so 0.999 vs nov11's 0.9965 = 3.5× too little absorption.
+            omega=float(cfg.get('omega', cfg.get('omega_sw', 0.999))),
+            l_center=bool(cfg.get('l_center_rad', True)),
         )
-
-        # Compute radht_SW from Frad_SW: ddzm(Frad_SW) / (rho * Cp)
-        # This matches the pattern in radiation_module.F90.
         radht_sw = (
             -(frad_sw[:, 1:] - frad_sw[:, :-1]) * gr.invrs_dzt
             / (state['rho'] * _CP)
@@ -100,6 +123,7 @@ def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bo
         kappa=float(cfg.get('kappa', 0.0)),
         l_rad_above_cloud=bool(cfg.get('l_rad_above_cloud', False)),
         l_sample=l_sample,
+        sw=sw,
     )
 
     frad_total = frad_sw + frad_lw
@@ -110,12 +134,104 @@ def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bo
     state['radht_SW'] = radht_sw
     state['radht_LW'] = radht_lw
 
-    if l_sample:
-        clubb_api.stats_update("Frad", frad_total)
-        clubb_api.stats_update("Frad_SW", frad_sw)
-        clubb_api.stats_update("Frad_LW", frad_lw)
-        clubb_api.stats_update("radht_SW", radht_sw)
-        clubb_api.stats_update("radht_LW", radht_lw)
+    if l_sample and sw is not None:
+        sw.update("Frad", frad_total)
+        sw.update("Frad_SW", frad_sw)
+        sw.update("Frad_LW", frad_lw)
+        sw.update("radht_SW", radht_sw)
+        sw.update("radht_LW", radht_lw)
+
+
+def _advance_soil_veg_step(state: dict, l_sample: bool = False):
+    """Advance the gabls3 soil/vegetation temperatures (soil_vegetation.F90, called from radiation_module.F90).
+    Uses the SURFACE slice (CLUBB index 0 in JAX) of the previous step's BUGSrad fluxes + the current
+    surface turbulent fluxes. Initialises veg/soil temps on first call; persists them in state."""
+    from clubb_jax.src.Radiation.soil_vegetation import advance_soil_veg, initialize_soil_veg
+    ngrdcol = state['ngrdcol']
+    if 'veg_T_in_K' not in state:
+        deep, sfc, veg = initialize_soil_veg(ngrdcol)
+        state['deep_soil_T_in_K'], state['sfc_soil_T_in_K'], state['veg_T_in_K'] = deep, sfc, veg
+
+    dt = float(state['dt_main'])
+    rho_sfc = np.asarray(state['rho_zm'], dtype=np.float64)[:, 0]    # rho_zm(:,1) in Fortran
+    z = np.zeros(ngrdcol)
+    sfc0 = lambda key: np.asarray(state[key], dtype=np.float64)[:, 0] if key in state else z
+    deep, sfc, veg, _ = advance_soil_veg(
+        dt, rho_sfc, sfc0('Frad_SW_up'), sfc0('Frad_SW_down'), sfc0('Frad_LW_down'),
+        np.asarray(state['wpthlp_sfc'], dtype=np.float64), np.asarray(state['wprtp_sfc'], dtype=np.float64),
+        np.asarray(state['p_sfc'], dtype=np.float64),
+        state['deep_soil_T_in_K'], state['sfc_soil_T_in_K'], state['veg_T_in_K'])
+    state['deep_soil_T_in_K'] = np.asarray(deep)
+    state['sfc_soil_T_in_K'] = np.asarray(sfc)
+    state['veg_T_in_K'] = np.asarray(veg)
+
+
+def _advance_bugsrad_radiation(state: dict, time_current: float, l_sample: bool = False):
+    """BUGSrad branch — port of radiation_module.F90 case("bugsrad") (the -Dradoffline path).
+    Builds the CLUBB↔BUGSrad grid setup once (cached in state['_bugsrad_setup']), then per step maps
+    the CLUBB state onto the radiation grid and calls compute_bugsrad_radiation. T_in_K = thlm·exner +
+    Lv·rcm/Cp (T_in_K_module.F90); p on the m-grid via zt2zm; rsm/rim default to 0 (no microphysics)."""
+    import jax.numpy as jnp
+    from clubb_jax.src.Radiation.bugsrad_driver import (
+        load_std_atmosphere, build_rad_grid_setup, compute_bugsrad_radiation)
+    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+    from clubb_jax.src.CLUBB_core.constants_clubb import Lv as _LV
+
+    cfg = state['cfg']; gr = state['gr']; ngrdcol = state['ngrdcol']
+    sw = state.get('stats_writer')
+
+    p_in_Pa = np.asarray(state['p_in_Pa'], dtype=np.float64)
+    p_in_Pam = np.asarray(zt2zm_jax(jnp.asarray(p_in_Pa), gr), dtype=np.float64)
+
+    # build + cache the static radiation-grid layout (std-atm extension + buffer) on first call
+    setup = state.get('_bugsrad_setup')
+    if setup is None:
+        ext = load_std_atmosphere()
+        zm = np.asarray(gr.zm, dtype=np.float64)[0]
+        dzt = np.asarray(gr.dzt, dtype=np.float64)[0]          # zm_grid_spacing (Fortran passes gr%dzt)
+        rad_top = float(cfg.get('radiation_top', 50000.0))
+        setup = build_rad_grid_setup(zm, dzt, p_in_Pam[0], rad_top, ext)
+        state['_bugsrad_setup'] = setup
+
+    rcm = np.asarray(state['rcm'], dtype=np.float64)
+    thlm = np.asarray(state['thlm'], dtype=np.float64)
+    rtm = np.asarray(state['rtm'], dtype=np.float64)
+    exner = np.asarray(state['exner'], dtype=np.float64)
+    T_in_K = thlm * exner + _LV * rcm / _CP
+    zeros = np.zeros_like(rcm)
+    rsm = np.asarray(state.get('rsm', zeros), dtype=np.float64)
+    rim = np.asarray(state.get('rim', zeros), dtype=np.float64)
+
+    amu0 = float(_compute_amu0(state, time_current))           # raw cos zenith; bugs_rad masks night (<0.01)
+    amu0_arr = np.full(ngrdcol, amu0)
+    slr_arr = np.full(ngrdcol, float(cfg.get('slr', 1.0)))
+    sol_const = float(cfg.get('sol_const', 1367.0))
+    alb = lambda k: np.full(ngrdcol, float(cfg.get(k, 0.1)))
+
+    res = compute_bugsrad_radiation(
+        setup, T_in_K, rcm, rtm, rsm, rim,
+        np.asarray(state['cloud_frac'], dtype=np.float64),
+        np.asarray(state['ice_supersat_frac'], dtype=np.float64),
+        p_in_Pa, p_in_Pam, np.asarray(state['rho_zm'], dtype=np.float64), exner,
+        amu0_arr, slr_arr, alb('alvdr'), alb('alvdf'), alb('alndr'), alb('alndf'),
+        sol_const=sol_const)
+
+    state['radht'][:] = np.asarray(res['radht'])
+    state['Frad'] = np.asarray(res['Frad'])
+    state['Frad_SW'] = np.asarray(res['Frad_SW_up'] - res['Frad_SW_down'])
+    state['Frad_LW'] = np.asarray(res['Frad_LW_up'] - res['Frad_LW_down'])
+    state['radht_SW'] = np.asarray(res['radht_SW'])
+    state['radht_LW'] = np.asarray(res['radht_LW'])
+    # up/down components (surface slices feed soil_vegetation next step)
+    state['Frad_SW_up'] = np.asarray(res['Frad_SW_up']); state['Frad_SW_down'] = np.asarray(res['Frad_SW_down'])
+    state['Frad_LW_up'] = np.asarray(res['Frad_LW_up']); state['Frad_LW_down'] = np.asarray(res['Frad_LW_down'])
+
+    if l_sample and sw is not None:
+        sw.update("Frad", state['Frad'])
+        sw.update("Frad_SW", state['Frad_SW'])
+        sw.update("Frad_LW", state['Frad_LW'])
+        sw.update("radht_SW", state['radht_SW'])
+        sw.update("radht_LW", state['radht_LW'])
 
 
 def _simple_rad_lw(
@@ -131,25 +247,20 @@ def _simple_rad_lw(
     kappa: float,
     l_rad_above_cloud: bool,
     l_sample: bool,
+    sw=None,
 ):
-    """Port of simple_rad from simple_rad_module.F90.
-
-    Operates on full 2D (ngrdcol, nz) arrays matching the Fortran version.
-    """
+    """Port of simple_rad from simple_rad_module.F90."""
     nzm = gr.zm.shape[1]
     nzt = gr.zt.shape[1]
 
-    # Liquid water path on momentum levels — accumulates top-down.
     lwp = _liq_water_path(ngrdcol, nzm, nzt, rho, rcm, gr.invrs_dzt)
 
-    # Longwave radiative flux.
     if f1 > _EPS:
         frad_lw = f0 * np.exp(-kappa * lwp) + f1 * np.exp(-kappa * (lwp[:, 0:1] - lwp))
     else:
         frad_lw = f0 * np.exp(-kappa * lwp)
 
     if l_rad_above_cloud:
-        # Find z_i per column where rtm crosses 8 g/kg.
         z_i = np.zeros(ngrdcol, dtype=np.float64)
         for i in range(ngrdcol):
             k_iso = 0
@@ -165,8 +276,6 @@ def _simple_rad_lw(
                 gr.zt[i, k_iso], gr.zt[i, k_iso - 1],
             )
 
-        # Heaviside step function and above-cloud contribution.
-        # z_i shape (ngrdcol,) -> broadcast against zm (ngrdcol, nzm).
         dz = gr.zm - z_i[:, np.newaxis]
         heaviside = np.where(dz < -_EPS, 0.0, np.where(dz > _EPS, 1.0, 0.5))
 
@@ -179,10 +288,9 @@ def _simple_rad_lw(
                 * (0.25 * (dz_pos ** (4.0 / 3.0)) + z_i_broad * (dz_pos ** (1.0 / 3.0)))
             )
 
-        if l_sample:
-            clubb_api.stats_update("z_inversion", z_i)
+        if l_sample and sw is not None:
+            sw.update("z_inversion", z_i)
 
-    # Radiative heating rate on thermodynamic levels.
     radht_lw = (
         (1.0 / exner) * (-1.0 / (_CP * rho))
         * (frad_lw[:, 1:] - frad_lw[:, :-1]) * gr.invrs_dzt
@@ -194,7 +302,7 @@ def _simple_rad_lw(
 def _liq_water_path(ngrdcol: int, nzm: int, nzt: int,
                     rho: np.ndarray, rcm: np.ndarray,
                     invrs_dzt: np.ndarray) -> np.ndarray:
-    """Compute liquid water path on momentum levels, matching liq_water_path in Fortran."""
+    """Compute liquid water path on momentum levels."""
     lwp = np.zeros((ngrdcol, nzm), dtype=np.float64)
     for k in range(nzm - 2, -1, -1):
         lwp[:, k] = lwp[:, k + 1] + rcm[:, k] * rho[:, k] / invrs_dzt[:, k]
@@ -203,11 +311,180 @@ def _liq_water_path(ngrdcol: int, nzm: int, nzt: int,
 
 def _linear_interp(x: float, x_high: float, x_low: float,
                    y_high: float, y_low: float) -> float:
-    """Linear interpolation in the same argument order used by Fortran."""
     denom = x_high - x_low
     if abs(denom) < _EPS:
         return 0.5 * (y_high + y_low)
     return y_low + (x - x_low) * (y_high - y_low) / denom
+
+
+# ── cos_solar_zen ──────────────────────────────────────────────────────────────
+
+def _gregorian2julian_day(day: int, month: int, year: int) -> int:
+    """Julian day number (day of year, 1-based). Port of gregorian2julian_day."""
+    days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if _is_leap_year(year):
+        days_in_month[2] = 29
+    return sum(days_in_month[:month]) + day
+
+
+def _is_leap_year(year: int) -> bool:
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+
+
+def _compute_current_date(day: int, month: int, year: int, current_time_s: float):
+    """Advance start date by current_time_s seconds. Returns (day, month, year, time_in_day_s)."""
+    days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    total_seconds = current_time_s
+    total_days = int(total_seconds // 86400)
+    time_in_day = total_seconds - total_days * 86400.0
+
+    d, m, y = day, month, year
+    remaining = total_days
+    while remaining > 0:
+        dim = [0, 31, 29 if _is_leap_year(y) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        days_left_in_month = dim[m] - d + 1
+        if remaining < days_left_in_month:
+            d += remaining
+            remaining = 0
+        else:
+            remaining -= days_left_in_month
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
+            d = 1
+    return d, m, y, time_in_day
+
+
+def cos_solar_zen(day: int, month: int, year: int,
+                  current_time: float,
+                  lat_in_degrees: float, lon_in_degrees: float) -> float:
+    """Cosine of solar zenith angle. Port of cos_solar_zen_module.F90."""
+    present_day, present_month, present_year, present_time = \
+        _compute_current_date(day, month, year, current_time)
+
+    jul_day = _gregorian2julian_day(present_day, present_month, present_year)
+    days_in_year = 366 if _is_leap_year(present_year) else 365
+
+    hour = present_time / sec_per_hr
+    t = 2.0 * math.pi * (jul_day - 1) / days_in_year
+
+    delta = (_CSZ_C0
+             + _CSZ_C1 * math.cos(t)   + _CSZ_D1 * math.sin(t)
+             + _CSZ_C2 * math.cos(2*t) + _CSZ_D2 * math.sin(2*t)
+             + _CSZ_C3 * math.cos(3*t) + _CSZ_D3 * math.sin(3*t))
+
+    h = int(hour)
+    if 0 <= h <= 11:
+        zln = 180.0 - hour * 15.0
+    elif 12 <= h <= 23:
+        zln = 540.0 - hour * 15.0
+    else:
+        raise ValueError(f"Hour={hour} > 24 in cos_solar_zen")
+
+    longang = abs(lon_in_degrees - zln) * radians_per_deg
+    latang = lat_in_degrees * radians_per_deg
+
+    return (math.sin(latang) * math.sin(delta)
+            + math.cos(latang) * math.cos(delta) * math.cos(longang))
+
+
+# ── sunray_sw ──────────────────────────────────────────────────────────────────
+
+def sunray_sw(ngrdcol: int, nzt: int,
+              rcm: np.ndarray, rho: np.ndarray,
+              xi_abs: float, dzt: np.ndarray,
+              zm: np.ndarray, zt: np.ndarray,
+              radius: float, A: float, gc: float,
+              Fs0: float, omega: float, l_center: bool) -> np.ndarray:
+    """Shortwave flux. Port of rad_lwsw_module.F90:sunray_sw (lines 343-755).
+
+    Returns Frad_SW shape (ngrdcol, nzt+1) on momentum levels (bottom-up).
+    """
+    three_halves = 1.5
+
+    # Per-layer optical depth  tau(i,k) = 1.5 * rcm * rho * dzt / radius / rho_lw
+    tau = three_halves * rcm * rho * dzt / radius / rho_lw   # (ngrdcol, nzt)
+
+    # Column total optical depth
+    tauc = tau.sum(axis=1)   # (ngrdcol,)
+
+    # Delta-Eddington transformation (Duynkerke eqn.18)
+    ff = gc * gc
+    gcde = gc / (1.0 + gc)
+    omegade = (1.0 - ff) * omega / (1.0 - omega * ff)
+    taude = (1.0 - omega * ff) * tau   # (ngrdcol, nzt)
+
+    # Constants (scalar, same for all columns)
+    x1 = 1.0 - omegade * gcde
+    x2 = 1.0 - omegade
+    rk = math.sqrt(3.0 * x2 * x1)
+    xi_abs2 = xi_abs * xi_abs
+    rk2 = rk * rk
+    x3 = 4.0 * (1.0 - rk2 * xi_abs2)
+    rp = math.sqrt(3.0 * x2 / x1)
+    alpha = 3.0 * omegade * xi_abs2 * (1.0 + gcde * x2) / x3
+    beta = 3.0 * omegade * xi_abs * (1.0 + 3.0 * gcde * xi_abs2 * x2) / x3
+
+    rtt = 2.0 / 3.0
+    xp23p = 1.0 + rtt * rp
+    xm23p = 1.0 - rtt * rp
+    ap23b = alpha + rtt * beta
+    t1 = 1.0 - A - rtt * (1.0 + A) * rp
+    t2 = 1.0 - A + rtt * (1.0 + A) * rp
+    t3 = (1.0 - A) * alpha - rtt * (1.0 + A) * beta + A * xi_abs
+
+    # Per-column: column total D-E optical depth, C1, C2
+    taucde = (1.0 - omega * ff) * tauc   # (ngrdcol,)
+    exmu0 = np.exp(-taucde / xi_abs)
+    expk = np.exp(rk * taucde)
+    exmk = 1.0 / expk
+
+    c2 = (xp23p * t3 * exmu0 - t1 * ap23b * exmk) / (xp23p * t2 * expk - xm23p * t1 * exmk)
+    c1 = (ap23b - c2 * xm23p) / xp23p   # both shape (ngrdcol,)
+
+    # Flux computation on momentum levels: sequential taupath accumulation per column
+    Frad_SW = np.zeros((ngrdcol, nzt + 1), dtype=np.float64)
+
+    for i in range(ngrdcol):
+        # Top momentum level (k = nzt+1, Python index nzt)
+        taupath = 0.5 * taude[i, nzt - 1] if l_center else 0.0
+
+        def _flux(tp):
+            F_diff = (-4.0 / 3.0) * Fs0 * (
+                rp * (c1[i] * math.exp(-rk * tp) - c2[i] * math.exp(rk * tp))
+                - beta * math.exp(-tp / xi_abs)
+            )
+            F_dir = -Fs0 * xi_abs * math.exp(-tp / xi_abs)
+            return F_diff + F_dir
+
+        Frad_SW[i, nzt] = _flux(taupath)
+
+        # Interior levels k = nzt-1 down to 1 (Python indices nzt-1 down to 1)
+        for k_py in range(nzt - 1, 0, -1):
+            k_fort = k_py + 1  # Fortran 1-based: k goes nzt down to 2
+            if l_center:
+                # lin_interpolate_two_points(zm[k], zt[k], zt[k-1], taude[k], taude[k-1])
+                zm_k = zm[i, k_py]
+                zt_k = zt[i, k_py]
+                zt_km1 = zt[i, k_py - 1]
+                td_k = taude[i, k_py]
+                td_km1 = taude[i, k_py - 1]
+                denom = zt_k - zt_km1
+                if abs(denom) < 1e-300:
+                    interp = 0.5 * (td_k + td_km1)
+                else:
+                    interp = td_km1 + (zm_k - zt_km1) * (td_k - td_km1) / denom
+                taupath += interp
+            else:
+                taupath += taude[i, k_py - 1]
+            Frad_SW[i, k_py] = _flux(taupath)
+
+        # Bottom momentum level (k = 1, Python index 0)
+        taupath += taude[i, 0]
+        Frad_SW[i, 0] = _flux(taupath)
+
+    return Frad_SW
 
 
 def _compute_amu0(state: dict, time_current: float) -> float:
@@ -227,7 +504,7 @@ def _compute_amu0(state: dict, time_current: float) -> float:
             raise ValueError("time_current exceeds provided cos_solar_zen_times range.")
         return float(cos_vals[idx])
 
-    return clubb_api.cos_solar_zen(
+    return cos_solar_zen(
         int(cfg.get('day', 1)),
         int(cfg.get('month', 1)),
         int(cfg.get('year', 2000)),
@@ -238,7 +515,6 @@ def _compute_amu0(state: dict, time_current: float) -> float:
 
 
 def _compute_fs0(cfg: dict, amu0: float) -> float:
-    """Interpolate solar flux on cosine solar zenith lookup table."""
     fs_values = _as_1d_float(cfg.get('fs_values', [0.0]))
     cos_values = _as_1d_float(cfg.get('cos_solar_zen_values', [0.0]))
 

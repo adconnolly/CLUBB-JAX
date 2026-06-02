@@ -27,6 +27,13 @@ PYTHONPATH  = os.pathsep.join([JAX_ROOT, CLUBB_ROOT,
                                 os.path.join(CLUBB_ROOT, "clubb_python_api")])
 
 REL_TOL = 1e-6   # flag variables whose max|Δ|/max|ref| exceeds this
+# Absolute floor (numpy.allclose convention: |Δ| <= ABS_TOL + REL_TOL*|ref|).
+# Without it, fields that are physically ~0 in a given case (e.g. moisture
+# moments rtp2/rtpthlp/wprtp/wpthlp in a DRY case like ekman) report enormous
+# relative error from pure f64 roundoff (|Δ| ~ 1e-24 vs |ref| ~ 1e-24). The floor
+# is far below any real-scale prognostic difference, so it never masks a true
+# divergence (e.g. ekman wp2 |Δ| ~ 8e-5 still fails).
+ABS_TOL = 1e-12
 
 # Key prognostic state variables — these MUST match between Fortran and hybrid.
 # Diagnostic budget terms and mixing-length scalars can have timing differences.
@@ -35,6 +42,18 @@ PROGNOSTIC = {
     "wpthlp", "wprtp", "upwp", "vpwp", "up2", "vp2", "em",
     "sclrm",
 }
+
+
+def _read_dt_main(case: str) -> int:
+    """Read dt_main [s] from a case's {case}_model.in (default 60 if not found)."""
+    import re
+    path = os.path.join(CLUBB_ROOT, "input/case_setups", f"{case}_model.in")
+    try:
+        txt = open(path).read()
+    except OSError:
+        return 60
+    m = re.search(r"dt_main\s*=\s*([0-9.]+)", txt)
+    return int(float(m.group(1))) if m else 60
 
 
 def run(cmd, env=None, cwd=None):
@@ -81,7 +100,8 @@ def compare_nc(fort_path: str, jax_path: str) -> bool:
         max_ref  = float(np.nanmax(np.abs(fv)))
         rel = max_diff / max_ref if max_ref > 0 else 0.0
         is_prog = v in PROGNOSTIC
-        status = "PASS" if rel <= REL_TOL else "FAIL"
+        # allclose convention: pass on relative OR absolute agreement.
+        status = "PASS" if max_diff <= ABS_TOL + REL_TOL * max_ref else "FAIL"
         if status == "FAIL" and is_prog:
             prog_fail = True
         rows.append((v, max_diff, max_ref, rel, is_prog, status))
@@ -105,12 +125,28 @@ def main():
     parser.add_argument("--case", default="arm", help="Case name (default: arm)")
     parser.add_argument("--max-iters", type=int, default=30,
                         help="Number of timesteps (default: 30)")
+    parser.add_argument("--tout", type=int, default=None,
+                        help="Override stats sampling+output interval [s] for both runs. "
+                             "Default: auto = dt_main (true instantaneous, per-step output). "
+                             "This compares the PHYSICS directly and avoids stats-averaging-"
+                             "window artifacts for cases whose default stats_tout/stats_tsamp "
+                             "exceed dt (e.g. gabls2, gabls3_night).")
+    parser.add_argument("--override", default=None,
+                        help="Extra namelist overrides (KEY=val,...) applied to BOTH runs, "
+                             "e.g. 'l_ho_nontrad_coriolis=.true.' to enable a flag in Fortran+JAX.")
     args = parser.parse_args()
 
     case   = args.case
     niters = args.max_iters
     outdir_f = os.path.join(CLUBB_ROOT, f"output/{case}_compare_fort")
     outdir_j = os.path.join(CLUBB_ROOT, f"output/{case}_compare_jax")
+    # Force per-step output (stats_tsamp = stats_tout = interval) so JAX/Fortran records
+    # are instantaneous and time-aligned. Default interval = the case's dt_main.
+    interval = args.tout if args.tout is not None else _read_dt_main(case)
+    _ov = f"stats_tsamp={interval}.,stats_tout={interval}."
+    if args.override:
+        _ov += "," + args.override
+    tout_args = ["-override", _ov]
 
     env_jax = os.environ.copy()
     env_jax["PYTHONPATH"] = PYTHONPATH
@@ -121,7 +157,7 @@ def main():
     t0 = time.time()
     rc = run(scm + [case, "-legacy",
                     "-max_iters", str(niters),
-                    "-out_dir", outdir_f])
+                    "-out_dir", outdir_f] + tout_args)
     print(f"  Fortran: {time.time()-t0:.1f}s  (rc={rc})")
     if rc != 0:
         sys.exit(f"Fortran run failed (rc={rc})")
@@ -130,7 +166,7 @@ def main():
     t0 = time.time()
     rc = run(scm + [case, "-jax",
                     "-max_iters", str(niters),
-                    "-out_dir", outdir_j],
+                    "-out_dir", outdir_j] + tout_args,
              env=env_jax)
     print(f"  JAX hybrid: {time.time()-t0:.1f}s  (rc={rc})")
     if rc != 0:

@@ -14,6 +14,7 @@ import numpy as np
 from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax, rcm_sat_adj_jax
 from clubb_jax.src.CLUBB_core.T_in_K_module import calculate_thvm_jax
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.sponge_layer_damping import initialize_tau_sponge_damp
 from clubb_jax.src.CLUBB_core.calc_pressure import hydrostatic_jax
 from clubb_jax.src.CLUBB_core.parameters_tunable import (
     init_clubb_params_jax,
@@ -25,11 +26,11 @@ from clubb_jax.src.CLUBB_core.numerical_check import (
     check_clubb_settings_jax,
     check_parameters_jax,
 )
-from clubb_python.derived_types.config_flags import ConfigFlags
-from clubb_python.derived_types.grid_class import setup_grid as py_setup_grid
-from clubb_python.derived_types.sclr_idx import SclrIdx
-from clubb_python.derived_types.err_info import ErrInfo
-from clubb_python.derived_types.pdf_params import (
+from clubb_jax.src.derived_types.config_flags import ConfigFlags
+from clubb_jax.src.derived_types.grid_class import setup_grid as py_setup_grid
+from clubb_jax.src.derived_types.sclr_idx import SclrIdx
+from clubb_jax.src.derived_types.err_info import ErrInfo
+from clubb_jax.src.derived_types.pdf_params import (
     init_pdf_implicit_coefs_terms_api,
     init_pdf_params as init_pdf_params_py,
 )
@@ -46,6 +47,7 @@ from clubb_jax.src.Input_fields.sounding import (
 )
 from clubb_jax.src.Input_fields.surface import read_surface
 from clubb_jax.src.Benchmark_cases.arm import load_arm_forcings_data
+from clubb_jax.src.Benchmark_cases.generic_forcings import load_generic_forcings_data
 
 # ── Physical constants (from constants_clubb.F90, standalone block) ──────
 Cp = 1004.67
@@ -102,6 +104,7 @@ def _initialize_em_profile(runtype: str, gr, um: np.ndarray):
         "astex_a209": (700.0, 1.0),
         "fire": (700.0, 4.5),
         "dycoms2_rf01": (800.0, 1.1),
+        "mpace_a": (2000.0, 1.0),    # clubb_driver.F90:5131 (em=1 below 2 km cloud top, em_min above)
         "mpace_b": (1300.0, 1.0),
         "rico": (1500.0, 1.0),
     }
@@ -292,23 +295,21 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
     errors = []
 
     # --- Microphysics ---
-    if microphys_scheme != "none":
+    # 'none', 'khairoutdinov_kogan' (KK), and 'morrison' (M2005 2-moment) are supported. The Morrison
+    # rate library + driver + CLUBB interface (morrison_microphys_driver) are ported and validated on
+    # nov11_altocu fields; the per-step call is wired in advance_clubb_to_end (gated by the scheme).
+    if microphys_scheme not in ("none", "khairoutdinov_kogan", "morrison"):
         errors.append(
             f"microphys_scheme = '{microphys_scheme}' is not supported "
-            "(only 'none' is implemented)."
+            "(only 'none', 'khairoutdinov_kogan', and 'morrison' are implemented)."
         )
 
     # --- Cloud water sedimentation ---
-    # cloud_drop_sed is called from the Fortran driver loop but not from
-    # the Python driver; rcm_mc / thlm_mc stay zero when this is enabled.
-    if bool(cfg.get('l_cloud_sed', False)):
-        errors.append(
-            "l_cloud_sed = true is not supported "
-            "(cloud_drop_sed is not called from the Python driver)."
-        )
+    # cloud_drop_sed is now ported (Microphys/cloud_sed_module.py) and called from
+    # the Python driver loop, so l_cloud_sed is supported.
 
     # --- Radiation ---
-    supported_rad = {"none", "simplified", "simplified_bomex"}
+    supported_rad = {"none", "simplified", "simplified_bomex", "bugsrad"}
     if rad_scheme not in supported_rad:
         errors.append(
             f"rad_scheme = '{rad_scheme}' is not supported "
@@ -321,20 +322,20 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
         )
 
     # --- Sponge damping ---
-    # Sponge damping is applied in the Fortran driver loop after
-    # advance_clubb_core; the Python driver does not call these routines.
-    _SPONGE_FIELDS = [
-        "thlm", "rtm", "uv", "wp2", "wp3", "up2_vp2",
-    ]
+    # Sponge-layer damping: xm fields (thlm/rtm/uv) are ported
+    # (sponge_layer_damping.sponge_damp_xm, wired into advance_clubb_core).
+    # The xp2/xp3 variants (wp2/wp3/up2_vp2 -> sponge_damp_xp2/xp3) are not yet
+    # ported, so still block those.
+    _UNPORTED_SPONGE_FIELDS = ["wp2", "wp3", "up2_vp2"]
     sponge_enabled = [
-        f for f in _SPONGE_FIELDS
+        f for f in _UNPORTED_SPONGE_FIELDS
         if bool(cfg.get(f'{f}_sponge_damp_settings%l_sponge_damping', False))
     ]
     if sponge_enabled:
         names = ", ".join(sponge_enabled)
         errors.append(
-            f"Sponge damping is enabled for [{names}] but is not supported "
-            "(sponge_damp routines are not called from the Python driver)."
+            f"Sponge damping is enabled for [{names}] but the xp2/xp3 sponge "
+            "(sponge_damp_xp2/xp3) is not yet ported."
         )
 
     # --- SILHS / Latin Hypercube sampling ---
@@ -347,9 +348,7 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
     if bool(cfg.get('l_silhs_rad', False)):
         errors.append("l_silhs_rad = true is not supported (SILHS is not available).")
 
-    # --- Soil / vegetation ---
-    if bool(cfg.get('l_soil_veg', False)):
-        errors.append("l_soil_veg = true is not supported.")
+    # --- Soil / vegetation --- (ported Iter270, wired Iter271: soil_vegetation.py + gabls3 sfclyr)
 
     # --- Restarts ---
     if bool(cfg.get('l_restart', False)):
@@ -387,6 +386,10 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     Returns a dict containing all model state arrays and config.
     """
+    # Reset cross-timestep core state so each init starts clean (reentrancy — allows running
+    # multiple cases in one process without the previous case's ADG1 state leaking, Iter281).
+    from clubb_jax.src.CLUBB_core.advance_clubb_core_module import reset_clubb_core_state
+    reset_clubb_core_state()
     # Resolve to absolute path before any chdir so subsequent uses remain valid.
     namelist_path = str(Path(namelist_path).resolve())
     cfg = read_namelist(namelist_path)
@@ -510,6 +513,12 @@ def init_clubb_case(namelist_path: str) -> dict:
     # Build 2D arrays (ngrdcol, nzt) by broadcasting 1D profile
     thlm = np.tile(snd_interp['theta'], (ngrdcol, 1))
     rtm = np.tile(snd_interp['rt'], (ngrdcol, 1))
+    # NO IC floor (Iter186): the Fortran does NOT floor the initial rtm — its rtm_old entering step 1 is
+    # the bare sounding value (~0/2e-19 at rico's dry top, NOT 1e-8). It is the per-step fill_holes inside
+    # advance_xm_wpxp (rtm_cl budget, advance_clubb_core_module.py:~1700) that raises the sub-rt_tol dry top
+    # to 1e-8 each step, mass-conservingly pulling a tiny amount (~4.5e-11) from the topmost moist level.
+    # The old Iter141 `rtm=max(rtm,rt_tol)` floor pre-empted that fill → it never fired → the donor-level
+    # mass transfer (rico's step-1 k51 rtm seed) was missing. No-op for the 15 cases (rtm >= rt_tol at IC).
     um = np.tile(snd_interp['u'], (ngrdcol, 1))
     vm = np.tile(snd_interp['v'], (ngrdcol, 1))
     ug = np.tile(snd_interp['ug'], (ngrdcol, 1))
@@ -616,14 +625,20 @@ def init_clubb_case(namelist_path: str) -> dict:
     invrs_rho_ds_zm = 1.0 / rho_ds_zm
 
     # ── 7. Subsidence / vertical wind ───────────────────────────────────
+    # Boundary handling is subs_type-dependent, faithful to clubb_driver.F90:4748-4763:
+    #   wm[m/s]:     wm_zm = zt2zm(wm_zt); zero BOTH boundaries.
+    #   omega[Pa/s]: wm_zt = -wm_zt/(grav*rho), wm_zt[top]=0; wm_zm = zt2zm(wm_zt); zero TOP ONLY
+    #                (the bottom keeps the interpolated value — e.g. jun25's 6.94e-5). The old code
+    #                always zeroed both, which was unfaithful for omega cases with init subsidence.
     if subs_type == 'omega[Pa/s]':
         wm_zt = -wm_zt / (grav * rho)
         wm_zt[:, -1] = 0.0
-
-    # Iter62: zt2zm replaced with zt2zm_jax
-    wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr), dtype=np.float64)
-    wm_zm[:, 0] = 0.0
-    wm_zm[:, -1] = 0.0
+        wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr), dtype=np.float64)
+        wm_zm[:, -1] = 0.0
+    else:
+        wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr), dtype=np.float64)
+        wm_zm[:, 0] = 0.0
+        wm_zm[:, -1] = 0.0
 
     # ── 8. Initialize PDF and tunable parameters ────────────────────────
     # Use __file__-relative path so it works regardless of namelist location.
@@ -705,16 +720,38 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     # ── 10. Initialize remaining prognostic arrays to zero ──────────────
 
-    # Reference profiles (matches initialize_clubb logic in Fortran driver)
-    uv_sponge_enabled = bool(cfg.get('uv_sponge_damp_settings%l_sponge_damping', False))
+    # Reference profiles (matches initialize_clubb logic in Fortran driver,
+    # clubb_driver.F90:5298-5316). The reference is the initial sounding profile
+    # and is captured only when the field's sponge (or uv nudge) is active.
+    uv_sponge_enabled   = bool(cfg.get('uv_sponge_damp_settings%l_sponge_damping', False))
+    thlm_sponge_enabled = bool(cfg.get('thlm_sponge_damp_settings%l_sponge_damping', False))
+    rtm_sponge_enabled  = bool(cfg.get('rtm_sponge_damp_settings%l_sponge_damping', False))
     if flags.l_uv_nudge or uv_sponge_enabled:
         um_ref = um.copy()
         vm_ref = vm.copy()
     else:
         um_ref = np.zeros((ngrdcol, nzt))
         vm_ref = np.zeros((ngrdcol, nzt))
-    thlm_ref = np.zeros((ngrdcol, nzt))
-    rtm_ref = np.zeros((ngrdcol, nzt))
+    thlm_ref = thlm.copy() if thlm_sponge_enabled else np.zeros((ngrdcol, nzt))
+    rtm_ref  = rtm.copy()  if rtm_sponge_enabled  else np.zeros((ngrdcol, nzt))
+
+    # Sponge-layer damping config: precompute the per-field damping-timescale
+    # profile once (sponge_layer_damping.initialize_tau_sponge_damp). Applied
+    # inside advance_clubb_core after each xm solve. Only xm fields (rtm/thlm/uv)
+    # are ported; xp2/xp3 sponge (wp2/wp3/up2_vp2) is gated off in check_clubb_settings.
+    sponge_cfg = {}
+    _zt_col = np.asarray(gr.zt, dtype=np.float64)[0, :]
+    _zm_top = float(np.asarray(gr.zm, dtype=np.float64)[0, -1])
+    for _key, _on in (('rtm', rtm_sponge_enabled), ('thlm', thlm_sponge_enabled),
+                      ('uv', uv_sponge_enabled)):
+        if not _on:
+            continue
+        _tau_min = float(cfg.get(f'{_key}_sponge_damp_settings%tau_sponge_damp_min', 60.0))
+        _tau_max = float(cfg.get(f'{_key}_sponge_damp_settings%tau_sponge_damp_max', 1800.0))
+        _depth_f = float(cfg.get(f'{_key}_sponge_damp_settings%sponge_damp_depth', 0.25))
+        _tau, _depth = initialize_tau_sponge_damp(
+            _zt_col, float(dt_main), _zm_top, _tau_min, _tau_max, _depth_f)
+        sponge_cfg[_key] = {'tau': _tau, 'depth': _depth}
 
     # Cloud properties
     nc0_in_cloud = float(cfg.get('nc0_in_cloud', Nc0_in_cloud))
@@ -724,9 +761,23 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     # Transport scalar/hydromet arrays across F2PY with a padded trailing extent.
     # The logical *_dim values remain authoritative and are used inside Fortran.
-    hydromet_dim = 0
+    # KK microphysics predicts 2 hydrometeors (rrm at idx 0, Nrm at idx 1); all other supported
+    # cases are hydromet_dim=0. The hydromet means are initialised to 0 (rico's sounding has no rain).
+    hm_metadata = None
+    if microphys_scheme == "khairoutdinov_kogan":
+        from clubb_jax.src.CLUBB_core.corr_varnce_module import kk_hm_metadata
+        hm_metadata = kk_hm_metadata()
+        hydromet_dim = hm_metadata.hydromet_dim   # = 2
+    elif microphys_scheme == "morrison":
+        from clubb_jax.src.CLUBB_core.corr_varnce_module import morrison_hm_metadata
+        hm_metadata = morrison_hm_metadata()
+        hydromet_dim = hm_metadata.hydromet_dim   # = 8 (rr/Nr/ri/Ni/rs/Ns/rg/Ng)
+    else:
+        hydromet_dim = 0
     hm_dim_transport = max(hydromet_dim, 1)
-    l_mix_rat_hm = np.zeros((hm_dim_transport,), dtype=bool)
+    hydromet = np.zeros((ngrdcol, nzt, hm_dim_transport))   # mean hydrometeors (rrm, Nrm)
+    l_mix_rat_hm = (np.asarray(hm_metadata.l_mix_rat_hm) if hm_metadata is not None
+                    else np.zeros((hm_dim_transport,), dtype=bool))
     wphydrometp = np.zeros((ngrdcol, nzm, hm_dim_transport))
     wp2hmp = np.zeros((ngrdcol, nzt, hm_dim_transport))
     rtphmp_zt = np.zeros((ngrdcol, nzt, hm_dim_transport))
@@ -851,12 +902,18 @@ def init_clubb_case(namelist_path: str) -> dict:
         saturation_formula=saturation_formula,
         sfctype=int(cfg['sfctype']),
         microphys_scheme=microphys_scheme,
+        # Apply the full KK rain microphysics (rates + hydrometeor transport) for KK cases (Iter157).
+        l_kk_micro_apply=(microphys_scheme == "khairoutdinov_kogan"),
+        # The microphysics is skipped until this time (microphys_driver.F90:389; nov11=64800 → 60-step
+        # spinup); default 0 = active from the start.
+        microphys_start_time=float(cfg.get('microphys_start_time', 0.0)),
         l_cloud_sed=l_cloud_sed,
         sigma_g=sigma_g,
         nc0_in_cloud=nc0_in_cloud,
         rad_scheme=rad_scheme,
         l_calc_thlp2_rad=l_calc_thlp2_rad,
-        hydromet_dim=hydromet_dim, sclr_dim=sclr_dim, edsclr_dim=edsclr_dim,
+        hydromet_dim=hydromet_dim, hydromet=hydromet, hm_metadata=hm_metadata,
+        sclr_dim=sclr_dim, edsclr_dim=edsclr_dim,
         T0=T0, lmin=lmin, mixt_frac_max_mag=mixt_frac_max_mag,
         ts_nudge=cfg['ts_nudge'],
         rtm_min=cfg['rtm_min'],
@@ -931,6 +988,7 @@ def init_clubb_case(namelist_path: str) -> dict:
         # Reference profiles
         um_ref=um_ref, vm_ref=vm_ref,
         thlm_ref=thlm_ref, rtm_ref=rtm_ref,
+        sponge=sponge_cfg,
         ug=ug, vg=vg,
         # Hydromet
         wphydrometp=wphydrometp,
@@ -957,12 +1015,18 @@ def init_clubb_case(namelist_path: str) -> dict:
         stats_writer=stats_writer,
     )
 
-    # ── ARM case: pre-load and vertically interpolate forcing data ──────────
+    # ── Case forcing data: pre-load and vertically interpolate ──────────────
     if runtype == 'arm':
         arm_forcings_path = _resolve_case_input_path(namelist_dir, 'arm', '_forcings.in')
         arm_sfc_path      = _resolve_case_input_path(namelist_dir, 'arm', '_sfc.in')
         state['_arm_forcings_data'] = load_arm_forcings_data(
             str(arm_forcings_path), str(arm_sfc_path), gr.zt[0, :]
+        )
+    else:
+        # Generic cases: load {runtype}_forcings.in and {runtype}_sfc.in if present
+        case_setups_dir = str(_CLUBB_RELEASE_ROOT / "input" / "case_setups")
+        state['_forcings_data'] = load_generic_forcings_data(
+            runtype, case_setups_dir, gr.zt[0, :]
         )
 
     print(f"Initialized {runtype} case: nzm={nzm}, nzt={nzt}, ngrdcol={ngrdcol}")

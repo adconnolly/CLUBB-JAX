@@ -11,7 +11,9 @@ import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
-from clubb_python import clubb_api
+# clubb_api (f90-wrapped Fortran) is imported LAZILY inside the pre-advance PDF block only — the
+# default (post-advance) path is pure JAX, so the driver imports clean of clubb_python and runs
+# standalone for the faithful cases. Only ipdf_pre_advance/pre_post placement (non-default) needs it.
 from clubb_jax.src.CLUBB_core.grid_class import zm2zt, zt2zm, ddzt, zm2zt2zm, zm2zt_jax, zt2zm_jax, zt2zm2zt
 from clubb_jax.src.CLUBB_core.diffusion import (
     diffusion_zt_lhs_jax, diffusion_zm_lhs_jax,
@@ -28,6 +30,16 @@ from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import (
     compute_shared_xm_wpxp_lhs_terms,
     wpxp_term_pr1_lhs_jax,
     wpxp_terms_bp_pr3_rhs_jax,
+)
+from clubb_jax.src.CLUBB_core.sponge_layer_damping import sponge_damp_xm
+from clubb_jax.src.CLUBB_core.mono_flux_limiter import (
+    monotonic_turbulent_flux_limit, calc_turb_adv_range,
+    MFL_UM, MFL_VM, MFL_RTM, MFL_THLM,
+)
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    w_tol as _W_TOL, w_tol_sqd as _W_TOL_SQD,
+    rt_tol as _RT_TOL, thl_tol as _THL_TOL,
+    rt_tol_mfl as _RT_TOL_MFL, thl_tol_mfl as _THL_TOL_MFL,
 )
 from clubb_jax.src.CLUBB_core.advance_wp2_wp3_module import advance_wp2_wp3_jax
 from clubb_jax.src.CLUBB_core.advance_windm_edsclrm_module import advance_windm_edsclrm_jax
@@ -74,6 +86,7 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
     max_mag_correlation,
     max_num_stdevs,
     chi_tol,
+    T_freeze_K,
     sqrt_2,
     sqrt_2pi,
     Rd,
@@ -170,397 +183,40 @@ class PdfParamsJAX:
 
 
 # Iter34 stats: JAX vs Fortran for complete pdf_closure_driver outputs
-_iter34_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter34_stats():
-    s = _iter34_stats
-    print(f"\n[Iter34 JAX-only — {s['n_calls']} calls (pdf_closure_driver override; Fortran oracle removed Iter50)]")
 
 
 # Iter43 stats: clip_covar_jax vs Fortran for rtpthlp (Cauchy-Schwarz)
-_iter43_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter43_stats():
-    s = _iter43_stats
-    print(f"\n[Iter43 JAX-only — {s['n_calls']} calls (clip_covar rtpthlp; Fortran oracle removed Iter44)]")
 
 
 # Accumulates per-timestep max |JAX - Fortran| for diffusion + solver (Iteration 4)
-_iter4_stats = {
-    'n_calls': 0,
-}
 
 # Call counter for term_ma_zm_lhs (Iteration 5; Fortran oracle removed Iter53)
-_iter5_stats = {
-    'n_calls': 0,
-}
 
 # Call counter for xpyp_term_ta_pdf_lhs_jax (Iteration 6; Fortran oracle removed Iter51)
-_iter6_stats = {
-    'n_calls': 0,
-}
 
 # Accumulates max |JAX - numpy_reference| for term_dp1_lhs (Iteration 7)
-_iter7_stats = {
-    'dp1_max': 0.0,
-    'n_calls': 0,
-}
 
 # Accumulates max |JAX - numpy_reference| for xp2_xpyp_lhs assembly (Iteration 8)
-_iter8_stats = {
-    'xp2_xpyp_lhs_max': 0.0,
-    'n_calls': 0,
-}
 
 # Accumulates max |JAX - numpy_reference| for xp2_xpyp_rhs (Iteration 9)
-_iter9_stats = {
-    'rhs_max': 0.0,
-    'n_calls': 0,
-}
 
 # advance_xp2_xpyp call count (Fortran oracle removed Iter47)
-_iter10_stats = {
-    'n_calls': 0,
-}
 
 # Accumulates max |JAX - Fortran| for full advance_xm_wpxp solve (Iteration 11)
-_iter11_stats = {
-    'n_calls': 0,
-}
 
 # Accumulates max |JAX - Fortran| for full advance_wp2_wp3 solve (Iteration 12)
-_iter12_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter4_stats():
-    """Print accumulated JAX call count for Iteration 4 (diffusion LHS + solver; Fortran oracle removed Iter53)."""
-    s = _iter4_stats
-    print(f"\n[Iter4 JAX-only — {s['n_calls']} timesteps (diffusion_zt/zm_lhs + tridiag_lu_solve; Fortran oracle removed Iter53)]")
-
-
-def report_iter5_stats():
-    """Print accumulated JAX call count for Iteration 5 (term_ma_zm_lhs; Fortran oracle removed Iter53)."""
-    s = _iter5_stats
-    print(f"\n[Iter5 JAX-only — {s['n_calls']} timesteps (term_ma_zm_lhs; Fortran oracle removed Iter53)]")
-
-
-def report_iter6_stats():
-    """Print xpyp_term_ta_pdf_lhs_jax call count (Fortran oracle removed Iter51)."""
-    s = _iter6_stats
-    print(f"\n[Iter6 JAX-only — {s['n_calls']} calls (xpyp_term_ta_pdf_lhs; Fortran oracle removed Iter51)]")
-
-
-def report_iter7_stats():
-    """Print accumulated JAX vs numpy-reference comparison stats for Iteration 7."""
-    s = _iter7_stats
-    print(f"\n[Iter7 JAX vs numpy-ref — {s['n_calls']} calls]")
-    print(f"  term_dp1_lhs         max |JAX - ref|:  {s['dp1_max']:.3e}")
-
-
-def report_iter8_stats():
-    """Print accumulated JAX vs numpy-reference comparison stats for Iteration 8."""
-    s = _iter8_stats
-    print(f"\n[Iter8 JAX vs numpy-ref — {s['n_calls']} calls]")
-    print(f"  xp2_xpyp_lhs (assembled) max |JAX - ref|: {s['xp2_xpyp_lhs_max']:.3e}")
-
-
-def report_iter9_stats():
-    """Print accumulated JAX vs numpy-reference comparison stats for Iteration 9."""
-    s = _iter9_stats
-    print(f"\n[Iter9 JAX vs numpy-ref — {s['n_calls']} calls (one per xp2_xpyp advance)]")
-    print(f"  xp2_xpyp_rhs (rtp2 case) max |JAX - ref|: {s['rhs_max']:.3e}")
-
-
-def report_iter10_stats():
-    """Print advance_xp2_xpyp JAX call count (Fortran oracle removed in Iter47)."""
-    s = _iter10_stats
-    print(f"\n[Iter10 JAX-only — {s['n_calls']} calls (advance_xp2_xpyp rtp2/thlp2/rtpthlp; Fortran oracle removed Iter47)]")
-
-
-def report_iter11_stats():
-    """Print advance_xm_wpxp JAX call count (Fortran oracle removed in Iter46)."""
-    s = _iter11_stats
-    print(f"\n[Iter11 JAX-only — {s['n_calls']} calls (advance_xm_wpxp; Fortran oracle removed Iter46)]")
-
-
-def report_iter12_stats():
-    s = _iter12_stats
-    print(f"\n[Iter12 JAX-only — {s['n_calls']} calls (advance_wp2_wp3 wp2/wp3/wp2_zt; Fortran oracle removed Iter48)]")
-
-
-_iter36_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter36_stats():
-    """Print advance_xp2_xpyp up2/vp2 JAX call count (Fortran oracle removed in Iter47)."""
-    s = _iter36_stats
-    print(f"\n[Iter36 JAX-only — {s['n_calls']} calls (advance_xp2_xpyp up2/vp2; Fortran oracle removed Iter47)]")
-
-
-_iter37_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter37_stats():
-    """Print advance_xm_wpxp wind JAX call count (Fortran oracle removed in Iter46)."""
-    s = _iter37_stats
-    print(f"\n[Iter37 JAX-only — {s['n_calls']} calls (advance_xm_wpxp um/upwp/vm/vpwp; Fortran oracle removed Iter46)]")
-
-
-_iter39_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter39_stats():
-    """Print accumulated JAX call count for Iteration 39 (sigma_sqd_w + pdf_params zm; Fortran oracle removed Iter55)."""
-    s = _iter39_stats
-    print(f"\n[Iter39 JAX-only — {s['n_calls']} calls (sigma_sqd_w + pdf_params zm; Fortran oracle removed Iter55)]")
 
 
 _prev_adg1_j25 = None  # carries Block U ADG1 result across timesteps for Block P override
 
-_iter40_stats = {
-    'n_calls': 0,
-}
 
-
-def report_iter40_stats():
-    """Print accumulated JAX call count for Iteration 40 (Block P w_1_zm/mixt_frac_zm from prev Block U; Fortran oracle removed Iter55)."""
-    s = _iter40_stats
-    print(f"\n[Iter40 JAX-only — {s['n_calls']} calls (Block P w_1_zm/mixt_frac_zm from prev Block U; Fortran oracle removed Iter55)]")
-
-
-_iter13_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter13_stats():
-    s = _iter13_stats
-    print(f"\n[Iter13 JAX-only — {s['n_calls']} calls (advance_windm_edsclrm um/vm/upwp/vpwp; Fortran oracle removed Iter49)]")
-
-
-_iter14_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter14_stats():
-    """Print accumulated JAX call count for Iteration 14 (compute_xp3)."""
-    s = _iter14_stats
-    print(f"\n[Iter14 JAX-only — {s['n_calls']} calls (compute_xp3; Fortran oracle removed Iter52)]")
-
-
-_iter15_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter15_stats():
-    """Print accumulated JAX call count for Iteration 15 (skx_func + calculate_thvm)."""
-    s = _iter15_stats
-    print(f"\n[Iter15 JAX-only — {s['n_calls']} calls (skx_func + calculate_thvm; Fortran oracle removed Iter52)]")
-
-
-_iter16_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter16_stats():
-    """Print accumulated JAX call count for Iteration 16 (calc_ri_zm + compute_cx_fnc_richardson)."""
-    s = _iter16_stats
-    print(f"\n[Iter16 JAX-only — {s['n_calls']} calls (calc_ri_zm + compute_cx_fnc_richardson; Fortran oracle removed Iter52)]")
-
-
-_iter17_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter17_stats():
-    """Print accumulated JAX call count for Iteration 17 (calc_sfc_varnce)."""
-    s = _iter17_stats
-    print(f"\n[Iter17 JAX-only — {s['n_calls']} calls (calc_sfc_varnce; Fortran oracle removed Iter52)]")
-
-
-_iter18_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter18_stats():
-    """Print accumulated JAX call count for Iteration 18 (compute_sigma_sqd_w)."""
-    s = _iter18_stats
-    print(f"\n[Iter18 JAX-only — {s['n_calls']} calls (compute_sigma_sqd_w; Fortran oracle removed Iter52)]")
-
-
-_iter19_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter19_stats():
-    """Print accumulated JAX call count for Iteration 19 (calc_brunt_vaisala_freq_sqd)."""
-    s = _iter19_stats
-    print(f"\n[Iter19 JAX-only — {s['n_calls']} calls (calc_brunt_vaisala_freq_sqd; Fortran oracle removed Iter52)]")
-
-
-_iter20_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter20_stats():
-    """Print accumulated JAX call count for Iteration 20 (diagnose_lscale_from_tau)."""
-    s = _iter20_stats
-    print(f"\n[Iter20 JAX-only — {s['n_calls']} calls (diagnose_lscale_from_tau; Fortran oracle removed Iter52)]")
-
-
-_iter21_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter21_stats():
-    """Print accumulated JAX call count for Iteration 21 (wp23_term_splat_lhs)."""
-    s = _iter21_stats
-    print(f"\n[Iter21 JAX-only — {s['n_calls']} calls (wp23_term_splat_lhs; Fortran oracle removed Iter52)]")
-
-
-_iter22_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter22_stats():
-    """Print accumulated JAX call count for Iteration 22 (fill_holes_vertical; Fortran oracle removed Iter53)."""
-    s = _iter22_stats
-    print(f"\n[Iter22 JAX-only — {s['n_calls']} timesteps (fill_holes_vertical wp2/wp3; Fortran oracle removed Iter53)]")
-
-
-_iter23_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter23_stats():
-    """Print accumulated JAX call count for Iteration 23 (clip_variance, clip_skewness, fill_holes_tke; Fortran oracle removed Iter53)."""
-    s = _iter23_stats
-    print(f"\n[Iter23 JAX-only — {s['n_calls']} timesteps (clip_variance/skewness/fill_holes_tke; Fortran oracle removed Iter53)]")
-
-
-_iter24_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter24_stats():
-    """Print accumulated JAX call count for Iteration 24 (clip_rcm, clip_covars_denom; Fortran oracle removed Iter44/45)."""
-    s = _iter24_stats
-    print(f"\n[Iter24 JAX-only — {s['n_calls']} calls (clip_rcm, clip_covars_denom; Fortran oracle removed Iter44/45)]")
-
-
-_iter25_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter25_stats():
-    s = _iter25_stats
-    print(f"\n[Iter25 JAX-only — {s['n_calls']} calls (ADG1_pdf_driver; Fortran oracle removed Iter50)]")
-
-
-_iter26_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter26_stats():
-    s = _iter26_stats
-    print(f"\n[Iter26 JAX-only — {s['n_calls']} calls (calc_comp_corrs_binormal; Fortran oracle removed Iter50)]")
-
-
-_iter27_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter27_stats():
-    s = _iter27_stats
-    print(f"\n[Iter27 JAX-only — {s['n_calls']} calls (calc_wp2xp_pdf; Fortran oracle removed Iter50)]")
-
-
-_iter28_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter28_stats():
-    s = _iter28_stats
-    print(f"\n[Iter28 JAX-only — {s['n_calls']} calls (calc_wpxp2_pdf; Fortran oracle removed Iter50)]")
-
-
-_iter29_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter29_stats():
-    s = _iter29_stats
-    print(f"\n[Iter29 JAX-only — {s['n_calls']} calls (calc_wp2xp2_pdf; Fortran oracle removed Iter50)]")
-
-
-_iter30_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter30_stats():
-    s = _iter30_stats
-    print(f"\n[Iter30 JAX-only — {s['n_calls']} calls (calc_wp4_pdf; Fortran oracle removed Iter50)]")
-
-
-_iter31_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter31_stats():
-    s = _iter31_stats
-    print(f"\n[Iter31 JAX-only — {s['n_calls']} calls (calc_wpxp2_pdf rt/thl; Fortran oracle removed Iter50)]")
-
-
-_iter32_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter32_stats():
-    s = _iter32_stats
-    print(f"\n[Iter32 JAX-only — {s['n_calls']} calls (calc_wpxpyp_pdf rt-thl; Fortran oracle removed Iter50)]")
-
-
-_iter33_stats = {
-    'n_calls': 0,
-}
-
-
-def report_iter33_stats():
-    s = _iter33_stats
-    print(f"\n[Iter33 JAX-only — {s['n_calls']} calls (wpthvp/wp2thvp/rtpthvp/thlpthvp; Fortran oracle removed Iter50)]")
+def reset_clubb_core_state():
+    """Reset the cross-timestep module state so a fresh run starts clean (reentrancy/composability).
+    Must be called at case init — otherwise a second case in the same process inherits the first
+    case's `_prev_adg1_j25` (wrong grid shape → broadcast error). The Fortran reuses stack locals
+    between calls, which is why this state lives at module scope rather than in `state`."""
+    global _prev_adg1_j25
+    _prev_adg1_j25 = None
 
 
 _RC_TOL = 1.0e-6       # Tolerance for cloud water mixing ratio [kg/kg]
@@ -596,6 +252,7 @@ def _stats_accumulate_py(sw, *, nzm, nzt, ngrdcol, dt, gr,
                           wp2, wp3, rtp2, rtp3, thlp2, thlp3, rtpthlp,
                           p_in_Pa, exner, rho, rho_zm, rho_ds_zm, rho_ds_zt,
                           thv_ds_zm, thv_ds_zt, wm_zt, wm_zm, rcm, cloud_frac,
+                          ice_supersat_frac,
                           thvm, ug, vg, ddzt_umvm_sqd, stability_correction,
                           Kh_zt, rsat, Kh_zm, em, wp3_on_wp2, wp3_on_wp2_zt,
                           sclrm, sclrp2, sclrprtp, sclrpthlp, sclrm_forcing,
@@ -650,6 +307,12 @@ def _stats_accumulate_py(sw, *, nzm, nzt, ngrdcol, dt, gr,
     sw.update("thvm", thvm)
     sw.update("rtm", rtm)
     sw.update("rcm", rcm)
+    # Cloud diagnostics (Fortran writes these; their absence makes the diagnostic
+    # comparison show a spurious 0 for every cloud case and hides real cloud-PDF
+    # divergences during debugging). cloud_frac/ice_supersat_frac are the physics
+    # state values, so this also lets the compare verify them.
+    sw.update("cloud_frac", cloud_frac)
+    sw.update("ice_supersat_frac", ice_supersat_frac)
     sw.update("um", um)
     sw.update("vm", vm)
     sw.update("wm_zt", wm_zt)
@@ -834,6 +497,30 @@ def _stats_accumulate_py(sw, *, nzm, nzt, ngrdcol, dt, gr,
         sw.update_col("thlm_spur_src", thlm_spur, icol=i)
 
 
+def _apply_sponge_field(key, xm, xm_ref, gr, dt_advance, sponge_cfg):
+    """Apply sponge-layer damping to a mean field toward its reference profile.
+
+    Faithful to the sponge block at the end of advance_xm_wpxp
+    (advance_xm_wpxp_module.F90:1053-1123). A no-op unless `sponge_cfg` contains
+    `key` (i.e. that field's l_sponge_damping is set). tau/depth are precomputed
+    once at init (sponge_layer_damping.initialize_tau_sponge_damp). The reference
+    profile xm_ref is the initial sounding profile (clubb_driver.F90:5298-5316).
+    """
+    if not sponge_cfg or key not in sponge_cfg:
+        return xm
+    prof = sponge_cfg[key]
+    tau, depth = prof['tau'], prof['depth']
+    zt_a = np.asarray(gr.zt, dtype=np.float64)
+    zm_a = np.asarray(gr.zm, dtype=np.float64)
+    ref_a = np.asarray(xm_ref, dtype=np.float64)
+    out = np.array(xm, dtype=np.float64)
+    dt = float(dt_advance)
+    for i in range(out.shape[0]):
+        out[i, :] = sponge_damp_xm(out[i, :], ref_a[i, :], zt_a[i, :],
+                                   zm_a[i, -1], tau, depth, dt)
+    return out
+
+
 def advance_clubb_core(
     *,
     gr,
@@ -970,6 +657,7 @@ def advance_clubb_core(
     wprtp2_carry=None,
     wpthlp2_carry=None,
     wprtpthlp_carry=None,
+    sponge_cfg=None,
 ):
     """Advance CLUBB one timestep with an explicit argument surface."""
     shzt = (ngrdcol, nzt)
@@ -1145,6 +833,7 @@ def advance_clubb_core(
 
         l_samp_stats = True  # always sample for pre or pre_post
 
+        from clubb_python import clubb_api  # lazy: only pre-advance PDF placement needs Fortran
         pdf_result = clubb_api.pdf_closure_driver(
             gr=gr, nzm=nzm, nzt=nzt, ngrdcol=ngrdcol,
             dt=dt, hydromet_dim=hydromet_dim, sclr_dim=sclr_dim,
@@ -1255,7 +944,6 @@ def advance_clubb_core(
             flags.l_predict_upwp_vpwp, gr,
         ))
         # Iter55: Fortran comparison removed (oracle removed Iter52)
-        _iter39_stats['n_calls'] += 1
         sigma_sqd_w = _ssw_jax39
         gamma_Skw_fnc = _gamma39  # save for stats write
 
@@ -1287,7 +975,6 @@ def advance_clubb_core(
             flags.l_predict_upwp_vpwp,
             gr,
         ), dtype=np.float64)
-        _iter18_stats['n_calls'] += 1
 
     if sigma_sqd_w is None:
         # If PDF closure was called pre-advance, sigma_sqd_w was set there
@@ -1375,7 +1062,6 @@ def advance_clubb_core(
         )
 
         # Iter55: Fortran pdf_params comparison removed (oracle removed Iter50)
-        _iter25_stats['n_calls'] += 1
         if l_sample and stats_writer is not None:
             stats_writer.update("mixt_frac",    np.asarray(_adg1_j25['mixt_frac'],    dtype=np.float64))
             stats_writer.update("w_1",          np.asarray(_adg1_j25['w_1'],          dtype=np.float64))
@@ -1479,7 +1165,6 @@ def advance_clubb_core(
         jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
         jnp.asarray(exner), jnp.asarray(thv_ds_zt),
     ), dtype=np.float64)
-    _iter15_stats['n_calls'] += 1
 
     # ================================================================== #
     # Block J: TKE computation
@@ -1515,7 +1200,6 @@ def advance_clubb_core(
             gr,
         )
     ]
-    _iter19_stats['n_calls'] += 1
     if l_sample and stats_writer is not None:
         stats_writer.update("bv_freq_sqd", brunt_vaisala_freq_sqd)
         stats_writer.update("bv_freq_sqd_mixed", brunt_vaisala_freq_sqd_mixed)
@@ -1642,7 +1326,6 @@ def advance_clubb_core(
             l_smooth_Heaviside_tau_wpxp=flags.l_smooth_Heaviside_tau_wpxp,
             gr=gr,
         )
-        _iter20_stats['n_calls'] += 1
         invrs_tau_zt     = np.asarray(_j_invrs_tau_zt,     dtype=np.float64)
         invrs_tau_zm     = np.asarray(_j_invrs_tau_zm,     dtype=np.float64)
         invrs_tau_sfc    = np.asarray(_j_invrs_tau_sfc,    dtype=np.float64)
@@ -1696,13 +1379,10 @@ def advance_clubb_core(
     )
     lhs_splat_wp2 = np.asarray(_jax21_wp2, dtype=np.float64)
     lhs_splat_wp3 = np.asarray(_jax21_wp3, dtype=np.float64)
-    _iter21_stats['n_calls'] += 1
     if l_sample and stats_writer is not None:
         stats_writer.update("bv_freq_sqd_splat", np.asarray(_bv_sqd_splat21, dtype=np.float64))
 
     # Iter53: iter4/5 shadow comparisons removed (Fortran oracle validated; JAX-only)
-    _iter4_stats['n_calls'] += 1
-    _iter5_stats['n_calls'] += 1
 
     # ================================================================== #
     # Block N: Surface variances
@@ -1737,7 +1417,6 @@ def advance_clubb_core(
         jnp.asarray(_zm_sfc17),
         jnp.asarray(sfc_elevation),
     )]
-    _iter17_stats['n_calls'] += 1
 
     # Surface forcing (sf) budget stats — sfc_varnce_module.F90 pattern
     if l_sample and stats_writer is not None:
@@ -1796,7 +1475,6 @@ def advance_clubb_core(
             varnce_w_1_zm = np.zeros((ngrdcol, nzm), dtype=np.float64)
             varnce_w_2_zm = np.zeros((ngrdcol, nzm), dtype=np.float64)
             mixt_frac_zm  = np.zeros((ngrdcol, nzm), dtype=np.float64)
-        _iter40_stats['n_calls'] += 1
     elif (flags.ipdf_call_placement in (ipdf_pre_advance_fields, ipdf_pre_post_advance_fields)
             and flags.iiPDF_type == iiPDF_ADG1
             and not flags.l_call_pdf_closure_twice):
@@ -1879,7 +1557,6 @@ def advance_clubb_core(
             l_use_shear_Richardson=flags.l_use_shear_Richardson,
             l_modify_limiters_for_cnvg_test=flags.l_modify_limiters_for_cnvg_test,
         ), dtype=np.float64)
-        _iter16_stats['n_calls'] += 1
     else:
         Cx_fnc_Richardson = np.zeros((ngrdcol, nzm))
 
@@ -1982,6 +1659,30 @@ def advance_clubb_core(
                 _rtp2_clip = _rtp2_jax
                 _thlp2_clip = _thlp2_jax
 
+            # Iter84: monotonic flux limiter setup. The turbulent-advection range is
+            # field-independent — compute once, reuse for rtm/thlm/um/vm. The limiter is
+            # applied after each solve and before clip_covar (matching the Fortran
+            # xm_wpxp_clipping_and_stats order). It is a no-op unless w'x' exceeds the
+            # monotonic bounds (fixes atex; no-op for the bit-faithful set).
+            _lle_mfl, _hle_mfl = calc_turb_adv_range(
+                w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm, mixt_frac_zm,
+                gr, float(dt_advance))
+            _rho_ds_zm_mfl = np.asarray(rho_ds_zm, np.float64)
+            _rho_ds_zt_mfl = np.asarray(rho_ds_zt, np.float64)
+            _irho_zm_mfl = np.asarray(invrs_rho_ds_zm, np.float64)
+            _irho_zt_mfl = np.asarray(invrs_rho_ds_zt, np.float64)
+            _wm_zt_mfl = np.asarray(wm_zt, np.float64)
+
+            def _apply_mfl(stype, xm_j, wpxp_j, xm_old, xp2, xm_forcing,
+                           xp2_thr, xm_tol):
+                xm_a, wpxp_a = monotonic_turbulent_flux_limit(
+                    stype, np.asarray(xm_j, np.float64), np.asarray(wpxp_j, np.float64),
+                    np.asarray(xm_old, np.float64), np.asarray(xp2, np.float64),
+                    _wm_zt_mfl, np.asarray(xm_forcing, np.float64),
+                    _rho_ds_zm_mfl, _rho_ds_zt_mfl, _irho_zm_mfl, _irho_zt_mfl,
+                    xp2_thr, xm_tol, _lle_mfl, _hle_mfl, gr, float(dt_advance))
+                return jnp.asarray(xm_a), jnp.asarray(wpxp_a)
+
             # Solve wprtp/rtm pair — no clipping in solve; apply separately to get pre-clip value
             _wprtp_preclip11, _rtm_jax11 = advance_xm_wpxp_jax(
                 wpxp=jnp.array(_wprtp_pre11),
@@ -2004,6 +1705,20 @@ def advance_clubb_core(
                 dt=float(dt_advance),
                 gr=gr,
             )
+            if getattr(flags, 'l_mono_flux_lim_rtm', False):
+                _rtm_jax11, _wprtp_preclip11 = _apply_mfl(
+                    MFL_RTM, _rtm_jax11, _wprtp_preclip11, _rtm_pre11, rtp2,
+                    rtm_forcing, _RT_TOL ** 2, _RT_TOL_MFL)
+            # rtm_cl: fill_holes_vertical on the mean field (advance_xm_wpxp_module.F90:4977-5012),
+            # gated fill_holes_type/=0 & solve_type/=um/vm; zt-level, threshold=rt_tol, full zt range.
+            # A bitwise no-op where rtm>=rt_tol everywhere (all 15 uniform-grid cases); fires only at a
+            # stretched dry top near the floor (rico k51 moist/dry interface — the step-1 rtm seed).
+            if flags.fill_holes_type != 0:
+                _rtm_jax11 = jnp.asarray(fill_holes_vertical_jax(
+                    field=_rtm_jax11, rho_ds=jnp.asarray(rho_ds_zt),
+                    dz=jnp.asarray(gr.dzt), threshold=float(rt_tol),
+                    lower_k=gr.k_lb_zt, upper_k=gr.k_ub_zt,
+                    fill_holes_type=flags.fill_holes_type))
             _wprtp_jax11 = clip_covar_jax(_wprtp_preclip11, _wp2_jax, _rtp2_clip)
 
             # Solve wpthlp/thlm pair (same lhs_ta_wprtp for ADG1)
@@ -2015,7 +1730,7 @@ def advance_clubb_core(
                 C6_Skw_fnc=_C6thl_11,
                 C7_Skw_fnc=_C7_11,
                 invrs_tau_C6_zm=jnp.array(invrs_tau_C6_zm),
-                lhs_ta_wpxp=_sh11['lhs_ta_wprtp'],   # ADG1: same for all wpxp
+                lhs_ta_wpxp=_sh11['lhs_ta_wprtp'],
                 lhs_diff_zm=_sh11['lhs_diff_zm'],
                 lhs_ma_zm=_sh11['lhs_ma_zm'],
                 lhs_ma_zt=_sh11['lhs_ma_zt'],
@@ -2028,10 +1743,21 @@ def advance_clubb_core(
                 dt=float(dt_advance),
                 gr=gr,
             )
+            if getattr(flags, 'l_mono_flux_lim_thlm', False):
+                _thlm_jax11, _wpthlp_preclip11 = _apply_mfl(
+                    MFL_THLM, _thlm_jax11, _wpthlp_preclip11, _thlm_pre11, thlp2,
+                    thlm_forcing, _THL_TOL ** 2, _THL_TOL_MFL)
+            # thlm_cl: fill_holes_vertical on thlm (threshold=thl_tol). thlm~300>>thl_tol so this is a
+            # guaranteed no-op, but kept to mirror the Fortran (advance_xm_wpxp_module.F90:5008) exactly.
+            if flags.fill_holes_type != 0:
+                _thlm_jax11 = jnp.asarray(fill_holes_vertical_jax(
+                    field=_thlm_jax11, rho_ds=jnp.asarray(rho_ds_zt),
+                    dz=jnp.asarray(gr.dzt), threshold=float(thl_tol),
+                    lower_k=gr.k_lb_zt, upper_k=gr.k_ub_zt,
+                    fill_holes_type=flags.fill_holes_type))
             _wpthlp_jax11 = clip_covar_jax(_wpthlp_preclip11, _wp2_jax, _thlp2_clip)
 
             # Iter46: Fortran oracle removed; JAX results are the state.
-            _iter11_stats['n_calls'] += 1
 
             # ============================================================ #
             # Iter35: Override advance_xm_wpxp state with JAX values        #
@@ -2042,6 +1768,11 @@ def advance_clubb_core(
             wpthlp = np.asarray(_wpthlp_jax11, dtype=np.float64).copy()
             thlm   = np.asarray(_thlm_jax11,   dtype=np.float64).copy()
 
+            # Sponge-layer damping for rtm/thlm (advance_xm_wpxp_module.F90:1053-1093).
+            # No-op unless sponge_cfg enables the field (e.g. ekman).
+            rtm  = _apply_sponge_field('rtm',  rtm,  rtm_ref, gr, dt_advance, sponge_cfg)
+            thlm = _apply_sponge_field('thlm', thlm, thlm_ref, gr, dt_advance, sponge_cfg)
+
             # Iter46: clip_rcm using JAX-updated rtm (moved from after Fortran call)
             _rcm_pre24 = np.asarray(rcm, dtype=np.float64).copy()
             _rcm_j24 = np.asarray(clip_rcm_jax(
@@ -2049,7 +1780,6 @@ def advance_clubb_core(
                 rtm=jnp.asarray(np.asarray(rtm, dtype=np.float64)),
             ))
             rcm = np.asarray(_rcm_j24, dtype=np.float64).copy()
-            _iter24_stats['n_calls'] += 1
 
             # ============================================================ #
             # Iter37: JAX shadow for um/upwp and vm/vpwp (advance_xm_wpxp) #
@@ -2065,6 +1795,11 @@ def advance_clubb_core(
             _ddzt_vm37  = np.asarray(ddzt(jnp.asarray(_vm_pre37), gr))
             _upwp_forcing37 = _C_uu_shr37 * _wp2_37 * _ddzt_um37  # (ngrdcol, nzm)
             _vpwp_forcing37 = _C_uu_shr37 * _wp2_37 * _ddzt_vm37  # (ngrdcol, nzm)
+            # Nontraditional Coriolis term for upwp (advance_xm_wpxp_module.F90:3098-3106).
+            if getattr(flags, 'l_ho_nontrad_coriolis', False):
+                _fcy37 = np.asarray(fcor_y, dtype=np.float64)[:, np.newaxis]
+                _upwp_forcing37 = _upwp_forcing37 + _fcy37 * (
+                    np.asarray(up2, dtype=np.float64) - _wp2_37)
 
             # Coriolis + large-scale forcing for um/vm  (l_implemented=False)
             # um_tndcy = um_forcing - fcor * (vg - vm_pre)
@@ -2150,6 +1885,10 @@ def advance_clubb_core(
                 dt=float(dt_advance),
                 gr=gr,
             )
+            if getattr(flags, 'l_mono_flux_lim_um', False):
+                _um_jax37, _upwp_preclip37 = _apply_mfl(
+                    MFL_UM, _um_jax37, _upwp_preclip37, _um_pre37, up2,
+                    _um_tndcy37, _W_TOL_SQD, _W_TOL)
             _upwp_jax37 = clip_covar_jax(_upwp_preclip37, _wp2_jax, _up2_37)
 
             # Solve vpwp/vm pair — no clipping in solve; apply separately
@@ -2174,10 +1913,13 @@ def advance_clubb_core(
                 dt=float(dt_advance),
                 gr=gr,
             )
+            if getattr(flags, 'l_mono_flux_lim_vm', False):
+                _vm_jax37, _vpwp_preclip37 = _apply_mfl(
+                    MFL_VM, _vm_jax37, _vpwp_preclip37, _vm_pre37, vp2,
+                    _vm_tndcy37, _W_TOL_SQD, _W_TOL)
             _vpwp_jax37 = clip_covar_jax(_vpwp_preclip37, _wp2_jax, _vp2_37)
 
             # Iter46: Fortran oracle removed; JAX results are the state.
-            _iter37_stats['n_calls'] += 1
 
             # ============================================================ #
             # Iter37: Override advance_xm_wpxp wind state with JAX values   #
@@ -2187,6 +1929,19 @@ def advance_clubb_core(
             um   = np.asarray(_um_jax37,   dtype=np.float64).copy()
             vpwp = np.asarray(_vpwp_jax37, dtype=np.float64).copy()
             vm   = np.asarray(_vm_jax37,   dtype=np.float64).copy()
+
+            # Sponge-layer damping for um/vm (advance_xm_wpxp_module.F90:1095-1123,
+            # under l_predict_upwp_vpwp + uv_sponge). No-op unless sponge_cfg enables 'uv'.
+            um = _apply_sponge_field('uv', um, um_ref, gr, dt_advance, sponge_cfg)
+            vm = _apply_sponge_field('uv', vm, vm_ref, gr, dt_advance, sponge_cfg)
+
+            # uv nudging toward the initial reference profiles (advance_xm_wpxp_module.F90:
+            # 1126-1151, under l_predict_upwp_vpwp + l_uv_nudge). No-op unless l_uv_nudge
+            # (none of the cloud/dry cases use it; coriolis_test does, ts_nudge=dt → full reset).
+            if getattr(flags, 'l_uv_nudge', False):
+                _nf = float(dt_advance) / float(ts_nudge)
+                um = um - (um - np.asarray(um_ref, dtype=np.float64)) * _nf
+                vm = vm - (vm - np.asarray(vm_ref, dtype=np.float64)) * _nf
 
             # ============================================================ #
             # Iter69: advance_xm_wpxp budget term stats writes               #
@@ -2539,11 +2294,10 @@ def advance_clubb_core(
                 jnp.array(invrs_rho_ds_zm),
                 gr,
             ))
-            _iter6_stats['n_calls'] += 1
 
             # ============================================================ #
-            # Block M+7: Iteration 7 shadow comparison — term_dp1_lhs_jax
-            # No direct Fortran API equivalent; validate against numpy formula.
+            # Block M+7: dp1 pressure-damping LHS term (_Cn_np/_inv_tau/_dp1_ref), assembled in
+            # numpy here and fed (jnp.array'd) into the M+10 xp2_xpyp solve.
             # Uses C2rt (uniform in z) * invrs_tau_xp2_zm, boundaries zeroed.
             # ============================================================ #
             _c2rt = float(clubb_params[0, iC2rt - 1])
@@ -2553,17 +2307,9 @@ def advance_clubb_core(
             _dp1_ref = _Cn_np * _inv_tau
             _dp1_ref[:, 0]  = 0.0
             _dp1_ref[:, -1] = 0.0
-            _dp1_jax = np.asarray(term_dp1_lhs_jax(
-                jnp.array(_Cn_np), jnp.array(_inv_tau)
-            ))
-            _iter7_stats['dp1_max'] = max(
-                _iter7_stats['dp1_max'],
-                float(np.max(np.abs(_dp1_jax - _dp1_ref))),
-            )
-            _iter7_stats['n_calls'] += 1
 
             # ============================================================ #
-            # Block M+8: Iteration 8 shadow comparison — xp2_xpyp_lhs_jax
+            # Block M+8: mean-advection LHS term (_lhs_ma_f) for the M+10 xp2_xpyp solve.
             # Assemble all components via JAX and compare against numpy reference.
             # Uses rtp2 term components as representative inputs.
             # ============================================================ #
@@ -2581,37 +2327,9 @@ def advance_clubb_core(
             ))
             _lhs_ma_f = np.asarray(term_ma_zm_lhs_jax(jnp.asarray(wm_zm), gr))
             # lhs_ta already computed above
-            _lhs_dp1_scaled = _dp1_ref * _gamma   # pre-scale as Fortran does
-            # numpy assembly reference
-            _super_ref = np.zeros((ngrdcol, nzm))
-            _main_ref  = np.zeros((ngrdcol, nzm))
-            _sub_ref   = np.zeros((ngrdcol, nzm))
-            _super_ref[:, 1:-1] = (_lhs_diff_f[0, :, 1:-1] + _lhs_ma_f[0, :, 1:-1]
-                                   + _lhs_ta_jax[0, :, 1:-1] * _gamma)
-            _main_ref[:, 1:-1]  = (_lhs_diff_f[1, :, 1:-1] + _lhs_ma_f[1, :, 1:-1]
-                                   + _lhs_ta_jax[1, :, 1:-1] * _gamma
-                                   + _lhs_dp1_scaled[:, 1:-1] + 1.0 / _dt_adv)
-            _sub_ref[:, 1:-1]   = (_lhs_diff_f[2, :, 1:-1] + _lhs_ma_f[2, :, 1:-1]
-                                   + _lhs_ta_jax[2, :, 1:-1] * _gamma)
-            _super_ref[:, 0]  = 0.0;  _super_ref[:, -1]  = 0.0
-            _main_ref[:, 0]   = 1.0;  _main_ref[:, -1]   = 1.0
-            _sub_ref[:, 0]    = 0.0;  _sub_ref[:, -1]    = 0.0
-            _lhs8_ref = np.stack([_super_ref, _main_ref, _sub_ref], axis=0)
-            _lhs8_jax = np.asarray(xp2_xpyp_lhs_jax(
-                jnp.array(_lhs_ta_jax),
-                jnp.array(_lhs_ma_f),
-                jnp.array(_lhs_diff_f),
-                jnp.array(_lhs_dp1_scaled),
-                _dt_adv,
-            ))
-            _iter8_stats['xp2_xpyp_lhs_max'] = max(
-                _iter8_stats['xp2_xpyp_lhs_max'],
-                float(np.max(np.abs(_lhs8_jax - _lhs8_ref))),
-            )
-            _iter8_stats['n_calls'] += 1
 
             # ============================================================ #
-            # Block M+9: Iteration 9 shadow comparison — xp2_xpyp_rhs_jax
+            # Block M+9: turbulent-advection RHS term (_rhs9_ref) for the M+10 xp2_xpyp solve.
             # Computes RHS for the rtp2 case (xam=xbm=rtm, wpxap=wpxbp=wprtp).
             # rhs_ta from JAX xpyp_term_ta_pdf_rhs_jax (Fortran oracle removed Iter51).
             # Comparison is JAX vs numpy reference (same inputs), target ≤ 1e-15.
@@ -2658,26 +2376,6 @@ def advance_clubb_core(
             )
             _rhs9_ref[:, -1] = _threshold9
             # JAX RHS
-            _rhs9_jax = np.asarray(xp2_xpyp_rhs_jax(
-                jnp.array(_lhs_ta_jax),
-                jnp.array(_rhs_ta9),
-                jnp.array(_Cn_np),
-                jnp.array(_inv_tau),
-                _threshold9,
-                jnp.array(_rtp2_np),
-                jnp.array(_rtm_np),
-                jnp.array(_rtm_np),
-                jnp.array(_wprtp_np),
-                jnp.array(_wprtp_np),
-                jnp.array(_invrs_dzm_np),
-                jnp.array(_rtp2_forcing_np),
-                _dt_adv,
-            ))
-            _iter9_stats['rhs_max'] = max(
-                _iter9_stats['rhs_max'],
-                float(np.max(np.abs(_rhs9_jax - _rhs9_ref))),
-            )
-            _iter9_stats['n_calls'] += 1
 
             # ============================================================ #
             # Block M+10: Iteration 10 — full JAX advance_xp2_xpyp solve.
@@ -2832,82 +2530,6 @@ def advance_clubb_core(
                 jnp.array(_wprtp_np), jnp.array(_wpthlp_np),
                 jnp.array(_invrs_dzm_np), jnp.array(_rtpthlp_forcing_np), _dt_adv,
             ))
-            # Per-component RHS diagnostic at worst case (ts=628, col=0, lev=44)
-            _DIAG_TS = 590; _DIAG_COL = 0; _DIAG_LEV = 39
-            _DIAG_LOG = '/glade/work/adac/Claude/CLUBB-JAX/clubb_release/thlp2_rhs_debug.log'
-            if _iter10_stats['n_calls'] == _DIAG_TS:
-                c, k = _DIAG_COL, _DIAG_LEV
-                _g = _gamma  # 1.5
-                _omg = 1.0 - _g
-                # Decompose thlp2 RHS at level k
-                _d_ta   = float(_rhs_ta10_thlp2[c, k])
-                _d_oi_ta = float(_omg * (
-                    -_lhs_ta_10[0,c,k]*_thlp2_np[c,k+1]
-                    -_lhs_ta_10[1,c,k]*_thlp2_np[c,k]
-                    -_lhs_ta_10[2,c,k]*_thlp2_np[c,k-1]))
-                # TP: -wpthlp*invrs_dzm*(thlm[k]-thlm[k-1]) × 2
-                # thlm is on zt grid (nzt), momentum interior k maps to zt k and k-1
-                _d_tp   = float(-_wpthlp_np[c,k]*_invrs_dzm_np[c,k]*(
-                                    _thlm_np[c,k]-_thlm_np[c,k-1])
-                                -_wpthlp_np[c,k]*_invrs_dzm_np[c,k]*(
-                                    _thlm_np[c,k]-_thlm_np[c,k-1]))
-                _d_dp1  = float(_Cn_np[c,k]*_inv_tau[c,k]*_threshold_thlp2)
-                _d_oi_dp1 = float(_omg*(-_Cn_np[c,k]*_inv_tau[c,k]*_thlp2_np[c,k]))
-                _d_frc  = float(_thlp2_forcing_np[c,k])
-                _d_time = float((1.0/_dt_adv)*_thlp2_np[c,k])
-                _d_total = _d_ta + _d_oi_ta + _d_tp + _d_dp1 + _d_oi_dp1 + _d_frc + _d_time
-                # Decompose rtp2 RHS at same level
-                _d_ta_r   = float(_rhs_ta10_rtp2[c, k])
-                _d_oi_ta_r = float(_omg * (
-                    -_lhs_ta_10[0,c,k]*_rtp2_np[c,k+1]
-                    -_lhs_ta_10[1,c,k]*_rtp2_np[c,k]
-                    -_lhs_ta_10[2,c,k]*_rtp2_np[c,k-1]))
-                _d_tp_r   = float(-_wprtp_np[c,k]*_invrs_dzm_np[c,k]*(
-                                    _rtm_np[c,k]-_rtm_np[c,k-1])
-                                  -_wprtp_np[c,k]*_invrs_dzm_np[c,k]*(
-                                    _rtm_np[c,k]-_rtm_np[c,k-1]))
-                _d_dp1_r  = float(_Cn_np[c,k]*_inv_tau[c,k]*float(rt_tol**2))
-                _d_oi_dp1_r = float(_omg*(-_Cn_np[c,k]*_inv_tau[c,k]*_rtp2_np[c,k]))
-                _d_frc_r  = float(_rtp2_forcing_np[c,k])
-                _d_time_r = float((1.0/_dt_adv)*_rtp2_np[c,k])
-                _d_total_r = _d_ta_r+_d_oi_ta_r+_d_tp_r+_d_dp1_r+_d_oi_dp1_r+_d_frc_r+_d_time_r
-                # lhs_ta bands at level k
-                _lta_s = float(_lhs_ta_10[0,c,k]); _lta_m = float(_lhs_ta_10[1,c,k]); _lta_b = float(_lhs_ta_10[2,c,k])
-                # Write full breakdown to log file (bypasses task output truncation)
-                with open(_DIAG_LOG, 'w') as _diagf:
-                    _diagf.write(f"[Iter10 thlp2 RHS components at ts={_DIAG_TS} col={c} lev={k}]\n")
-                    _diagf.write(f"  ta={_d_ta:.6e}  oi_ta={_d_oi_ta:.6e}  tp={_d_tp:.6e}\n")
-                    _diagf.write(f"  dp1={_d_dp1:.6e}  oi_dp1={_d_oi_dp1:.6e}  forcing={_d_frc:.6e}\n")
-                    _diagf.write(f"  time={_d_time:.6e}  total_jax={_d_total:.6e}\n")
-                    _diagf.write(f"  rhs10_thlp2[c,k]={_rhs10_thlp2[c,k]:.6e}  (should match total)\n")
-                    _diagf.write(f"[Iter10 rtp2 RHS components at ts={_DIAG_TS} col={c} lev={k}]\n")
-                    _diagf.write(f"  ta={_d_ta_r:.6e}  oi_ta={_d_oi_ta_r:.6e}  tp={_d_tp_r:.6e}\n")
-                    _diagf.write(f"  dp1={_d_dp1_r:.6e}  oi_dp1={_d_oi_dp1_r:.6e}  forcing={_d_frc_r:.6e}\n")
-                    _diagf.write(f"  time={_d_time_r:.6e}  total_jax={_d_total_r:.6e}\n")
-                    _diagf.write(f"  rhs10_rtp2[c,k]={_rhs10_rtp2[c,k]:.6e}\n")
-                    _diagf.write(f"  thlp2_old[k-1..k+1]={_thlp2_np[c,k-1]:.6e} {_thlp2_np[c,k]:.6e} {_thlp2_np[c,k+1]:.6e}\n")
-                    _diagf.write(f"  rtp2_old[k-1..k+1]={_rtp2_np[c,k-1]:.6e} {_rtp2_np[c,k]:.6e} {_rtp2_np[c,k+1]:.6e}\n")
-                    _diagf.write(f"  thlm[k-1..k]={_thlm_np[c,k-1]:.6e} {_thlm_np[c,k]:.6e}\n")
-                    _diagf.write(f"  wpthlp[k]={_wpthlp_np[c,k]:.6e}  invrs_dzm[k]={_invrs_dzm_np[c,k]:.6e}\n")
-                    _diagf.write(f"  lhs_ta[super,main,sub]@k={k}: {_lta_s:.6e} {_lta_m:.6e} {_lta_b:.6e}\n")
-                    _diagf.write(f"  Cn={_Cn_np[c,k]:.6e}  inv_tau={_inv_tau[c,k]:.6e}  threshold_thlp2={_threshold_thlp2:.6e}\n")
-                    _diagf.write(f"  dt_adv={_dt_adv:.1f}\n")
-                    _diagf.write(f"  thlp2_forcing[k]={_thlp2_forcing_np[c,k]:.6e}\n")
-                    # rtp2/thlp2 ratio for oi_ta comparison
-                    _ratio = _thlp2_np[c,k] / _rtp2_np[c,k] if abs(_rtp2_np[c,k]) > 1e-30 else float('inf')
-                    _d_oi_ta_scaled = _d_oi_ta_r * _ratio
-                    _diagf.write(f"  thlp2/rtp2 ratio={_ratio:.6e}\n")
-                    _diagf.write(f"  oi_ta_rtp2*ratio={_d_oi_ta_scaled:.6e}  (should ≈ oi_ta_thlp2={_d_oi_ta:.6e})\n")
-                    _diagf.write(f"  (ta+oi_ta+tp)_thlp2={_d_ta+_d_oi_ta+_d_tp:.6e}\n")
-                    _diagf.write(f"  (ta+oi_ta+tp)_rtp2={_d_ta_r+_d_oi_ta_r+_d_tp_r:.6e}\n")
-                # Also print compact summary to stdout
-                print(f"\n[Iter10 thlp2/rtp2 RHS components at ts={_DIAG_TS} col={c} lev={k}]")
-                print(f"  thlp2: ta={_d_ta:.3e} oita={_d_oi_ta:.3e} tp={_d_tp:.3e} oidp1={_d_oi_dp1:.3e} time={_d_time:.3e} total={_d_total:.3e}")
-                print(f"  rtp2:  ta={_d_ta_r:.3e} oita={_d_oi_ta_r:.3e} tp={_d_tp_r:.3e} oidp1={_d_oi_dp1_r:.3e} time={_d_time_r:.3e} total={_d_total_r:.3e}")
-                print(f"  lhs_ta[sup,main,sub]@k={k}: {_lta_s:.3e} {_lta_m:.3e} {_lta_b:.3e}")
-                print(f"  thlp2_old[k]={_thlp2_np[c,k]:.3e}  rtp2_old[k]={_rtp2_np[c,k]:.3e}  ratio={_thlp2_np[c,k]/_rtp2_np[c,k]:.3e}")
-                print(f"  Written to {_DIAG_LOG}")
-                import sys; sys.stdout.flush()
             # Solve with single JAX LHS
             _lhs10_jax = jnp.array(_lhs10)
             _soln10_rtp2    = np.asarray(tridiag_lu_solve_jax(_lhs10_jax, jnp.array(_rhs10_rtp2)))
@@ -2945,7 +2567,6 @@ def advance_clubb_core(
                 lower_k=_hf_lower, upper_k=_hf_upper,
                 fill_holes_type=flags.fill_holes_type,
             ))
-            _iter22_stats['n_calls'] += 1
 
             # Apply clip_variance (Fortran does this after pos_definite_variances).
             # When l_min_xp2_from_corr_wx, threshold is boosted to wpthlp^2/(wp2*corr^2)
@@ -2979,7 +2600,6 @@ def advance_clubb_core(
                 max_mag_corr=0.99,
             ))
             # Iter47: Fortran oracle removed; JAX results are the state.
-            _iter10_stats['n_calls'] += 1
 
             # ============================================================ #
             # Budget stats: rtp2/thlp2/rtpthlp + scalar TA terms           #
@@ -3212,6 +2832,11 @@ def advance_clubb_core(
                 + _pr2_36
                 + (1.0 / _dt_adv) * _up2_pre36[:, 1:-1]
             )
+            # Nontraditional Coriolis term for up2 (advance_xp2_xpyp_module.F90:772).
+            if getattr(flags, 'l_ho_nontrad_coriolis', False):
+                _fcy36 = np.asarray(fcor_y, dtype=np.float64)[:, np.newaxis]
+                _rhs36_up2[:, 1:-1] = (_rhs36_up2[:, 1:-1]
+                                       - 2.0 * _fcy36 * _upwp_np36[:, 1:-1])
             _rhs36_up2[:, 0]  = _up2_pre36[:, 0]
             _rhs36_up2[:, -1] = float(w_tol_sqd)
             # RHS for vp2 (swap up2↔vp2, u↔v)
@@ -3272,7 +2897,6 @@ def advance_clubb_core(
             _up2_jax36_cv[:, :-1] = np.maximum(_up2_jax36_fh[:, :-1], float(w_tol_sqd))
             _vp2_jax36_cv[:, :-1] = np.maximum(_vp2_jax36_fh[:, :-1], float(w_tol_sqd))
             # Iter47: Fortran oracle removed; JAX results are the state.
-            _iter36_stats['n_calls'] += 1
 
             # ============================================================ #
             # Budget stats: up2/vp2 + pressure rotation (upwp_pr4/vpwp_pr4) #
@@ -3480,6 +3104,9 @@ def advance_clubb_core(
                 nu1=_nu1_12,
                 nu8=_nu8_12,
                 gr=gr,
+                l_ho_nontrad_coriolis=getattr(flags, 'l_ho_nontrad_coriolis', False),
+                fcor_y=fcor_y,
+                wp2up=wp2up,
             )
 
             # Apply post-solve steps to JAX result, matching Fortran wp23_solve
@@ -3497,7 +3124,6 @@ def advance_clubb_core(
                 lower_k=_hf_lower12, upper_k=_hf_upper12,
                 fill_holes_type=flags.fill_holes_type,
             ), dtype=np.float64)
-            _iter22_stats['n_calls'] += 1
 
             # fill_holes_wp2_from_horz_tke (ARM: l_wp2_fill_holes_tke=True) — Iter53: Fortran oracle removed
             _up2_out12 = _up2_pre12
@@ -3540,7 +3166,6 @@ def advance_clubb_core(
                 xp2=jnp.asarray(_wp2_jax12),
                 threshold_lo=jnp.asarray(_wp2_min12),
             ), dtype=np.float64)
-            _iter23_stats['n_calls'] += 1
 
             # zm2zt to get wp2_zt
             _wp2_zt_jax12 = np.asarray(zm2zt(_wp2_jax12, gr), dtype=np.float64)
@@ -3558,7 +3183,6 @@ def advance_clubb_core(
             ), dtype=np.float64)
 
             # Iter48: Fortran oracle removed; JAX results are the state.
-            _iter12_stats['n_calls'] += 1
 
             # Iter68: advance_wp2_wp3_module.F90 stats writes (C1/C11_Skw_fnc, budgets)
             if l_sample and stats_writer is not None:
@@ -3772,7 +3396,6 @@ def advance_clubb_core(
                 l_tke_aniso=bool(flags.l_tke_aniso),
             )
             # Iter49: Fortran oracle removed; JAX results are the state.
-            _iter13_stats['n_calls'] += 1
             # Iter42: override advance_windm_edsclrm state with JAX values
             # (no-op for ARM with l_predict_upwp_vpwp=True, but explicit for completeness)
             um   = np.asarray(_um_jax13,   dtype=np.float64).copy()
@@ -3825,7 +3448,6 @@ def advance_clubb_core(
                     gr,
                 )
             ]
-            _iter14_stats['n_calls'] += 1
             # Iter68: advance_xp3_module.F90 stats (compute_xp3 path = ADG1)
             if l_sample and stats_writer is not None:
                 _ssw_zt_68 = np.asarray(
@@ -3939,7 +3561,6 @@ def advance_clubb_core(
             )
 
             # Iter50: Fortran oracle removed; comparison vs pdf_params deactivated.
-            _iter25_stats['n_calls'] += 1
             # Iter40: save Block U ADG1 result for next timestep's Block P override
             _prev_adg1_j25 = _adg1_j25
 
@@ -3976,7 +3597,6 @@ def advance_clubb_core(
                 mixt_frac=_adg1_j25['mixt_frac'],
             )
             # Iter50: Fortran oracle removed; comparison vs pdf_params deactivated.
-            _iter26_stats['n_calls'] += 1
 
             # ============================================================ #
             # Iter60 (Block U): JAX rcm/cloud_frac from post-advance PDF   #
@@ -4063,11 +3683,57 @@ def advance_clubb_core(
             rcm        = np.asarray(_rcm_60,        dtype=np.float64)
             cloud_frac = np.asarray(_cloud_frac_60, dtype=np.float64)
 
-            # Iter62: update ice_supersat_frac from Block U ADG1 output.
-            # Fortran pdf_closure_module.F90 calc_ice_cloud_frac_component
-            # (lines 2576-2583): for T > T_freeze_K, ice_supersat_frac = cloud_frac.
-            # ARM case is all warm-cloud, so this holds exactly.
-            ice_supersat_frac = cloud_frac.copy()
+            # Update ice_supersat_frac from Block U ADG1 output (l_calc_ice_supersat_frac
+            # is hardcoded .true. in pdf_closure_module.F90:928). Faithful port of
+            # calc_ice_cloud_frac_component (pdf_closure_module.F90:2490): for levels above
+            # freezing it equals the liquid cloud_frac; for below-freezing levels it is the
+            # PDF fraction supersaturated w.r.t. ICE (chi above chi_at_ice_sat). The old
+            # warm-only shortcut (=cloud_frac) gave 0 at cold, ice-supersaturated layers
+            # (e.g. ekman's 10 km top, T~203 K), corrupting the splat Brunt-Vaisala term.
+            def _ice_cf60(mean_chi, stdev_chi_in, crt, rsatl, tl, cf_liq):
+                rsat_ice = sat_mixrat_ice_jax(_p60, tl)
+                delta    = mean_chi - crt * (rsat_ice - rsatl)   # chi - chi_at_ice_sat
+                is_clear = (((jnp.abs(delta) <= eps) & (stdev_chi_in <= chi_tol))
+                            | (delta < -max_num_stdevs * stdev_chi_in))
+                is_full  = delta > max_num_stdevs * stdev_chi_in
+                safe_s   = jnp.maximum(stdev_chi_in, 1.0e-100)
+                zeta     = delta / safe_s
+                ssf_mid  = 0.5 * (1.0 + jax.scipy.special.erf(zeta / sqrt_2))
+                ssf      = jnp.where(is_clear, 0.0, jnp.where(is_full, 1.0, ssf_mid))
+                # Above freezing: same as the liquid cloud-fraction component.
+                return jnp.where(tl > T_freeze_K, cf_liq, ssf)
+
+            _issf1_60 = _ice_cf60(_chi1_60, _schi1_60, _crt1_60, _rsatl1_60, _tl1_60, _cf1_60)
+            _issf2_60 = _ice_cf60(_chi2_60, _schi2_60, _crt2_60, _rsatl2_60, _tl2_60, _cf2_60)
+            _issf_60  = _mf60 * _issf1_60 + (1.0 - _mf60) * _issf2_60
+            ice_supersat_frac = np.asarray(_issf_60, dtype=np.float64)
+
+            # Iter156: propagate the zt-level PDF component moments into the returned pdf_params so the
+            # KK microphysics (kk_microphys_step) can read them. The JAX otherwise computes them as Block-U
+            # locals that flow only to stats; pdf_params was zero-initialized (it is a fallback for
+            # non-ADG1/non-ARM, :1815), and the 15 non-microphysics cases never read these fields — so
+            # populating them is safe (verified: ARM/bomex still bit-faithful).
+            pdf_params = pdf_params._replace(
+                chi_1=np.asarray(_chi1_60, np.float64), chi_2=np.asarray(_chi2_60, np.float64),
+                stdev_chi_1=np.asarray(_schi1_60, np.float64), stdev_chi_2=np.asarray(_schi2_60, np.float64),
+                cloud_frac_1=np.asarray(_cf1_60, np.float64), cloud_frac_2=np.asarray(_cf2_60, np.float64),
+                rc_1=np.asarray(_rc1_60, np.float64), rc_2=np.asarray(_rc2_60, np.float64),
+                mixt_frac=np.asarray(_mf60, np.float64),
+                thl_1=np.asarray(_thl1_60, np.float64), thl_2=np.asarray(_thl2_60, np.float64),
+                ice_supersat_frac_1=np.asarray(_issf1_60, np.float64),
+                ice_supersat_frac_2=np.asarray(_issf2_60, np.float64),
+                # Iter172: the additional component moments the KK second-moment covariance driver
+                # (KK_upscaled_covar_driver) consumes — w/eta/rt means+stdevs, the chi-eta transform
+                # coefficients, and corr_chi_eta. corr_w_chi/corr_w_eta stay 0 (ADG1, pdf_closure:1037).
+                w_1=np.asarray(_adg1_j25['w_1'], np.float64), w_2=np.asarray(_adg1_j25['w_2'], np.float64),
+                varnce_w_1=np.asarray(_adg1_j25['varnce_w_1'], np.float64),
+                varnce_w_2=np.asarray(_adg1_j25['varnce_w_2'], np.float64),
+                rt_1=np.asarray(_rt1_60, np.float64), rt_2=np.asarray(_rt2_60, np.float64),
+                stdev_eta_1=np.asarray(_seta1_60, np.float64), stdev_eta_2=np.asarray(_seta2_60, np.float64),
+                crt_1=np.asarray(_crt1_60, np.float64), crt_2=np.asarray(_crt2_60, np.float64),
+                cthl_1=np.asarray(_cthl1_60, np.float64), cthl_2=np.asarray(_cthl2_60, np.float64),
+                corr_chi_eta_1=np.asarray(_corr_ce1_60, np.float64),
+                corr_chi_eta_2=np.asarray(_corr_ce2_60, np.float64))
 
             # ============================================================ #
             # Iter61 (Block U): JAX cloud water flux variables             #
@@ -4181,7 +3847,6 @@ def advance_clubb_core(
                 mixt_frac=_adg1_j25['mixt_frac'],
             )
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter27_stats['n_calls'] += 1
 
             # Iter28 shadow: calc_wpxp2_pdf for wpup2, wpvp2
             # For ADG1: corr_u_w = corr_v_w = 0
@@ -4204,7 +3869,6 @@ def advance_clubb_core(
                 mixt_frac=_adg1_j25['mixt_frac'],
             )
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter28_stats['n_calls'] += 1
 
             # Iter29 shadow: calc_wp2xp2_pdf for wp2up2, wp2vp2
             # Fortran computes on zt then converts to zm; we do the same.
@@ -4233,7 +3897,6 @@ def advance_clubb_core(
             _wp2up2_zm_j29 = _wp2up2_zm_j29.at[:, _k_ub29].set(0.0)
             _wp2vp2_zm_j29 = _wp2vp2_zm_j29.at[:, _k_ub29].set(0.0)
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter29_stats['n_calls'] += 1
 
             # Iter30 shadow: calc_wp4_pdf
             # Fortran computes on zt then converts to zm.
@@ -4251,7 +3914,6 @@ def advance_clubb_core(
             _wp4_zm_j30 = _wp4_zm_j30.at[:, _k_lb30].set(0.0)
             _wp4_zm_j30 = _wp4_zm_j30.at[:, _k_ub30].set(0.0)
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter30_stats['n_calls'] += 1
 
             # Iter31 shadow: wprtp2, wpthlp2 via calc_wpxp2_pdf
             # For ADG1: corr_w_rt = corr_w_thl = 0
@@ -4274,7 +3936,6 @@ def advance_clubb_core(
                 mixt_frac=_adg1_j25['mixt_frac'],
             )
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter31_stats['n_calls'] += 1
 
             # Iter32 shadow: wprtpthlp via calc_wpxpyp_pdf
             # For ADG1: corr_w_rt = corr_w_thl = 0; corr_rt_thl from iter26
@@ -4293,7 +3954,6 @@ def advance_clubb_core(
                 mixt_frac=_adg1_j25['mixt_frac'],
             )
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter32_stats['n_calls'] += 1
 
             # Iter33 shadow: wpthvp, wp2thvp, rtpthvp, thlpthvp
             # Formula: wpthvp_zt = wpthlp_zt + ep1*thv_ds_zt*wprtp_zt + rc_coef_zt*wprcp_zt
@@ -4302,9 +3962,15 @@ def advance_clubb_core(
             # rtpthlp, rtp2, thlp2, _rtprcp, thlprcp, wprcp_out are zm-grid → zm2zt
             _rc_coef_j33 = (Lv / (jnp.asarray(exner) * Cp)
                             - ep2 * jnp.asarray(thv_ds_zt))
-            _wprcp_zt_j33 = zm2zt_jax(jnp.asarray(wprcp_out), gr)
-            _rtprcp_zt_j33 = zm2zt_jax(jnp.asarray(_rtprcp), gr)
-            _thlprcp_zt_j33 = zm2zt_jax(jnp.asarray(thlprcp), gr)
+            # Use the native zt-grid rc-flux moments from Iter61 (NOT a zt→zm→zt
+            # round-trip of the zm output). Fortran (pdf_closure_module.F90:1130-1155)
+            # computes wprcp(i,k) and wpthvp(i,k)=...+rc_coef*wprcp on the SAME pdf
+            # grid in one pass. The round-trip smooths sharp cloud-top wprcp gradients
+            # — negligible for ARM (small cloud frac) but a ~5e-4 error for thick-cloud
+            # cases (DYCOMS from step 1, BOMEX at cloud onset).
+            _wprcp_zt_j33 = _wprcp_zt_61
+            _rtprcp_zt_j33 = _rtprcp_zt_61
+            _thlprcp_zt_j33 = _thlprcp_zt_61
             _rtpthlp_zt_j33 = zm2zt_jax(jnp.asarray(rtpthlp), gr)
             _rtp2_zt_j33 = zm2zt_jax(jnp.asarray(rtp2), gr)
             _thlp2_zt_j33 = zm2zt_jax(jnp.asarray(thlp2), gr)
@@ -4329,7 +3995,6 @@ def advance_clubb_core(
             _rtpthvp_zm_j33 = _rtpthvp_zm_j33.at[:, _k_ub33].set(0.0)
             _thlpthvp_zm_j33 = _thlpthvp_zm_j33.at[:, _k_ub33].set(0.0)
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter33_stats['n_calls'] += 1
 
             # ============================================================ #
             # Iter34: Override pdf_closure_driver state with JAX values     #
@@ -4338,7 +4003,6 @@ def advance_clubb_core(
             # _ssw_j34 already computed above (before _adg1_j25 call).     #
             # ============================================================ #
             # Iter50: Fortran oracle removed; JAX results are the state.
-            _iter34_stats['n_calls'] += 1
 
             # Override state with JAX-computed values.
             sigma_sqd_w = _ssw_j34
@@ -4346,6 +4010,13 @@ def advance_clubb_core(
             wp2thvp   = np.asarray(_wp2thvp_zt_j33)
             rtpthvp   = np.asarray(_rtpthvp_zm_j33)
             thlpthvp  = np.asarray(_thlpthvp_zm_j33)
+            # rc_coef_zm = zt2zm(rc_coef) with k_ub zeroed (pdf_closure_module.F90:4234).
+            # Carried (post-advance placement) to the NEXT step's diagnose_upxp/upthvp
+            # cloud term (rc_coef_zm*uprcp). Previously left stale at its zero init —
+            # harmless for ARM (uprcp≈0) but wrong for cloudy cases (dycoms/bomex).
+            rc_coef_zm = np.asarray(
+                zt2zm_jax(_rc_coef_j33, gr).at[:, gr.k_ub_zm].set(0.0),
+                dtype=np.float64)
             wpup2     = np.asarray(_wpup2_j28)
             wpvp2     = np.asarray(_wpvp2_j28)
             wp2up2    = np.asarray(_wp2up2_zm_j29)
@@ -4390,6 +4061,14 @@ def advance_clubb_core(
                 stats_writer.update("wp2thvp",   np.asarray(wp2thvp,        dtype=np.float64))
                 stats_writer.update("rtpthvp",   np.asarray(rtpthvp,        dtype=np.float64))
                 stats_writer.update("thlpthvp",  np.asarray(thlpthvp,       dtype=np.float64))
+                # PDF cloud-water fluxes (computed in Block 61; Fortran writes these).
+                # Outputting them lets the diagnostic compare verify the cloud-flux
+                # physics directly instead of reading an unwritten 0 (see Iter97 note).
+                stats_writer.update("wprcp",     np.asarray(_wprcp_zm_61,   dtype=np.float64))
+                stats_writer.update("rtprcp",    np.asarray(_rtprcp_zm_61,  dtype=np.float64))
+                stats_writer.update("thlprcp",   np.asarray(_thlprcp_zm_61, dtype=np.float64))
+                stats_writer.update("uprcp",     np.asarray(_uprcp_zm_61,   dtype=np.float64))
+                stats_writer.update("vprcp",     np.asarray(_vprcp_zm_61,   dtype=np.float64))
 
                 # Iter69: rc_coef and rc_coef_zm (Fortran pdf_closure_module.F90 line 4503-4519)
                 stats_writer.update("rc_coef", np.asarray(_rc_coef_j33, dtype=np.float64))
@@ -4534,6 +4213,7 @@ def advance_clubb_core(
             wm_zt=wm_zt, wm_zm=wm_zm,
             rcm=rcm,
             cloud_frac=cloud_frac,
+            ice_supersat_frac=ice_supersat_frac,
             thvm=thvm,
             ug=ug, vg=vg,
             ddzt_umvm_sqd=ddzt_umvm_sqd,

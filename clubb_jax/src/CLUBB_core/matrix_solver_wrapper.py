@@ -267,5 +267,13 @@ def penta_lu_solve_jax(
     return soln_final_t.T  # (ngrdcol, ndim)
 
 
-# JIT-compiled penta solver
-penta_lu_solve = jit(penta_lu_solve_jax)
+# Called eagerly (per prognostic variable, per timestep), these solvers redefine their nested scan
+# bodies (lu_step/fwd_step/bwd_step) on every call, so JAX's scan compile-cache misses and XLA recompiles
+# each step → unbounded compile-cache growth (a co-cause of the rico OOM, Iter290; ~40 scan recompiles/step
+# remained after the parabolic_cylinder fix). Jitting the pure (lhs, rhs) -> soln entry points makes every
+# call hit the jit cache by input aval (one compile per distinct grid size, then reused), bounding memory
+# and removing the per-step recompiles. jit is value-preserving and composes with grad, so the solves stay
+# bit-identical and differentiable. All callers import these names, so rebinding here covers every use.
+tridiag_lu_solve_jax = jit(tridiag_lu_solve_jax)
+penta_lu_solve_jax = jit(penta_lu_solve_jax)
+penta_lu_solve = penta_lu_solve_jax   # back-compat alias (advance_xm_wpxp_module imports this)

@@ -46,11 +46,14 @@ def zm2zt_jax(azm: jnp.ndarray, gr) -> jnp.ndarray:
     # dzt[k] = zm[k+1] - zm[k], shape (ngrdcol, nzt)
     dzt = zm[:, 1:] - zm[:, :-1]
 
-    # w_above = (zt[k] - zm[k]) / dzt[k]
-    w_above = (zt - zm[:, :-1]) / dzt
-
-    # azt[k] = w_above * azm[k+1] + (1 - w_above) * azm[k]
-    return w_above * azm[:, 1:] + (1.0 - w_above) * azm[:, :-1]
+    # Both weights computed DIRECTLY, matching Fortran calc_zm2zt_weights
+    # (grid_class.F90:2621/2625) — NOT w_below = 1 - w_above. The two are
+    # identical (0.5) on an evenly-spaced grid but differ by ~1 ULP on a
+    # stretched grid (grid_type=2, e.g. rico), so the direct form is the
+    # faithful one. azt[k] = w_above*azm[k+1] + w_below*azm[k].
+    w_above = (zt - zm[:, :-1]) / dzt          # weights_zm2zt(m_above)
+    w_below = (zm[:, 1:] - zt) / dzt           # weights_zm2zt(m_below)
+    return w_above * azm[:, 1:] + w_below * azm[:, :-1]
 
 
 def zt2zm_jax(azt: jnp.ndarray, gr, zm_min: float | None = None) -> jnp.ndarray:
@@ -84,9 +87,12 @@ def zt2zm_jax(azt: jnp.ndarray, gr, zm_min: float | None = None) -> jnp.ndarray:
     # denom = zt[k] - zt[k-1], shape (ngrdcol, nzm-2)
     denom_int = zt[:, 1:] - zt[:, :-1]          # (ngrdcol, nzt-1) = (ngrdcol, nzm-2)
     zm_int = zm[:, 1:-1]                          # (ngrdcol, nzm-2)
-    w_above_int = (zm_int - zt[:, :-1]) / denom_int   # weight for azt[k]
-    # azm_int[k] = w_above * azt[k] + (1-w_above) * azt[k-1]
-    azm_int = w_above_int * azt[:, 1:] + (1.0 - w_above_int) * azt[:, :-1]
+    # Both weights DIRECT, matching Fortran calc_zt2zm_weights (grid_class.F90:
+    # 2265/2269) — NOT w_below = 1 - w_above (identical on uniform grids, ~1 ULP
+    # apart on stretched grids like rico). azm[k] = w_above*azt[k] + w_below*azt[k-1].
+    w_above_int = (zm_int - zt[:, :-1]) / denom_int      # weights_zt2zm(t_above)
+    w_below_int = (zt[:, 1:] - zm_int) / denom_int       # weights_zt2zm(t_below)
+    azm_int = w_above_int * azt[:, 1:] + w_below_int * azt[:, :-1]
 
     # --- Lower boundary k=0 (ascending grid): linear extension below zt[0] ---
     # Fortran: azm(1) = azt(1) for ascending grid
@@ -99,8 +105,9 @@ def zt2zm_jax(azt: jnp.ndarray, gr, zm_min: float | None = None) -> jnp.ndarray:
     # where t_above weight = (zm(nzm) - zt(nzt-1)) / (zt(nzt) - zt(nzt-1))
     # Python 0-indexed:
     denom_top = zt[:, -1:] - zt[:, -2:-1]        # (ngrdcol, 1)
-    w_above_top = (zm[:, -1:] - zt[:, -2:-1]) / denom_top
-    azm_top = w_above_top * azt[:, -1:] + (1.0 - w_above_top) * azt[:, -2:-1]
+    w_above_top = (zm[:, -1:] - zt[:, -2:-1]) / denom_top   # weights_zt2zm(nzm,t_above)
+    w_below_top = (zt[:, -1:] - zm[:, -1:]) / denom_top     # weights_zt2zm(nzm,t_below), direct
+    azm_top = w_above_top * azt[:, -1:] + w_below_top * azt[:, -2:-1]
 
     azm = jnp.concatenate([azm_bot, azm_int, azm_top], axis=1)
 

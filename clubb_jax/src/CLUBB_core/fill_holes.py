@@ -156,3 +156,16 @@ def fill_holes_vertical_jax(field, rho_ds, dz, threshold, lower_k, upper_k,
         return _fill_holes_sliding_window_jax(field, rho_dz, threshold, lower_k, upper_k)
     else:
         raise NotImplementedError(f"fill_holes_type={fill_holes_type} not implemented")
+
+
+# Called eagerly ~7-9× per timestep (rtm, thlm, rtp2, thlp2, up2, vp2, wp2), the inner sliding-window
+# `fori_loop` / global-fill bodies CLOSE OVER `rho_dz`/`threshold`, so eager use bakes those values into
+# the loop jaxpr → XLA recompiles every step → unbounded compile-cache growth (the Iter290 residual ~9
+# scan-recompiles/step; Iter291). Jitting the entry makes the arrays tracers (hoisted to operands), so
+# each (grid-size, fill_type) variant compiles ONCE and cache-hits. The int control args
+# (lower_k/upper_k/fill_holes_type/grid_dir_indx) drive Python branching/shaping → static; `threshold`
+# is only used arithmetically → traced. Value-preserving + differentiable; all callers import this name.
+fill_holes_vertical_jax = jax.jit(
+    fill_holes_vertical_jax,
+    static_argnames=("lower_k", "upper_k", "fill_holes_type", "grid_dir_indx"),
+)

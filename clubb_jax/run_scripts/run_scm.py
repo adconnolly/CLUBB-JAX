@@ -193,8 +193,33 @@ def setup_files_and_aggregate(args, output_dir):
     if not os.path.isdir(config_dir):
         sys.exit(f"--config directory does not exist: {config_dir}")
 
+    # A case may select a non-default tunable-parameters file via `parameter_file`
+    # in its &model_setting namelist (e.g. ekman/coriolis_test/atex_long). That key
+    # is a run-script directive, not a Fortran namelist variable, so it must be used
+    # to pick the params file AND stripped from the aggregate (else the Fortran
+    # namelist read errors). Path is relative to clubb_release/run_scripts/.
+    case_param_file = None
+    with open(model_file) as _mf:
+        m = re.search(r'^\s*parameter_file\s*=\s*["\']([^"\']+)["\']',
+                      _mf.read(), re.MULTILINE)
+    if m:
+        case_param_file = os.path.normpath(
+            os.path.join(CLUBB_ROOT, "run_scripts", m.group(1)))
+        # Some upstream model.in files carry a stale parameter_file directory
+        # (e.g. coriolis_test points at input/tunable_parameters/ but the file
+        # actually lives in input/tunable_parameters_coriolis_cases/). If the
+        # literal path is missing, fall back to locating the basename anywhere
+        # under input/ so the case still runs.
+        if not os.path.isfile(case_param_file):
+            _base = os.path.basename(case_param_file)
+            for _root, _dirs, _files in os.walk(os.path.join(CLUBB_ROOT, "input")):
+                if _base in _files:
+                    case_param_file = os.path.join(_root, _base)
+                    break
+
     # Files (respect overrides)
-    params_file       = args.params       or os.path.join(config_dir, "tunable_parameters.in")
+    params_file       = args.params       or case_param_file \
+                                          or os.path.join(config_dir, "tunable_parameters.in")
     flags_file        = args.flags        or os.path.join(config_dir, "configurable_model_flags.in")
     silhs_params_file = args.silhs_params or os.path.join(config_dir, "silhs_parameters.in")
     stats_arg = (args.stats or "").strip()
@@ -304,7 +329,10 @@ def setup_files_and_aggregate(args, output_dir):
             files_to_aggregate.append(stats_file)
         for f in files_to_aggregate:
             with open(f) as src:
-                out.write(strip_comments_and_remove_keys(src.read()))
+                # `parameter_file` is a run-script directive, not a Fortran namelist
+                # variable — strip it so the Fortran namelist read does not error.
+                out.write(strip_comments_and_remove_keys(
+                    src.read(), keys_to_remove=["parameter_file"]))
                 out.write("\n")
 
     return clubb_input_namelist, model_file, run_cmd, run_cwd, run_env

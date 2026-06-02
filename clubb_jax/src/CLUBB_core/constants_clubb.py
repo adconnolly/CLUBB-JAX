@@ -18,6 +18,12 @@ Rv = 461.5
 ep = Rd / Rv
 ep1 = (1.0 - ep) / ep
 ep2 = 1.0 / ep
+rc_tol = 1.0e-6        # Tolerance for r_c  [kg/kg]  (constants_clubb.F90)
+Ncn_tol = 1.0e2        # Tolerance for N_cn [#/kg]   (constants_clubb.F90)
+micron_per_m = 1.0e6   # Micrometers per meter        (constants_clubb.F90)
+rho_lw = 1000.0        # Density of liquid water [kg/m^3] (constants_clubb.F90)
+sec_per_hr = 3600.0    # Seconds per hour
+radians_per_deg = np.pi / 180.0
 kappa = Rd / Cp
 p0 = 1.0e5
 
@@ -27,6 +33,8 @@ w_tol = 2.0e-2
 w_tol_sqd = w_tol ** 2
 thl_tol = 1.0e-2
 rt_tol = 1.0e-8
+thl_tol_mfl = 0.2      # [K]      monotonic-flux-limiter xm_tol (constants_clubb.F90:262)
+rt_tol_mfl = 1.0e-4    # [kg/kg]  monotonic-flux-limiter xm_tol (constants_clubb.F90:263)
 em_min = 1.5 * w_tol_sqd   # minimum TKE
 
 zero = 0.0
@@ -53,6 +61,8 @@ cloud_frac_min = 0.005
 max_num_stdevs = 5.0         # Range of standard deviations for PDF truncation
 chi_tol = max(1.0e-8, np.finfo(np.float64).eps)  # Tolerance for chi [kg/kg]
 
+T_freeze_K = 273.15          # Freezing point of water [K] (constants_clubb.F90:219)
+
 import math as _math
 sqrt_2   = _math.sqrt(2.0)
 sqrt_2pi = _math.sqrt(2.0 * _math.pi)
@@ -73,6 +83,7 @@ ic_K8 = 44
 ic_K9 = 46
 ic_K10 = 74
 ic_K10h = 75
+ithlp2_rad_coef = 76   # parameter_indices.F90 line 121
 
 iC1 = 1
 iC1b = 2

@@ -12,11 +12,13 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
     iRichardson_num_min,
     iRichardson_num_max,
     ilambda0_stability_coef,
+    ithlp2_rad_coef,
     Cp,
     Lv,
     Rd,
     ep,
     grav,
+    rc_tol,
     zero_threshold,
     min_max_smth_mag,
 )
@@ -260,3 +262,30 @@ def calc_brunt_vaisala_freq_sqd_jax(
         brunt_vaisala_freq_sqd = bv_dry_main
 
     return brunt_vaisala_freq_sqd, bv_mixed, bv_smth, bv_dry, bv_moist
+
+
+def calculate_thlp2_rad_jax(rcm, thlprcp, radht, clubb_params, gr):
+    """Compute radiative cooling contribution to thlp2 forcing.
+
+    Faithful port of advance_helper_module.F90:calculate_thlp2_rad (lines 2170-2255).
+    Only updates levels where rcm_zm > rc_tol.
+
+    Args:
+        rcm:          cloud water mixing ratio on zt levels  (ngrdcol, nzt)
+        thlprcp:      thl'rc' on zm levels                   (ngrdcol, nzm)
+        radht:        SW+LW heating rate on zt levels        (ngrdcol, nzt)
+        clubb_params: tunable parameters                     (ngrdcol, 102)
+        gr:           grid object (provides zt2zm weights)
+    Returns:
+        thlp2_rad increment (ngrdcol, nzm) — caller adds to thlp2_forcing
+    """
+    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+    rcm_zm = zt2zm_jax(jnp.asarray(rcm), gr)
+    radht_zm = zt2zm_jax(jnp.asarray(radht), gr)
+    thlp2_rad_coef = clubb_params[:, ithlp2_rad_coef - 1][:, jnp.newaxis]
+    increment = jnp.where(
+        rcm_zm > rc_tol,
+        thlp2_rad_coef * 2.0 * radht_zm / rcm_zm * jnp.asarray(thlprcp),
+        0.0,
+    )
+    return increment
