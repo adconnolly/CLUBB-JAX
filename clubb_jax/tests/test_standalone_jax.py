@@ -50,7 +50,7 @@ def test_faithful_cases_run_without_clubb_python():
             sys.path.remove(p)
         sys.path.insert(0, p)
 
-    from clubb_jax.src.clubb_standalone import init_clubb_case
+    from clubb_jax.src.clubb_driver import init_clubb_case
     from clubb_jax.src.advance_clubb_to_end import advance_clubb_to_end
 
     # These cases are genuinely entirely-in-JAX (forcings ported) — they must run with clubb_python blocked.

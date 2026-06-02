@@ -1,6 +1,7 @@
 # Large archives and generated outputs — not tracked
 clubb_release_archive/
 jax_driver_test_results/
+clubb_jax/output/
 
 # Python bytecode
 __pycache__/

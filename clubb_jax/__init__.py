@@ -3,7 +3,7 @@
 This package lives at the repository root, while the Python API package lives
 under ``clubb_python_api/``.  Add that sibling directory to ``sys.path`` so
 ``clubb_python`` imports work when the driver is launched via
-``python -m clubb_jax.clubb_standalone`` from the repo root.
+``python -m clubb_jax.src.clubb_standalone`` from the repo root.
 """
 
 from pathlib import Path

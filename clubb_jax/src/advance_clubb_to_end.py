@@ -4,6 +4,8 @@ This module contains the timestep advancement logic that was split out from
 the previous monolithic Python driver file.
 """
 
+import gc
+
 import numpy as np
 import jax.numpy as jnp
 
@@ -26,6 +28,9 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
     rad_interval = int(dt_rad / dt_main)
     n_steps = ifinal if max_steps is None else min(ifinal, max_steps)
     sw = state.get('stats_writer')  # Python stats writer; None → fall back to Fortran API
+
+    _GC_INTERVAL = 10          # force a cyclic-GC pass every N sampled steps (Iter325 OOM fix)
+    _samples_since_gc = 0
 
     for itime_idx in range(n_steps):
         itime = itime_idx + 1
@@ -133,6 +138,25 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
 
         # ── Update time ─────────────────────────────────────────────────
         time_current = time_initial + itime * dt_main
+
+        # Periodic cyclic-GC collection on sampled steps (Iter325). The per-step diagnostic
+        # JAX arrays produced when l_sample=True form reference cycles (Array↔traceback/aval),
+        # which CPython's generational GC does not reclaim promptly inside this tight numeric
+        # loop → orphaned device buffers accumulate (~78/sampled step on mpace_a) → OOM on long
+        # per-step-stats runs (e.g. compare_runs forces sampling every step). An explicit
+        # gc.collect() frees them (verified: live_arrays stays flat). Stats-off runs don't sample,
+        # so they never leak and never pay this cost. Amortised over _GC_INTERVAL sampled steps.
+        if l_sample:
+            _samples_since_gc += 1
+            if _samples_since_gc >= _GC_INTERVAL:
+                gc.collect()
+                _samples_since_gc = 0
+
+        import os as _os
+        if _os.environ.get('CLUBB_LEAK'):
+            import jax as _jax, resource as _res
+            _rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss / 1024.0
+            print(f"  [LEAK] step {itime}: live_arrays={len(_jax.live_arrays())}  maxRSS={_rss:.0f}MB", flush=True)
 
         if l_stdout:
             print(f"iteration: {itime:8d} / {ifinal:8d}"

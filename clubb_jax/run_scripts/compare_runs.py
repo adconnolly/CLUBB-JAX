@@ -138,8 +138,11 @@ def main():
 
     case   = args.case
     niters = args.max_iters
+    # Output convention (see DESIGN.md): Fortran stats live under clubb_release/output/,
+    # JAX stats under clubb_jax/output/. Each run also gets its own *_compare_* subdir
+    # so neither clobbers a stored oracle.
     outdir_f = os.path.join(CLUBB_ROOT, f"output/{case}_compare_fort")
-    outdir_j = os.path.join(CLUBB_ROOT, f"output/{case}_compare_jax")
+    outdir_j = os.path.join(JAX_ROOT, "clubb_jax", f"output/{case}_compare_jax")
     # Force per-step output (stats_tsamp = stats_tout = interval) so JAX/Fortran records
     # are instantaneous and time-aligned. Default interval = the case's dt_main.
     interval = args.tout if args.tout is not None else _read_dt_main(case)

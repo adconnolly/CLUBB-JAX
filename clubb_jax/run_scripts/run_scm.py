@@ -12,7 +12,13 @@ import sys
 RUN_SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 JAX_ROOT    = os.path.normpath(os.path.join(RUN_SCRIPTS, "../.."))   # CLUBB-JAX/
 CLUBB_ROOT  = os.path.normpath(os.path.join(JAX_ROOT, "clubb_release"))
-DEFAULT_OUTPUT_DIR  = os.path.join(CLUBB_ROOT, "output")
+
+# Output convention: JAX-produced stats live under clubb_jax/output/, the Fortran
+# oracle under clubb_release/output/. Defaulting -jax to its OWN directory means a
+# bare `-jax` run can no longer clobber the stored Fortran oracle
+# (clubb_release/output/<case>_stats.nc) — see DESIGN.md "Oracle-protection convention".
+DEFAULT_OUTPUT_DIR     = os.path.join(CLUBB_ROOT, "output")          # Fortran / legacy / exe
+DEFAULT_JAX_OUTPUT_DIR = os.path.join(JAX_ROOT, "clubb_jax", "output")  # JAX driver
 
 # create_multi_col_params.py lives in clubb_release/run_scripts (not yet translated)
 multi_col_params_script = os.path.join(CLUBB_ROOT, "run_scripts", "create_multi_col_params.py")
@@ -264,15 +270,15 @@ def setup_files_and_aggregate(args, output_dir):
             pythonpath_entries.append(existing_pythonpath)
         run_env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     elif args.jax:
-        jax_driver = os.path.join(JAX_ROOT, "clubb_jax", "clubb_standalone.py")
+        jax_driver = os.path.join(JAX_ROOT, "clubb_jax", "src", "clubb_standalone.py")
         if not os.path.isfile(jax_driver):
             sys.exit(f"JAX standalone driver not found: {jax_driver}")
         clubb_python_api_dir = os.path.join(CLUBB_ROOT, "clubb_python_api")
         if not os.path.isdir(clubb_python_api_dir):
             sys.exit(f"Python API directory not found: {clubb_python_api_dir}")
         run_cwd = RUN_SCRIPTS
-        executable = f"{sys.executable} -m clubb_jax.clubb_standalone"
-        run_cmd = [sys.executable, "-m", "clubb_jax.clubb_standalone"]
+        executable = f"{sys.executable} -m clubb_jax.src.clubb_standalone"
+        run_cmd = [sys.executable, "-m", "clubb_jax.src.clubb_standalone"]
         run_env = os.environ.copy()
         existing_pythonpath = run_env.get("PYTHONPATH", "")
         pythonpath_entries = [JAX_ROOT, CLUBB_ROOT, clubb_python_api_dir]
@@ -481,7 +487,7 @@ def main():
         help="Run the Python standalone driver (python -m clubb_python_driver.clubb_standalone)")
 
     parser.add_argument("-jax", action="store_true",
-        help="Run the JAX standalone driver (python -m clubb_jax.clubb_standalone)")
+        help="Run the JAX standalone driver (python -m clubb_jax.src.clubb_standalone)")
 
     # The old method of compile clubb resulted in the executable "clubb/bin/clubb_standalone"
     # this option causes that to be the prefered executable, unless -exe is specified
@@ -493,7 +499,8 @@ def main():
 
     # Allow a custom output directory to be used for all generated files.
     parser.add_argument("-out_dir", metavar="[DIR]",
-        help="Output directory for results.\nDefault: output")
+        help="Output directory for results.\n"
+             "Default: clubb_jax/output/ for -jax, clubb_release/output/ otherwise.")
 
     # Runtime options
     parser.add_argument("-debug", metavar="[NUM]",
@@ -538,8 +545,14 @@ def main():
         print("\n\033[93mWARNING: Specifying --nzmax will have no effect without "
                 "specifying a --zm_grid or --zt_grid\033[0m")
 
-    output_dir = (os.path.abspath(args.out_dir) if args.out_dir
-                    else os.path.abspath(DEFAULT_OUTPUT_DIR))
+    # -jax defaults to clubb_jax/output/ (its own dir), everything else to
+    # clubb_release/output/ (the Fortran oracle home). -out_dir overrides either.
+    if args.out_dir:
+        output_dir = os.path.abspath(args.out_dir)
+    elif args.jax:
+        output_dir = os.path.abspath(DEFAULT_JAX_OUTPUT_DIR)
+    else:
+        output_dir = os.path.abspath(DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: setup and aggregate namelist files into <output_dir>/CASE.in

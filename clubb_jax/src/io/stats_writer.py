@@ -198,19 +198,12 @@ class StatsWriter:
         """Accumulate a sample for the named variable (mirrors stats_update_2d).
 
         value shape: (ngrdcol, nz) for profile vars, (ngrdcol,) or scalar for sfc.
-
-        ★ The `np.asarray(value)` is done BEFORE the registry check, even for variables
-        not in this case's registry (Iter324). The diagnostic `value` is a JAX array
-        returned by the jitted core; if it is dropped WITHOUT being materialised, XLA
-        retains its device buffer (a per-call leak of ~85 arrays/step → OOM on long
-        per-step-stats runs of large-var-set Morrison cases, ~step 150-250). Forcing the
-        host transfer here lets the buffer be freed. update_col takes a Python float, no leak.
         """
         if not self.l_sample:
             return
-        val = np.asarray(value, dtype=np.float64)   # materialise FIRST — frees the JAX device buffer (Iter324 leak fix)
         if name not in self._buffer:
             return  # variable not in registry — silently ignore
+        val = np.asarray(value, dtype=np.float64)
 
         buf = self._buffer[name]
         cnt = self._nsamples[name]
@@ -244,9 +237,9 @@ class StatsWriter:
         """Start a budget window by subtracting the current state from the buffer."""
         if not self.l_sample:
             return
-        val = np.asarray(val_before, dtype=np.float64)   # materialise FIRST (frees the JAX device buffer)
         if name not in self._buffer:
             return
+        val = np.asarray(val_before, dtype=np.float64)
         buf = self._buffer[name]
         if buf.ndim == 2 and buf.shape[1] > 1:
             buf[:, :] -= val
@@ -266,9 +259,9 @@ class StatsWriter:
         """
         if not self.l_sample:
             return
-        val = np.asarray(val_after, dtype=np.float64)   # materialise FIRST (frees the JAX device buffer)
         if name not in self._buffer:
             return
+        val = np.asarray(val_after, dtype=np.float64)
         buf = self._buffer[name]
         cnt = self._nsamples[name]
         if buf.ndim == 2 and buf.shape[1] > 1:
