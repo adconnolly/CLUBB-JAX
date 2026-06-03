@@ -9,7 +9,12 @@ Supported schemes:
 
 import math
 import numpy as np
+import jax.numpy as jnp
 
+# Tracer-transparent shim (REFACTOR B5): _asarray/_xp/_iset behave EXACTLY like numpy for concrete arrays
+# (normal runs bit-identical) but route to jnp under a jax.grad trace, so radiation (rcm→radht→thlm_forcing)
+# stays on the whole-driver autodiff graph. See CLUBB_core/tracer_numpy.py.
+from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray, _xp, _iset, _is_tracer_arg, _safe_pow
 from clubb_jax.src.CLUBB_core.constants_clubb import sec_per_hr, radians_per_deg, rho_lw
 
 _CP = 1004.67
@@ -127,7 +132,7 @@ def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bo
     )
 
     frad_total = frad_sw + frad_lw
-    state['radht'][:] = radht_sw + radht_lw
+    state['radht'] = _iset(state['radht'], np.s_[:], radht_sw + radht_lw)  # _iset: tracer-safe under grad
     state['Frad'] = frad_total
     state['Frad_SW'] = frad_sw
     state['Frad_LW'] = frad_lw
@@ -153,17 +158,20 @@ def _advance_soil_veg_step(state: dict, l_sample: bool = False):
         state['deep_soil_T_in_K'], state['sfc_soil_T_in_K'], state['veg_T_in_K'] = deep, sfc, veg
 
     dt = float(state['dt_main'])
-    rho_sfc = np.asarray(state['rho_zm'], dtype=np.float64)[:, 0]    # rho_zm(:,1) in Fortran
+    rho_sfc = _asarray(state['rho_zm'], dtype=np.float64)[:, 0]    # rho_zm(:,1) in Fortran
     z = np.zeros(ngrdcol)
-    sfc0 = lambda key: np.asarray(state[key], dtype=np.float64)[:, 0] if key in state else z
+    # _asarray (REFACTOR B5): the surface fluxes (wpthlp_sfc/wprtp_sfc) are tracers under a jax.grad trace;
+    # advance_soil_veg is jax-compatible, so keep them on the graph (the interactive veg_T it returns feeds the
+    # NEXT step's surface flux). np.asarray would sever (TracerArrayConversionError).
+    sfc0 = lambda key: _asarray(state[key], dtype=np.float64)[:, 0] if key in state else z
     deep, sfc, veg, _ = advance_soil_veg(
         dt, rho_sfc, sfc0('Frad_SW_up'), sfc0('Frad_SW_down'), sfc0('Frad_LW_down'),
-        np.asarray(state['wpthlp_sfc'], dtype=np.float64), np.asarray(state['wprtp_sfc'], dtype=np.float64),
-        np.asarray(state['p_sfc'], dtype=np.float64),
+        _asarray(state['wpthlp_sfc'], dtype=np.float64), _asarray(state['wprtp_sfc'], dtype=np.float64),
+        _asarray(state['p_sfc'], dtype=np.float64),
         state['deep_soil_T_in_K'], state['sfc_soil_T_in_K'], state['veg_T_in_K'])
-    state['deep_soil_T_in_K'] = np.asarray(deep)
-    state['sfc_soil_T_in_K'] = np.asarray(sfc)
-    state['veg_T_in_K'] = np.asarray(veg)
+    state['deep_soil_T_in_K'] = _asarray(deep)
+    state['sfc_soil_T_in_K'] = _asarray(sfc)
+    state['veg_T_in_K'] = _asarray(veg)
 
 
 def _advance_bugsrad_radiation(state: dict, time_current: float, l_sample: bool = False):
@@ -179,6 +187,15 @@ def _advance_bugsrad_radiation(state: dict, time_current: float, l_sample: bool 
 
     cfg = state['cfg']; gr = state['gr']; ngrdcol = state['ngrdcol']
     sw = state.get('stats_writer')
+
+    # Detach-under-trace (REFACTOR B5). BUGSrad (correlated-k RT, std-atm extension, many bands) is
+    # reverse-mode memory-PROHIBITIVE, and radiation runs AFTER the core — so the radht it writes feeds only
+    # the NEXT step's forcing, never the current step's prognostics. Under a jax.grad trace we therefore skip
+    # it (leaving state['radht'] etc. at their incoming values): EXACT for a single-step gradient, and treats
+    # radiation as a detached forcing for multi-step rollouts (the practical choice for heavy RT). The light
+    # simplified-LW scheme stays fully differentiable (it is cheap); only BUGSrad is detached.
+    if _is_tracer_arg([state['thlm'], state['rcm'], state['rtm']]):
+        return
 
     p_in_Pa = np.asarray(state['p_in_Pa'], dtype=np.float64)
     p_in_Pam = np.asarray(zt2zm_jax(jnp.asarray(p_in_Pa), gr), dtype=np.float64)
@@ -234,6 +251,28 @@ def _advance_bugsrad_radiation(state: dict, time_current: float, l_sample: bool 
         sw.update("radht_LW", state['radht_LW'])
 
 
+def _inversion_height_jax(rtm, zt, nzt, thresh=8.0e-3):
+    """Differentiable jnp mirror of the inversion-height loop in `_simple_rad_lw` (used only under a
+    jax.grad trace). k_iso = first level (from the bottom) with rtm <= thresh; z_i is rtm=thresh linearly
+    interpolated between k_iso-1 and k_iso. Forward-identical to the loop: k_iso==0 -> 0; all-above -> use the
+    top two levels; the |denom|<eps fallback -> midpoint. The integer index is data-dependent (piecewise
+    constant), the interpolated VALUE carries the gradient w.r.t. rtm."""
+    above = rtm > thresh                                          # (ngrdcol, nzt)
+    k_iso = jnp.sum(jnp.cumprod(above.astype(rtm.dtype), axis=1), axis=1).astype(jnp.int32)  # leading-True count
+    k = jnp.clip(k_iso, 1, nzt - 1)                               # gatherable: k-1>=0 and k<nzt
+    km1 = k - 1
+    r_hi = jnp.take_along_axis(rtm, k[:, None], axis=1)[:, 0]
+    r_lo = jnp.take_along_axis(rtm, km1[:, None], axis=1)[:, 0]
+    z_hi = jnp.take_along_axis(zt, k[:, None], axis=1)[:, 0]
+    z_lo = jnp.take_along_axis(zt, km1[:, None], axis=1)[:, 0]
+    denom = r_hi - r_lo
+    small = jnp.abs(denom) < _EPS
+    denom_safe = jnp.where(small, 1.0, denom)                     # avoid 0/0 in the masked grad
+    z_interp = jnp.where(small, 0.5 * (z_hi + z_lo),
+                         z_lo + (thresh - r_lo) * (z_hi - z_lo) / denom_safe)
+    return jnp.where(k_iso == 0, 0.0, z_interp)                   # k_iso==0 -> z_i=0
+
+
 def _simple_rad_lw(
     gr,
     ngrdcol: int,
@@ -256,40 +295,53 @@ def _simple_rad_lw(
     lwp = _liq_water_path(ngrdcol, nzm, nzt, rho, rcm, gr.invrs_dzt)
 
     if f1 > _EPS:
-        frad_lw = f0 * np.exp(-kappa * lwp) + f1 * np.exp(-kappa * (lwp[:, 0:1] - lwp))
+        frad_lw = f0 * _xp.exp(-kappa * lwp) + f1 * _xp.exp(-kappa * (lwp[:, 0:1] - lwp))
     else:
-        frad_lw = f0 * np.exp(-kappa * lwp)
+        frad_lw = f0 * _xp.exp(-kappa * lwp)
 
     if l_rad_above_cloud:
-        z_i = np.zeros(ngrdcol, dtype=np.float64)
-        for i in range(ngrdcol):
-            k_iso = 0
-            while k_iso < nzt and rtm[i, k_iso] > 8.0e-3:
-                k_iso += 1
-            if k_iso == 0 or k_iso > nzt:
-                z_i[i] = 0.0
-                continue
-            if k_iso == nzt:
-                k_iso = nzt - 1
-            z_i[i] = _linear_interp(
-                8.0e-3, rtm[i, k_iso], rtm[i, k_iso - 1],
-                gr.zt[i, k_iso], gr.zt[i, k_iso - 1],
+        # Above-cloud LW correction. Block-level tracer dispatch (REFACTOR B5): the inversion-height search is
+        # a data-dependent threshold-crossing loop on rtm and the correction uses boolean-mask in-place writes
+        # + fractional powers — so concrete runs keep the EXACT original (bit-identical) while a jax.grad trace
+        # takes a jnp mirror (jnp inversion finder, mask-MULTIPLY instead of boolean-index, _safe_pow for the
+        # dz**(1/3)/(4/3) cloud-top inf-grad).
+        if not _is_tracer_arg([rtm, frad_lw]):
+            z_i = np.zeros(ngrdcol, dtype=np.float64)
+            for i in range(ngrdcol):
+                k_iso = 0
+                while k_iso < nzt and rtm[i, k_iso] > 8.0e-3:
+                    k_iso += 1
+                if k_iso == 0 or k_iso > nzt:
+                    z_i[i] = 0.0
+                    continue
+                if k_iso == nzt:
+                    k_iso = nzt - 1
+                z_i[i] = _linear_interp(
+                    8.0e-3, rtm[i, k_iso], rtm[i, k_iso - 1],
+                    gr.zt[i, k_iso], gr.zt[i, k_iso - 1],
+                )
+            dz = gr.zm - z_i[:, np.newaxis]
+            heaviside = np.where(dz < -_EPS, 0.0, np.where(dz > _EPS, 1.0, 0.5))
+            pos = heaviside > 0.0
+            if np.any(pos):
+                dz_pos = np.maximum(dz[pos], 0.0)
+                z_i_broad = np.broadcast_to(z_i[:, np.newaxis], (ngrdcol, nzm))[pos]
+                frad_lw[pos] += (
+                    rho_zm[pos] * _CP * _LS_DIV * heaviside[pos]
+                    * (0.25 * (dz_pos ** (4.0 / 3.0)) + z_i_broad * (dz_pos ** (1.0 / 3.0)))
+                )
+            if l_sample and sw is not None:
+                sw.update("z_inversion", z_i)
+        else:
+            z_i = _inversion_height_jax(rtm, gr.zt, nzt)
+            dz = jnp.asarray(gr.zm) - z_i[:, None]
+            heaviside = jnp.where(dz < -_EPS, 0.0, jnp.where(dz > _EPS, 1.0, 0.5))
+            dz_pos = jnp.maximum(dz, 0.0)
+            correction = (
+                jnp.asarray(rho_zm) * _CP * _LS_DIV * heaviside
+                * (0.25 * _safe_pow(dz_pos, 4.0 / 3.0) + z_i[:, None] * _safe_pow(dz_pos, 1.0 / 3.0))
             )
-
-        dz = gr.zm - z_i[:, np.newaxis]
-        heaviside = np.where(dz < -_EPS, 0.0, np.where(dz > _EPS, 1.0, 0.5))
-
-        pos = heaviside > 0.0
-        if np.any(pos):
-            dz_pos = np.maximum(dz[pos], 0.0)
-            z_i_broad = np.broadcast_to(z_i[:, np.newaxis], (ngrdcol, nzm))[pos]
-            frad_lw[pos] += (
-                rho_zm[pos] * _CP * _LS_DIV * heaviside[pos]
-                * (0.25 * (dz_pos ** (4.0 / 3.0)) + z_i_broad * (dz_pos ** (1.0 / 3.0)))
-            )
-
-        if l_sample and sw is not None:
-            sw.update("z_inversion", z_i)
+            frad_lw = frad_lw + correction
 
     radht_lw = (
         (1.0 / exner) * (-1.0 / (_CP * rho))
@@ -302,11 +354,15 @@ def _simple_rad_lw(
 def _liq_water_path(ngrdcol: int, nzm: int, nzt: int,
                     rho: np.ndarray, rcm: np.ndarray,
                     invrs_dzt: np.ndarray) -> np.ndarray:
-    """Compute liquid water path on momentum levels."""
-    lwp = np.zeros((ngrdcol, nzm), dtype=np.float64)
-    for k in range(nzm - 2, -1, -1):
-        lwp[:, k] = lwp[:, k + 1] + rcm[:, k] * rho[:, k] / invrs_dzt[:, k]
-    return lwp
+    """Compute liquid water path on momentum levels (cumulative from the top down).
+
+    Tracer-transparent (REFACTOR B5): vectorized reverse-cumsum that sums in the SAME top-down order as the
+    original in-place loop (`lwp[k] = lwp[k+1] + contrib[k]`), so it is bit-identical for concrete runs while
+    routing through jnp under a jax.grad trace (the loop's `lwp[:,k] = <tracer>` would otherwise sever)."""
+    contrib = rcm * rho / invrs_dzt                                   # (ngrdcol, nzt)
+    rev_cumsum = _xp.flip(_xp.cumsum(_xp.flip(contrib, axis=1), axis=1), axis=1)  # lwp[:, :nzt], top-down order
+    zeros_top = _xp.zeros((ngrdcol, 1), dtype=np.float64)             # lwp[:, nzm-1] = 0 (top boundary)
+    return _xp.concatenate([rev_cumsum, zeros_top], axis=1)           # (ngrdcol, nzm)
 
 
 def _linear_interp(x: float, x_high: float, x_low: float,

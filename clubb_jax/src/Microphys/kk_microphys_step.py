@@ -17,6 +17,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5: detect a jax.grad trace
 from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction
 from clubb_jax.src.Microphys.KK_microphys.kk_microphys_driver import compute_kk_microphysics
 
@@ -81,6 +82,12 @@ def _compute_kk_covar_mc(state, pdf, prereqs, precip_frac_1, precip_frac_2):
 def advance_kk_microphysics(state: dict):
     """Compute the KK microphysics tendencies (rcm_mc/thlm_mc/rrm_mc/Nrm_mc) from the post-advance
     state and store them. Transport + feedback application are gated (see module docstring)."""
+    # Detach-under-trace (REFACTOR B5): KK microphysics runs AFTER the core, so the *_mc tendencies it stores
+    # feed only the NEXT step's forcings — dead for a single-step gradient. Skip under a jax.grad trace
+    # (exact for single-step; a detached forcing for multi-step rollouts), same rationale as BUGSrad radiation.
+    if _is_tracer_arg([state['thlm'], state['rcm'], state['cloud_frac']]):
+        return
+
     hmm = state['hm_metadata']
     pdf = state['pdf_params']
     iirr, iiNr = int(hmm.iirr), int(hmm.iiNr)

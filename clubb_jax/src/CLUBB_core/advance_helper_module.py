@@ -28,6 +28,7 @@ from clubb_jax.src.CLUBB_core.grid_class import (
     zt2zm_jax,
     ddzt_jax,
 )
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt  # REFACTOR B5: finite grad for sqrt(max(0,·))
 
 # ── advance_helper_module constants ─────────────────────────────────────────
 _RICHARDSON_DIV_THRESH = 1.0e-6  # Richardson_num_divisor_threshold
@@ -150,7 +151,12 @@ def _lscale_width_vert_avg_jax(var_profile, rho_ds_zm, below_grnd_val, gr):
     numer_below = n_below * denom_at_lb * below_grnd_val
     denom_below = n_below * denom_at_lb
 
-    return (numer_sum + numer_below) / (denom_sum + denom_below)
+    # Guard the divisor (REFACTOR B5): a window always contains level k itself so the denominator is
+    # physically nonzero, but a zero lane (or its reverse-mode 0/0) would poison the gradient — the
+    # var_profile (Brunt-Vaisala freq sq) numerator is thlm-dependent. Forward-identical for denom!=0.
+    denom = denom_sum + denom_below
+    denom_safe = jnp.where(denom != 0.0, denom, 1.0)
+    return (numer_sum + numer_below) / denom_safe
 
 
 def wp23_term_splat_lhs_jax(
@@ -169,7 +175,10 @@ def wp23_term_splat_lhs_jax(
         gr=gr,
     )
 
-    brunt_freq_splat = jnp.sqrt(jnp.maximum(0.0, bv_sqd_splat))
+    # _safe_sqrt (REFACTOR B5): bv_sqd_splat goes negative in unstable (convective) layers; the bare
+    # jnp.sqrt(jnp.maximum(0,·)) has an inf reverse-mode gradient at the clip (it poisoned the bomex thlm
+    # whole-driver grad). Forward-identical, finite (0) gradient where bv_sqd_splat<=0.
+    brunt_freq_splat = _safe_sqrt(bv_sqd_splat)
     brunt_freq_splat_smooth = zm2zt2zm_jax(brunt_freq_splat, gr)
     brunt_freq_splat_zt = zm2zt_jax(brunt_freq_splat, gr)
 
@@ -283,9 +292,12 @@ def calculate_thlp2_rad_jax(rcm, thlprcp, radht, clubb_params, gr):
     rcm_zm = zt2zm_jax(jnp.asarray(rcm), gr)
     radht_zm = zt2zm_jax(jnp.asarray(radht), gr)
     thlp2_rad_coef = clubb_params[:, ithlp2_rad_coef - 1][:, jnp.newaxis]
+    # Double-where (REFACTOR B5): guard the divisor so the masked (rcm_zm<=rc_tol) lanes can't poison the
+    # reverse-mode gradient with 0/0 — forward-identical since those lanes are discarded by the outer where.
+    rcm_safe = jnp.where(rcm_zm > rc_tol, rcm_zm, 1.0)
     increment = jnp.where(
         rcm_zm > rc_tol,
-        thlp2_rad_coef * 2.0 * radht_zm / rcm_zm * jnp.asarray(thlprcp),
+        thlp2_rad_coef * 2.0 * radht_zm / rcm_safe * jnp.asarray(thlprcp),
         0.0,
     )
     return increment

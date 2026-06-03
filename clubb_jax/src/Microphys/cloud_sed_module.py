@@ -15,6 +15,7 @@ import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax, ddzm_jax
 from clubb_jax.src.CLUBB_core.constants_clubb import rho_lw, Cp, Lv
+from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray  # REFACTOR B5: tracer-transparent np.asarray
 
 _PI = float(np.pi)
 
@@ -65,6 +66,7 @@ def cloud_drop_sed(rcm, Ncm, rho_zm, rho, exner, sigma_g, gr):
 
     rcm_mc  = sed_rcm
     thlm_mc = -(Lv / (Cp * exner_j)) * sed_rcm
-    return (np.asarray(rcm_mc, dtype=np.float64),
-            np.asarray(thlm_mc, dtype=np.float64),
-            np.asarray(Fcsed, dtype=np.float64))
+    # _asarray (REFACTOR B5): the body is already jnp (differentiable); only these returns severed the graph.
+    return (_asarray(rcm_mc, dtype=np.float64),
+            _asarray(thlm_mc, dtype=np.float64),
+            _asarray(Fcsed, dtype=np.float64))

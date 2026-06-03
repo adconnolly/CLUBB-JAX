@@ -14,6 +14,10 @@ from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad_j
 from clubb_jax.src.Benchmark_cases.arm import prescribe_forcings_arm, _Cp as _ARM_Cp, _Lv as _ARM_Lv
 from clubb_jax.src.Benchmark_cases.generic_forcings import prescribe_forcings_generic
 from clubb_jax.src.CLUBB_core.advance_clubb_core_module import advance_clubb_core as _advance_clubb_core_py
+# Tracer-transparent shim (REFACTOR B5): _asarray behaves exactly like np.asarray for concrete
+# arrays (normal runs bit-identical) but routes to jnp under a jax.grad trace so the whole-driver
+# autodiff graph survives the imperative `state[k] = ...` writebacks. See CLUBB_core/tracer_numpy.py.
+from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray
 
 
 def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | None = None):
@@ -165,7 +169,7 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
 
 def _calculate_thvm(state: dict):
     """Update virtual potential temperature diagnostic. Iter65: JAX-only."""
-    state['thvm'] = np.asarray(calculate_thvm_jax(
+    state['thvm'] = _asarray(calculate_thvm_jax(
         jnp.asarray(state['thlm']),
         jnp.asarray(state['rtm']),
         jnp.asarray(state['rcm']),
@@ -186,7 +190,7 @@ def _calculate_thlp2_rad(state: dict):
         clubb_params=state['clubb_params'],
         gr=state['gr'],
     )
-    state['thlp2_forcing'] = state['thlp2_forcing'] + np.asarray(increment, dtype=np.float64)
+    state['thlp2_forcing'] = state['thlp2_forcing'] + _asarray(increment, dtype=np.float64)
 
 
 def _cloud_drop_sed(state: dict, l_sample: bool = False):

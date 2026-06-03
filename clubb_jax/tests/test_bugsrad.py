@@ -137,7 +137,7 @@ def test_gascon_vs_fortran_replica():
 
 
 def _cloudg_replica(ib, pp, tt, wcont, re, pdist, cnrw, cniw, cnri, cnii, xlam, flag):
-    pi = float(np.arccos(np.float32(-1.0)))
+    pi = float(np.pi)   # REFACTOR A3: float64 π (was the float32 value, for bit-faithfulness)
     eps = 1.0e-5
     cnr = cnri[ib] if flag else cnrw[ib]
     cni = cnii[ib] if flag else cniw[ib]
@@ -166,7 +166,7 @@ def _cloudg_replica(ib, pp, tt, wcont, re, pdist, cnrw, cniw, cnri, cnii, xlam, 
                                                   + 1.0 / (um ** 2 * (um + 1.0) ** p0) - 1.0 / um ** 2)
                     vm = 4.0 * xm * cni
                     expr = p0 / (vm * (vm + 1.0) ** p1) + 1.0 / (vm ** 2 * (vm + 1.0) ** p0) - 1.0 / vm ** 2
-                    abs_ = area + c1 * float(np.float32(expr))
+                    abs_ = area + c1 * expr   # REFACTOR A3: float64 (was sngl float32 truncation)
                     tcld[i, l] = ext * dz
                     if ext < abs_:
                         ext = abs_
@@ -185,8 +185,8 @@ def test_cloudg_vs_fortran_replica():
     cnrw = 1.3 + 0.1 * rng.random(mb); cniw = 0.01 + 0.2 * rng.random(mb)
     cnri = 1.3 + 0.1 * rng.random(mb); cnii = 0.01 + 0.2 * rng.random(mb)
     xlam = 0.5 + 80.0 * rng.random(mb)
-    # _PI must match the float32-π Fortran value (faithfulness detail)
-    assert _CLOUDG_PI == float(np.arccos(np.float32(-1.0))) != float(np.pi), "cloudg π must be float32-π, not double π"
+    # REFACTOR A3: cloudg now uses float64 π (the float32-π bit-faithfulness contrivance was removed).
+    assert _CLOUDG_PI == float(np.pi), "cloudg π must be float64 π after REFACTOR A3"
     worst = 0.0
     for flag in (False, True):
         for ib in (0, 5, 11):           # band 1 (extinction-only) + two general bands
@@ -197,7 +197,7 @@ def test_cloudg_vs_fortran_replica():
                 den = np.abs(r).max()
                 worst = max(worst, np.abs(j - r).max() / (den + 1e-300))
     assert worst < 1e-12, f"cloudg JAX vs Fortran-replica worst rel {worst:.2e}"
-    print(f"  cloudg (ADT cloud optics; complex ext, sngl abs, float32-π; water+ice): vs replica rel {worst:.1e}  PASS")
+    print(f"  cloudg (ADT cloud optics; complex ext, float64 abs+π; water+ice): vs replica rel {worst:.1e}  PASS")
 
 
 def test_comscp_vs_fortran_replica():
@@ -660,7 +660,7 @@ def test_bugsrad_radiation_dispatch():
 def test_bugs_rad_differentiable():
     """The BUGSrad radiative transfer is DIFFERENTIABLE (a stated project goal): jax.grad of a radiative
     loss (TOA outgoing LW + total SW heating) w.r.t. temperature and cloud water is finite AND nonzero
-    (the radiation responds to its physical inputs), even through cloudg's float32 `sngl` truncation."""
+    (the radiation responds to its physical inputs). cloudg is now fully float64 (REFACTOR A3)."""
     import jax, jax.numpy as jnp
     from clubb_jax.src.Radiation.BUGSrad.bugs_rad import bugs_rad
     rng = np.random.default_rng(1); ncol, nlm = 1, 40

@@ -172,13 +172,17 @@ BLOCKED_CASES = {
 _RESULT_RE = re.compile(r"Prognostic failures:\s*(\d+)\s+Diagnostic failures.*?:\s*(\d+)")
 
 
-def run_case(case: str, max_iters: int) -> dict:
-    """Run compare_runs.py for one case; parse prognostic/diagnostic failure counts."""
+def run_case(case: str, max_iters: int, tier: str = "bit") -> dict:
+    """Run compare_runs.py for one case; parse prognostic/diagnostic failure counts.
+
+    With tier='physical', the case PASS/FAIL is the Tier-C verdict (compare_runs' exit code);
+    the parsed prognostic-failure count (the legacy bit-gate line, always printed) is still
+    reported as informational."""
     # compare_runs.py auto-forces per-step output (stats_tsamp = stats_tout = dt_main),
     # so the gate compares the PHYSICS directly — immune to stats-averaging-window
     # artifacts for cases whose default stats output is averaged (gabls2, gabls3_night).
     cmd = [sys.executable, os.path.join(RUN_SCRIPTS, "compare_runs.py"),
-           "--case", case, "--max-iters", str(max_iters)]
+           "--case", case, "--max-iters", str(max_iters), "--tier", tier]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     out = proc.stdout + proc.stderr
     m = _RESULT_RE.search(out)
@@ -200,6 +204,9 @@ def main():
     p.add_argument("--list", action="store_true", help="print default case set and exit")
     p.add_argument("--survey", action="store_true",
                    help="auto-discover ALL cases and categorise RUNS/UNSUPPORTED/ERROR (JAX smoke)")
+    p.add_argument("--tier", choices=["bit", "physical"], default="bit",
+                   help="correctness standard (REFACTOR.md §2): 'bit' = legacy machine-precision gate "
+                        "(default); 'physical' = Tier-C field-class tolerances (the numerical-accuracy gate).")
     args = p.parse_args()
 
     if args.survey:
@@ -221,18 +228,23 @@ def main():
 
     all_pass = True
     for case in cases:
-        r = run_case(case, args.max_iters)
+        r = run_case(case, args.max_iters, tier=args.tier)
         if not r["ran"]:
             all_pass = False
             print(f"{case:<16}  {'ERROR':<8}  {'-':>8}  {'-':>8}  {r['tail']}")
             continue
-        status = "PASS" if r["prog_fail"] == 0 else "FAIL"
-        if r["prog_fail"] != 0:
+        # tier='physical' → case verdict is the Tier-C result (compare_runs exit code rc==0);
+        # tier='bit' → verdict is 0 prognostic failures.
+        case_ok = (r["rc"] == 0) if args.tier == "physical" else (r["prog_fail"] == 0)
+        status = "PASS" if case_ok else "FAIL"
+        if not case_ok:
             all_pass = False
         print(f"{case:<16}  {status:<8}  {r['prog_fail']:>8}  {r['diag_fail']:>8}")
 
     print("-" * 70)
-    print(f"\nResult: {'PASS — all cases bit-faithful (prognostic)' if all_pass else 'FAIL — see above'}")
+    _ok_msg = ("PASS — all cases bit-faithful (prognostic)" if args.tier == "bit"
+               else "PASS — all cases within Tier-C numerical-accuracy tolerances")
+    print(f"\nResult [{args.tier}]: {_ok_msg if all_pass else 'FAIL — see above'}")
     sys.exit(0 if all_pass else 1)
 
 

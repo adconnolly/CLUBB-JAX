@@ -26,29 +26,24 @@ from clubb_jax.src.Microphys.KK_microphys.parabolic_cylinder import (
     dv_parabolic_cylinder,
     _gamma_real,
 )
-from clubb_jax.src.Microphys.KK_microphys.parabolic_expax import expax_U
 
 _INV_SQRT_2PI = 1.0 / jnp.sqrt(2.0 * jnp.pi)
 # D_v argument bound: the dispatch only SELECTS these forms when |s_c| <= parab_cyl_max_input
 # (=49); beyond that the const-PDF approximation is used instead. Clamping the (unused) extreme
 # argument keeps every selected/tested case exact while preventing the large-negative-z series
-# overflow (->nan) from poisoning the autodiff graph. See KK_upscaled_means dispatch.
+# overflow (->nan) from poisoning the autodiff graph. See KK_upscaled_means dispatch. (This is a
+# differentiability guard, NOT a bit-faithfulness contrivance — retained.)
 _DV_ARG_MAX = 50.0
-# Above this argument, the oracle's `Dv_fnc` (arg>0) computes U(a,x) via `expax` (Parabolic.f90)
-# at the SCM-run tolerance epss=1e-4 — a different (less accurate) value than the high-accuracy
-# DLMF `dv_parabolic_cylinder`. For faithfulness we reproduce it with `expax_U` here (the dispatch
-# uses expax for x >= (30-a)/2.5; a=-order-0.5 >= 1.5 for every KK call, so x>=15 is safely in
-# that region — validated bit-exact vs the parab harness, Iter316). Only do/ds & rico make dvc
-# calls in this region; the one bit-faithful KK case (dycoms2_rf02_so) makes none → no regression.
-_EXPAX_ARG_MIN = 15.0
 
 
 def _dvc(order, arg):
-    z = jnp.clip(arg, -_DV_ARG_MAX, _DV_ARG_MAX)
-    use_expax = z >= _EXPAX_ARG_MIN
-    x_safe = jnp.where(use_expax, z, 30.0)         # off-branch: a convergent x (expax diverges for small x)
-    dv_expax = expax_U(-order - 0.5, x_safe)       # = U(-order-0.5, z) = Dv_fnc(order, z>0)
-    return jnp.where(use_expax, dv_expax, dv_parabolic_cylinder(order, z))
+    # Accurate float64 DLMF parabolic-cylinder D_v over the whole (clamped) range.
+    # REFACTOR A1 (iter7): the previous `arg >= 15` branch reproduced the oracle's deliberately
+    # low-accuracy `expax` at epss=1e-4 purely to bit-match do/ds in the SCM run. That contrivance
+    # (parabolic_expax.py) has been DELETED — float64-accurate is simpler and strictly more correct;
+    # do/ds are judged under Tier-C/D, not bit-faithfulness. The bit-faithful KK case dycoms2_rf02_so
+    # makes no dvc calls in that region, so it is unaffected.
+    return dv_parabolic_cylinder(order, jnp.clip(arg, -_DV_ARG_MAX, _DV_ARG_MAX))
 
 
 def bivar_NL_mean(mu_x1, mu_x2_n, sigma_x1, sigma_x2_n,

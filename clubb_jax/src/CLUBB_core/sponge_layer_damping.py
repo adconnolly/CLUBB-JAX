@@ -51,14 +51,11 @@ def sponge_damp_xm(xm, xm_ref, z, zm_top, tau, sponge_layer_depth, dt):
     """Damp xm toward xm_ref in the top sponge layer (sponge_damp_xm).
 
     Implicit discretization: xm_p[k] = (xm[k] + (dt/tau[k])*xm_ref[k]) / (1 + dt/tau[k]).
-    xm/xm_ref/z are (nz,). Returns the damped (nz,) array.
-    """
-    xm_p = np.array(xm, dtype=np.float64)
-    nz = len(z)
-    for k in range(nz - 1, -1, -1):          # top down
-        if zm_top - z[k] < sponge_layer_depth:
-            dt_on_tau = dt / tau[k]
-            xm_p[k] = (xm[k] + dt_on_tau * xm_ref[k]) / (1.0 + dt_on_tau)
-        else:
-            break
-    return xm_p
+
+    Vectorized + tracer-transparent (REFACTOR B5): ``tau`` is ``inf`` outside the sponge (initialize_tau_
+    sponge_damp), so ``dt/tau == 0`` there and the formula collapses to ``xm`` (a no-op) — making this
+    pure broadcast arithmetic, **bit-identical** to the original top-down loop (which only touches the top
+    contiguous sponge block) yet differentiable. Works for a 1-D column or a batched (ngrdcol, nz) array.
+    (z/zm_top/sponge_layer_depth are now implicit in ``tau`` and kept only for signature compatibility.)"""
+    dt_on_tau = dt / tau                       # 0.0 where tau=inf (outside the sponge), finite inside
+    return (xm + dt_on_tau * xm_ref) / (1.0 + dt_on_tau)

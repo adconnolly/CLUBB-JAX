@@ -23,6 +23,10 @@ import jax.numpy as jnp
 from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv
 from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+# Tracer-transparency (REFACTOR B5): _asarray/_xp/_iset behave EXACTLY like numpy for concrete arrays
+# (normal runs bit-identical) but route to jnp under a jax.grad trace, so the whole-driver autodiff graph
+# survives the surface-BC interpolation. See CLUBB_core/tracer_numpy.py.
+from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray, _xp, _iset, _is_tracer_arg, _safe_sqrt
 
 _EPS64 = np.finfo(np.float64).eps
 _BLANK = -999.9
@@ -52,8 +56,17 @@ _Z_BOT_CNVG = 25.0  # fixed model height for the convergence-test BC
 
 
 def _fsign(x: np.ndarray) -> np.ndarray:
-    """Fortran sign(1.0, x): +1 for x >= 0, -1 for x < 0 (unlike numpy.sign at 0)."""
-    return np.where(x >= 0.0, 1.0, -1.0)
+    """Fortran sign(1.0, x): +1 for x >= 0, -1 for x < 0 (unlike numpy.sign at 0).
+    Tracer-transparent (_xp.where) so the surface-BC interpolation is differentiable."""
+    return _xp.where(x >= 0.0, 1.0, -1.0)
+
+
+def _min3(a, b, c):
+    """min(a, b, c), tracer-transparent (jnp.minimum under a trace, builtin min otherwise → bit-identical
+    for the finite, non-NaN slope magnitudes here)."""
+    if _is_tracer_arg([a, b, c]):
+        return jnp.minimum(jnp.minimum(a, b), c)
+    return min(a, b, c)
 
 
 def _mono_cubic_interp(z_in, km1, k00, kp1, kp2,
@@ -67,13 +80,13 @@ def _mono_cubic_interp(z_in, km1, k00, kp1, kp2,
         sp1 = (fp2 - fp1) / (zp2 - zp1)
         dfdx00 = s00
         pp1 = (s00 * hp1 + sp1 * h00) / (h00 + hp1)
-        dfdxp1 = (_fsign(s00) + _fsign(sp1)) * min(abs(s00), abs(sp1), 0.5 * abs(pp1))
+        dfdxp1 = (_fsign(s00) + _fsign(sp1)) * _min3(abs(s00), abs(sp1), 0.5 * abs(pp1))
     elif kp1 == kp2:
         hm1 = z00 - zm1
         sm1 = (f00 - fm1) / (z00 - zm1)
         s00 = (fp1 - f00) / (zp1 - z00)
         p00 = (sm1 * h00 + s00 * hm1) / (hm1 + h00)
-        dfdx00 = (_fsign(sm1) + _fsign(s00)) * min(abs(sm1), abs(s00), 0.5 * abs(p00))
+        dfdx00 = (_fsign(sm1) + _fsign(s00)) * _min3(abs(sm1), abs(s00), 0.5 * abs(p00))
         dfdxp1 = s00
     else:
         hm1 = z00 - zm1
@@ -83,8 +96,8 @@ def _mono_cubic_interp(z_in, km1, k00, kp1, kp2,
         sp1 = (fp2 - fp1) / (zp2 - zp1)
         p00 = (sm1 * h00 + s00 * hm1) / (hm1 + h00)
         pp1 = (s00 * hp1 + sp1 * h00) / (h00 + hp1)
-        dfdx00 = (_fsign(sm1) + _fsign(s00)) * min(abs(sm1), abs(s00), 0.5 * abs(p00))
-        dfdxp1 = (_fsign(s00) + _fsign(sp1)) * min(abs(s00), abs(sp1), 0.5 * abs(pp1))
+        dfdx00 = (_fsign(sm1) + _fsign(s00)) * _min3(abs(sm1), abs(s00), 0.5 * abs(p00))
+        dfdxp1 = (_fsign(s00) + _fsign(sp1)) * _min3(abs(s00), abs(sp1), 0.5 * abs(pp1))
     c1 = (dfdx00 + dfdxp1 - 2.0 * s00) / (h00 ** 2)
     c2 = (3.0 * s00 - 2.0 * dfdx00 - dfdxp1) / h00
     zprime = z_in - z00
@@ -112,46 +125,54 @@ def _read_surface_var_for_bc(state: dict) -> dict:
             'exner_bot': (state['p_sfc'] / _P0_BC) ** _KAPPA_BC,
         }
 
-    # l_modify_bc_for_cnvg_test = True, constant_height_option = 2 (interpolation)
+    # l_modify_bc_for_cnvg_test = True, constant_height_option = 2 (interpolation).
+    # The nearest-level indices come from the (concrete) grid only, so there is no data-dependent control
+    # flow on the traced fields; the field VALUES flow through _mono_cubic_interp (tracer-transparent).
+    # Build per-column lists and _xp.stack them (jnp under a trace, numpy otherwise → bit-identical) so the
+    # autodiff graph survives — the old np.empty()+in-place assignment severed it.
     ngrdcol = state['ngrdcol']
-    zt = np.asarray(gr.zt)
+    zt = np.asarray(gr.zt)   # grid: always concrete
     zm = np.asarray(gr.zm)
-    rho_zm = np.asarray(state['rho_zm'])
+    rho_zm = _asarray(state['rho_zm'])
     z_bot = _Z_BOT_CNVG
 
-    um_zm    = np.asarray(zt2zm_jax(jnp.asarray(state['um']), gr))
-    vm_zm    = np.asarray(zt2zm_jax(jnp.asarray(state['vm']), gr))
-    thlm_zm  = np.asarray(zt2zm_jax(jnp.asarray(state['thlm']), gr))
-    rtm_zm   = np.asarray(zt2zm_jax(jnp.asarray(state['rtm']), gr))
-    exner_zm = np.array(zt2zm_jax(jnp.asarray(state['exner']), gr))
-    exner_zm[:, 0] = (state['p_sfc'] / _P0_BC) ** _KAPPA_BC
+    um_zm    = _asarray(zt2zm_jax(jnp.asarray(state['um']), gr))
+    vm_zm    = _asarray(zt2zm_jax(jnp.asarray(state['vm']), gr))
+    thlm_zm  = _asarray(zt2zm_jax(jnp.asarray(state['thlm']), gr))
+    rtm_zm   = _asarray(zt2zm_jax(jnp.asarray(state['rtm']), gr))
+    exner_zm = _asarray(zt2zm_jax(jnp.asarray(state['exner']), gr))
+    exner_zm = _iset(exner_zm, np.s_[:, 0], (state['p_sfc'] / _P0_BC) ** _KAPPA_BC)
 
-    out = {k: np.empty(ngrdcol) for k in
-           ('z_bot', 'um_bot', 'vm_bot', 'rtm_bot', 'thlm_bot', 'rho_bot', 'exner_bot')}
-    out['z_bot'][:] = z_bot
-
+    cols = {k: [] for k in ('um_bot', 'vm_bot', 'rtm_bot', 'thlm_bot', 'rho_bot', 'exner_bot')}
     for i in range(ngrdcol):
-        kmin = int(np.argmin(np.abs(zt[i] - z_bot)))  # nearest zt level (0-based)
+        kmin = int(np.argmin(np.abs(zt[i] - z_bot)))  # nearest zt level (0-based), concrete grid
         if kmin == 0:
             km1, k00, kp1, kp2 = 0, 0, 1, 2
         else:
             km1, k00, kp1, kp2 = kmin - 1, kmin, kmin + 1, kmin + 2
         zi = zm[i]
-        out['rho_bot'][i] = rho_zm[i, kmin]
+        cols['rho_bot'].append(rho_zm[i, kmin])
         for key, src in (('um_bot', um_zm), ('vm_bot', vm_zm),
                          ('thlm_bot', thlm_zm), ('rtm_bot', rtm_zm),
                          ('exner_bot', exner_zm)):
-            out[key][i] = _mono_cubic_interp(
+            cols[key].append(_mono_cubic_interp(
                 z_bot, km1, k00, kp1, kp2,
                 zi[km1], zi[k00], zi[kp1], zi[kp2],
-                src[i, km1], src[i, k00], src[i, kp1], src[i, kp2])
+                src[i, km1], src[i, k00], src[i, kp1], src[i, kp2]))
+
+    out = {k: _xp.stack(v) for k, v in cols.items()}
+    out['z_bot'] = _xp.full(ngrdcol, z_bot)
     return out
 
 
 # ── Shared surface utilities (sfc_flux.F90) ────────────────────────────────
 
 def _compute_ubar(um_bot: np.ndarray, vm_bot: np.ndarray) -> np.ndarray:
-    """Mean surface wind speed, lower-bounded by ubmin=0.25 m/s."""
+    """Mean surface wind speed, lower-bounded by ubmin=0.25 m/s. Tracer-transparent (REFACTOR B5):
+    concrete runs keep the exact numpy path (bit-identical); under a jax.grad trace use _safe_sqrt so a
+    near-zero wind doesn't give a nan gradient (the `maximum` would otherwise still propagate it)."""
+    if _is_tracer_arg([um_bot, vm_bot]):
+        return jnp.maximum(_UBMIN, _safe_sqrt(um_bot ** 2 + vm_bot ** 2))
     return np.maximum(_UBMIN, np.sqrt(um_bot ** 2 + vm_bot ** 2))
 
 
@@ -173,10 +194,12 @@ def _set_sclr_sfc_rtm_thlm(state: dict, wpthlp_sfc: np.ndarray,
     if state['sclr_dim'] > 0:
         if sclr_idx.iisclr_thl > 0:
             k = sclr_idx.iisclr_thl - 1
-            state['wpsclrp'][:, :, k] = wpthlp_sfc[:, np.newaxis] * np.ones((ngrdcol, nzm))
+            state['wpsclrp'] = _iset(state['wpsclrp'], np.s_[:, :, k],
+                                     wpthlp_sfc[:, np.newaxis] * np.ones((ngrdcol, nzm)))
         if sclr_idx.iisclr_rt > 0:
             k = sclr_idx.iisclr_rt - 1
-            state['wpsclrp'][:, :, k] = wprtp_sfc[:, np.newaxis] * np.ones((ngrdcol, nzm))
+            state['wpsclrp'] = _iset(state['wpsclrp'], np.s_[:, :, k],
+                                     wprtp_sfc[:, np.newaxis] * np.ones((ngrdcol, nzm)))
 
 
 def _stats_surface_update(state: dict, wpthlp_sfc, wprtp_sfc, upwp_sfc,
@@ -674,9 +697,14 @@ def _gabls2_sfclyr(state: dict, time_current: float, ngrdcol: int,
 
     sstheta = T_sfc * ((p0 / p_sfc_arr) ** Rd_over_Cp)
     bflx_arr = wpthlp_sfc * grav / sstheta
-    ustar = np.array([_diag_ustar(float(z_bot[i]), float(bflx_arr[i]),
-                                   float(ubar[i]), z0)
-                      for i in range(ngrdcol)])
+    # Tracer dispatch (REFACTOR B5): concrete = exact per-column _diag_ustar loop; trace = jnp mirror.
+    if not _is_tracer_arg([bflx_arr, ubar]):
+        ustar = np.array([_diag_ustar(float(z_bot[i]), float(bflx_arr[i]),
+                                       float(ubar[i]), z0)
+                          for i in range(ngrdcol)])
+    else:
+        from clubb_jax.src.Benchmark_cases.arm import _diag_ustar_jax
+        ustar = _diag_ustar_jax(jnp.asarray(z_bot), bflx_arr, jnp.asarray(ubar), z0)
     return wpthlp_sfc, wprtp_sfc, ustar, T_sfc
 
 
@@ -734,6 +762,54 @@ def _landflx_scalar(th, ts, qh, qs, uh, vh, h, z0):
     return shf, lhf, vel, ustar
 
 
+def _landflx_jax(th, ts, qh, qs, uh, vh, h, z0):
+    """Differentiable, vectorized jnp mirror of ``_landflx_scalar`` (used ONLY under a jax.grad trace).
+
+    The data-dependent unstable (r<0, 3 Businger-Dyer iterations) vs stable (r>=0, quadratic) branches are
+    both computed and selected with ``jnp.where``; clip-sqrt → ``_safe_sqrt``; ``1/(2a)`` and ``1/vel`` are
+    guarded so the unselected branch can't poison the gradient. Forward-identical to the scalar version on
+    the taken branch (the ``(1-15*xsi)**0.25`` base stays >=1 since xsi<=0, so the fractional power is safe)."""
+    ep1 = 0.608
+    zody = jnp.log(h / z0)
+    vel0 = _safe_sqrt(jnp.maximum(0.5, uh ** 2 + vh ** 2))           # >= sqrt(0.5), grad-safe
+    r = 9.81 / ts * (th * (1.0 + ep1 * qh) - ts * (1.0 + ep1 * qs)) * h / vel0 ** 2
+    unstable = r < 0.0
+
+    # unstable: 3 explicit Businger-Dyer iterations (xsi forced <= 0 each step)
+    xsi_u = jnp.zeros_like(r)
+    fm_u = zody
+    fh_u = 0.74 * zody
+    for _ in range(3):
+        xm = (1.0 - 15.0 * xsi_u) ** 0.25                           # base = 1-15*xsi_u >= 1 (xsi_u<=0)
+        xh = _safe_sqrt(jnp.abs(1.0 - 9.0 * xsi_u)) / 0.74
+        fm_u = zody - (2.0 * jnp.log((1.0 + xm) / 2.0) + jnp.log((1.0 + xm * xm) / 2.0)
+                       - 2.0 * jnp.arctan(xm) + jnp.pi / 2.0)
+        fh_u = 0.74 * (zody - 2.0 * jnp.log((1.0 + 0.74 * xh) / 2.0))
+        xsi_u = -jnp.abs(r / fh_u * fm_u ** 2)
+
+    # stable: quadratic root
+    a = 4.8 ** 2 * r - 6.35
+    b = (2.0 * r * 4.8 - 1.0) * zody
+    c = r * zody ** 2
+    sq = _safe_sqrt(jnp.maximum(0.0, b * b - 4.0 * a * c))
+    a_safe = jnp.where(jnp.abs(a) > 1.0e-30, a, 1.0e-30)            # guard 1/(2a)
+    xsi_s = jnp.maximum((-b + sq) / (2.0 * a_safe), (-b - sq) / (2.0 * a_safe))
+    fm_s = zody + 4.8 * xsi_s
+    fh_s = zody + 7.8 * xsi_s
+
+    xsi = jnp.where(unstable, xsi_u, xsi_s)
+    fm  = jnp.where(unstable, fm_u, fm_s)
+    vel = _safe_sqrt(uh ** 2 + vh ** 2)
+    ustar = 0.4 / fm * vel
+
+    xsi = jnp.where(xsi >= 0.0, jnp.maximum(1.0e-5, xsi), jnp.minimum(-1.0e-5, xsi))
+    xlmo = h / xsi
+    denom = jnp.log(h / 0.25) - (-5.0 * h) / xlmo + (-5.0 * 0.25) / xlmo
+    shf = 0.4 * ustar * (ts - th) / denom
+    lhf = 0.4 * ustar * (qs - qh) / denom
+    return shf, lhf, vel, ustar
+
+
 def _gabls3_night_sfclyr(state: dict, time_current: float, ngrdcol: int,
                           um_bot, vm_bot, thlm_bot, rtm_bot, z_bot) -> tuple:
     """GABLS3 night surface fluxes (gabls3_night.F90:gabls3_night_sfclyr).
@@ -752,19 +828,25 @@ def _gabls3_night_sfclyr(state: dict, time_current: float, ngrdcol: int,
     ts_val = float(np.interp(time_current, times, ts_arr)) if ts_arr is not None else float(thlm_bot[0])
     qs_val = float(np.interp(time_current, times, qs_arr)) if qs_arr is not None else float(rtm_bot[0])
 
-    wpthlp_sfc = np.zeros(ngrdcol)
-    wprtp_sfc  = np.zeros(ngrdcol)
-    ubar       = np.zeros(ngrdcol)
-    ustar      = np.zeros(ngrdcol)
-
-    for i in range(ngrdcol):
-        shf, lhf, vel, us = _landflx_scalar(
-            float(thlm_bot[i]), ts_val, float(rtm_bot[i]), qs_val,
-            float(um_bot[i]), float(vm_bot[i]), float(z_bot[i]), z0)
-        wpthlp_sfc[i] = shf
-        wprtp_sfc[i]  = lhf
-        ubar[i]       = vel
-        ustar[i]      = us
+    # Tracer dispatch (REFACTOR B5): landflx is a Businger-Dyer MO scheme with a data-dependent r<0 branch
+    # and float()s — concrete runs keep the exact per-column loop (bit-identical), the jax.grad trace uses the
+    # vectorized differentiable mirror _landflx_jax.
+    if not _is_tracer_arg([thlm_bot, um_bot, vm_bot, rtm_bot]):
+        wpthlp_sfc = np.zeros(ngrdcol)
+        wprtp_sfc  = np.zeros(ngrdcol)
+        ubar       = np.zeros(ngrdcol)
+        ustar      = np.zeros(ngrdcol)
+        for i in range(ngrdcol):
+            shf, lhf, vel, us = _landflx_scalar(
+                float(thlm_bot[i]), ts_val, float(rtm_bot[i]), qs_val,
+                float(um_bot[i]), float(vm_bot[i]), float(z_bot[i]), z0)
+            wpthlp_sfc[i] = shf
+            wprtp_sfc[i]  = lhf
+            ubar[i]       = vel
+            ustar[i]      = us
+    else:
+        wpthlp_sfc, wprtp_sfc, ubar, ustar = _landflx_jax(
+            thlm_bot, ts_val, rtm_bot, qs_val, um_bot, vm_bot, jnp.asarray(z_bot), z0)
 
     # Momentum flux
     upwp_arr = sfc.get('upwp_sfc')
@@ -785,20 +867,27 @@ def _gabls3_sfclyr(state: dict, ngrdcol: int, ubar, thlm_bot, rtm_bot, z_bot, ex
     using the interactive vegetation temperature `veg_T_in_K` (from soil_vegetation) as the surface temp:
     `wpthlp_sfc=-C_10·ubar·(thlm-veg_T/exner)`, `wprtp_sfc=-C_10·ubar·(rtm-offset)` then ×10, ustar via
     diag_ustar with the veg-based buoyancy flux. C_10=0.00195, offset=9.9e-3, z0=0.15."""
-    from clubb_jax.src.Benchmark_cases.arm import _diag_ustar
+    from clubb_jax.src.Benchmark_cases.arm import _diag_ustar, _diag_ustar_jax
     from clubb_jax.src.CLUBB_core.constants_clubb import grav
     C_10, offset, z0 = 0.00195, 9.9e-3, 0.15
-    veg_T = np.asarray(state.get('veg_T_in_K', np.full(ngrdcol, 300.0)), dtype=np.float64)
+    veg_T = _asarray(state.get('veg_T_in_K', np.full(ngrdcol, 300.0)), dtype=np.float64)
 
     wpthlp_sfc = -C_10 * ubar * (thlm_bot - veg_T / exner_bot)       # compute_wpthlp_sfc, T_sfc=veg_T
     wprtp_sfc = -C_10 * ubar * (rtm_bot - offset)                    # compute_wprtp_sfc, adjustment=offset
     wprtp_sfc = wprtp_sfc * 10.0                                     # gabls3.F90:116
 
-    ustar = np.zeros(ngrdcol)
-    for i in range(ngrdcol):
-        veg_theta = veg_T[i] / exner_bot[i]
-        bflx = float(wpthlp_sfc[i]) * grav / veg_theta
-        ustar[i] = _diag_ustar(float(z_bot[i]), bflx, float(ubar[i]), z0)
+    # ustar via diag_ustar (data-dependent MO branches + float()). Tracer dispatch (REFACTOR B5): concrete
+    # runs keep the exact per-column loop (bit-identical); the jax.grad trace uses the vectorized jnp mirror.
+    if not _is_tracer_arg([wpthlp_sfc, ubar]):
+        ustar = np.zeros(ngrdcol)
+        for i in range(ngrdcol):
+            veg_theta = veg_T[i] / exner_bot[i]
+            bflx = float(wpthlp_sfc[i]) * grav / veg_theta
+            ustar[i] = _diag_ustar(float(z_bot[i]), bflx, float(ubar[i]), z0)
+    else:
+        veg_theta = veg_T / exner_bot
+        bflx = wpthlp_sfc * grav / veg_theta
+        ustar = _diag_ustar_jax(jnp.asarray(z_bot), bflx, jnp.asarray(ubar), z0)
     return wpthlp_sfc, wprtp_sfc, ustar
 
 
@@ -888,9 +977,14 @@ def _arm_variant_sfclyr(state: dict, time_current: float, ngrdcol: int,
     wprtp_sfc  = latent_ht / (rho_bot * Lv)
 
     bflx = grav / thlm_bot * wpthlp_sfc
-    ustar = np.array([_diag_ustar(float(z_bot[i]), float(bflx[i]),
-                                   float(ubar[i]), z0)
-                      for i in range(ngrdcol)])
+    # Tracer dispatch (REFACTOR B5): concrete = exact per-column _diag_ustar loop; trace = jnp mirror.
+    if not _is_tracer_arg([bflx, ubar]):
+        ustar = np.array([_diag_ustar(float(z_bot[i]), float(bflx[i]),
+                                       float(ubar[i]), z0)
+                          for i in range(ngrdcol)])
+    else:
+        from clubb_jax.src.Benchmark_cases.arm import _diag_ustar_jax
+        ustar = _diag_ustar_jax(jnp.asarray(z_bot), bflx, jnp.asarray(ubar), z0)
     return wpthlp_sfc, wprtp_sfc, ustar
 
 
@@ -1365,8 +1459,8 @@ def prescribe_forcings_generic(state: dict, time_current: float,
         wpthlp_sfc, wprtp_sfc, ustar, upwp_sfc, vpwp_sfc, T_sfc = \
             _rico_sfclyr(state, time_current, ngrdcol,
                          um_bot, vm_bot, thlm_bot, rtm_bot, rho_bot, exner_bot, z_bot, ubar)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
         # rico_sfclyr computes momentum flux directly (not via ustar^2/ubar)
 
     elif runtype == 'dycoms2_rf01':
@@ -1394,31 +1488,31 @@ def prescribe_forcings_generic(state: dict, time_current: float,
             state, time_current, ngrdcol,
             z_bot, state['p_sfc'], ubar, thlm_bot, rtm_bot, exner_bot)
         upwp_sfc, vpwp_sfc = _compute_momentum_flux(um_bot, vm_bot, ubar, ustar)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
 
     elif runtype == 'gabls3_night':
         l_set_sclr = True
         wpthlp_sfc, wprtp_sfc, ustar, upwp_sfc, vpwp_sfc = _gabls3_night_sfclyr(
             state, time_current, ngrdcol, um_bot, vm_bot, thlm_bot, rtm_bot, z_bot)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
 
     elif runtype == 'gabls3':
         l_set_sclr = True
         wpthlp_sfc, wprtp_sfc, ustar = _gabls3_sfclyr(
             state, ngrdcol, ubar, thlm_bot, rtm_bot, z_bot, exner_bot)
         upwp_sfc, vpwp_sfc = _compute_momentum_flux(um_bot, vm_bot, ubar, ustar)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
 
     elif runtype == 'mpace_a':
         l_set_sclr = True
         wpthlp_sfc, wprtp_sfc, ustar = _mpace_a_sfclyr(
             state, time_current, ngrdcol, np.asarray(state['rho_zm'])[:, 0])
         upwp_sfc, vpwp_sfc = _compute_momentum_flux(um_bot, vm_bot, ubar, ustar)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
 
     elif runtype == 'atex':
         l_compute_momentum_flux = True
@@ -1472,8 +1566,8 @@ def prescribe_forcings_generic(state: dict, time_current: float,
         wpthlp_sfc, wprtp_sfc, ustar = _zero_flux_sfclyr(ngrdcol)
         upwp_sfc = np.zeros(ngrdcol)
         vpwp_sfc = np.zeros(ngrdcol)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
 
     elif runtype == 'cobra':
         l_compute_momentum_flux = True
@@ -1517,8 +1611,8 @@ def prescribe_forcings_generic(state: dict, time_current: float,
         wpthlp_sfc = np.full(ngrdcol, 0.0 if time_current > 80880.0 else 0.05)
         wprtp_sfc  = np.zeros(ngrdcol)
         upwp_sfc, vpwp_sfc = _compute_momentum_flux(um_bot, vm_bot, ubar, ustar)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
 
     elif runtype == 'ekman':
         # ekman.F90:ekman_sfclyr — ustar=0.3, zero heat/moisture flux, momentum
@@ -1529,8 +1623,8 @@ def prescribe_forcings_generic(state: dict, time_current: float,
         wpthlp_sfc = np.zeros(ngrdcol)
         wprtp_sfc  = np.zeros(ngrdcol)
         upwp_sfc, vpwp_sfc = _compute_momentum_flux(um_bot, vm_bot, ubar, ustar)
-        state['upwp_sfc'][:] = upwp_sfc
-        state['vpwp_sfc'][:] = vpwp_sfc
+        state['upwp_sfc'] = _iset(state['upwp_sfc'], np.s_[:], upwp_sfc)
+        state['vpwp_sfc'] = _iset(state['vpwp_sfc'], np.s_[:], vpwp_sfc)
 
     elif runtype == 'coriolis_test':
         # coriolis_test.F90 sfclyr unverified; leave the zero-flux stub.
@@ -1576,11 +1670,13 @@ def prescribe_forcings_generic(state: dict, time_current: float,
         upwp_sfc, vpwp_sfc = _compute_momentum_flux(um_bot, vm_bot, ubar, ustar)
 
     # ── 6. Write back surface state ────────────────────────────────────────
-    state['wpthlp_sfc'][:] = wpthlp_sfc
-    state['wprtp_sfc'][:] = wprtp_sfc
-    state['upwp_sfc'][:] = upwp_sfc
-    state['vpwp_sfc'][:] = vpwp_sfc
-    state['T_sfc'][:] = T_sfc
+    # _iset (REFACTOR B5): under a jax.grad trace the surface fluxes are tracers, so the in-place
+    # `state[k][:] = ...` would sever the graph; _iset is functional under trace, in-place otherwise.
+    state['wpthlp_sfc'] = _iset(state['wpthlp_sfc'], np.s_[:], wpthlp_sfc)
+    state['wprtp_sfc']  = _iset(state['wprtp_sfc'],  np.s_[:], wprtp_sfc)
+    state['upwp_sfc']   = _iset(state['upwp_sfc'],   np.s_[:], upwp_sfc)
+    state['vpwp_sfc']   = _iset(state['vpwp_sfc'],   np.s_[:], vpwp_sfc)
+    state['T_sfc']      = _iset(state['T_sfc'],      np.s_[:], T_sfc)
     state['ustar'] = ustar.copy() if hasattr(ustar, 'copy') else np.asarray(ustar)
 
     if l_set_sclr:

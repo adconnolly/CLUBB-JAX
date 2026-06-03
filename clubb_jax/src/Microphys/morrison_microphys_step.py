@@ -10,6 +10,7 @@ Iter204 form), so the Morrison sedimentation velocity for the CLUBB transport is
 """
 import numpy as np
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5: detect a jax.grad trace
 from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import morrison_microphys_driver
 
 
@@ -21,6 +22,12 @@ def advance_morrison_microphysics(state: dict):
     is an explicit Euler integration by the *_mc; the full CLUBB hydrometeor transport (advection +
     eddy diffusion, with zero sedimentation velocity) is layered on subsequently.
     """
+    # Detach-under-trace (REFACTOR B5): Morrison runs AFTER the core, storing _morr_*_mc for the NEXT step's
+    # forcings — dead for a single-step gradient. Skip under a jax.grad trace (exact for single-step; detached
+    # forcing for multi-step), same as KK microphysics / BUGSrad radiation.
+    if _is_tracer_arg([state['thlm'], state['rcm'], state['cloud_frac']]):
+        return
+
     hmm = state['hm_metadata']
     g = lambda k: np.asarray(state[k], np.float64)
     hydromet = g('hydromet')                      # (ngrdcol, nzt, 8)

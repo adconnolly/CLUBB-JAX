@@ -1393,18 +1393,14 @@ def morrison_microphys_driver(rcm, Ncm, rrm, Nrm, rim, Nim, rsm, Nsm, rgm, Ngm,
     # rcm + rcm_mc·dt and T_in_K = T + ten['T']·dt → thlm_mc = (ten['T'] − Lv/Cp·rcm_mc)/exner. The PCC
     # parts of ten['T'] and rcm_mc cancel (thlm conserved under condensation); the cloud-sed rcm change
     # remains — that is the strong WBF-like heating at cloud-top mixed-phase points (the 184-pt signal).
-    # ★ Iter299: compute thlm_mc via the SINGLE-PRECISION thlm<->T_in_K round-trip, faithful to
-    # morrison_microphys_module.F90: T_in_K=real(thlm2T_in_K(...)) (:399), rcm_r4=real(rcm) (:416), and
-    # thlm_mc=(T_in_K2thlm_api(real(T_in_K),exner,real(rcm_r4))-thlm)/dt (:793) — `real(...)` is default
-    # REAL(4)=single. The Fortran keeps T_in_K/rcm in real*4, so the round-trip leaves a ~1e-7 residual
-    # even with ZERO microphysics tendencies (this IS the mpace_a clear-air thlm_mc; the algebraically-equal
-    # double form (ten['T']-Lv/Cp·rcm_mc)/exner gives exactly 0). thlm2T_in_K=thlm·exner+Lv·rcm/Cp,
-    # T_in_K2thlm=(T_in_K-Lv/Cp·rcm)/exner (T_in_K_module.F90), Lv/Cp from constants_clubb (=_LV/_CP).
-    _f32 = lambda x: x.astype(jnp.float32).astype(jnp.float64)
-    _T_in_K_init = _f32(thlm * exner + _LV * rcm / _CP)       # F90:399 real(thlm2T_in_K(thlm,exner,rcm))
-    _T_in_K_fin = _f32(_T_in_K_init + ten['T'] * dt)          # M2005 advances T_in_K (single) by the T tendency
-    _rcm_fin_r4 = _f32(rcm + rcm_mc * dt)                     # F90:416 rcm_r4=real(rcm) (advanced by M2005)
-    thlm_mc = ((_T_in_K_fin - _LV / _CP * _rcm_fin_r4) / exner - thlm) / dt   # F90:793 T_in_K2thlm round-trip
+    # thlm_mc: the float64-exact form. The Fortran computes this through a single-precision
+    # thlm<->T_in_K round-trip (morrison_microphys_module.F90:399/416/793, `real(...)`=REAL(4)), which
+    # algebraically reduces to (ten['T'] − Lv/Cp·rcm_mc)/exner once the T_in_K_init and rcm terms cancel
+    # (thlm is conserved under condensation; only the cloud-sed rcm change survives as the cloud-top heating).
+    # The REFACTOR drops the deliberate `real*4` round-trip (its sole effect was a ~1e-7 single-precision
+    # residual reproduced for bit-faithfulness, REFACTOR.md §3.1 A2) — float64 is simpler and more accurate;
+    # the clear-air case (mpace_a) now correctly gives thlm_mc≈0 instead of the ~2.8e-7 artifact.
+    thlm_mc = (ten['T'] - _LV / _CP * rcm_mc) / exner
     return {
         'rcm_mc': rcm_mc, 'rvm_mc': ten['qv'],
         'thlm_mc': thlm_mc,

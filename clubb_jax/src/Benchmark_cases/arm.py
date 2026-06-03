@@ -7,6 +7,11 @@ Constants from constants_clubb.F90 (standalone block):
 
 import math
 import numpy as np
+import jax.numpy as jnp
+# Tracer-transparency (REFACTOR B5): only used to detect a jax.grad trace and route the surface-flux
+# block through a differentiable jnp mirror. Normal (concrete) runs take the original float path
+# unchanged → bit-identical. See CLUBB_core/tracer_numpy.py.
+from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg, _safe_sqrt
 
 # Physical constants matching constants_clubb.F90 standalone block
 _Cp   = 1004.67   # dry air specific heat at const pressure [J/(kg K)]
@@ -62,6 +67,41 @@ def _diag_ustar(z: float, bflx: float, wnd: float, z0: float) -> float:
                         + c1)
                 ustar = wnd * _vonk / (lnz - psi1)
 
+    return ustar
+
+
+def _diag_ustar_jax(z, bflx, wnd, z0):
+    """Differentiable jnp mirror of ``_diag_ustar`` (used ONLY under a jax.grad trace).
+
+    The two data-dependent branches (``abs(bflx)>1e-6`` gate; stable ``zeta>0`` vs unstable, plus the
+    ``zeta>1e10`` clamp) become ``jnp.where`` selections, and the 4-iteration Monin-Obukhov loop is
+    unrolled. Forward-identical to ``_diag_ustar`` on the taken branch; finite reverse-mode gradient
+    (``bflx`` guarded away from 0 so the unused branch can't poison the grad; ``_safe_sqrt`` for the
+    quartic root)."""
+    lnz   = jnp.log(z / z0)
+    klnz  = _vonk / lnz
+    c1    = jnp.pi / 2.0 - 3.0 * jnp.log(2.0)
+    ustar = wnd * klnz
+    apply = jnp.abs(bflx) > 1.0e-6
+    bflx_safe = jnp.where(apply, bflx, 1.0)   # avoid 1/0 in lmo when the MO correction is inactive
+    for _ in range(4):
+        lmo  = -(ustar ** 3) / (_vonk * bflx_safe)
+        # Sign-preserving floor on lmo (REFACTOR B5): in very stable conditions (gabls3) the MO iteration
+        # drives ustar->0 so lmo->0 and `z/lmo` would blow the reverse-mode gradient to inf (then 0*inf=nan in
+        # the zeta>1e10 clamp). Forward-identical for non-degenerate lmo (e.g. arm, which never hits this).
+        _tiny = 1.0e-12
+        lmo_safe = jnp.where(jnp.abs(lmo) > _tiny, lmo, jnp.where(lmo >= 0.0, _tiny, -_tiny))
+        zeta = z / lmo_safe
+        ustar_stable = jnp.where(zeta > 1.0e10, 1.0e-10,
+                                 _vonk * wnd / (lnz + _am * zeta))
+        x    = _safe_sqrt(_safe_sqrt(1.0 - _bm * zeta))
+        psi1 = (2.0 * jnp.log(1.0 + x)
+                + jnp.log(1.0 + x * x)
+                - 2.0 * jnp.arctan(x)
+                + c1)
+        ustar_unstable = wnd * _vonk / (lnz - psi1)
+        ustar_new = jnp.where(zeta > 0.0, ustar_stable, ustar_unstable)
+        ustar = jnp.where(apply, ustar_new, ustar)
     return ustar
 
 
@@ -269,34 +309,38 @@ def prescribe_forcings_arm(state: dict, time_current: float) -> None:
 
     # ── read_surface_var_for_bc (l_modify_bc_for_cnvg_test=False) ────────────
     # Fortran uses gr%zt(i,1) which in Python 0-indexed is zt[col, 0]
-    z_bot    = float(state['gr'].zt[0, 0])
-    um_bot   = float(state['um'][0, 0])
-    vm_bot   = float(state['vm'][0, 0])
-    thlm_bot = float(state['thlm'][0, 0])
-
-    # ── compute_ubar ─────────────────────────────────────────────────────────
-    ubar = max(0.25, math.sqrt(um_bot ** 2 + vm_bot ** 2))
+    z_bot = float(state['gr'].zt[0, 0])   # grid: always concrete
 
     # ── arm_sfclyr ───────────────────────────────────────────────────────────
-    # compute_ht_mostr_flux: linear interp of sfc fluxes
+    # compute_ht_mostr_flux: linear interp of sfc fluxes (time_current concrete → concrete)
     heat_flx     = _time_interp_sfc(time_current, fd['sfc_times'], fd['sens_ht'])
     moisture_flx = _time_interp_sfc(time_current, fd['sfc_times'], fd['latent_ht'])
-
-    # Convert to natural units
     wpthlp_val = heat_flx     / (_rho_sfc * _Cp)   # K m/s
     wprtp_val  = moisture_flx / (_rho_sfc * _Lv)   # m/s
 
-    # Buoyancy flux (m^2/s^3)
-    bflx = (_grav / thlm_bot) * wpthlp_val
-
-    # Compute ustar (scalar, ngrdcol=1 for SCM)
-    ustar = _diag_ustar(z_bot, bflx, ubar, _z0)
-
-    # Assign surface fluxes (broadcast to ngrdcol)
-    state['wpthlp_sfc'][:] = wpthlp_val
-    state['wprtp_sfc'][:]  = wprtp_val
-
-    # ── compute_momentum_flux ────────────────────────────────────────────────
-    state['upwp_sfc'][:] = -um_bot * ustar ** 2 / ubar
-    state['vpwp_sfc'][:] = -vm_bot * ustar ** 2 / ubar
-    state['ustar'] = np.full(ngrdcol, ustar)
+    # The surface-layer scalars depend on um/vm/thlm at the bottom level, so under a jax.grad trace
+    # (REFACTOR B5) they are tracers. Dispatch on that: concrete runs keep the EXACT original Python
+    # float path (bit-identical); the trace takes the differentiable jnp mirror (_diag_ustar_jax).
+    _um0, _vm0, _thlm0 = state['um'][0, 0], state['vm'][0, 0], state['thlm'][0, 0]
+    if not _is_tracer_arg([_um0, _vm0, _thlm0]):
+        um_bot   = float(_um0)
+        vm_bot   = float(_vm0)
+        thlm_bot = float(_thlm0)
+        ubar  = max(0.25, math.sqrt(um_bot ** 2 + vm_bot ** 2))    # compute_ubar
+        bflx  = (_grav / thlm_bot) * wpthlp_val                    # buoyancy flux (m^2/s^3)
+        ustar = _diag_ustar(z_bot, bflx, ubar, _z0)                # scalar, ngrdcol=1 for SCM
+        state['wpthlp_sfc'][:] = wpthlp_val
+        state['wprtp_sfc'][:]  = wprtp_val
+        state['upwp_sfc'][:] = -um_bot * ustar ** 2 / ubar         # compute_momentum_flux
+        state['vpwp_sfc'][:] = -vm_bot * ustar ** 2 / ubar
+        state['ustar'] = np.full(ngrdcol, ustar)
+    else:
+        um_bot, vm_bot, thlm_bot = _um0, _vm0, _thlm0
+        ubar  = jnp.maximum(0.25, jnp.sqrt(um_bot ** 2 + vm_bot ** 2))
+        bflx  = (_grav / thlm_bot) * wpthlp_val
+        ustar = _diag_ustar_jax(z_bot, bflx, ubar, _z0)
+        state['wpthlp_sfc'] = jnp.full(ngrdcol, wpthlp_val)
+        state['wprtp_sfc']  = jnp.full(ngrdcol, wprtp_val)
+        state['upwp_sfc'] = jnp.full(ngrdcol, -um_bot * ustar ** 2 / ubar)
+        state['vpwp_sfc'] = jnp.full(ngrdcol, -vm_bot * ustar ** 2 / ubar)
+        state['ustar'] = jnp.full(ngrdcol, ustar)

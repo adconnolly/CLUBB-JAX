@@ -11,6 +11,8 @@ import sys
 
 import numpy as np
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5: detect jax.grad trace
+
 CLUBB_NO_ERROR    = 0
 CLUBB_FATAL_ERROR = 99
 
@@ -130,6 +132,12 @@ def parameterization_check_jax(
     """
     proc_name = "advance_clubb_core"
     location = prefix + proc_name
+
+    # Differentiability (REFACTOR B5): this is a pure NaN/Inf/negativity diagnostic — under a jax.grad
+    # trace the fields are tracers, NaN-checking a tracer is meaningless, and np.asarray() on one errors.
+    # Skip the diagnostic (return err_info unchanged) when tracing; concrete runs are unaffected.
+    if _is_tracer_arg([thlm, rtm, um, vm, wp2, wp3, thlm_forcing, rtm_forcing]):
+        return err_info
 
     # Start fresh: CLUBB resets err_code before each step
     err_code = np.zeros(ngrdcol, dtype=np.int32)

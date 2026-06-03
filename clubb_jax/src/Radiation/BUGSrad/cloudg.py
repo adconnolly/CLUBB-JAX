@@ -5,9 +5,10 @@
 radius `re` [µm], using Anomalous Diffraction Theory (Stephens et al. 1990 with Mitchell-1994
 spherical corrections, modified-gamma m=0.5). Water clouds unless `flag` (ice).
 
-★ Faithfulness details replicated from the Fortran:
-  - `pi = acos(-1.)` is computed in SINGLE precision (default real literal) → the float32 value of π.
-  - the absorption term uses `sngl(...)` — the parenthesized real expression is TRUNCATED to float32.
+REFACTOR A3 (iter8): the Fortran computes π in SINGLE precision (`acos(-1.)`) and truncates the
+absorption core with `sngl(...)`. Those were deliberate single-precision artifacts the JAX once
+reproduced for bit-faithfulness; under the numerical-accuracy standard we use float64 (simpler, ~1e-7
+more accurate, well within Tier-C for gabls3 — the only bugsrad case).
   - band 1 (ib=0 here) computes extinction only (wcld=0.999999, asy=0.85, real refractive index).
 """
 import jax
@@ -16,8 +17,7 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-# pi = acos(-1.) in Fortran single precision → float32 value of π promoted to double.
-_PI = float(np.arccos(np.float32(-1.0)))
+_PI = float(np.pi)   # float64 π (REFACTOR A3: was the float32 value of π for bit-faithfulness)
 _EPS = 1.0e-5
 
 
@@ -61,8 +61,7 @@ def cloudg(ib, pp, tt, wcont, re, pdist, cnrw, cniw, cnri, cnii, xlam, flag):
         vm = 4.0 * xm * cni                             # real
         expr = (p0 / (vm * (vm + 1.0) ** p1)
                 + 1.0 / (vm ** 2 * (vm + 1.0) ** p0) - 1.0 / vm ** 2)
-        expr_sngl = expr.astype(jnp.float32).astype(jnp.float64)   # sngl(...)
-        abs_ = area + c1 * expr_sngl
+        abs_ = area + c1 * expr   # REFACTOR A3: float64 (was sngl(...) float32 truncation)
         tcld = ext * dz
         ext = jnp.where(ext < abs_, abs_, ext)
         wcld = (ext - abs_) / ext

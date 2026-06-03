@@ -19,6 +19,7 @@ Reference: clubb_release/src/CLUBB_core/mono_flux_limiter.F90
 from __future__ import annotations
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zt2zm_jax
@@ -246,3 +247,106 @@ def monotonic_turbulent_flux_limit(
                 xm[i, k_ub_zt] = xm_enter_mfl[i, k_ub_zt]
 
     return xm, wpxp
+
+
+def monotonic_turbulent_flux_limit_jax(
+    solve_type, xm, wpxp, xm_old, xp2, wm_zt, xm_forcing,
+    rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+    xp2_threshold, xm_tol, low_lev_effect, high_lev_effect,
+    gr, dt, l_mono_flux_lim_spikefix=True,
+):
+    """JAX (lax.scan) port of `monotonic_turbulent_flux_limit` — bit-exact to the NumPy version and
+    differentiable w.r.t. the fields (REFACTOR B2, iter11). `low_lev_effect`/`high_lev_effect` are the
+    integer turbulent-advection ranges from `calc_turb_adv_range`; they derive from the w-PDF (not the
+    limited fields), so they are structural CONSTANTS for the limiter's gradient. The sequential per-level
+    clip (level k reads the possibly-adjusted wpxp[k-1]) is a `lax.scan` with the adjusted wpxp as carry."""
+    xm = jnp.asarray(xm, dtype=jnp.float64)
+    wpxp = jnp.asarray(wpxp, dtype=jnp.float64)
+    xm_old = jnp.asarray(xm_old, dtype=jnp.float64)
+    xp2 = jnp.asarray(xp2, dtype=jnp.float64)
+    wm_zt = jnp.asarray(wm_zt, dtype=jnp.float64)
+    xm_forcing = jnp.asarray(xm_forcing, dtype=jnp.float64)
+    rho_ds_zm = jnp.asarray(rho_ds_zm, dtype=jnp.float64)
+    rho_ds_zt = jnp.asarray(rho_ds_zt, dtype=jnp.float64)
+    invrs_rho_ds_zm = jnp.asarray(invrs_rho_ds_zm, dtype=jnp.float64)
+    invrs_rho_ds_zt = jnp.asarray(invrs_rho_ds_zt, dtype=jnp.float64)
+    lle = jnp.asarray(low_lev_effect, dtype=jnp.int64)
+    hle = jnp.asarray(high_lev_effect, dtype=jnp.int64)
+
+    ngrdcol, nzt = xm.shape
+    nzm = nzt + 1
+    is_uv = solve_type in (MFL_UM, MFL_VM)
+    max_xp2 = _MAX_XP2[solve_type]
+    invrs_dt = 1.0 / dt
+    grid_dir = float(gr.grid_dir)
+    dzt = jnp.asarray(gr.dzt, dtype=jnp.float64)
+    invrs_dzt = jnp.asarray(gr.invrs_dzt, dtype=jnp.float64)
+    spikefix_rtm = bool(l_mono_flux_lim_spikefix and solve_type == MFL_RTM)
+
+    xm_enter = xm
+
+    # x'^2 -> zt, clip; per-level min/max allowable.
+    xp2_zt = jnp.minimum(jnp.maximum(zm2zt_jax(xp2, gr), xp2_threshold), max_xp2)
+    max_dev = jnp.maximum(2.0 * jnp.sqrt(xp2_zt), xm_tol)
+    xm_without_ta = xm_old + dt * xm_forcing
+    min_lev = (xm_without_ta - max_dev) if is_uv else jnp.maximum(xm_without_ta - max_dev, 0.0)
+    max_lev = xm_without_ta + max_dev
+
+    # min/max allowable over the turbulent-advection window [lle, hle] (clamped to [0, nzt-1]).
+    lo = jnp.maximum(lle, 0)
+    hi = jnp.minimum(hle, nzt - 1)
+    jj = jnp.arange(nzt)
+    win = (jj[None, None, :] >= lo[:, :, None]) & (jj[None, None, :] <= hi[:, :, None])  # (ngrdcol,nzt,nzt)
+    min_x_allowable = jnp.min(jnp.where(win, min_lev[:, None, :], jnp.inf), axis=2)
+    max_x_allowable = jnp.max(jnp.where(win, max_lev[:, None, :], -jnp.inf), axis=2)
+
+    wpxp_thresh_term_zt = invrs_dt * grid_dir * dzt * (xm_without_ta - min_x_allowable)
+    wpxp_mfl_max_term_zt = rho_ds_zt * wpxp_thresh_term_zt
+    wpxp_mfl_min_term_zt = rho_ds_zt * invrs_dt * grid_dir * dzt * (xm_without_ta - max_x_allowable)
+    wpxp_thresh_term = zt2zm_jax(wpxp_thresh_term_zt, gr)   # (ngrdcol, nzm)
+
+    # Sequential clip of wpxp over interior zm levels k = 1..nzm-2 (carry = adjusted wpxp[k-1]).
+    ks = jnp.arange(1, nzm - 1)
+    inp = (wpxp[:, ks].T, wpxp_mfl_max_term_zt[:, ks - 1].T, wpxp_mfl_min_term_zt[:, ks - 1].T,
+           wpxp_thresh_term[:, ks - 1].T, rho_ds_zm[:, ks - 1].T, invrs_rho_ds_zm[:, ks].T)
+
+    def clip_step(carry, level):
+        wk, mxt, mnt, thr, rkm1, irk = level
+        spikefix_cond = (jnp.abs(carry) > thr) & (carry < 0.0)
+        mfl_max_raw = irk * (mxt + rkm1 * carry)
+        mfl_max = jnp.where(spikefix_cond, 0.0, mfl_max_raw) if spikefix_rtm else mfl_max_raw
+        over_max = wk > mfl_max
+        mfl_min = irk * (mnt + rkm1 * carry)
+        under_min = (~over_max) & (wk < mfl_min)
+        wk_new = jnp.where(over_max, mfl_max, jnp.where(under_min, mfl_min, wk))
+        net = jnp.where(over_max, mfl_max - wk, jnp.where(under_min, mfl_min - wk, 0.0))
+        adj = (over_max | under_min) & (jnp.abs(net) > _EPS)
+        return wk_new, (wk_new, adj)
+
+    _, (wk_new_T, adj_T) = jax.lax.scan(clip_step, wpxp[:, 0], inp)
+    wpxp_new = jnp.concatenate([wpxp[:, :1], wk_new_T.T, wpxp[:, -1:]], axis=1)
+    adj_needed = jnp.any(adj_T, axis=0)                    # (ngrdcol,)
+
+    # Re-solve xm implicitly with the limited wpxp; apply per-column where adjustment was needed.
+    lhs = term_ma_zt_lhs_jax(wm_zt, gr).at[1, :, :].add(invrs_dt)
+    rhs = (xm_old * invrs_dt + xm_forcing
+           - invrs_rho_ds_zt * invrs_dzt
+           * (rho_ds_zm[:, 1:] * wpxp_new[:, 1:] - rho_ds_zm[:, :-1] * wpxp_new[:, :-1]))
+    xm_mfl = tridiag_lu_solve_jax(lhs, rhs)
+    xm = jnp.where(adj_needed[:, None], xm_mfl, xm)
+
+    # Spike fix at the domain top: conserve column xm if the top level moved a lot.
+    k_ub_zt = nzt - 1
+    zm = jnp.asarray(gr.zm, dtype=jnp.float64)
+    dz = zm[:, nzm - 1] - zm[:, nzm - 2]
+    cond_top = jnp.abs(xm[:, k_ub_zt] - xm_enter[:, k_ub_zt]) > 10.0 * xm_tol
+    xm_density_weighted = rho_ds_zt[:, k_ub_zt] * (xm[:, k_ub_zt] - xm_enter[:, k_ub_zt]) * dz
+    xm_vert_integral = jnp.sum(rho_ds_zt[:, :k_ub_zt] * xm[:, :k_ub_zt] * grid_dir * dzt[:, :k_ub_zt], axis=1)
+    small_int = jnp.abs(xm_vert_integral) < _EPS
+    safe_int = jnp.where(jnp.abs(xm_vert_integral) > 0.0, xm_vert_integral, 1.0)
+    adj_coef = jnp.maximum(xm_density_weighted / safe_int, -0.99)
+    xm_scaled = (xm * (1.0 + adj_coef)[:, None]).at[:, k_ub_zt].set(xm_enter[:, k_ub_zt])
+    xm_small = xm.at[:, k_ub_zt].set(xm_enter[:, k_ub_zt])
+    xm = jnp.where(cond_top[:, None], jnp.where(small_int[:, None], xm_small, xm_scaled), xm)
+
+    return xm, wpxp_new

@@ -9,6 +9,7 @@ Implements:
 
 import jax.numpy as jnp
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt  # REFACTOR B5: finite grad for sqrt(max(0,·))
 from clubb_jax.src.CLUBB_core.constants_clubb import (
     rt_tol, thl_tol, w_tol_sqd, zero_threshold,
     ibeta,
@@ -51,8 +52,10 @@ def ADG1_w_closure_jax(wm, wp2, Skw, sigma_sqd_w, sqrt_wp2, mixt_frac_max_mag):
     #                   w_2_n = -sqrt(mf/(1-mf) * (1-sigma_sqd_w)) < 0
     one_minus_mf = 1.0 - mixt_frac
     sigma_factor = 1.0 - sigma_sqd_w
-    w_1_n = jnp.sqrt(one_minus_mf / mixt_frac * sigma_factor)
-    w_2_n = -jnp.sqrt(mixt_frac / one_minus_mf * sigma_factor)
+    # _safe_sqrt (REFACTOR B5): sigma_factor = 1-sigma_sqd_w -> 0 in well-mixed/surface layers, so the bare
+    # sqrt has an inf reverse-mode gradient there (the bomex thlm surface nan). Forward-identical (arg >= 0).
+    w_1_n = _safe_sqrt(one_minus_mf / mixt_frac * sigma_factor)
+    w_2_n = -_safe_sqrt(mixt_frac / one_minus_mf * sigma_factor)
 
     # Actual means
     w_1 = wm + sqrt_wp2 * w_1_n
@@ -219,8 +222,8 @@ def calc_comp_corrs_binormal_jax(xpyp, xm, ym,
              - one_minus_mf * (mu_x_2 - xm) * (mu_y_2 - ym))
 
     # Denominator: weighted sum of component geometric means of std devs
-    denom = (mixt_frac * jnp.sqrt(sigma_x_1_sqd * sigma_y_1_sqd)
-             + one_minus_mf * jnp.sqrt(sigma_x_2_sqd * sigma_y_2_sqd))
+    denom = (mixt_frac * _safe_sqrt(sigma_x_1_sqd * sigma_y_1_sqd)
+             + one_minus_mf * _safe_sqrt(sigma_x_2_sqd * sigma_y_2_sqd))
 
     # smooth_corr_quotient — two smooth_max calls with denom_thresh=eps
     _denom_thresh = eps  # = max(1e-10, machine_eps) = 1e-10
@@ -269,9 +272,9 @@ def calc_wp2xp_pdf_jax(wm, xm, w_1, w_2, x_1, x_2,
     dx_2 = x_2 - xm
 
     term1 = ((dw_1 ** 2 + varnce_w_1) * dx_1
-             + 2.0 * corr_w_x_1 * jnp.sqrt(varnce_w_1 * varnce_x_1) * dw_1)
+             + 2.0 * corr_w_x_1 * _safe_sqrt(varnce_w_1 * varnce_x_1) * dw_1)
     term2 = ((dw_2 ** 2 + varnce_w_2) * dx_2
-             + 2.0 * corr_w_x_2 * jnp.sqrt(varnce_w_2 * varnce_x_2) * dw_2)
+             + 2.0 * corr_w_x_2 * _safe_sqrt(varnce_w_2 * varnce_x_2) * dw_2)
 
     return mixt_frac * term1 + one_minus_mf * term2
 
@@ -296,9 +299,9 @@ def calc_wpxp2_pdf_jax(wm, xm, w_1, w_2, x_1, x_2,
     dx_2 = x_2 - xm
 
     term1 = (dw_1 * (dx_1 ** 2 + varnce_x_1)
-             + 2.0 * corr_w_x_1 * jnp.sqrt(varnce_w_1 * varnce_x_1) * dx_1)
+             + 2.0 * corr_w_x_1 * _safe_sqrt(varnce_w_1 * varnce_x_1) * dx_1)
     term2 = (dw_2 * (dx_2 ** 2 + varnce_x_2)
-             + 2.0 * corr_w_x_2 * jnp.sqrt(varnce_w_2 * varnce_x_2) * dx_2)
+             + 2.0 * corr_w_x_2 * _safe_sqrt(varnce_w_2 * varnce_x_2) * dx_2)
 
     return mixt_frac * term1 + one_minus_mf * term2
 
@@ -323,10 +326,10 @@ def calc_wp2xp2_pdf_jax(wm, xm, w_1, w_2, x_1, x_2,
     dx_2 = x_2 - xm
 
     term1 = (dw_1 ** 2 * (dx_1 ** 2 + varnce_x_1)
-             + 4.0 * corr_w_x_1 * jnp.sqrt(varnce_w_1 * varnce_x_1) * dx_1 * dw_1
+             + 4.0 * corr_w_x_1 * _safe_sqrt(varnce_w_1 * varnce_x_1) * dx_1 * dw_1
              + (dx_1 ** 2 + (1.0 + 2.0 * corr_w_x_1 ** 2) * varnce_x_1) * varnce_w_1)
     term2 = (dw_2 ** 2 * (dx_2 ** 2 + varnce_x_2)
-             + 4.0 * corr_w_x_2 * jnp.sqrt(varnce_w_2 * varnce_x_2) * dx_2 * dw_2
+             + 4.0 * corr_w_x_2 * _safe_sqrt(varnce_w_2 * varnce_x_2) * dx_2 * dw_2
              + (dx_2 ** 2 + (1.0 + 2.0 * corr_w_x_2 ** 2) * varnce_x_2) * varnce_w_2)
 
     return mixt_frac * term1 + one_minus_mf * term2
@@ -368,12 +371,12 @@ def calc_wpxpyp_pdf_jax(wm, xm, ym, w_1, w_2, x_1, x_2, y_1, y_2,
     dy_1 = y_1 - ym; dy_2 = y_2 - ym
 
     term1 = (dw_1 * dx_1 * dy_1
-             + corr_x_y_1 * jnp.sqrt(varnce_x_1 * varnce_y_1) * dw_1
-             + corr_w_y_1 * jnp.sqrt(varnce_w_1 * varnce_y_1) * dx_1
-             + corr_w_x_1 * jnp.sqrt(varnce_w_1 * varnce_x_1) * dy_1)
+             + corr_x_y_1 * _safe_sqrt(varnce_x_1 * varnce_y_1) * dw_1
+             + corr_w_y_1 * _safe_sqrt(varnce_w_1 * varnce_y_1) * dx_1
+             + corr_w_x_1 * _safe_sqrt(varnce_w_1 * varnce_x_1) * dy_1)
     term2 = (dw_2 * dx_2 * dy_2
-             + corr_x_y_2 * jnp.sqrt(varnce_x_2 * varnce_y_2) * dw_2
-             + corr_w_y_2 * jnp.sqrt(varnce_w_2 * varnce_y_2) * dx_2
-             + corr_w_x_2 * jnp.sqrt(varnce_w_2 * varnce_x_2) * dy_2)
+             + corr_x_y_2 * _safe_sqrt(varnce_x_2 * varnce_y_2) * dw_2
+             + corr_w_y_2 * _safe_sqrt(varnce_w_2 * varnce_y_2) * dx_2
+             + corr_w_x_2 * _safe_sqrt(varnce_w_2 * varnce_x_2) * dy_2)
 
     return mixt_frac * term1 + one_minus_mf * term2

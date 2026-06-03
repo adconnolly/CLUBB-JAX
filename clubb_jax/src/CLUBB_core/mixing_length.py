@@ -15,6 +15,7 @@ calc_lscale_directly_jax:
 import jax
 import jax.numpy as jnp
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow  # REFACTOR B5: finite grad for max(x,0)**p
 from clubb_jax.src.CLUBB_core.constants_clubb import (
     Cp,
     em_min,
@@ -75,6 +76,38 @@ def _smooth_heaviside_peskin_jax(x, smth_range):
     return jnp.where(x < -smth_range, 0.0, jnp.where(x > smth_range, 1.0, mid))
 
 
+def _safe_sqrt(x):
+    """``sqrt(max(x,0))`` with a finite (0) gradient at x<=0 (double-where).
+
+    Plain ``jnp.sqrt(jnp.maximum(0.0, x))`` is forward-correct but its reverse-mode gradient is
+    ``inf`` at the clipped boundary (d/dx sqrt = 1/(2*sqrt) -> inf as the arg -> 0). REFACTOR B3 (iter9):
+    needed once the parcel-ascent became ``jax.grad``-able — the CAPE-fraction discriminants legitimately
+    clip to 0, which previously produced a nan gradient. Forward-identical to the clipped sqrt."""
+    xp = jnp.maximum(x, 0.0)
+    safe = jnp.where(xp > 0.0, xp, 1.0)
+    return jnp.where(xp > 0.0, jnp.sqrt(safe), 0.0)
+
+
+def _bounded_while(cond_fn, body_fn, init_state, max_iters):
+    """Reverse-mode-differentiable replacement for ``jax.lax.while_loop`` (REFACTOR B3, iter9).
+
+    Runs a FIXED ``max_iters`` ``lax.scan``; each step applies ``body_fn`` only where ``cond_fn`` is
+    still true (pytree select), freezing the state otherwise. For a loop whose body already no-ops once
+    its ``done`` flag is set, this reproduces the ``while_loop``'s final state **bit-exactly** as long as
+    ``max_iters >= the true iteration count`` — the extra steps are frozen no-ops. Unlike
+    ``lax.while_loop`` (dynamic trip count → reverse-mode AD raises), the fixed-length scan supports
+    ``jax.grad``. The body must be nan-free on frozen iterations (true here: the frozen index stays at a
+    valid level and the body has no 0-division), so the discarded computations don't poison the gradient.
+    """
+    def step(state, _):
+        run = cond_fn(state)
+        new = body_fn(state)
+        state2 = jax.tree_util.tree_map(lambda o, n: jnp.where(run, n, o), state, new)
+        return state2, None
+    final, _ = jax.lax.scan(step, init_state, None, length=max_iters)
+    return final
+
+
 def diagnose_lscale_from_tau_jax(
     upwp_sfc,                   # (ngrdcol,)
     vpwp_sfc,                   # (ngrdcol,)
@@ -126,7 +159,8 @@ def diagnose_lscale_from_tau_jax(
     invrs_tau_bkgnd = C_bkgnd[:, None] / tau_const           # (ngrdcol, nzm)
 
     # --- Step 3–5: invrs_tau_shear via smoothed norm of ddzt ---
-    norm_ddzt_umvm = jnp.sqrt(ddzt_umvm_sqd)                 # (ngrdcol, nzm)
+    norm_ddzt_umvm = _safe_sqrt(ddzt_umvm_sqd)              # (ngrdcol, nzm) — _safe_sqrt: finite grad at
+    #   zero wind shear (sqrt(0) has inf derivative → nan'd the whole um/vm grad; REFACTOR B4, iter23)
     smooth_norm = zm2zt2zm_jax(norm_ddzt_umvm, gr, zm_min=zero_threshold)  # (ngrdcol, nzm)
     C_shear = clubb_params[:, iC_invrs_tau_shear - 1]
     invrs_tau_shear_smooth = C_shear[:, None] * smooth_norm   # (ngrdcol, nzm)
@@ -143,7 +177,10 @@ def diagnose_lscale_from_tau_jax(
     invrs_tau_no_N2_zm = invrs_tau_bkgnd + invrs_tau_sfc + invrs_tau_shear
 
     # --- Step 8: brunt_freq_pos (l_smooth_min_max=False) ---
-    brunt_freq_pos = jnp.sqrt(jnp.maximum(zero_threshold, brunt_vaisala_freq_sqd_smth))
+    # _safe_sqrt (REFACTOR B5): zero_threshold == 0.0, so this is the bare sqrt(max(0,·)) whose reverse-mode
+    # gradient is inf at the clip (bv_smth<=0 in convective/surface layers). This was THE binding inf-source
+    # of the bomex thlm whole-driver nan (stop_gradient bisection, iter29). Forward-identical.
+    brunt_freq_pos = _safe_sqrt(brunt_vaisala_freq_sqd_smth)
 
     # --- Step 9: ice_supersat_frac_zm, brunt_freq_out_cloud ---
     ice_supersat_frac_zm = zt2zm_jax(ice_supersat_frac, gr, zm_min=zero_threshold)
@@ -176,7 +213,7 @@ def diagnose_lscale_from_tau_jax(
                               + C_sfc[:, None] * 2.0
                               * jnp.sqrt(em) / z_eff)
         bv_safe = jnp.maximum(1.0e-7, brunt_vaisala_freq_sqd_smth)
-        ratio = jnp.clip(jnp.sqrt(ddzt_umvm_sqd / bv_safe), 0.3, 1.0)
+        ratio = jnp.clip(_safe_sqrt(ddzt_umvm_sqd / bv_safe), 0.3, 1.0)   # _safe_sqrt: finite grad at zero shear
         invrs_tau_xp2_zm  = ratio * invrs_tau_xp2_zm
         C_N2_wpxp = clubb_params[:, iC_invrs_tau_N2_wpxp - 1]
         invrs_tau_wpxp_zm = (2.0 * invrs_tau_zm
@@ -203,8 +240,9 @@ def diagnose_lscale_from_tau_jax(
     # --- Step 13: Ri enhancement of invrs_tau_wpxp above altitude_threshold ---
     C_wpxp_Ri  = clubb_params[:, iC_invrs_tau_wpxp_Ri - 1]   # (ngrdcol,)
     wpxp_Ri_exp = clubb_params[:, iwpxp_Ri_exp - 1]           # (ngrdcol,)
-    Ri_pos = jnp.maximum(Ri_zm, 0.0)
-    Ri_term = jnp.minimum(C_wpxp_Ri[:, None] * Ri_pos ** wpxp_Ri_exp[:, None], 12.0)
+    # _safe_pow (REFACTOR B5): wpxp_Ri_exp can be <1, so the bare max(Ri_zm,0)**exp has an inf reverse-mode
+    # gradient at Ri_zm<=0 (unstable layers) — it poisoned the bomex thlm whole-driver grad. Forward-identical.
+    Ri_term = jnp.minimum(C_wpxp_Ri[:, None] * _safe_pow(Ri_zm, wpxp_Ri_exp[:, None]), 12.0)
     above = zm > alt_thresh[:, None]
     invrs_tau_wpxp_zm = jnp.where(
         above,
@@ -364,7 +402,9 @@ def _upward_inner_while(
         return (j_out, tke_out, thl_out, rt_out, dCAPE_out, done_out,
                 j_last_out, tke_exit_out, dep_out, dej_out)
 
-    final = jax.lax.while_loop(cond_fn, body_fn, init_state)
+    # REFACTOR B3: bit-exact bounded-scan replacement for while_loop (grad-able). The up-parcel ascends
+    # from j=k_py+2 to at most k_ub_zt_py, so k_ub_zt_py (=nzt-1, static) bounds the iteration count.
+    final = _bounded_while(cond_fn, body_fn, init_state, k_ub_zt_py)
     j_final, tke_final, _, _, _, done_final, j_last, tke_exit, dCAPE_exit_prev, dCAPE_exit_j = final
 
     exited_early = done_final  # True if TKE exhausted before reaching k_ub_zt
@@ -412,9 +452,7 @@ def _compute_lscale_up_col(
         dCAPE_1_kp1 = dCAPE_dz_1_up[k_py + 1]
         # Avoid division by zero: if dCAPE_1_kp1 = 0, set frac_a = 0
         safe_dCAPE_a = jnp.where(jnp.abs(dCAPE_1_kp1) > 0.0, dCAPE_1_kp1, 1.0)
-        frac_a = -jnp.sqrt(jnp.maximum(
-            0.0, -2.0 * tke_i_k * dzm[k_py + 1] * dCAPE_1_kp1
-        )) / safe_dCAPE_a
+        frac_a = -_safe_sqrt(-2.0 * tke_i_k * dzm[k_py + 1] * dCAPE_1_kp1) / safe_dCAPE_a
 
         # ---- Case B/C: TKE survives initial step — run inner while loop ----
         j_last, exited_early, j_final, tke_exit, dCAPE_exit_prev, dCAPE_exit_j = (
@@ -451,7 +489,7 @@ def _compute_lscale_up_col(
                 - 2.0 * tke_exit * invrs_dzm[j_final] * dCAPE_diff)
         frac_quad = (
             - dCAPE_exit_prev * invrs_diff * dzm[j_final]
-            - jnp.sqrt(jnp.maximum(0.0, disc)) * invrs_diff * dzm[j_final]
+            - _safe_sqrt(disc) * invrs_diff * dzm[j_final]
         )
         frac_inner = jnp.where(linear_case, frac_linear, frac_quad)
         frac_bc = jnp.where(exited_early, frac_inner, 0.0)
@@ -490,6 +528,7 @@ def _downward_inner_while(
     zt,                               # (nzt,)
     k_lb_zt_py,
     saturation_formula,
+    max_iters,                        # static bound on the descent length (REFACTOR B3)
 ):
     """Inner while loop for downward parcel trajectory from k_py-2.
 
@@ -550,7 +589,9 @@ def _downward_inner_while(
         return (j_out, tke_out, thl_out, rt_out, dCAPE_out, done_out,
                 j_last_out, tex_out, dep1_out, dej_out)
 
-    final = jax.lax.while_loop(cond_fn, body_fn, init_state)
+    # REFACTOR B3: bit-exact bounded-scan replacement for while_loop (grad-able). The down-parcel
+    # descends from j=k_py-2 to >= k_lb_zt_py; max_iters (=k_ub_zt_py=nzt-1, static) bounds it.
+    final = _bounded_while(cond_fn, body_fn, init_state, max_iters)
     j_final, _, _, _, _, done_final, j_last, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j = final
 
     exited_early = done_final
@@ -586,9 +627,7 @@ def _compute_lscale_down_col(
         # Fortran uses k_zm for the boundary term: dzm[k_zm] where k_zm = k (ascending)
         dCAPE_1_km1 = dCAPE_dz_1_down[k_py - 1]
         safe_dCAPE_a = jnp.where(jnp.abs(dCAPE_1_km1) > 0.0, dCAPE_1_km1, 1.0)
-        frac_a = jnp.sqrt(jnp.maximum(
-            0.0, 2.0 * tke_i_k * dzm[k_py] * dCAPE_1_km1
-        )) / safe_dCAPE_a
+        frac_a = _safe_sqrt(2.0 * tke_i_k * dzm[k_py] * dCAPE_1_km1) / safe_dCAPE_a
 
         # ---- Case B/C: TKE survives initial step ----
         j_last, exited_early, j_final, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j = (
@@ -604,6 +643,7 @@ def _compute_lscale_down_col(
                 dzm, invrs_dzm, zt,
                 k_lb_zt_py,
                 saturation_formula,
+                k_ub_zt_py,   # static descent bound (REFACTOR B3)
             )
         )
 
@@ -621,7 +661,7 @@ def _compute_lscale_down_col(
                 + 2.0 * tke_exit * invrs_dzm[j_final + 1] * dCAPE_diff)
         frac_quad = (
             - dCAPE_exit_plus1 * invrs_diff * dzm[j_final + 1]
-            + jnp.sqrt(jnp.maximum(0.0, disc)) * invrs_diff * dzm[j_final + 1]
+            + _safe_sqrt(disc) * invrs_diff * dzm[j_final + 1]
         )
         frac_inner = jnp.where(linear_case, frac_linear, frac_quad)
         frac_bc = jnp.where(exited_early, frac_inner, 0.0)
@@ -813,7 +853,9 @@ def compute_mixing_length_jax(
 
     Lscale_up   = jnp.maximum(lminh, Lscale_up_all)
     Lscale_down = jnp.maximum(lminh, Lscale_down_all)
-    Lscale = jnp.sqrt(Lscale_up * Lscale_down)
+    # _safe_sqrt (REFACTOR B5): Lscale_down (and the lminh floor) -> 0 where a parcel cannot descend
+    # (near surface / very stable), so the bare sqrt of the product has an inf reverse-mode gradient there.
+    Lscale = _safe_sqrt(Lscale_up * Lscale_down)
 
     # Upper boundary: Lscale[k_ub] = Lscale[k_ub - 1]
     Lscale = Lscale.at[:, k_ub_zt_py].set(Lscale[:, k_ub_zt_py - 1])

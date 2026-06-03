@@ -6,6 +6,7 @@ Only the non-Andre, non-vary-depth path is implemented.
 
 import jax.numpy as jnp
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt, _safe_pow  # REFACTOR B5: finite grad at 0
 from clubb_jax.src.CLUBB_core.constants_clubb import (
     eps,
     grav,
@@ -58,15 +59,17 @@ def calc_sfc_varnce_jax(
 
     # 1. Friction velocity squared (magnitude of surface momentum flux)
     #    In Fortran: ustar2 = sqrt(upwp^2 + vpwp^2)  [m^2/s^2]
-    ustar2 = jnp.sqrt(upwp_sfc ** 2 + vpwp_sfc ** 2)
+    ustar2 = _safe_sqrt(upwp_sfc ** 2 + vpwp_sfc ** 2)   # _safe_sqrt: finite grad at zero surface stress
 
     # 2. Convective velocity (l_vary_convect_depth=False → use z_const=1 m)
     #    wstar = ( (1/T0) * grav * wpthlp_sfc * z_const )^(1/3)  when wpthlp > 0
+    # _safe_pow (REFACTOR B5): in STABLE conditions (wpthlp_sfc<0, e.g. gabls3) safe_cubed=max(0,·)=0 and the
+    # bare 0**(1/3) has an inf reverse grad that the `where` masks into a nan (0*inf). Forward-identical.
     safe_cubed = jnp.maximum(0.0, (1.0 / T0) * grav * wpthlp_sfc * _Z_CONST)
-    wstar = jnp.where(wpthlp_sfc > 0.0, safe_cubed ** (1.0 / 3.0), 0.0)
+    wstar = jnp.where(wpthlp_sfc > 0.0, _safe_pow(safe_cubed, 1.0 / 3.0), 0.0)
 
     # 3. Effective surface velocity (l_vary_convect_depth=False → coef=0.3)
-    uf = jnp.sqrt(ustar2 + 0.3 * wstar ** 2)
+    uf = _safe_sqrt(ustar2 + 0.3 * wstar ** 2)
     uf = jnp.maximum(ufmin, uf)
 
     # 4. Surface second-order moments (l_vary_convect_depth=False)

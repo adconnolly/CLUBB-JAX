@@ -75,7 +75,12 @@ python clubb_jax/tests/test_diffusion.py
 python clubb_jax/tests/test_penta_solver.py
 python clubb_jax/tests/test_penta_faithful.py      # penta_lu solve == Fortran-order numpy replica (0 ULP eager)
 python clubb_jax/tests/test_f2py_advance_xm_wpxp.py # f2py advance_xm_wpxp .so directly callable (oracle unblocked; needs clubb_python_api)
-python clubb_jax/tests/test_differentiability.py   # jax.grad through the building blocks
+python clubb_jax/tests/test_differentiability.py   # jax.grad through the building blocks (+ mixing-length reverse, REFACTOR B3)
+python clubb_jax/tests/test_full_timestep_grad.py  # ★ REFACTOR B4: full-timestep jax.grad through advance_clubb_core (FD-correct)
+python clubb_jax/tests/probe_driver_grad.py <case>  # ★ REFACTOR B5: WHOLE-driver jax.grad through advance_clubb_to_end (per case; FD-correct)
+python clubb_jax/run_scripts/compare_grad.py        # ★ REFACTOR B5 GATE: whole-driver differentiability dashboard, all cases (grad analogue of compare_cases)
+python clubb_jax/tests/test_mono_flux_limiter.py   # REFACTOR B2: JAX lax.scan flux limiter == NumPy (bit-exact) + grad
+python clubb_jax/tests/test_invariants.py          # REFACTOR Tier-A: oracle-free conservation/positivity/Cauchy-Schwarz
 python clubb_jax/tests/test_pdf_utilities.py       # lognormal<->normal moments — BIT-TO-BIT vs f2py
 python clubb_jax/tests/test_kk_autoconversion.py   # KK rate functions vs quadrature/scipy
 python clubb_jax/tests/test_kk_rico_oracle.py      # KK autoconv END-TO-END vs Fortran rico rrm_auto
@@ -105,7 +110,7 @@ Oracle-generation commands target `clubb_release/output/...` explicitly via `-le
 **Verification oracles, in order of preference:**
 1. **In-loop f2py shadow** -- most CLUBB_core routines are bit-to-bit verifiable via `clubb_f2py`. Caveats: some
    wrappers FPE-trap/core-dump (`f2py_precip_fraction`); the `.so` is also callable DIRECTLY past a stale wrapper
-   using the `__doc__`-introspected signature (`run_scripts/cmp_terms_f2py.py`, `compare_xm_wpxp_f2py.py`) -- an
+   using the `__doc__`-introspected signature (`run_scripts/debug/cmp_terms_f2py.py`, `debug/compare_xm_wpxp_f2py.py`) -- an
    input-matched per-term comparison the namelist A/B can't do.
 2. **Case-stats oracle** (for unported subsystems the f2py API can't reach, e.g. microphysics): a Fortran SCM run
    writes both a rate's PDF-moment INPUTS and its rate OUTPUTS, so the JAX rate is verifiable in isolation by
@@ -155,13 +160,50 @@ fill_holes, PDF cloud_frac, Brunt-Vaisala, the ADG1 w/full PDF closure, the KK r
 full-array, edge-robust to rel ~1e-10), mixing-length forward-mode; the Iter290-291 core jits preserve grad.
 Radiation too (`bugs_rad`, `soil_vegetation` are `jax.grad`-able). **Hardening convention:** a vanishing-denominator
 quotient gives 0/0=nan whose VJP `jnp.where` masking does NOT fix (nan*0=nan) -- fix AT the operation (custom_jvp
-safe-division, double-where safe_sqrt/_pos_pow, a D_v arg clamp), all forward-preserving. **End-to-end `jax.grad`
-through a whole timestep is NOT yet available** -- three coupled blockers: (1) the orchestration round-trips through
-NumPy (~520 `state[..]=np.asarray` writebacks + ~50 in-place mutations, an all-or-nothing refactor risking all
-bit-faithful cases); (2) the NumPy `mono_flux_limiter` (Python loops, non-differentiable, fires only
-atex/gabls3_night); (3) `mixing_length`'s `lax.while_loop` (forward-mode AD only; a bounded-scan transform exists
-but regresses the bit-faithful path to O(nzt^2), ruled out Iter180). The core physics (ADG1 closure, the prognostic
-solvers) is already reverse-mode differentiable; the gap is the glue.
+safe-division, double-where safe_sqrt/_pos_pow, a D_v arg clamp), all forward-preserving. **★★ End-to-end
+`jax.grad` through the core CLUBB timestep IS NOW AVAILABLE (REFACTOR B4, iter16-21).** `advance_clubb_core`
+(the full closure + all prognostic solves + mixing length + flux limiter) is reverse-mode differentiable —
+`jax.grad` w.r.t. the mean profile is finite and finite-difference-correct (rel 4.0e-10,
+`tests/test_full_timestep_grad.py`). Achieved by **tracer-transparent numpy** (a drop-in shim that is jnp
+under a JAX trace and *exactly* numpy otherwise, so the bit-faithful suite is unaffected): `_asarray`,
+the `_xp` ufunc/`_like` shim, `_iset` (immutable-safe assignment), removal of dead shadow-comparison
+scaffolding, and guarding the `_prev_adg1_j25` module-global under trace. The B2 flux limiter (iter11) and B3
+mixing length (iter9) feed into this. **Convention (R6): hard min/max are differentiable (subgradient); only
+`while_loop`/`np.asarray`/in-place-mutation/numpy-ufuncs break tracing — make them tracer-transparent, harden
+`sqrt(maximum(0,·))` with `_safe_sqrt` and `maximum(x,0)**p` (p<1) with `_safe_pow` (clip-sqrt/clip-pow have
+an inf reverse grad AT the clip — they nan only where the quantity actually reaches ≤0, so a stable case
+passes while a convective one fails; audit every sqrt/fractional-pow on a possibly-≤0 quantity), and never
+store a tracer in module-global state.** Grad uses the
+standard differentiable-forward config (`debug_level=0`, `l_sample=False` — diagnostics/stats off). The shim
+lives in `src/CLUBB_core/tracer_numpy.py` (`_asarray`/`_xp`/`_iset`/`_safe_sqrt`/`_is_tracer_arg`), shared by
+the core and the driver. **★★ WHOLE-DRIVER `jax.grad` is now AVAILABLE for the arm case (REFACTOR B5,
+iter25):** `jax.grad` through one full `advance_clubb_to_end` step (thvm + arm surface forcings + the core,
+stats off) is finite + FD-correct (`tests/probe_driver_grad.py`; `d(½∑um²)/dum` rel 1.3e-8 exercises the
+differentiable surface momentum-flux path). Two B5 patterns, both **bit-identical for concrete runs** (validated
+arm Tier-B + Tier-C): **(R7) block-level tracer dispatch** — guard a small branchy block (Python `float()`/
+`math`/`max`/fixed-point loops, e.g. the Monin-Obukhov `_diag_ustar`) with `if not _is_tracer_arg([...]):` →
+exact original float path, `else:` → `jnp`/`jnp.where` mirror (`_diag_ustar_jax`); guard divisors a `where`
+would otherwise leave `nan` in the unused branch (poisons reverse-mode grad even when masked). **(R8)
+diagnostic-skip-under-trace** — pure NaN/Inf/stats checks that don't feed the prognostics early-`return`
+unchanged when an input is a tracer (`parameterization_check_jax`). **iter26 extended this to the
+`generic_forcings` driver** (the path for ~17 cases): the generic surface scheme (incl. the convergence-test
+`_mono_cubic_interp` BC and `_compute_ubar`) is now tracer-transparent and `d(½∑um²)/dum` whole-driver grad is
+FD-correct for bomex. **iter27–29: bomex whole-driver grad is now COMPLETE (thlm + um both 87/87,
+FD-correct rel ≤5.4e-7)** after hardening the inf-grad `sqrt`/`pow` sites that detonate in convective layers
+(the binding one: `mixing_length.py:180` `sqrt(maximum(zero_threshold, bv_smth))` with `zero_threshold==0`,
+pinned by **stop_gradient bisection**). So both the arm and generic_forcings whole-driver
+paths are differentiable. **iters 30–33: whole-driver `jax.grad` is now finite for ~18 of 19 cases** —
+all the major subsystems are tracer-transparent: simplified + BUGSrad radiation, soil-veg, KK + Morrison
+microphysics (the post-core diagnostics use **detach-under-trace** — they feed only the next step, so are
+dead for a single-step gradient; BUGSrad is also reverse-mode memory-prohibitive), the sponge layer
+(vectorized to a no-op-outside-sponge form), cloud-droplet sedimentation, and the case surface schemes
+(R7 `_diag_ustar_jax` dispatch). Some cases show a single-level FD kink at a hard physical threshold
+(8e-3 `rtm` inversion) — a genuine non-smooth point, not a bug. **iter34: the last blocker (gabls3_night
+`_landflx_scalar`, a Businger-Dyer land-surface MO scheme) is ported to `_landflx_jax` → ALL 19 cases now have
+a finite whole-driver gradient.** `run_scripts/compare_grad.py` is the suite-wide differentiability GATE
+(grad analogue of compare_cases); `tests/probe_driver_grad.py <case>` is the per-case validator;
+`tests/_nanhunt.py` + stop_gradient bisection locate residual nan; clip-`sqrt`/fractional-`pow` →
+`_safe_sqrt`/`_safe_pow`. **The B5 goal ("differentiable, entirely in JAX") is met suite-wide.**
 
 **★ "Entirely in JAX."** The JAX driver imports no `clubb_python` at module level (verified by
 `tests/test_standalone_jax.py`, which runs cases with `clubb_python` blocked). 19 cases have entirely-in-JAX
@@ -185,15 +227,53 @@ recompilation -- all compiles are at startup) -> a `compare_runs` per-step-stats
 Workaround: run `advance_clubb_to_end` with `state['stats_writer']=None` and inspect the state dict, or sample at
 the case default interval. Low priority (no current need for long Morrison compare runs).
 
-**★ Faithfulness = matching the oracle's PRECISION, not just its formula.** The Fortran M2005 interface keeps
-`T_in_K`/`rcm_r4` in SINGLE precision (`real(...)` = default REAL(4), even in the PRECdouble build), so `thlm_mc`
-carries a ~1e-7 single-precision round-trip residual that is nonzero even with zero microphysics tendencies; the
-algebraically-equal float64 form gives 0. `module_mp_graupel.py` replicates the float32 casts -> mpace_a
-bit-faithful. (Test a precision hypothesis with an env-gated blanket-float32 experiment -- backup, verify
-float64-default bit-identical, then flip -- before claiming a case is "single-precision-fixable".)
+**★ Precision convention — SUPERSEDED by the REFACTOR (numerical-accuracy standard).** Historically the
+Fortran M2005 interface keeps `T_in_K`/`rcm_r4` in SINGLE precision (`real(...)`=REAL(4)), so its `thlm_mc`
+carries a ~1e-7 single-precision round-trip residual even with zero microphysics tendencies; the JAX once
+*replicated* the `real*4` casts to match it bit-for-bit (the sole reason mpace_a was "bit-faithful"). **Under
+the relaxed numerical-accuracy standard (done; see "Correctness standard") we no longer reproduce the oracle's imprecisions.**
+`module_mp_graupel.py` now computes `thlm_mc` in the algebraically-exact float64 form `(ten['T']−Lv/Cp·rcm_mc)/
+exner` → clear-air `thlm_mc≈0` (correct; was a 2.9e-7 artifact). mpace_a is no longer bit-faithful but PASSES
+Tier-C with large margin (means 70× / flux 21× / moment 104× / microphys 40×). **General rule going forward:
+prefer float64 accuracy; validate within Tier-C rather than reproducing single-precision artifacts.**
 
 4 persistent diagnostic-only (non-prognostic) differences, not fixable without matching Fortran FP ordering:
 `rtm_spur_src` ~2e-16, `thlm_spur_src` ~2e-11, `rtp2_pd` ~7e-27, `up2_pd` ~1e-17.
+
+---
+
+## Correctness standard (relaxed: numerical accuracy + differentiability)
+
+The original gate was **bit-faithfulness** to the Fortran oracle (`compare_runs.py`, rel 1e-6 / abs 1e-12 on
+prognostics). That was the right scaffolding for the incremental port — it caught real bugs (the stretched-grid
+`weights_zm2zt` column-swap, the stale `wm_zm`, the KK covar driver) — but it outlived its use: it forced the
+JAX to reproduce the Fortran's *imprecisions* (single-precision casts, the low-accuracy `expax`), it blocked
+differentiability (hard min/max, `while_loop`, numpy round-trips), it produced brittle "failures" that are pure
+FP/oracle artifacts at sharp edges, and trajectory-level bit agreement is *physically impossible* for chaotic
+turbulence past the Lyapunov horizon anyway. The numerical-accuracy refactor (done on this branch) relaxed it to
+a **tiered standard** — a change is correct if it passes the tiers appropriate to what it touches:
+
+| Tier | Checks | Hardness / tool |
+|---|---|---|
+| **A. Invariants & conservation** | water/energy/mass conservation, positivity (`rrm,Nrm,rcm,…≥0`), bounded correlations (`\|corr\|≤1`), finiteness | **strict, oracle-free** — `tests/test_invariants.py`, `run_scripts/invariants.py` |
+| **B. Golden-trajectory regression** | vs a stored **JAX reference run** per case, rel ~1e-9 | **strict-ish** — `run_scripts/golden.py`, `update_golden.py`, `validate_case.py --no-fortran` |
+| **C. Physical fidelity vs Fortran** | windowed, field-scaled rel error within the chaos horizon (aggregate, not point bit-match) | **relaxed** — `compare_cases.py --tier physical`, `validation.py` |
+| **D. Climatology / statistics** | time-mean & variance profiles, BL depth, cloud fraction past the chaos horizon | **statistical** (the honest gate for chaos-limited cases) |
+| **E. Differentiability** | finite-difference grad checks; whole-driver `jax.grad` | **strict** — `compare_grad.py`, `probe_driver_grad.py`, `test_differentiability.py` |
+
+**Tier-C field-class tolerances** (point-max `max|Δ|/(max|ref|+floor)`): means (`thlm,rtm,um,vm`) **1e-4**;
+fluxes (`wpthlp,wprtp,upwp,vpwp`) **1e-3**; second moments (`wp2,wp3,rtp2,thlp2,em,…`) **3e-3**; microphysics
+(`rrm,Nrm`) **1e-2**; diagnostics + `*_mc` tendencies **report-only** (timing-confounded). Bit-faithful cases
+pass Tier-C by construction (rel ~1e-11 ≪ tol); calibrated against rico (near-worst FP case — dynamics PASS
+2–10× margin) and arm/bomex (~1e7×).
+
+**Status (this branch):** **18/18** `compare_cases` DEFAULT_CASES PASS Tier-C (17 strictly bit-faithful + mpace_a
+within tolerance on its single-precision Morrison residual); **all 19 cases are whole-driver-`jax.grad`-
+differentiable** (see "Differentiability status"). The accuracy-lowering contrivances were removed —
+`parabolic_expax` (`epss=1e-4`), the Morrison `real*4` casts, BUGSrad `sngl`/float32-π — so the JAX is now
+strictly *more* accurate there. **Preserve:** the Fortran oracle as a reference-within-tolerance (`--tier bit`
+stays for debugging); golden refs as the regression net (re-baseline only via `update_golden.py`, deliberate +
+reviewed); and **Tier A strict** — relaxed tolerances must never hide a conservation bug.
 
 ---
 
@@ -250,7 +330,7 @@ Each JAX module mirrors its Fortran oracle at the same relative path under `src/
 | `kk_microphys_driver.py::kk_sedimentation` | `KK_microphys_module.F90:1542` | KK mean sed velocities Vrr/VNr from the mean volume radius (KK00 Eq.37), clipped <=0, top zero-flux BC. **Bit-exact vs the rico oracle** (\|d\|max 1.1e-16 on rain points, via the bit-faithful `zt2zm`); differentiable. The V_hm input `advance_hydrometeor` needs |
 | `Microphys/advance_microphys_module.py` | `advance_microphys_module.F90` | The full hydrometeor transport solve: `sed_centered_diff_lhs` + `term_turb_sed_lhs/rhs` (mean + turbulent sedimentation, flux-form), `microphys_lhs`/`microphys_rhs` (the implicit Crank-Nicholson tridiagonal: 1/dt + 1/2 diffusion_zt + term_ma_zt + sed + turb-sed), `advance_one_hydrometeor` (assemble + `tridiag_lu_solve`), and `calculate_K_hm` (the hydrometeor eddy diffusivity, capped at \|corr(w,hm)\|<=1). Verified by the conservation contract (~5e-15) + the rico `rrm_ma`/`rrm_ts` budgets; K_hm bit-validated vs the oracle's stored `K_hm_<hm>`. `tests/test_kk_rico_oracle.py` |
 | `Microphys/KK_microphys/KK_upscaled_turbulent_sed.py` | `KK_microphys/KK_upscaled_turbulent_sed.F90` | `kk_sed_vel_covars` -- the rain sed-velocity covariances <V'r'>/<V'N'> (bivariate-lognormal, impc/expc semi-implicit split). **Bit-faithful-to-the-gate vs the rico oracle** (rel 4.5e-11, no timing confound); differentiable. Feeds `term_turb_sed_lhs` |
-| `Microphys/KK_microphys/{parabolic_cylinder,PDF_integrals_means,KK_upscaled_means}.py` | `Microphys/KK_microphys/{KK_utilities,PDF_integrals_means,KK_upscaled_means}.F90` + `parameters_KK.F90` | **Complete upscaled-KK analytic means library** -- all 4 means (auto/accr via bivar_NL, evap via trivar_NLL over the chi<0 half, mvr via bivar_LL), built on the parabolic-cylinder D_v (1F1 series + optimally-truncated asymptotic; `parabolic_expax.py` reproduces the oracle's epss=1e-4 `expax` branch for do/ds). Verified vs scipy.pbdv + brute-force quadrature (<=3e-11); all jitted + differentiable |
+| `Microphys/KK_microphys/{parabolic_cylinder,PDF_integrals_means,KK_upscaled_means}.py` | `Microphys/KK_microphys/{KK_utilities,PDF_integrals_means,KK_upscaled_means}.F90` + `parameters_KK.F90` | **Complete upscaled-KK analytic means library** -- all 4 means (auto/accr via bivar_NL, evap via trivar_NLL over the chi<0 half, mvr via bivar_LL), built on the parabolic-cylinder D_v (1F1 series + optimally-truncated asymptotic, accurate float64 everywhere — the do/ds `epss=1e-4` `expax` reproduction was removed in the REFACTOR, A1). Verified vs scipy.pbdv + brute-force quadrature (<=3e-11); all jitted + differentiable |
 | `Microphys/Morrison_microphys/module_mp_graupel.py` | `Morrison_microphys/module_mp_graupel.F90` | **Complete Morrison 2-moment (M2005) port.** Special functions `polysvp_jax`/`derf1_jax`/`gamma_jax` (bit-exact / vs scipy ~1e-15). All process rates -- warm-rain (KK bulk PRC/PRA + evap PRE) + the full ice block (deposition/sublimation, snow/graupel collection, aggregation, nucleation, freezing, self-collection, melting), oracle-validated to a few % (timing confound) or bit-exact. The single-column step (`compute_m2005_rates` -> `m2005_step_tendencies`, cold/warm branches selected per level by T>=273.15 + the PCC saturation adjustment) verified by the **water-conservation contract** (sum mass tendencies ~1e-21). Sedimentation (`morrison_sedimentation`: rain/ice/snow/graupel/cloud, shared-NSTEP CFL, conservation-verified; vertical=LAST axis; the CLUBB<->M2005 grid index FLIP) + pre-rate slope clamps + the `morrison_microphys_driver` CLUBB interface (`hydromet_mc=(field_final-field_initial)/dt`; `thlm_mc` via the `real*4` round-trip, see the precision lesson). Wired via `morrison_microphys_step.py` (gated on `microphys_scheme=='morrison'`). Runs float64 except the deliberate single-precision interface casts. `tests/test_morrison_{special,rates,differentiable}.py` |
 | `T_in_K_module.py` | `T_in_K_module.F90` | `calculate_thvm` — bit-exact |
 | `calc_pressure.py` | `calc_pressure.F90` + `hydrostatic_module.F90` | `hydrostatic`, `init_pressure` via `jax.lax.scan` |
@@ -329,10 +409,11 @@ JAX is MORE accurate than the low-accuracy Fortran defaults):**
   at the sharp cloud-top CF3D edge (the in-cloud /CF3D <-> grid-mean *CF3D conversion where cloud_frac->0) plus the
   M2005 single-precision floor keep it off the gate.
 - **dycoms2_rf02_do / _ds** (KK, drizzle): the KK rt/thl covariance is physically correct but cancellation-amplifies
-  the parabolic-cylinder `D_v`. The SCM oracle runs `parab` at `epss=1e-4`; the JAX is bit-faithful to the TRUE
-  function, so the gap WAS the oracle's deliberate low accuracy (proven with oracle numbers, Iter310). The faithful
-  `expax` asymptotic port (Iter316) reproduces the epss=1e-4 artifact -> BULK-bit-exact; the residual is irreducible
-  cloud-top-edge XLA-vs-ifx libm (exp/log) in the severe covar cancellation, same class as rico/nov11.
+  the parabolic-cylinder `D_v`. The SCM oracle runs `parab` at `epss=1e-4`; the JAX uses the accurate float64 `D_v`,
+  so the bit-gap WAS the oracle's deliberate low accuracy (proven with oracle numbers, Iter310). **REFACTOR A1
+  (iter7): the `expax` reproduction of the oracle's epss=1e-4 artifact was DELETED** (`parabolic_expax.py` removed) —
+  the JAX is now simply more accurate than the low-accuracy oracle. do/ds are not bit-faithful by design and are
+  judged under Tier-C (dynamics) / Tier-D (drizzle hydrometeors), not against the oracle's imprecision.
 
 **Durable lessons (the conventions these investigations produced):**
 - **NEVER trust a default-vs-computed value** -- a Fortran line `x=default` may be overwritten later; verify the
@@ -346,6 +427,19 @@ JAX is MORE accurate than the low-accuracy Fortran defaults):**
   fallback -- port the case's tndcy/sfclyr to `generic_forcings.py`.
 
 ---
+
+**★★ Numerical-accuracy refactor — COMPLETE (both criteria met).** **(b) Faithful:** all 18 `compare_cases`
+DEFAULT_CASES PASS Tier-C (`--tier physical --max-iters 30`) — 17 stay strictly bit-faithful (0 prognostic
+failures), mpace_a passes within tolerance (the intended A2 reclassification: float64 `thlm_mc` is more accurate
+than the Fortran single-precision artifact). The accuracy-lowering contrivances (A1 expax, A2 Morrison real*4,
+A3 BUGSrad sngl/float32-π) were removed and the differentiability work (B2–B5) was all forward-identical, so the
+suite has ZERO faithfulness regression; Tier-B goldens baselined for all 18. **(a) Differentiable:** whole-driver
+`jax.grad` through one `advance_clubb_to_end` step is finite + finite-difference-correct for **all 19 cases**
+(`compare_grad.py`); see "Differentiability status". The sole case outside the faithful suite is **rico**, whose
+KK rain-microphysics *transport+feedback* is a deliberately staged, gated-off port (`l_kk_micro_apply` default
+off) — a pre-existing incomplete subsystem, not touched by this refactor.
+
+---
 ## Remaining Work
 
 **★ Achievable-state assessment -- read before picking the next piece.** The non-subsystem bit-faithful
@@ -354,6 +448,14 @@ cases it unblocks are themselves numerically-limited (see the characterized case
 numerically-limited microphysics cases as "bugs" -- they are characterized.** The project is at its practical
 bit-faithful ceiling for the tractable scope; full 48-case completion is gated by Fortran numerical limits (some
 the Fortran's own imprecision) plus impractical ports.
+
+**★ The strategic pivot (done) — the bit-faithful ceiling was an artifact of the *gate*, not the physics.**
+Several "numerically-limited" cases were limited only because the JAX is MORE accurate than the low-accuracy
+Fortran oracle, and a few modules existed solely to reproduce the oracle's imprecision (`parabolic_expax` at
+`epss=1e-4`; the Morrison `real*4` casts; BUGSrad's `sngl`/float32). The **numerical-accuracy refactor** (this
+branch) relaxed the gate to the tiered standard (see "Correctness standard"), which simultaneously simplified
+the code, improved accuracy, and unlocked whole-driver `jax.grad`. **New work should judge correctness by the
+tiered standard, not the bit-faithful frontier.**
 
 **Subsystem status:**
 - **KK microphysics (`khairoutdinov_kogan`)** -- COMPLETE and wired per-step: the full upscaled-mean/covariance
@@ -365,10 +467,12 @@ the Fortran's own imprecision) plus impractical ports.
   sedimentation, the CLUBB<->M2005 interface, and the per-step wiring + hydrometeor transport. Runs float64 except
   the deliberate `real*4` interface casts. Faithful case: mpace_a; FP-limited: nov11, dycoms2_rf02_morr.
 - **BUGSrad correlated-k radiation + `soil_vegetation`** -- COMPLETE and wired (`Radiation/BUGSrad/`,
-  `bugsrad_driver.py`); `bugs_rad` is jitted (the eager dispatch leaked ~700 MB/call). Made **gabls3 bit-faithful**
-  (the one clean radiation-only win). Faithfulness notes: pass the constants the Fortran CALLER passes
-  (constants_clubb grav/Cp, not BUGSrad's physconst); replicate cloudg's deliberate float32 (`sngl`) truncation;
-  the build is `-Dradoffline -Dnooverlap -DCLUBB` (no ghost layer, simple two_rt called twice, `newexp` unused).
+  `bugsrad_driver.py`); `bugs_rad` is jitted (the eager dispatch leaked ~700 MB/call). gabls3 was the one
+  clean radiation-only win (bit-faithful before the REFACTOR; now Tier-C). Notes: pass the constants the
+  Fortran CALLER passes (constants_clubb grav/Cp, not BUGSrad's physconst); the build is `-Dradoffline
+  -Dnooverlap -DCLUBB` (no ghost layer, simple two_rt called twice, `newexp` unused). **REFACTOR A3 (iter8):
+  cloudg's deliberate float32 `sngl` truncation + float32-π were dropped (now float64) — ~1e-7 more accurate,
+  within Tier-C; the JAX no longer reproduces those single-precision artifacts.**
 - **COAMPS microphysics** (arm_0003) -- unported. **SILHS** interactive Latin-Hypercube sampling
   (rico_silhs/mpace_b/lba) -- random, not bit-reproducible; not a bit-faithfulness target.
 
@@ -390,20 +494,34 @@ damping for wp2/wp3/up2_vp2); the `pdf_closure_driver` `ipdf_pre_advance_fields`
 
 ## Agent Working Rules
 
-1. **Read `DESIGN.md` in full** at the start of every session — it contains current state, conventions, and what's next.
-2. **Append to `CHANGELOG.md`** at the end of each session — one entry summarising what changed. Do not read the full changelog history.
-3. Read the Fortran source for the target function in `clubb_release/src/` — it is the oracle.
-4. Implement in the appropriate `clubb_jax/src/CLUBB_core/` file (path mirrors the Fortran oracle).
-5. Export from `clubb_jax/src/CLUBB_core/__init__.py`.
-6. **If the target function is in the ARM timestep path:** add a shadow comparison block in
-   `src/CLUBB_core/advance_clubb_core_module.py` that runs both Fortran and JAX on the same
-   inputs and prints `max |JAX - Fortran|` via a `report_*_stats()` call registered in
-   `src/advance_clubb_to_end.py`. Target ≤ machine epsilon before removing the Fortran call.
-   **If the target function is in a non-ARM branch** (e.g. `ipdf_pre_advance_fields`,
-   `l_upwind_xpyp_ta`, non-ADG1 PDF path): identify or create a test case that exercises that
-   branch — ARM will not enter it, so `compare_runs.py` alone is insufficient. Verify accuracy
-   directly via a standalone script or unit test before removing the Fortran call.
-7. Run `python clubb_jax/run_scripts/compare_runs.py --max-iters 30` — must show 0 prognostic
-   failures. This is a necessary check for ARM regressions but **not sufficient** for non-ARM
-   paths, which are not exercised by this test.
-8. Update the **Remaining Work** section above and append to `CHANGELOG.md`.
+**The Fortran→JAX port is complete.** Every `clubb_release/src/CLUBB_core/*.F90` has a JAX mirror, the
+driver runs 100% in JAX, and the bit-faithful frontier is saturated (18 cases). The incremental
+**shadow-comparison** workflow that built the port (run JAX beside the Fortran oracle in-loop, match to
+machine epsilon, remove the Fortran call) is **retired** — there is nothing left to port that way. Most work
+now is **refactoring, simplification, differentiability, and working under the numerical-accuracy
+standard** (see "Correctness standard" above).
+
+1. **Read `DESIGN.md` in full** at the start of every session. At the end, append one concise entry to
+   `CHANGELOG.md`; do not read the full changelog history (it is the append-only work record).
+2. **Keep the module-naming mirror.** Every `src/CLUBB_core/<name>.py` mirrors
+   `clubb_release/src/CLUBB_core/<name>.F90` at the identical relative path; the Fortran stays the algorithm
+   reference (now a *reference within tolerance*, not a per-timestep oracle). Export new public symbols from
+   the relevant package `__init__.py`.
+3. **Judge correctness by the tiered standard, not bit-faithfulness** (see "Correctness standard"):
+   conservation / invariants (strict, Tier A), regression vs the golden JAX trajectory (Tier B),
+   physical-fidelity vs Fortran within the field-scaled tolerance (Tier C), and — for any change to the core
+   physics glue — a `jax.grad` / finite-difference differentiability check (Tier E). `compare_cases.py`
+   (Tier C) + `compare_grad.py` (Tier E) are the gates; a NEW "failure" that is a known FP / oracle-precision
+   artifact (sharp-edge sedimentation, covariance cancellation, single-precision residual) is
+   **characterized, not chased**.
+4. **Run the gate after any shared/core change**: `python clubb_jax/run_scripts/compare_cases.py
+   --max-iters 30` (expect 0 prognostic failures across the bit-faithful cases), plus a periodic
+   `--max-iters 100` durability pass. Re-baseline golden references only as a deliberate, reviewed step.
+5. **Prefer the simpler / more-accurate / differentiable form.** When a faithfulness contrivance and a
+   cleaner form differ only at the ULP level (smooth vs hard `min/max`, accurate vs oracle-truncated `D_v`,
+   float64 vs replicated `real*4`, smooth vs NumPy flux limiter), take the cleaner one and re-validate under
+   the tiered standard — that is the whole point of the numerical-accuracy refactor.
+6. **Porting a genuinely new subsystem** (COAMPS or SILHS — the only unported pieces): the historical
+   technique still applies — read the Fortran oracle, mirror its path under `src/`, and validate with a
+   case-stats oracle (feed the Fortran's own state into the JAX routine) or a conservation contract, since
+   the f2py API exposes no microphysics. See DESIGN.md "Verification oracles."

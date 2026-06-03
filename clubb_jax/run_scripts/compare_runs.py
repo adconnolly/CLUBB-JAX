@@ -63,13 +63,21 @@ def run(cmd, env=None, cwd=None):
     return proc.returncode
 
 
-def compare_nc(fort_path: str, jax_path: str) -> bool:
-    """Compare two CLUBB stats NetCDF files. Return True if they agree."""
+def compare_nc(fort_path: str, jax_path: str, tier: str = "bit") -> bool:
+    """Compare two CLUBB stats NetCDF files. Return True if they agree under `tier`.
+
+    tier='bit'      → legacy machine-precision gate (REL_TOL/ABS_TOL on PROGNOSTIC vars).
+    tier='physical' → Tier-C field-class tolerances (REFACTOR.md §2, via validation.py).
+
+    The legacy "Prognostic failures:" summary line is printed in BOTH tiers so downstream
+    parsers (compare_cases.py) are unaffected; only the returned verdict depends on `tier`.
+    """
     try:
         import netCDF4 as nc
     except ImportError:
         print("netCDF4 not available — skipping comparison")
         return True
+    import validation
 
     ds_f = nc.Dataset(fort_path)
     ds_j = nc.Dataset(jax_path)
@@ -113,11 +121,16 @@ def compare_nc(fort_path: str, jax_path: str) -> bool:
 
     n_prog_fail = sum(1 for _, _, _, _, ip, st in rows if ip and st == "FAIL")
     n_diag_fail = sum(1 for _, _, _, _, ip, st in rows if not ip and st == "FAIL")
+    # Legacy summary line — kept verbatim in every tier (compare_cases.py parses it).
     print(f"\n  Prognostic failures: {n_prog_fail}   Diagnostic failures (timing): {n_diag_fail}")
+
+    # Tier-C field-class verdict (REFACTOR.md §2). Computed always; gates only when tier='physical'.
+    verdict = validation.tiered_verdict([(v, md, mr, rl) for v, md, mr, rl, _, _ in rows])
+    print("\n" + validation.format_verdict(verdict))
 
     ds_f.close()
     ds_j.close()
-    return not prog_fail
+    return verdict["all_pass"] if tier == "physical" else (not prog_fail)
 
 
 def main():
@@ -134,6 +147,10 @@ def main():
     parser.add_argument("--override", default=None,
                         help="Extra namelist overrides (KEY=val,...) applied to BOTH runs, "
                              "e.g. 'l_ho_nontrad_coriolis=.true.' to enable a flag in Fortran+JAX.")
+    parser.add_argument("--tier", choices=["bit", "physical"], default="bit",
+                        help="Correctness standard for the verdict (REFACTOR.md §2). "
+                             "'bit' = legacy machine-precision gate (default; for debugging a real "
+                             "regression). 'physical' = Tier-C field-class tolerances.")
     args = parser.parse_args()
 
     case   = args.case
@@ -182,11 +199,14 @@ def main():
     print(f"  Fortran: {fort_nc}")
     print(f"  JAX:     {jax_nc}\n")
 
-    ok = compare_nc(fort_nc, jax_nc)
-    if ok:
-        print(f"\nResult: PASS — all PROGNOSTIC variables within rel_tol={REL_TOL:.0e}")
+    ok = compare_nc(fort_nc, jax_nc, tier=args.tier)
+    if args.tier == "physical":
+        msg = ("PASS — all gated fields within Tier-C field-class tolerances"
+               if ok else "FAIL — gated field(s) exceed Tier-C tolerance (see ** rows above)")
     else:
-        print(f"\nResult: FAIL — prognostic variable(s) exceed rel_tol={REL_TOL:.0e} (see ** rows above)")
+        msg = (f"PASS — all PROGNOSTIC variables within rel_tol={REL_TOL:.0e}"
+               if ok else f"FAIL — prognostic variable(s) exceed rel_tol={REL_TOL:.0e} (see ** rows above)")
+    print(f"\nResult [{args.tier}]: {msg}")
     sys.exit(0 if ok else 1)
 
 

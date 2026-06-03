@@ -357,8 +357,41 @@ def test_mixing_length_forward_differentiable():
     rel = abs(float(jvp) - fd) / (abs(fd) + 1e-30)
     assert np.isfinite(float(jvp)) and abs(float(jvp)) > 0 and rel < 1e-3, \
         f"mixing-length jvp: ad={float(jvp):.4e} fd={fd:.4e} rel={rel:.2e}"
-    print(f"  mixing length (Golaz parcel ascent): FORWARD-mode jvp finite+correct (rel {rel:.1e}); "
-          f"reverse-mode blocked by while_loop (Iter179)  PASS")
+    print(f"  mixing length (Golaz parcel ascent): FORWARD-mode jvp finite+correct (rel {rel:.1e})  PASS")
+
+
+def test_mixing_length_reverse_differentiable():
+    """REFACTOR B3 (iter9): the parcel-ascent `lax.while_loop`s (mixing_length.py:367,:553) were replaced
+    by a bit-exact bounded `lax.scan` (`_bounded_while`), so the Golaz mixing length is now REVERSE-mode
+    differentiable — `jax.grad` previously RAISED on the dynamic-trip-count while_loop. grad w.r.t. the
+    mean thlm profile is finite, nonzero, and finite-difference-correct (directional derivative)."""
+    from clubb_jax.src.CLUBB_core.mixing_length import compute_mixing_length_jax
+    gr = setup_grid(ngrdcol=1, deltaz=100.0, zm_init=0.0, zm_top=3000.0, grid_type=1)
+    nzt = gr.zt.shape[1]
+    rtm = jnp.full((1, nzt), 0.008)
+    exner = jnp.full((1, nzt), 0.97)
+    p = jnp.full((1, nzt), 9.0e4)
+
+    def lscale_sum(thlm):
+        thvm = thlm * (1.0 + 0.61 * rtm)
+        em = jnp.full((1, gr.zm.shape[1]), 0.5)
+        Lscale, _u, _d = compute_mixing_length_jax(
+            thvm, thlm, rtm, em, jnp.full((1,), 1.0e5), p, exner, thvm,
+            jnp.full((1,), 1.0e-3), 20.0, 3, False, gr)
+        return jnp.sum(Lscale)
+
+    thlm0 = jnp.asarray(300.0 + 0.004 * jnp.arange(nzt))[None]
+    g = jax.grad(lscale_sum)(thlm0)                 # reverse-mode — raised before B3
+    g_np = np.asarray(g)
+    assert np.all(np.isfinite(g_np)) and float(jnp.sum(jnp.abs(g))) > 0, "grad not finite/nonzero"
+    tangent = jnp.ones_like(thlm0)
+    dir_ad = float(jnp.sum(g * tangent))            # grad·tangent should match the central difference
+    eps = 1e-4
+    fd = float((lscale_sum(thlm0 + eps * tangent) - lscale_sum(thlm0 - eps * tangent)) / (2 * eps))
+    rel = abs(dir_ad - fd) / (abs(fd) + 1e-30)
+    assert rel < 1e-3, f"mixing-length grad: ad={dir_ad:.4e} fd={fd:.4e} rel={rel:.2e}"
+    print(f"  mixing length (Golaz parcel ascent): REVERSE-mode jax.grad finite+correct (rel {rel:.1e}) "
+          f"— B3 bounded-scan unlocked it  PASS")
 
 
 def test_kk_covar_driver_differentiable():
@@ -432,5 +465,6 @@ if __name__ == "__main__":
     test_adg1_w_closure_differentiable()
     test_adg1_full_pdf_driver_differentiable()
     test_mixing_length_forward_differentiable()
+    test_mixing_length_reverse_differentiable()
     test_kk_covar_driver_differentiable()
     print("All differentiability tests PASSED.")
