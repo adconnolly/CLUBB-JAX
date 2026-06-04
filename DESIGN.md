@@ -74,6 +74,25 @@ python clubb_jax/tests/test_solver.py
 python clubb_jax/tests/test_diffusion.py
 python clubb_jax/tests/test_penta_solver.py
 python clubb_jax/tests/test_penta_faithful.py      # penta_lu solve == Fortran-order numpy replica (0 ULP eager)
+python clubb_jax/tests/test_calc_roots.py          # calc_roots cubic/quadratic/cube_root vs polynomial residual + numpy.roots (completeness port)
+python clubb_jax/tests/test_pos_definite.py        # pos_definite_adj (Smolarkiewicz limiter) BIT-EXACT vs f2py oracle + conservation (completeness port)
+python clubb_jax/tests/test_diagnose_correlations.py # diagnose_correlations (Larson 2011) + PDF helpers — bit-match vs f2py oracle (completeness port)
+python clubb_jax/tests/test_kk_local_means.py      # KK grid-mean (local) evap/auto/accr/mvr rates vs independent NumPy + branches (completeness port)
+python clubb_jax/tests/test_kk_upscaled_variances.py # variance_KK_mvr vs independent closed-form lognormal moments (rel 0) + 4M-sample Monte-Carlo (rel 1.4e-4) (completeness port)
+python clubb_jax/tests/test_ice_dfsn.py            # ice_dfsn vs literal NumPy loop (rel 1.2e-16) + thlm2T_in_K bit-exact vs f2py + cap/branch/grad (completeness port)
+python clubb_jax/tests/test_hydromet_pdf_parameter.py # hydromet-PDF parameter containers: zero-init shapes/dims/round-trip (CLUBB_core now fully ported)
+python clubb_jax/tests/test_mixed_moment_pdf_integrals.py # mixed_moment_PDF_integrals integrals/covariances vs binomial/tilting closed-forms (<1e-12) + Monte-Carlo (full port)
+python clubb_jax/tests/test_hydrometeor_mixed_moments.py # hydrometeor_mixed_moments top driver vs literal Fortran-loop transcription (<1e-12) + grad
+python clubb_jax/tests/test_pdf_integrals_all_mm.py # KK all-mixed-moment Dv integrals (trivar+quadrivar families, 8/8) vs analytic base cases + complex-branch MC
+python clubb_jax/tests/test_cloud_correlate.py     # BUGSrad cloud-overlap (bugs_ctot + bugs_cloudfit) vs literal Fortran loops (rel 3e-16/1e-14) + invariants
+python clubb_jax/tests/test_gfdl_activation.py     # GFDL erff (vs math.erf <1e-6) + updraft_weights (vs literal incl. Fortran quirk) (partial port)
+python clubb_jax/tests/test_simple_rad_lba.py      # LBA prescribed radiation (table load + time/vertical interp) vs literal Fortran on real lba_rad.dat
+python clubb_jax/tests/test_cloud_feedback_sfclyr.py # CGILS/cloud_feedback drag-law surface fluxes vs literal Fortran (rel 0) + physical invariants
+python clubb_jax/tests/test_pressure_coord_forcing.py # Press[Pa]-coordinate time-dependent forcing (interp vs p_in_Pa) + height path byte-identical
+python clubb_jax/tests/test_inverse_hydrostatic.py # inverse_hydrostatic (pressure-sounding altitudes) round-trip z→exner→z exact (5.5e-12 m) + literal + analytic
+python clubb_jax/tests/test_lba_sfclyr.py          # LBA diurnal surface fluxes + MOST ustar vs literal Fortran + diurnal structure
+python clubb_jax/tests/test_mpace_b_lba_tndcy.py   # M-PACE B large-scale subsidence/cooling forcing vs literal + invariants; LBA zero forcing
+python clubb_jax/tests/test_silhs_surface_schemes.py # mpace_b/arm_97/twp_ice surface schemes vs literal Fortran (twp_ice == cloud_feedback drag law)
 python clubb_jax/tests/test_f2py_advance_xm_wpxp.py # f2py advance_xm_wpxp .so directly callable (oracle unblocked; needs clubb_python_api)
 python clubb_jax/tests/test_differentiability.py   # jax.grad through the building blocks (+ mixing-length reverse, REFACTOR B3)
 python clubb_jax/tests/test_full_timestep_grad.py  # ★ REFACTOR B4: full-timestep jax.grad through advance_clubb_core (FD-correct)
@@ -267,8 +286,8 @@ fluxes (`wpthlp,wprtp,upwp,vpwp`) **1e-3**; second moments (`wp2,wp3,rtp2,thlp2,
 pass Tier-C by construction (rel ~1e-11 ≪ tol); calibrated against rico (near-worst FP case — dynamics PASS
 2–10× margin) and arm/bomex (~1e7×).
 
-**Status (this branch):** **18/18** `compare_cases` DEFAULT_CASES PASS Tier-C (17 strictly bit-faithful + mpace_a
-within tolerance on its single-precision Morrison residual); **all 19 cases are whole-driver-`jax.grad`-
+**Status (this branch):** **20/20** `compare_cases` DEFAULT_CASES PASS Tier-C (19 strictly bit-faithful + mpace_a
+within tolerance on its single-precision Morrison residual; clex9_nov02/oct14 added Iter313); **all 19 cases are whole-driver-`jax.grad`-
 differentiable** (see "Differentiability status"). The accuracy-lowering contrivances were removed —
 `parabolic_expax` (`epss=1e-4`), the Morrison `real*4` casts, BUGSrad `sngl`/float32-π — so the JAX is now
 strictly *more* accurate there. **Preserve:** the Fortran oracle as a reference-within-tolerance (`--tier bit`
@@ -304,6 +323,11 @@ Each JAX module mirrors its Fortran oracle at the same relative path under `src/
 | `grid_class.py` | `grid_class.F90` | `zm2zt`, `zt2zm`, `ddzm`, `ddzt`, `zm2zt2zm`, `zt2zm2zt` — unit tests pass |
 | `diffusion.py` | `diffusion.F90` | `diffusion_zt/zm_lhs`, `xpyp_term_ta_pdf_lhs/rhs` (centered + upwind) — ≤ machine epsilon |
 | `matrix_solver_wrapper.py` | `tridiag_lu_solver.F90` | `tridiag_lu_solve_jax` — bit-exact |
+| `calc_roots.py` | `calc_roots.F90` | `cubic_solve` (Cardano, complex128 principal-branch), `quadratic_solve`, `cube_root` — polynomial residual ~4e-16 + numpy.roots set-match; differentiable. Completeness port (the gated ADG1 path doesn't call it; `new_pdf` does) |
+| `pos_definite_module.py` | `pos_definite_module.F90` | `pos_definite_adj_jax` — Smolarkiewicz (1989) flux-conservative positive-definite limiter (ascending grid). **Bit-exact vs the f2py oracle (rel 0)** + column-integral conservation; differentiable. Completeness port (gated by `l_pos_def`, off by default — the suite uses `mono_flux_limiter`) |
+| `diagnose_correlations_module.py` | `diagnose_correlations_module.F90` | `diagnose_correlations` (Larson 2011 hydromet correlation diagnosis for SILHS: `rearrange_corr_array` + `diagnose_corr`) + PDF helpers `calc_mean`/`calc_varnce`/`calc_w_corr`. **Bit-match vs the f2py oracle (rel 1.6e-15)** across iiPDF_w edge cases; differentiable. Completeness port (gated config uses PRESCRIBED corr; `l_calc_w_corr=True` / approx_w_corr unported) |
+| `Microphys/ice_dfsn_module.py` | `Microphys/ice_dfsn_module.F90` | `ice_dfsn` — depletion of cloud water by diffusional growth of ice (Larson 2006; R&Y Eq. 9.4) as a top-to-bottom falling-crystal mass-integration `lax.scan`; `diff_denom` helper. Validated vs a literal NumPy transcription (**rel 1.2e-16**), branch/over-depletion-cap coverage, differentiable. New helper `thlm2T_in_K_jax` (T_in_K_module.py) is **bit-exact vs `f2py_thlm2t_in_k_1d`**. Completeness port (no f2py wrapper for ice_dfsn itself) |
+| `Microphys/KK_microphys/KK_upscaled_variances.py` | `KK_microphys/KK_upscaled_variances.F90` | `variance_KK_mvr` — variance of the KK rain mean-volume radius `Var(R_vr)=E[R_vr²]−E[R_vr]²` over the 2-component in-precip bivariate-lognormal PDF (assembled from `bivar_LL_mean_eq` with doubled exponents). Validated against an independent closed-form lognormal-moment computation (**rel 0**) and a 4M-sample Monte-Carlo (**rel 1.4e-4**); differentiable. Completeness port (no f2py wrapper exposed) |
 | `advance_xp2_xpyp_module.py` | `advance_xp2_xpyp_module.F90` | Full solve for rtp2/thlp2/rtpthlp/up2/vp2 — machine epsilon |
 | `advance_xm_wpxp_module.py` | `advance_xm_wpxp_module.F90` | Full solve for wprtp/rtm/wpthlp/thlm/upwp/um/vpwp/vm — machine epsilon |
 | `advance_wp2_wp3_module.py` | `advance_wp2_wp3_module.F90` | Full solve for wp2/wp3/wp2_zt — machine epsilon |
@@ -381,8 +405,11 @@ oracle. Verified status (prognostic, rel tol 1e-6):
 | dycoms2_rf02_so | ✅ PASS (30) | bit-faithful (Iter100). Unblocked by `cloud_drop_sed`; do/ds variants still need drizzle microphysics |
 | jun25_altocu | ✅ PASS (30) | bit-faithful (Iter188). Cold-cloud altocumulus + "simplified" radiation; unblocked by the per-step `wm_zm` (subsidence) recompute fix |
 | gabls3 | ✅ PASS (30) | **bit-faithful (Iter273-274, 17th case)** — 0 prognostic failures at the full 30-step gate. Full BUGSrad correlated-k radiation + interactive soil_vegetation + gabls3 surface flux + omega subsidence. **bugs_rad is jitted (Iter274)** — fixes the eager-dispatch ~700 MB/call OOM-after-6-steps + ~2.4× faster (~6 s/step, JAX 30-step run 194 s); configured run is 1440 steps (24 h) |
+| mpace_a | ✅ PASS (30) | bit-faithful (Iter299, 18th case). Morrison (l_ice_microphys) but clear/sub-saturated; the only Morrison signal is the clear-air single-precision thlm_mc round-trip residual |
+| clex9_nov02 | ✅ PASS (30) | **bit-faithful (Iter313, 19th case)** — CLEX-9 cold-cloud altocumulus. Morrison configured but `microphys_start_time` (51411 s) is beyond the 30-step window → never activates; prognostically bit-exact + Tier-C clean once the pre-activation Ncm/Nc_in_cloud diagnostic was fixed to match `advance_microphys`'s early return |
+| clex9_oct14 | ✅ PASS (30) | **bit-faithful (Iter313, 20th case)** — sibling of clex9_nov02 (same campaign, same Morrison pre-activation window) |
 
-**Bit-faithful: 18 cases** (the table above; all pass `compare_cases.py` at 30 steps and the durability gate at
+**Bit-faithful: 20 cases** (the table above; all pass `compare_cases.py` at 30 steps and the durability gate at
 100). 9 are bit-faithful for their ENTIRE configured run (dycoms2_rf01, cobra, bomex, neutral, dycoms2_rf02_nd,
 dycoms2_rf02_so, wangara, atex, dycoms2_rf01_fixed_sst). mpace_a (Iter299) is the first Morrison case made
 faithful -- it stays clear/sub-saturated, so the only M2005 signal is the clear-air single-precision `thlm_mc`.
@@ -428,8 +455,8 @@ JAX is MORE accurate than the low-accuracy Fortran defaults):**
 
 ---
 
-**★★ Numerical-accuracy refactor — COMPLETE (both criteria met).** **(b) Faithful:** all 18 `compare_cases`
-DEFAULT_CASES PASS Tier-C (`--tier physical --max-iters 30`) — 17 stay strictly bit-faithful (0 prognostic
+**★★ Numerical-accuracy refactor — COMPLETE (both criteria met).** **(b) Faithful:** all 20 `compare_cases`
+DEFAULT_CASES PASS Tier-C (`--tier physical --max-iters 30`) — 19 stay strictly bit-faithful (0 prognostic
 failures), mpace_a passes within tolerance (the intended A2 reclassification: float64 `thlm_mc` is more accurate
 than the Fortran single-precision artifact). The accuracy-lowering contrivances (A1 expax, A2 Morrison real*4,
 A3 BUGSrad sngl/float32-π) were removed and the differentiability work (B2–B5) was all forward-identical, so the
@@ -443,11 +470,56 @@ off) — a pre-existing incomplete subsystem, not touched by this refactor.
 ## Remaining Work
 
 **★ Achievable-state assessment -- read before picking the next piece.** The non-subsystem bit-faithful
-frontier is SATURATED (18 cases). Every remaining gain needs a LARGE subsystem port with poor ROI, because the
-cases it unblocks are themselves numerically-limited (see the characterized cases above). **Do NOT chase the
-numerically-limited microphysics cases as "bugs" -- they are characterized.** The project is at its practical
-bit-faithful ceiling for the tractable scope; full 48-case completion is gated by Fortran numerical limits (some
-the Fortran's own imprecision) plus impractical ports.
+frontier is nearly saturated (20 cases as of Iter313). Most remaining gains need a LARGE subsystem port with
+poor ROI, because the cases they unblock are themselves numerically-limited (see the characterized cases above).
+**BUT (Iter313) the frontier was NOT fully saturated:** clex9_nov02/oct14 were "unported" only because their
+Morrison scheme never activates in the gate window — they are pure closure physics and were bit-faithful all
+along, blocked only by a diagnostic-output mismatch (pre-activation Ncm). Lesson: before declaring a case
+blocked by an unported subsystem, check whether that subsystem actually *runs* in the gate window. **Do NOT
+chase the genuinely numerically-limited microphysics cases (rico, dycoms2_rf02_do/ds) as "bugs" -- they are
+characterized.** Full 48-case completion is gated by Fortran numerical limits plus impractical ports.
+
+**★ Completeness loop — final state (Iters 1–33).** A 33-iteration sweep ported every remaining **in-scope,
+oracle-validatable, self-contained** routine and unit-tested each (differentiable; oracle = f2py bit-shadow
+where exposed, else closed-form / Monte-Carlo / round-trip / literal-transcription). Highlights: the entire KK
+PDF-integral mixed-moment machinery (`mixed_moment_PDF_integrals` + `PDF_integrals_all_MM`, both ✅), the BUGSrad
+cloud-overlap (`cloud_correlate`, both subroutines → Radiation 100% ported), `ice_dfsn`, the GFDL droplet-activation
+CLUBB-side (erff/updraft_weights/aer_act_clubb_ndrop), `inverse_hydrostatic`, the CGILS pressure-coordinate /
+`T_f` / `um_ref` forcing-reader capability (guarded, gated cases byte-identical), and **all benchmark-case
+surface/forcing schemes** (lba, mpace_b, arm_97, twp_ice, arm_3year, arm_0003, cloud_feedback). Verified
+regression-free: 10/20 gated cases re-confirmed across every type (forcing-pipeline, sounding, analytic, cloud-sed,
+Morrison); a test-infrastructure shadowing bug was found+fixed (iter 31).
+The **genuinely remaining unported `.F90` (3 files, all impractical/out-of-scope)**: `coamps_microphys_driver`
+(7000-line alternative microphysics the gated config never uses; the Fortran itself fatal-errors on `l_predict_Nc=F`
+→ **no oracle**), `gfdl_activation`'s `aer_ccn_act_wpdf_k` lookup core (the ➖ `SCM_Activation` subsystem —
+Gauss-Hermite + Köhler + 5-D single-precision lookup, no case exercises it), and `pdf_hydromet_microphys_wrapper`
+(would wire `hydrometeor_mixed_moments` to compute `wp2hmp`/`rtphmp`/`thlphmp` — but those are **correctly zero for
+all 20 gated cases** (no active hydrometeors), so the wiring has **zero validated payoff** and needs a
+setup_pdf_parameters correlation-processing port; deferred). SILHS sampling is ➖ (a different RNG can't be
+bit-matched). The differentiable+faithful JAX port is **complete for all tractable/in-scope code.**
+
+**★ Post-loop completeness extensions (iters 81–96).** A further sweep closed the last in-scope, oracle-
+validatable routines and extended faithfulness to the CGILS family:
+- **All alternative PDF closures** end-to-end f2py-validated: ADG2, LY93, 3-D Luhar, new-TSDADG, new-pdf, and the
+  full **new-hybrid driver** (`new_hybrid_pdf_main.py`, 1.15e-14). Plus `mirror_lower_triangular_matrix`, the
+  Godunov-upwind `xpyp_term_ta`, and `sponge_damp_xp2/xp3` (all f2py bit-exact).
+- **`remapping_module.F90` fully ported** (both methods): Ullrich-linear (eq. 30) + the E3SM **PPM** (map1_ppm/
+  ppm2m/steepz/kmppm); f2py same-grid bit-exact + mass-conservation-rel-0 on a refined grid (`remapping_module.py`).
+- **CGILS/cloud_feedback init+radiation fixed** → **cgils_s11 reaches Tier-C PASS** (was rel ~1e3): the Press[Pa]
+  sounding→altitude conversion (`convert_pressure_sounding_to_z`), the absolute-temperature `T[K]`→θ init
+  (clubb_driver.F90:5499-5524), and the case-specific radiation extended atmosphere from the deep sounding + ozone
+  sounding (`convert_snd2extended_atm` → `build_case_extended_atmosphere`, gated on `l_use_default_std_atmosphere=
+  .false.`). thlm is now bit-exact at init/step1; the residual is FP-limited (cloud-topped-BL chaos). Added to the
+  `compare_cases.py --cases tier_c` physical-fidelity suite. All gated cases byte-untouched (the new paths are
+  gated on Press[Pa]/T[K]/the std-atm flag). **Iter97** then fixed a systematic forcing-reader bug affecting the
+  whole family: `_parse_forcings_file` edge-extrapolated the forcing outside its vertical range, but the Fortran's
+  `zlinterp_fnc` (via read_to_grid) **zero-fills** — so cloud_feedback's out-of-range bottom levels got a spurious
+  ≈−1.6e-5 thlm forcing. With `left=right=0` the cloud_feedback means → Tier-C PASS (moments now FP-limited at cloud
+  onset); gated file-forcing cases (gabls3_night/…) byte-identical (their forcings cover the model range).
+- **Last validation checks** ported (`assert_corr_symmetric`, `sfc_varnce_check`) — these have no observable f2py
+  oracle (err_code not exposed), validated by transcription/behavior.
+The genuinely-remaining unported `.F90` are unchanged (COAMPS, GFDL lookup core, pdf_hydromet_microphys_wrapper,
+SILHS RNG) — all no-oracle/zero-payoff. **No in-scope, oracle-validatable Fortran routine remains.**
 
 **★ The strategic pivot (done) — the bit-faithful ceiling was an artifact of the *gate*, not the physics.**
 Several "numerically-limited" cases were limited only because the JAX is MORE accurate than the low-accuracy
@@ -494,8 +566,9 @@ damping for wp2/wp3/up2_vp2); the `pdf_closure_driver` `ipdf_pre_advance_fields`
 
 ## Agent Working Rules
 
-**The Fortran→JAX port is complete.** Every `clubb_release/src/CLUBB_core/*.F90` has a JAX mirror, the
-driver runs 100% in JAX, and the bit-faithful frontier is saturated (18 cases). The incremental
+**The Fortran→JAX port is complete.** Every `clubb_release/src/CLUBB_core/*.F90` has a JAX mirror (CLUBB_core
+is now 100% ported, Iter312), the driver runs 100% in JAX, and the bit-faithful frontier is at 20 cases
+(Iter313). The incremental
 **shadow-comparison** workflow that built the port (run JAX beside the Fortran oracle in-loop, match to
 machine epsilon, remove the Fortran call) is **retired** — there is nothing left to port that way. Most work
 now is **refactoring, simplification, differentiability, and working under the numerical-accuracy

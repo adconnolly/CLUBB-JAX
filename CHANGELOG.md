@@ -31,6 +31,634 @@ The dated entries below are the per-iteration work record (newest first).
 
 ---
 
+### 2026-06-04 — Completeness loop iter 103: full unit-suite green + TRANSLATION_STATUS summary refreshed
+
+- Ran the **full unit-test suite** to completion (detached, working-dir output to dodge the harness tmpfs ENOSPC):
+  **all 91 test files PASS, 0 failures** — the definitive regression confirmation after the iter-100 stale-test fix.
+  This backs every row-level claim in TRANSLATION_STATUS with green tests (the iters-81-99 ports + the core).
+- Refreshed the stale TRANSLATION_STATUS **summary header** (the original loop's last count, ~Iter313, predated the
+  iters-81-102 sweep). Re-counted the table: ✅ 59→**65**, 🔁 **60**, added the missing **◐ partial** category (3:
+  new_pdf / new_hybrid_pdf / matrix_operations — gated/oracle-validatable routines done, unused variants remain),
+  ➖ **64**, ❌ 10; "Ported in some form" 120→**128 of 202**. Prose updated to name the genuinely-remaining no-oracle/
+  impractical gaps (COAMPS, GFDL 5-D lookup, SCM aerosol, pdf_hydromet_microphys_wrapper, SILHS). Per-row entries
+  were already current.
+
+### 2026-06-04 — Completeness loop iter 102: CGILS sibling Tier-C survey — cgils_s12 added to the suite
+
+- Surveyed the CGILS control cases after the iter-97 forcing fix, to expand the validated `TIER_C_CASES` suite.
+  - **cgils_s12 (stratus): Tier-C verdict PASS** → added to `TIER_C_CASES`. The iter-97 forcing zero-fill is what
+    tipped it: its forcing tops out at 101687 Pa, *below* the model bottom (~101781 Pa), so it had out-of-range
+    levels that were previously edge-extrapolated (unlike s11, whose forcing covered the bottom).
+  - **cgils_s6 (shallow cumulus): Tier-C FAIL on Ncm only** (rel 1.0, droplet number) — every mean/flux/moment
+    class PASSES; the residual is cloud-edge FP in droplet number for the more-variable cumulus regime. A near-pass,
+    not added (the verdict requires all classes).
+- So **2 of 3 CGILS controls (s11, s12) are now Tier-C-faithful and in the suite**; s6 is a near-pass. Updated the
+  TRANSLATION_STATUS CGILS row.
+
+### 2026-06-04 — Completeness loop iter 101: whole-driver differentiability gate re-confirmed after iters 89-100
+
+- Verified the **differentiable** half of the goal still holds after the iters-89-100 driver/radiation/forcing
+  changes (none are in the gradient path — sounding init + radiation extended-atmosphere setup are init-time numpy
+  cached in state; the forcing zero-fill is an additive numpy constant per step; the rcm/cloud_frac guard is a
+  B5-skipped diagnostic). `compare_grad.py` (whole-driver `jax.grad`): **bomex 87/87 grad-finite, FD-correct 5.4e-7
+  (COMPLETE); dycoms2_rf01 500/500 grad-finite (KINK — finite grad, expected hard-threshold FD kink)**. The
+  dycoms2_rf01 BUGSrad path being grad-finite confirms the iter-92 radiation-ext-atmosphere change is differentiable.
+  Gate verdict: **PASS — all cases differentiable.**
+- The **CGILS path itself is now differentiable**: `compare_grad.py --cases cgils_s11` → **44/44 grad-finite**
+  (thlm + um), KINK status (finite grad, hard-threshold FD kink). So cgils_s11 is now **both faithful (Tier-C PASS)
+  and differentiable** — iter-89 init-unblock made the whole-driver `jax.grad` reachable for the case.
+
+### 2026-06-04 — Completeness loop iter 100: unit-suite regression sweep — caught + fixed a stale forcing test
+
+- Ran a regression sweep over the iters-81-99 additions + the core/changed modules (the full `run_all_tests.py`
+  via background kept failing on the harness tmpfs ENOSPC, so I ran the tests directly in the foreground). **All 12
+  port tests pass** (remapping Ullrich+PPM, new_hybrid driver, ADG2/Luhar-3D/calculate_w_responder PDF leaves,
+  sponge xp2/xp3, Godunov TA-term, mirror_lower_triangular, validation checks, radiation ext-atmosphere, pressure
+  sounding). Core checks pass: test_new_pdf, test_solver (6/6), test_diffusion (17/17, incl. the Godunov terms),
+  test_inverse_hydrostatic.
+- **Caught a real inconsistency**: `test_pressure_coord_forcing` FAILED — it built its reference with
+  `np.interp(..., left=edge, right=edge)`, the *old* edge-extrapolation that the **iter-97 fix corrected to
+  zero-fill** (matching the Fortran `zlinterp_fnc`). The test encoded the bug. Updated both references (pressure +
+  height paths) to `left=0.0, right=0.0`; the test now PASSES, correctly validating the zero-fill behavior. (The
+  iter-97 fix itself is confirmed correct: cloud_feedback's out-of-range forcing matched the Fortran's 0.0, and
+  three gated file-forcing cases stay bit-faithful.)
+- Operational: the auto-backgrounding of long commands writes harness logs to the `tasks/` tmpfs, which
+  intermittently reports ENOSPC (a quota artifact); foreground runs redirected to / inspected in the working dir
+  are the reliable workaround. (CHANGELOG compression was done in iter 99.)
+
+### 2026-06-04 — Completeness loop iter 99: iter-97 regression confirmed bit-faithful + CHANGELOG compression
+
+- **Regression verification of the iter-97 forcing-reader change** completed. The iter-98 background full-gate
+  run failed (exit 144) due to the harness tmpfs ENOSPC quota artifact (it couldn't write its output; the actual
+  scratch FS has 30 T free). Re-ran targeted foreground checks (output redirected to the working dir) on the
+  height-coordinate file-forcing gated cases that exercise the changed `_parse_forcings_file` path: **cobra,
+  jun25_altocu** both **0 prognostic failures / bit-faithful PASS** (joining gabls3_night from iter 97). Three
+  representative file-forcing gated cases confirm the `left=right=0` zero-fill is byte-identical for cases whose
+  forcings cover the model range; the analytic/arm-loader cases don't use the changed path. **No regression.**
+- CHANGELOG compression (every-10 milestone): folded iters 86–90 into two condensed batch entries
+  (86–88 = mirror_lower_triangular + new_hybrid driver + Ullrich remapping; 89–90 = the CGILS Press[Pa]→z + T[K]→θ
+  init arc), preserving the key ports + validation numbers.
+
+### 2026-06-04 — Completeness loop iter 98: cloud_feedback moment residual = FP; full-gate regression verification
+
+- Characterized the post-iter-97 cloud_feedback_s11 residual. `diagnose_divergence`: the moments are now bit-faithful
+  through ~step 5 (thlp2 ~1e-5) and diverge only at **cloud onset (step ~5-6)** with **balanced sign** (thlp2
+  s2:24/20, wp2 s3:25/19) — genuine FP/chaos in the cloud-topped boundary layer, not a systematic bug. So the
+  iter-97 forcing fix resolved the last *systematic* error in the CGILS/cloud_feedback family: init + forcing +
+  radiation are now faithful (means PASS Tier-C), and the residual is the irreducible cloud-onset FP sensitivity
+  (the same endpoint as cgils_s11 / rico).
+- Verification: launched the **full 20-case bit-faithful gate** (`compare_cases.py --max-iters 30`) to confirm the
+  iter-97 forcing-reader change did not regress any bit-faithful case. Of the 20, 7 exercise the changed
+  `_parse_forcings_file` path (gabls3/gabls3_night/cobra/jun25_altocu/mpace_a/clex9_nov02/clex9_oct14); gabls3_night
+  was already separately re-confirmed bit-faithful in iter 97. The others all have height-coordinate forcings that
+  cover the model range (so zero-fill is byte-identical), and the analytic/arm-loader cases are untouched.
+  (Confirmed regression-free in iter 99: cobra + jun25_altocu also bit-faithful.)
+- DESIGN.md "post-loop extensions" updated with the iter-97 forcing fix.
+
+### 2026-06-04 — Completeness loop iter 97: fix the forcing-reader out-of-range zero-fill (cloud_feedback family)
+
+- Root-caused the cloud_feedback step-1 thlm divergence (4.7e-3, absent in cgils_s11). Compared the step-0 thlm
+  budget JAX-vs-Fortran: `exner`/`radht`/`rcm`/`cloud_frac`/`wpthlp_sfc` all match, but **`thlm_forcing` at the
+  bottom 3 model levels was jax≈−1.58e-5 vs fort=0.0** (levels 3+ bit-exact). 1.58e-5 × dt(300s) = 4.7e-3 = exactly
+  the thlm step-1 difference.
+- The bug: `generic_forcings.py:_parse_forcings_file` interpolated the forcing onto the model grid with
+  `np.interp(..., left=edge, right=edge)` (constant edge-extrapolation), but the Fortran reader uses
+  `zlinterp_fnc` (interpolation.F90, via read_to_grid) which **zero-fills outside the forcing's range**. cloud_
+  feedback's forcing bottom (100731 Pa) sits *above* the model's lowest 3 levels (101781/101485/100832 Pa), so
+  those out-of-range levels were edge-extrapolated to ≈−1.6e-5 instead of zeroed. cgils_s11's forcing reaches
+  101967 Pa (below all model levels) → no out-of-range → it was bit-exact, which is why this hid until now.
+- Fix: `left=0.0, right=0.0` in that `np.interp` (matching `zlinterp_fnc` for both height- and pressure-coordinate
+  forcing). Verified: the JAX thlm_forcing is now 0.0 at the bottom 3 levels = the Fortran. **cloud_feedback_s11
+  improved sharply** — the means (thlm/rtm) now PASS Tier-C and the moments dropped ~34× (rtp2 0.117→3.4e-3,
+  wprtp 0.085→0.025); the residual is now the FP-limited moments (cloud-topped-BL chaos, like cgils). This fixes a
+  *systematic* bug shared by every CGILS/cloud_feedback case whose forcing doesn't cover the model range.
+- **No gated regression**: gabls3_night (a bit-faithful file-forcing case) is still **0 prognostic failures /
+  bit-faithful PASS** — gated forcings cover the model range, so zero-fill is byte-identical for them (arm uses its
+  own loader; bomex/dycoms/atex are analytic).
+
+### 2026-06-04 — Completeness loop iter 96: port the last validation-check routines (assert_corr_symmetric, sfc_varnce_check)
+
+- A fresh definitive f2py-vs-ported scan (all 210 wrappers vs every JAX def) confirmed the f2py surface is now
+  fully exhausted except validation-check routines and false positives (already-ported-under-other-names). Also
+  established these checks have **no observable f2py oracle**: they set `err_code` on the stored err_info and
+  `return` (no error-stop), and `f2py_get_err_info_values` exposes only lat/lon/rank, not err_code.
+- Ported the two genuinely-missing checks (the family's `parameterization_check`/`check_clubb_settings`/
+  `check_parameters` were already done):
+  - `corr_varnce_module.py:assert_corr_symmetric` — True iff a normal-space correlation matrix is symmetric
+    within 1e-6 AND has a unit diagonal within eps (1e-10).
+  - `numerical_check.py:sfc_varnce_check` — True iff every calc_surface_varnce output (wp2/up2/vp2/thlp2/rtp2/
+    rtpthlp_sfc + passive-scalar variances) is finite.
+  Both return the boolean verdict (the JAX never error-stops, vs the Fortran's err_code set).
+- `tests/test_validation_checks.py`: behavioral/transcription validation (valid→True; asymmetric / non-unit-
+  diagonal / NaN / Inf → False, incl. passive scalars) + an f2py no-crash cross-check that a valid matrix runs
+  through `f2py_assert_corr_symmetric` and the JAX agrees. PASS.
+- This exhausts the in-scope, validatable Fortran surface. Genuinely remaining unported `.F90` are all
+  no-oracle/impractical (COAMPS microphysics, GFDL `aer_ccn_act_wpdf_k` 5-D lookup, `pdf_hydromet_microphys_wrapper`
+  zero-payoff) or ➖ SILHS RNG.
+
+### 2026-06-04 — Completeness loop iter 95: port the E3SM PPM remapping (method 2) — remapping_module fully ported
+
+- Ported the Piecewise-Parabolic-Method conservative vertical remap (remapping_module.F90 method 2), the last
+  in-scope oracle-validatable routine: `remap_vals_ppm` → `_map1_ppm` → `_ppm2m` / `_steepz` / `_kmppm`. Faithful
+  to the kord=4 path map1_ppm uses (the kord≥7 Huynh branch omitted). Vectorized over (ncol, km) with `jnp.where`
+  for the per-cell limiter branches (kmppm modes 0/1/2) and the iv-dependent boundary constraints; the data-
+  dependent k0 source-cell search is a `jnp.searchsorted`, and the variable-length whole-cell mass sum is a
+  cumulative-sum gather. Differentiable. Wired into `remap_vals_to_target` (the `grid_remap_method==2` branch,
+  previously NotImplementedError) + an `iv` arg on the same-grid driver.
+- `tests/test_remapping_ppm.py`: (1) f2py bit-shadow vs `f2py_remap_vals_to_target_same_grid` with
+  grid_remap_method=2, **bit-exact 0.0** for iv=1,0,-1 (validates the map1_ppm integration + k0 search + that
+  ppm2m preserves the cell mean); (2) **mass conservation rel 0.0** remapping onto a refined target grid — PPM is
+  conservative by construction, so this is a genuine oracle-free check of the reconstruction (a buggy ppm2m breaks
+  it); (3) finite `jax.grad`. Fixed one off-by-one in `_steepz`'s alfa slices during bring-up. The Ullrich-linear
+  test still passes (no regression).
+- **`remapping_module.F90` is now fully ported** (both remap methods) → ✅ in TRANSLATION_STATUS. With this, the
+  last in-scope, oracle-validatable Fortran routine is done; the genuinely-remaining unported `.F90` are all
+  no-oracle/zero-payoff (COAMPS microphysics, the GFDL CCN 5-D lookup core, pdf_hydromet_microphys_wrapper) or
+  ➖ SILHS RNG, per DESIGN.md "Remaining Work".
+
+### 2026-06-04 — Completeness loop iter 94: CGILS breadth survey + radiation-ext-atmosphere regression test
+
+- Surveyed how far the iter-89/90/92 CGILS init+radiation fixes generalize across the 12-case family:
+  - `cgils_s6` and `cloud_feedback_s11` both now have **exner PASS** (init fully correct — the Press[Pa]→z + T[K]→θ
+    + case-ozone/deep-sounding extended-atmosphere path is regime-independent), but neither clears Tier-C at 10
+    steps — they're more FP-sensitive regimes (s6 shallow cumulus; cloud_feedback a different SST/forcing).
+  - `diagnose_divergence(cloud_feedback_s11)`: thlm diverges at **step 1** (4.7e-3, vs bit-exact for cgils_s11) with
+    a near-constant per-step increment — same FP-limited class, just seeded earlier by its more active cloud/SST.
+  - Ruled out two candidate bugs by comparison with the Tier-C-passing cgils_s11: **ozone** (the Fortran model-level
+    ozone is `5.4e-5/rho`, identical to the JAX — only the *extended* levels use the case ozone, which iter 92
+    already handles) and **u/v nudging** (cloud_feedback has the identical `l_uv_nudge`+blank-`um_ref` config as the
+    passing cgils_s11). So the cloud_feedback residual is FP-regime sensitivity, not a new systematic bug.
+- Code — **regression test for the iter-92 radiation extended-atmosphere code** (`tests/test_rad_extended_atmosphere.py`),
+  which affects all 12 CGILS/cloud_feedback cases but previously had only end-to-end validation: on the real
+  cgils_s11 sounding + ozone sounding it checks `build_case_extended_atmosphere`/`read_ozone_sounding` against the
+  `convert_snd2extended_atm` semantics (63 levels → 36.3 km; alt ascending; `T_in_K`= the T[K] column verbatim;
+  `sp_hmdty`=rt/(1+rt); `p_in_mb`=p/100; `o3l`= the ozone column; physical sanity) + the thm[K] θ·exner branch with
+  the Fortran's p_sfc level-1 exner quirk. PASS.
+
+### 2026-06-04 — Completeness loop iter 93: confirm cgils_s11 is FP-limited + add the Tier-C physical-fidelity suite
+
+- Adversarial follow-up to iter 92. `diagnose_divergence` on cgils_s11 (all fixes in): **thlm is bit-exact at step 1
+  (4.5e-13)** and the residual past step 2 now has **balanced sign** (s3: 19 vs 25) and is ~17× smaller than before
+  the radiation fix — i.e. the iter-89/90/92 work removed the *systematic* init/radiation bias, and what remains is
+  genuine **FP/chaos amplification** (the cloud-topped boundary layer magnifies a sub-tolerance cloud difference).
+  This matches rico/coriolis_test: faithful, not bug-limited. Verified the radiation surface temperature isn't the
+  cause (`ts = T_in_K(bottom)` matches the Fortran exactly).
+- Confirmed the init fix **generalizes**: a `cgils_s6` (different CGILS regime) compare has **exner PASS** (init
+  correct) too; it's more FP-sensitive (shallow-cumulus regime) so it doesn't clear Tier-C at 10 steps, but the
+  shared Press[Pa]→z + T[K]→θ + ext-atmosphere path is confirmed regime-independent.
+- Code — **expanded the test suite** (`run_scripts/compare_cases.py`): added a `TIER_C_CASES` registry of
+  physically-faithful-but-FP-limited cases (cgils_s11) and a `--cases tier_c` convenience token that runs them under
+  `--tier physical`, plus a `--list` line. This locks cgils_s11 in as a Tier-C regression guard for the CGILS
+  init+radiation path. `--list` verified.
+
+### 2026-06-04 — Completeness loop iter 92: port convert_snd2extended_atm — cgils_s11 reaches Tier-C PASS
+
+- Implemented iter-91's identified fix: the radiation extended atmosphere from the case's own sounding + ozone
+  sounding when `l_use_default_std_atmosphere=.false.`. Port of sounding.F90:convert_snd2extended_atm.
+- `Radiation/bugsrad_driver.py`: added `read_ozone_sounding` (parse `{case}_ozone_sounding.in`, one o3 value per
+  main-sounding level) and `build_case_extended_atmosphere` (build an `ext` dict — alt/T_in_K/sp_hmdty/p_in_mb/o3l,
+  same shape conventions as `load_std_atmosphere` — from the deep sounding: `T_in_K`= the T column for `T[K]` else
+  θ·exner, `sp_hmdty`=rt/(1+rt), `p_in_mb`=p/100, `o3l`=the ozone column). Drops straight into `build_rad_grid_setup`.
+- `clubb_driver.py`: at init, when `rad_scheme=='bugsrad'` and `l_use_default_std_atmosphere=.false.` and the ozone
+  file exists, precompute `state['_rad_ext_atm']` from the converted sounding + ozone. `Radiation/radiation.py`:
+  `ext = state.get('_rad_ext_atm') or load_std_atmosphere()` — uses the case atmosphere when present, else the
+  default. **Gated on the flag/ozone-file, so the 18 bit-faithful cases are byte-untouched** (dycoms2_rf01 BUGSrad +
+  arm smoke-tested clean).
+- Result: **cgils_s11 model-top radht bias dropped ~20×** (~1.4e-5 → ~7e-7 K/s at the top), and the whole case now
+  reaches **Tier-C PASS** (physical fidelity vs Fortran) — the full arc is rel ~1e3 (iter 88, pre-init-fix) → 1e-4
+  Tier-C-fail (iter 90) → **Tier-C PASS** (iter 92). The residual is now a small surface-level radht difference
+  (~5% at the lowest level, RMS 4.9e-7) — a separate, finer issue blocking strict bit-faithfulness. This radiation
+  fix is shared by all 12 CGILS/cloud_feedback cases (+ astex_a209, twp_ice).
+
+### 2026-06-04 — Completeness loop iter 91: root-cause the CGILS radht residual → radiation extended atmosphere
+
+- Continued the cgils_s11 investigation from iter 90 (the residual thlm forcing drift). `compare_runs` diagnostics:
+  **`exner` and `p_in_Pa` now PASS** (the iter-89/90 init fixes are confirmed correct), but **`radht` / `radht_LW`
+  / `radht_SW` FAIL** — radiative heating is the driver, not the LS forcing (`thlm_f = T_f/exner` matches; the rad
+  update schedule `mod(itime,3)==0 or itime==1` matches the Fortran).
+- Localized the radht difference to the **model-TOP levels** (not the cloud) — JAX over-cools there (-3.5e-5 vs
+  -2.1e-5 K/s). Root cause: cgils sets **`l_use_default_std_atmosphere = .false.`**, so the Fortran builds the
+  radiation extended atmosphere (T/q/p/o3 above the model top) from the case's **own deep sounding +
+  `{case}_ozone_sounding.in`** (`convert_snd2extended_atm`), whereas the JAX has **no handling of this flag** and
+  always uses the default US-standard atmosphere (`atmosphere.in`) + a hardcoded `5.4e-5/rho` ozone. Confirmed the
+  CGILS/cloud_feedback/astex/twp_ice cases ship ozone soundings while the gated BUGSrad cases (dycoms2, …) do not —
+  which is exactly why gated cases stay bit-faithful and cgils does not. This narrows the long-standing vague "CGILS
+  forcing reader diverges" note to a precise, additive, gated-case-safe fix target.
+- Code (verifiable, safe): (a) `advance_clubb_core_module.py` — guarded the nan-producing `rcm/cloud_frac`
+  diagnostic divide (`cf_safe = where(cf>min, cf, 1)`), removing a RuntimeWarning and a gradient-poisoning nan in
+  the unused branch (forward-identical); (b) `Radiation/radiation.py` — emit a one-time warning when
+  `l_use_default_std_atmosphere=.false.` so the radiation limitation is explicit instead of silently biased. arm
+  (gated) smoke-tested clean.
+- Next: port `convert_snd2extended_atm` (build the radiation extended atmosphere from the case sounding + ozone
+  sounding when `l_use_default_std_atmosphere=.false.`) to close the cgils radht residual.
+
+### 2026-06-04 — Completeness loop iters 89–90: CGILS init fix (Press[Pa]→z + T[K]→θ) — cgils_s11 rel 1e3 → near-Tier-C
+
+Unblocked the CGILS/cloud_feedback "100K init error" (12 cases) then the follow-on 69 K thlm error.
+- **iter 89** — `interpolate_sounding` used a `Press[Pa]` sounding's pressure column as a height coordinate. Added
+  `Input_fields/sounding.py:convert_pressure_sounding_to_z` (port of input_interpret.F90:read_z_profile pressure
+  branch): derives level altitudes hydrostatically from the sounding's own thermodynamics (`exner` → thlm/rcm/theta
+  → thvm → `inverse_hydrostatic`), composing the f2py-validated saturation/thvm/hydrostatic blocks. Wired into
+  `clubb_driver.py` gated on `alt_type=='Press[Pa]'` (z[m] cases byte-untouched). cgils_s11 now initializes + runs.
+  `tests/test_pressure_sounding_z.py` (round-trips bit-exact 0.0).
+- **iter 90** — `diagnose_divergence` then found thlm JUMP@step1 0→69 K: cgils's temperature column is absolute
+  `T[K]`, but the driver treated it as θ. Added the T→θ pre-conversion using the sounding's own pressure
+  (clubb_driver.F90:5499-5524), gated on `theta_type=='T[K]'`. **thlm now bit-exact at init/step1 (4.5e-13)**; the
+  case went rel ~1e3 → Tier-C nearly passing (residual root-caused to radiation in iters 91-92 and forcing in 97).
+
+### 2026-06-04 — Completeness loop iters 86–88: mirror_lower_triangular + new_hybrid driver + Ullrich remapping (bit-exact)
+
+All f2py-validated, pure-jnp, differentiable.
+- **iter 86** — `matrix_operations.py:mirror_lower_triangular_matrix` (symmetrize lower→upper, `tril(M)+tril(M,−1)ᵀ`),
+  f2py **0.0**. Plus a definitive f2py-vs-ported cross-check (all 210 wrappers vs every JAX def): the leaf-level
+  f2py-oracle'd surface is exhausted except the new_hybrid driver, false positives (already ported under other
+  names), and no-oracle subsystems (COAMPS/GFDL/SILHS).
+- **iter 87** — `new_hybrid_pdf_main.py`: the full new-hybrid PDF driver (`calc_F_w_zeta_w` + `calc_responder_driver`
+  + `new_hybrid_pdf_driver`, Griffin & Larson 2020), f2py end-to-end **1.15e-14** over all 31 outputs (the
+  implicit_coefs_terms output isn't f2py-exposed → omitted). **Completes every CLUBB two-component PDF closure**
+  (ADG1/ADG2/LY93/new-pdf/new-tsdadg/3-D-Luhar/new-hybrid). `tests/test_new_hybrid_pdf_main.py`.
+- **iter 88** — `remapping_module.py`: the Ullrich-linear conservative vertical grid-remap — `calc_mass_over_grid_
+  intervals` (the Fortran while-loop spline-mass reformulated as a differentiable cumulative-M) + `remapping_matrix`
+  (eq. 30) + matvec + `remap_vals_to_target[_same_grid]`. f2py same-grid **0.0** (both variable branches) + analytic
+  mass-integral / conservation unit checks. (PPM method 2 added iter 95.) `tests/test_remapping_module.py`.
+
+### 2026-06-03 — Completeness loop iters 81–85: bit-exact PDF/util leaf ports (condensed)
+
+All f2py-validated, pure-jnp, differentiable. Tests: one `tests/test_*.py` per item.
+- **iter 81** — `Luhar_3D_pdf_driver` + `backsolve_Luhar_params` (cubic branch) → `adg1_adg2_3d_luhar_pdf.py`;
+  completes the 3-D Luhar PDF (max-|Sk| sets the PDF, the other two backsolve m via `max_cubic_root`). f2py
+  end-to-end **2.40e-14** (13 outputs, all 3 setter branches; also exercises the iter-71 cubic_solve fix).
+- **iter 82** — `ADG2_pdf_driver` (w from the Luhar closure, rt/thl as ADG responders) → same module; f2py
+  **1.33e-15** (16 outputs). With this, **all CLUBB two-component PDF drivers are ported** (ADG1/ADG2/LY93/
+  new-pdf/new-TSDADG/3-D-Luhar).
+- **iter 83** — `sponge_damp_xp2` (`max((1−dt/τ)²·xp2, x_tol_sqd)`) + `sponge_damp_xp3` (`(1−dt/τ)³·xp3`) →
+  `sponge_layer_damping.py`, completing the sponge family. f2py **0.0** (exact).
+- **iter 84** — Godunov-upwind `xpyp_term_ta_pdf_{lhs,rhs}_godunov` → `diffusion.py` (uses `invrs_dzm` + a
+  flux-split stencil), completing the TA-term family (centered+upwind+Godunov). f2py **0.0** (exact).
+- **iter 85** — new-hybrid (G&L 2020) `calculate_w_params` + `calculate_responder_params` (responder uses
+  `<w'x'>`/`<w'^2>` explicitly) → `new_pdf.py`. f2py **1.2e-14 / 7.1e-15**.
+
+### 2026-06-03 — Completeness loop iters 71–80: new-hybrid/TSDADG/Luhar PDFs end-to-end + cubic_solve bug fix
+
+Ported and oracle-validated CLUBB's remaining alternative two-component PDF closures — the most complex,
+multi-routine subsystems left — and fixed a real cubic_solve correctness bug found along the way. All bit-exact
+or near-machine-precision vs f2py and differentiable; new/extended test file per item.
+- **iter 71 — FIX `cubic_solve`** (`calc_roots.py`): the principal-branch complex `**(1/3)` returned *garbage*
+  for negative-real Cardano args (D>0, R<0); new `_cardano_cbrt` uses the real sign-preserving cube root for
+  real args (matching gfortran). Roots now satisfy the cubic to ~1e-16. Also fixed `test_calc_roots`'s
+  silently-SKIPping f2py oracle. Ported `sort_roots` + `calc_limits_F_x_responder` (**f2py 6.7e-16**).
+- **iters 72–74 — new_tsdadg PDF** fully ported (`new_tsdadg_pdf.py`): `calc_L_x_Skx_fnc`,
+  `calc_setter_parameters`, `calc_responder_parameters`, `tsdadg_pdf_driver` — **f2py end-to-end 1.07e-14**
+  across all 3 setter branches. `tests/test_new_tsdadg_pdf.py`.
+- **iters 75–76 — semi-implicit coefs** (`new_pdf.py`): `calc_coefs_{wp2xp,wpxp2,wpxpyp}_semiimpl` (**f2py
+  ≤1.3e-15**). Adversarial find: two routines named `calc_coefs_wpxpyp_semiimpl` (9-arg new_hybrid vs 17-arg
+  new_pdf); the f2py wraps the new_pdf three-factor one. `tests/test_coefs_semiimpl.py`.
+- **iters 77–78 — new-hybrid PDF** fully ported (`new_pdf_main.py`): `calc_F_x_zeta_x_setter`,
+  `calc_F_x_responder`, `calc_responder_var`, and `new_pdf_driver` — **f2py end-to-end 2.66e-15** over the 15
+  PDF-param outputs (incl. clipped Skrt/Skthl). The most complex alternative closure. `tests/test_new_pdf_main.py`.
+- **iters 79–80 — Luhar 3D PDF** building blocks (`adg1_adg2_3d_luhar_pdf.py`): `close_Luhar_pdf` (**f2py
+  4.4e-16**) and `max_cubic_root` (largest real cubic root via the fixed cubic_solve; root-property + np.roots
+  oracle). `tests/test_close_luhar_pdf.py`, `tests/test_max_cubic_root.py`. The Luhar_3D_pdf_driver +
+  backsolve_Luhar_params remain.
+
+These alternative PDFs are not used by the gated ADG1 config (completeness, not gated fidelity). CHANGELOG
+compressed at this iter-80 checkpoint.
+
+### 2026-06-03 — Completeness loop iters 61–70: alternative-PDF closures ported + clip/smooth-Heaviside validation
+
+Ported the alternative two-component PDF closures CLUBB offers besides ADG1 (gated config uses ADG1, so these
+are completeness ports), and finished f2py-validating the clip family. All bit-exact / near-machine-precision vs
+f2py and differentiable; new test file per item.
+- **iter 61** — `clip_skewness` f2py test (sharp branch bit-exact; smooth-Heaviside branch 2.9e-10), completing
+  the clip family (covar/variance/skewness). `tests/test_clip_skewness.py`.
+- **iter 62** — root-caused that residual: `smooth_heaviside_peskin` uses full-pi in JAX vs Fortran's TRUNCATED
+  `pi=3.141592654`/`invrs_pi` literals — JAX is *more accurate* (the truncated-const closed form reproduces
+  f2py to 1.1e-16). `tests/test_smooth_heaviside.py`.
+- **iters 63–64, 68–69** — `new_pdf.py` (Griffin & Larson 2018/2020): the implicit-coef set
+  `calc_coef_{wp4,wpxp2,wp2xp}_implicit`, `calc_mixture_fraction`, `calc_setter_var_params`,
+  `calc_responder_params`, + the `new_hybrid_pdf` cross-module aliases (`calculate_*`). **f2py ~1e-15**.
+  `tests/test_new_pdf.py`/`test_setter_var_params.py`/`test_responder_params.py`.
+- **iters 65–66** — `LY93_pdf.py` (Lewellen & Yoh 1993): `calc_params_LY93` + `calc_mixt_frac_LY93`
+  (frozen-bisection) + `LY93_driver`; **f2py ≤1.3e-15** end-to-end + moment reconstruction (mean/variance/
+  skewness). Module fully ported. `tests/test_ly93_pdf.py`.
+- **iter 67** — `calc_Luhar_params` (ADG Luhar closure, Larson/Golaz/Cotton 2002): **f2py 1.8e-15**.
+  `tests/test_luhar_params.py`.
+- **iter 70** — new `new_tsdadg_pdf.py` `calc_L_x_Skx_fnc` (skewness-dependent spread, swap-on-sign): **f2py
+  1.1e-16** (scalar wrapper). `tests/test_new_tsdadg_pdf.py`.
+
+Adversarial finds this run: the truncated-pi accuracy difference (iter 62); LY93/responder **negative component
+variances** are a known feature (moment identities verified with signed variances); and the scalar f2py wrapper
+for calc_L_x_Skx_fnc (iter 70). CHANGELOG compressed at this iter-70 checkpoint.
+
+### 2026-06-03 — Completeness loop iters 51–60: PDF-closure ports + f2py-validation gap-closure (bit-exact)
+
+A run split between (a) porting clean closed-form PDF/closure routines and (b) the iter-51 insight that *an
+untested port is not a tested port* — adding f2py bit-shadow tests to ported, gated-relevant routines that
+lacked one. Nearly all **f2py bit-exact** (0.0–1e-14), all differentiable; new test file per item.
+- **iter 51** — validated `rcm_sat_adj_jax` (frozen-bisection saturation adjustment, already ported) vs f2py:
+  **bit-match 3.5e-17**. `tests/test_rcm_sat_adj.py`.
+- **iters 52–53** — new `CLUBB_core/new_pdf.py` (iiPDF_new_hybrid, Griffin & Larson 2018):
+  `calc_coef_wp4_implicit`, `calc_coef_wpxp2_implicit` (both **f2py ~1e-15**, two-branch), `calc_mixture_fraction`
+  (literal/analytic). `tests/test_new_pdf.py`.
+- **iter 54** — the four binormal/trinormal moment integrals `calc_{wp4,wp2xp,wpxp2,wpxpyp}_pdf`
+  (pdf_closure → adg1_adg2_3d_luhar_pdf.py): **f2py 3.6e-15** + Monte-Carlo. `tests/test_pdf_moment_integrals.py`.
+- **iter 55** — f2py tests for `calculate_thvm` (5.7e-14) and `skx_func` (4.3e-14).
+- **iter 56** — extracted `compute_gamma_Skw_jax` (Gaussian-in-Skw γ; previously inline-only) as a vectorized
+  standalone: **f2py 5.6e-17**. `tests/test_compute_gamma_skw.py`.
+- **iter 57** — f2py test for `compute_sigma_sqd_w` (per-timestep PDF width): **bit-exact 0.0**.
+- **iter 58** — f2py test for `calculate_spurious_source` (budget-closure diagnostic): **3.6e-15**.
+- **iters 59–60** — f2py tests for the clipping family `clip_covar` and `clip_variance` (established their clip
+  values are solve_type/dt-independent): both **bit-exact 0.0**. `tests/test_clip_covar.py`,
+  `tests/test_clip_variance.py`.
+
+These are gated-relevant (PDF-closure moments, sigma_sqd_w, gamma_Skw, clipping) except the new_pdf hybrid set
+(alternative PDF). CHANGELOG compressed at this iter-60 checkpoint (iters 51–60 condensed here).
+
+### 2026-06-03 — Completeness loop iters 41–50: SILHS/PDF Cholesky + utility/interpolation routines (bit-exact)
+
+A run of self-contained, oracle-backed ports — most **f2py bit-exact** (matching the compiled Fortran to
+machine precision), all differentiable. New tests per item.
+- **iter 41 — `matrix_operations.cholesky_factor`** (new `CLUBB_core/matrix_operations.py`): LAPACK-style
+  equilibration + lower-Cholesky + τ-on-diagonal fallback for non-PD inputs; **f2py bit-match 1.1e-16**.
+  `tests/test_cholesky_factor.py`.
+- **iter 42 — `calc_corr_norm_and_cholesky_factor`** (setup_clubb_pdf_params): the "two unique arrays"
+  prescribed-corr + Cholesky path (ADG zeroing / Ncn override / eta-hm product), rc-selected; reconstruction
+  `L Lᵀ==corr`. `tests/test_calc_corr_norm_cholesky.py`.
+- **iter 43 — `calc_cholesky_corr_mtx_approx`** + `setup_corr_cholesky_mtx` + `cholesky_to_corr_mtx_approx`
+  (diagnose_correlations_module, Larson-2011 angle Cholesky `s=√(1−c²)`): **f2py bit-match 2.2e-16**.
+  `tests/test_cholesky_corr_mtx_approx.py`.
+- **iter 44 — `calc_comp_corrs_binormal` + `smooth_corr_quotient`** (pdf_utilities): binormal component
+  correlation from `<x'y'>`, |corr|≤0.99 bounded; **f2py bit-match 4.4e-16** + round-trip.
+  `tests/test_calc_comp_corrs_binormal.py`.
+- **iter 45 — `compute_variance_binormal`** (pdf_utilities, f2py 8.9e-16 + Monte-Carlo) + **new
+  `CLUBB_core/interpolation.py`** with `lin_interpolate_two_points` + `mono_cubic_interp` (Steffen 1990,
+  **f2py 4.4e-16**). `tests/test_binormal_moments.py`, `tests/test_interpolation.py`.
+- **iter 46 — `linear_interp_factor` + `zlinterp_fnc`** (interpolation.py): vertical linear interp with
+  zero-fill (= `jnp.interp`); literal binary_search transcription oracle.
+- **iter 47 — `calc_w_up_in_cloud`** (pdf_closure_module → adg1_adg2_3d_luhar_pdf.py): cloudy updraft/downdraft
+  velocity from the binormal w-PDF; f2py match 1.3e-11 (erf-implementation-limited). `tests/test_w_up_in_cloud.py`.
+- **iter 48 — `smooth_min_jax` + `calc_xpwp`** (advance_helper_module): smooth-min primitive + down-gradient
+  eddy flux; **f2py bit-exact 0.0**. `tests/test_advance_helper_extras.py`.
+- **iter 49 — `pvertinterp`** (advance_helper_module): pressure-coordinate interpolation with clamping;
+  **f2py bit-exact 0.0**. `tests/test_pvertinterp.py`.
+- **iter 50 — `update_xp2_mc`** (new `CLUBB_core/update_xp2_mc.py`): rain-evaporation tendencies of the five
+  second moments (Morrison `l_morr_xp2_mc`, default-off), top-down precip-frac fill + zt2zm; bit-exact vs
+  literal-NumPy transcription. `tests/test_update_xp2_mc.py`.
+
+Scope: all are genuine unported Fortran routines; the PDF/Cholesky set (41–44) is SILHS-facing (the gated KK
+driver uses prescribed constant correlations, so they add tested-completeness, not gated-case fidelity), the
+rest are utility/diagnostic. CHANGELOG compressed at this iter-50 checkpoint (iters 41–50 condensed here).
+
+### 2026-06-03 — Completeness loop iters 36–40: full hydrometeor PDF-correlation pipeline (setup_clubb_pdf_params)
+
+Ported the entire normal→real-space PDF correlation machinery for the hydrometeor microphysics PDF into
+`clubb_jax/src/CLUBB_core/setup_clubb_pdf_params.py`, each piece validated and differentiable:
+- **iter 36 — `calc_corr_w_hm_n`** (F90:3428): diagnoses the w–ln(hm) component correlation from the overall
+  `<w'hm'>` flux (4-way branch on which components vary, ±max_mag_correlation clamp). Strongest oracle is a
+  **round-trip** (the routine inverts the flux assembly): recover corr to 4.7e-15 over 200 configs;
+  + literal-NumPy branch transcription, clamp, finite grad. `tests/test_calc_corr_w_hm_n.py`.
+- **iters 37–38 — the six `component_corr_*` routines** (F90:2448–2939): w_x (ADG-zero / cloud-below), chi_eta
+  (cloud-below + optional ±max_mag_correlation Cholesky clamp), and the four `*_ip` (w_hm passthrough/cloud-
+  below, x_hm, hmx_hmy, eta_hm product). Literal-NumPy oracle over an rc grid straddling rc_tol; all branches
+  exercised; eta-product grad exact. `tests/test_component_corr_ip.py`.
+- **iter 39 — `comp_corr_norm`** (F90:1273): assembles the two lower-triangular, then symmetrized,
+  `(ngrdcol,nzt,pdf_dim,pdf_dim)` normal-space correlation arrays from all the above. Oracle: structural
+  invariants (symmetric, unit diagonal, |corr|≤1) + spot-checks of every assembly rule against the building
+  blocks + ADG / l_calc_w_corr branches + finite grad. `tests/test_comp_corr_norm.py`. Adversarial-review
+  finding replicated faithfully: the non-fixed eta–w block (F90:1560) re-writes (w,chi) instead of (w,eta).
+- **iter 40 — `denorm_transform_corr`** (F90:3208): transforms the normal-space arrays to real space — normal
+  pairs unchanged, normal–lognormal via `corr_NN2NL`, lognormal–lognormal via `corr_NN2LL` (both already in
+  `pdf_utilities.py`). Oracle: structure + every entry vs direct NN2NL/NN2LL calls + finite grad.
+  `tests/test_denorm_transform_corr.py`. Faithful to the Fortran quirk that component-2 Ncn transforms reuse
+  the component-1 Ncn variance ratio (Ncn is inherently in-cloud).
+
+Net: the in-JAX path from PDF moments → assembled normal-space corr array → real-space corr array is now
+complete and oracle-tested. Honest scope: this pipeline feeds `pdf_hydromet_microphys_wrapper`, whose payoff
+(wp2hmp/rtphmp/thlphmp) is zero for all 20 gated cases, so it adds tested-completeness, not gated-case fidelity.
+The remaining wrapper glue (assembling these calls end-to-end with the hydromet mixed-moment integrals) is the
+last piece. CHANGELOG compressed at this iter-40 checkpoint (iters 36–40 condensed into this block).
+
+
+### 2026-06-03 — Completeness loop iter 35: whole-driver differentiability gate re-confirmed after the forcing changes
+
+- **Re-ran the whole-driver differentiability gate** (`compare_grad.py`) — the "differentiable" half of the
+  project goal, not re-verified since the iters 23-25 forcing-reader/inverse_hydrostatic changes. Result on a
+  representative span (arm, bomex, gabls3_night, clex9_nov02): **grad-finite 4/4**; arm/bomex/gabls3_night are
+  FD-correct (COMPLETE, worst-FD ~6.5e-7); clex9_nov02 is grad-finite with its known FD kink at the
+  Morrison/saturation thresholds (expected — its forcing path is height-coordinate, untouched by my changes).
+  **Differentiability gate: PASS.**
+- Together with iters 31-34 (faithfulness regression-free across all case types + arm bit-faithful at 100 steps),
+  **both halves of the goal — differentiable AND faithful — are confirmed intact** after 35 iterations of changes.
+- Assessed the GFDL lookup core's `ghquad` (Gauss-Hermite nodes): it is hardcoded data tables for fixed n — pure
+  data transcription, not physics — reinforcing that the ➖ `SCM_Activation` subsystem (no case exercises it) is
+  correctly out of scope and the CLUBB-side boundary I ported is the right one.
+- **Status:** the in-scope port is complete, differentiable, and faithful (verified). No physics change.
+
+### 2026-06-03 — Completeness loop iter 34: benchmark-case routines all-ported confirmed + durability gate + final-state doc
+
+- **Confirmed all 7 unported benchmark-case `.F90` files have ALL their subroutines ported:** each of arm_97 /
+  twp_ice / cloud_feedback / arm_3year / arm_0003 has exactly ONE subroutine (its `_sfclyr`, all ported); lba and
+  mpace_b have their tndcy+sfclyr (both ported). The case files stay ❌ only because the cases can't RUN
+  end-to-end (SILHS/COAMPS/data/Morrison), NOT from unported routines. So only **3 files have genuinely-unported
+  routines**, all impractical/out-of-scope/no-payoff (coamps no-oracle, gfdl lookup ➖-subsystem, pdf_hydromet
+  no-payoff).
+- **Durability gate (the strongest remaining validation):** ran `compare_runs arm --max-iters 100` — **bit-faithful
+  + Tier-C PASS at 100 steps** → the iters 23-25 forcing-reader changes have no late-activating regression.
+- **DESIGN.md:** added a "Completeness loop — final state (Iters 1–33)" assessment documenting that the
+  differentiable+faithful JAX port is complete for all tractable/in-scope code, with the precise justification for
+  the 3 impractical/out-of-scope remainders.
+- **Status:** the in-scope/achievable port surface is complete and durably verified. No physics change. Counts unchanged.
+
+### 2026-06-03 — Completeness loop iter 33: full regression confirmation across case types + GFDL-core scope assessment
+
+- **Closed the last regression-verification gap:** the iter-23 `clubb_driver` change (passing `p_in_Pa` to the
+  generic forcing loader) runs at init for ALL generic cases, but only the *forcing* cases were verified (iter 32).
+  Ran the gate on the non-forcing generic cases — **bomex, dycoms2_rf01, atex, fire, ekman, cobra all PASS the bit
+  gate (0 prognostic failures)**. Together with iter 32 (arm/jun25_altocu/gabls3_night bit-faithful, mpace_a
+  physical-tier, clex9 from iter 24), **10 of the 20 gated cases are now directly re-verified across every type**
+  (forcing-pipeline, sounding, analytic-forcing, cloud-sed, Morrison) → the cumulative changes from 33 iterations
+  are confirmed regression-free.
+- **Assessed the GFDL activation lookup core** (the one piece I'd called "external/impractical"): it actually
+  lives in the repo (`Microphys/SCM_Activation/aer_ccn_act_k.F90`, 959 lines, + droplets*.dat), but it is a large
+  ➖-classified subsystem (Gauss-Hermite quadrature + Köhler-theory activation + 5-D lookup, single-precision, no
+  case exercises it / no oracle) — confirming the CLUBB-side orchestration (erff/updraft/ndrop, ported) is the
+  correct boundary; the lookup core stays out of scope.
+- **Status:** the port's tractable/in-scope surface is complete and verified regression-free; the genuinely
+  remaining files (COAMPS no-oracle monolith, GFDL/COAMPS lookup subsystems, SILHS RNG, the deferred pdf_hydromet
+  wiring) are impractical or out-of-scope. No physics change. Counts unchanged.
+
+### 2026-06-03 — Completeness loop iter 32: bit-faithful gate regression-confirmed for the forcing changes + T_f apply unit test
+
+- **Definitive regression check of the iters 23-24 forcing-pipeline changes:** ran `compare_cases.py` on the
+  gated cases that use the generic time-dependent forcing pipeline I modified — **arm, jun25_altocu, gabls3_night
+  all PASS the bit gate (0 prognostic failures)** → the pressure-coordinate / T_f / um_ref additions are confirmed
+  regression-free. (mpace_a "fails" the *bit* tier with its known single-precision Morrison `thlm_mc` residual but
+  PASSES the *physical* tier — worst 2.5e-4, its gate; and it uses the special `load_mpace_a_forcings` path I did
+  not touch, so it is doubly unaffected.)
+- **Added a direct unit test for the T_f apply-step branch** (`tests/test_pressure_coord_forcing.py:
+  test_apply_T_f_conversion`) — constructs a minimal state and verifies `_apply_time_dependent_forcings` sets
+  `thlm_forcing = T_f/exner` (with the top zeroed). This is the only forcing branch no gated case exercises, so it
+  had no direct coverage before; now the iter-23/24 absolute-temperature-forcing conversion is unit-tested exactly.
+- **Status:** all four affected gated cases verified (3 bit-faithful, mpace_a physical-tier); the forcing-reader
+  additions are now covered end-to-end (parser + apply). No physics change. Counts unchanged.
+
+### 2026-06-03 — Completeness loop iter 31: cumulative-regression sweep — fixed a test-infrastructure shadowing bug
+
+- **Validation sweep across all 30 iterations of additions** (especially the iters 23-24 shared forcing-pipeline
+  edits): re-ran the completeness/port test files. The CGILS forcing changes are confirmed regression-free
+  (clex9 bit-faithful; all 19 recent + foundational test files pass).
+- **Fixed a real test-infrastructure bug** the sweep surfaced: `test_pos_definite.py` + `test_diagnose_correlations.py`
+  (the iter-2/3 f2py-oracle tests) prepended `clubb_release/` to `sys.path` BEFORE `_ROOT`, so `import clubb_jax`
+  resolved to the shadowing `clubb_release/clubb_jax/` (no `src`) → `ModuleNotFoundError` when run standalone.
+  Fixed to keep `_ROOT` first and APPEND the clubb_release/f2py paths (same fix as iter-6's test_ice_dfsn). Both
+  now run their bit-exact f2py-oracle comparisons (rel 0 / 1.6e-15) standalone again. Scanned the rest of the
+  suite — no other test has the pattern.
+- **Feasibility-checked the deferred `pdf_hydromet_microphys_wrapper` wiring** (the only remaining integration):
+  confirmed it needs the full `hydromet_pdf_params` correlation structure (corr_chi_hm/eta_hm/w_hm_n/hmx_hmy),
+  which the JAX setup does NOT produce — wiring it requires porting more of setup_pdf_parameters' correlation
+  processing (major, invasive, oracle-limited, no gateable payoff). Deferral firmly justified.
+- **Status:** test suite green after the fix; no physics change. Counts unchanged.
+
+### 2026-06-03 — Completeness loop iter 30: GFDL `aer_act_clubb_ndrop` (activation orchestration complete); CHANGELOG compressed
+
+- **Ported `aer_act_clubb_ndrop`** (`Microphys/gfdl_activation.py`) — the layer-averaged activated droplet
+  concentration `Ndrop = (drop_1 P1 + drop_2 P2)(mixt_frac cloud_frac_1 + (1-mixt_frac) cloud_frac_2)`, combining
+  the per-component lookup-table droplet concentrations (caller-supplied) with the iter-20 updraft weights.
+  This **completes the CLUBB-side orchestration of GFDL droplet activation** (erff + updraft_weights + Ndrop);
+  only the external-data `aer_ccn_act_wpdf_k` lookup table itself remains (impractical).
+- **Validation (`tests/test_gfdl_activation.py`)** — `aer_act_clubb_ndrop` vs literal (<1e-6), no-cloud→0,
+  non-negativity, finite grad.
+- **CHANGELOG compression (10-iteration cadence):** condensed completeness-loop iters 17–26 into one summary
+  block; iters 27–30 kept in full.
+
+### 2026-06-03 — Completeness loop iter 29: arm_3year/arm_0003 surface schemes + pdf_hydromet wiring diagnosis
+
+- **Ported `arm_3year_sfclyr` + `arm_0003_sfclyr`** (→ arm_3year.py, arm_0003.py) — both algebraically identical
+  to `arm_97_sfclyr` (prescribed heat fluxes → kinematic + MOST diag_ustar); reuse the validated implementation,
+  verified equal in the test. **Every benchmark case file now has its surface scheme ported.** Both cases stay
+  unviable (arm_0003 COAMPS-fatal in the Fortran; arm_3year forcings data removed → no oracle).
+- **Diagnostic finding (adversarial review of the KK/Morrison path):** the JAX **stubs `wp2hmp`/`rtphmp_zt`/
+  `thlphmp_zt` to ZERO** (clubb_driver.py:792) — the iter-13 `hydrometeor_mixed_moments` port exists and is
+  unit-tested but is **NOT wired** into the running path; `pdf_hydromet_microphys_wrapper` (still ❌) is the
+  missing orchestration that would call it to compute the nonzero water-loading second moments. Wiring it would
+  change the KK/Morrison cases (rico/dycoms2_rf02_do/ds) — which are already oracle-limited — and requires a
+  PDF-struct→dict adapter, so it is deliberately deferred (invasive, no gateable payoff). Recorded so the gap is
+  explicit.
+- **Status:** all benchmark-case surface schemes ported (cases remain SILHS/COAMPS/data blocked). Counts unchanged.
+
+### 2026-06-03 — Completeness loop iter 28: three SILHS-blocked surface schemes (mpace_b/arm_97/twp_ice)
+
+- **Ported the surface schemes of three SILHS-blocked cases:**
+  - `mpace_b_sfclyr` (→ mpace_b.py): prescribed (time-interpolated) sensible/latent heat fluxes → kinematic
+    (`/(ρCp)`, `/(ρLv)`), fixed ustar = 0.25. **mpace_b.F90 now fully ported** (tndcy + sfclyr).
+  - `arm_97_sfclyr` (→ new arm_97.py): same kinematic conversion + the MOST `diag_ustar` (z0=0.035).
+  - `twp_ice_sfclyr` (→ new twp_ice.py): the RICO drag law, **algebraically identical to `cloud_feedback_sfclyr`**
+    (iter 22) — reuses that validated implementation, verified equal.
+- **Validation (`tests/test_silhs_surface_schemes.py`)** — each bit-exact vs a literal NumPy transcription
+  (mpace_b exact, arm_97 max diff 5.6e-17 incl. the MOST ustar); twp_ice verified == cloud_feedback_sfclyr; finite
+  `jax.grad`. These take the time-interpolated forcing as input (decoupling the time-dependent-data reader).
+- **Status:** mpace_b.F90 fully ported; arm_97.F90 + twp_ice.F90 surface schemes ported. All three CASES remain
+  SILHS-blocked (➖ out-of-scope subsystem). Counts unchanged.
+
+### 2026-06-03 — Completeness loop iter 27: M-PACE B LS forcing `mpace_b_tndcy` + LBA `lba_tndcy` (lba.F90 complete)
+
+- **Ported `mpace_b_tndcy`** (`Benchmark_cases/mpace_b.F90` → `Benchmark_cases/mpace_b.py`) — the M-PACE B Arctic
+  mixed-phase large-scale forcing: a divergence-driven subsidence `ω = min(D(p_sfc−p), D(p_sfc−pinv))` capped
+  above the inversion → `wm = −ω Rd thvm/(p g)` (zt2zm with zero BCs), an analytic radiative-cooling thlm
+  tendency (capped at −4 K/day, with the exner factor) and a moisture tendency, all functions of pressure.
+  Differentiable.
+- **Ported `lba_tndcy`** (zero LS forcing — LBA deep convection is surface-driven) → **lba.F90 both subroutines
+  now ported** (sfclyr iter 26 + tndcy).
+- **Validation (`tests/test_mpace_b_lba_tndcy.py`)** — `mpace_b_tndcy` bit-exact vs a literal NumPy transcription
+  (all 4 outputs, rel <1e-12) + physical invariants (subsidence wm_zt ≤ 0, wm_zm surface/top BCs = 0, cooling
+  thlm_forcing < 0) + finite `jax.grad`; `lba_tndcy` identically zero.
+- **Status:** lba.F90 routines all ported (case SILHS-blocked); mpace_b.F90 PARTIAL (tndcy ported, sfclyr remains).
+  Counts unchanged.
+
+### 2026-06-03 — Completeness loop iters 17–26 (condensed): finishing the strong-oracle frontier + CGILS plumbing
+
+Ten iterations that completed the remaining well-oracled subsystems and the CGILS/blocked-case input plumbing
+(full per-iter detail in git history). All differentiable, each oracle-validated.
+
+- **iter 17 — completed `PDF_integrals_all_MM.F90` (8/8) → ✅:** the quadrivar const reductions; the whole KK
+  all-mixed-moment D_v machinery is now ported (validated by analytic base cases + complex-branch Monte-Carlo).
+- **iters 18-19 — completed `Radiation/BUGSrad/cloud_correlate.F90` (2/2):** `bugs_ctot` (cloud-overlap total
+  cloud amount, the cld_below recurrence as a cumprod, bit-faithful vs literal) + `bugs_cloudfit` (maximal/random
+  split, grid-search). **`Radiation/` now fully ported.**
+- **iter 20 — GFDL `erff` + `updraft_weights`** (CLUBB-side activation; erff vs math.erf <1e-6; updraft weights
+  vs literal incl. a faithfully-reproduced Fortran normalization quirk).
+- **iter 21 — LBA prescribed radiation `simple_rad_lba`** (33×36 table interp, bit-exact on the real .dat) +
+  verified-characterization of the 7 remaining benchmark cases (all SILHS/COAMPS/data/Morrison-blocked).
+- **iter 22 — `cloud_feedback_sfclyr`** (CGILS RICO drag-law surface fluxes, shared by 12 cases).
+- **iters 23-24 — CGILS forcing-reader capability:** a `Press[Pa]` pressure-vertical-coordinate forcing path
+  (interpolate vs the model p_in_Pa), `T_f` absolute-temperature forcing (thlm_f=T_f/exner), and the time-dependent
+  `um_ref`/`vm_ref` nudging targets. Guarded so height-coordinate gated cases are byte-identical (clex9 stays
+  bit-faithful). Diagnosed cloud_feedback's residual divergence (Morrison-oracle-limited + a Press[Pa] SOUNDING).
+- **iter 25 — `inverse_hydrostatic`** (pressure-sounding altitudes via the log-mean hydrostatic integration);
+  the round-trip z→exner→z against the forward hydrostatic is exact (5.5e-12 m).
+- **iter 26 — LBA `lba_sfclyr`** (diurnal surface fluxes + MOST diag_ustar, bit-exact vs literal).
+
+Net: PDF_integrals_all_MM + cloud_correlate completed; Radiation fully ported; the CGILS pressure-coordinate
+forcing capability added (no regression); and the self-contained surface/forcing/sounding routines of the
+blocked cases ported with literal/analytic/round-trip oracles.
+
+### 2026-06-03 — Completeness loop iters 7–16 (condensed): KK PDF-integral mixed-moment machinery
+
+Ten iterations that ported the entire KK hydrometeor mixed-moment / covariance machinery (full per-iter detail
+in git history). Each function is differentiable and oracle-validated.
+
+- **iter 7 — `CLUBB_core/hydromet_pdf_parameter_module.F90`** → dataclasses + zero/init; **CLUBB_core fully ported**.
+- **iter 8 — +2 bit-faithful cases (clex9_nov02/oct14, gate 18→20).** Root-caused a pre-activation Ncm/Nc_in_cloud
+  diagnostic mismatch (Morrison `advance_microphys` early-returns before its stat writes during spin-up) + fixed a
+  `compare_runs.py` rel-masking integrity bug. Verified physics-neutral.
+- **iter 9 — namelist scalar-`sclr_tol_nl` parse fix** (unblocks astex_a209 → runs but KK-limited; reclassified
+  🔁) + ported the foundational closed-form moment integrals `univar_N`/`univar_L` of
+  `Microphys/mixed_moment_PDF_integrals.F90` (vs binomial expansion <1e-12 + MC).
+- **iters 10-13 — completed `mixed_moment_PDF_integrals.F90` (8/8) → ✅:** `bivar_NL` (tilting decomposition),
+  the `<x'^a hm'^b>` assembly (`bivar_NL_x_hm_all_MM_comp_eq` 4-branch jnp.where + `xp_a_hmpb`), the streamlined
+  covariances (`xphmp`/`hmxphmyp`), and the top driver `hydrometeor_mixed_moments` (vectorized over levels, vs a
+  literal Fortran-loop transcription <1e-12). Added `compute_mean_binormal` to pdf_utilities. Validated by
+  closed-form/branch <1e-12 + 8-16M Monte-Carlo.
+- **iters 14-16 — started `PDF_integrals_all_MM.F90` (5/8):** the trivariate family `trivar_NNL_MM` + its 3 const
+  reductions (x2>0 half-line, parabolic-cylinder D_v), and the general quadrivariate `quadrivar_NNLL_MM` (x2<0
+  subsaturated). Validated by analytic base cases (a=b=0 → Φ(±μ_x2/σ_x2)) <1e-9, σ→0 limit consistency, and
+  truncated-domain Monte-Carlo (complex principal-branch for the x2<0 region) <5e-3. Reuses the existing accurate
+  `dv_parabolic_cylinder`/`_gamma_real`/`_signed_pow`. (Adversarial review here caught a mis-derived covar
+  identity — replaced with the complex-branch MC.)
+
+Net over iters 7–16: CLUBB_core completed; in-scope ported 113→118; mixed_moment_PDF_integrals fully ported;
+PDF_integrals_all_MM started; the bit-faithful gate grew 18→20.
+
+### 2026-06-03 — Completeness loop iters 1–6 (condensed): six unported-module ports, each oracle-validated
+
+Six self-contained Fortran modules ported to JAX, each with its own validation test (full per-iter details in
+git history; condensed here per the 10-iteration cadence). Each is differentiable (`jax.grad` finite).
+
+- **iter 1 — `CLUBB_core/calc_roots.F90`** → `calc_roots.py`: `cubic_solve` (Cardano, complex128 principal
+  branch), `quadratic_solve`, `cube_root`. `tests/test_calc_roots.py`: polynomial residual ~4e-16 at every root
+  across all discriminant signs + set-match vs `numpy.roots` (f2py not exposed → SKIP).
+- **iter 2 — `CLUBB_core/pos_definite_module.F90`** → `pos_definite_module.py`: `pos_definite_adj_jax`,
+  Smolarkiewicz (1989) flux-conservative positive-definite renormalization (ascending grid, vectorized).
+  `tests/test_pos_definite.py`: **BIT-EXACT vs `f2py_pos_definite_adj` (rel 0)** + conservation invariant.
+  Established the reusable f2py-oracle workflow (`clubb_api.setup_grid` with the JAX grid's own heights →
+  `clubb_f2py.f2py_<routine>`).
+- **iter 3 — `CLUBB_core/diagnose_correlations_module.F90`** → `diagnose_correlations_module.py`:
+  `diagnose_correlations` (Larson 2011 SILHS hydrometeor correlation diagnosis) + `calc_mean/varnce/w_corr`.
+  `tests/test_diagnose_correlations.py`: **bit-match vs `f2py_diagnose_correlations` (rel 1.6e-15)** incl.
+  iiPDF_w edge cases.
+- **iter 4 — `Microphys/KK_microphys/KK_local_means.F90`** → `KK_local_means.py`: the 4 grid-mean KK warm-rain
+  rates (evap/auto/accr/mvr). `tests/test_kk_local_means.py`: vs independent NumPy transcription (rel <1e-13) +
+  branch coverage. (f2py oracle exhausted for the remaining files from here on → analytic/MC oracles.)
+- **iter 5 — `Microphys/KK_microphys/KK_upscaled_variances.F90`** → `KK_upscaled_variances.py`: `variance_KK_mvr`
+  (variance of the KK rain mean-volume radius). `tests/test_kk_upscaled_variances.py`: two oracles — closed-form
+  lognormal moment (**rel 0**) + 4M-sample Monte-Carlo (**rel 1.4e-4**).
+- **iter 6 — `Microphys/ice_dfsn_module.F90`** → `ice_dfsn_module.py`: `ice_dfsn` (cloud-water depletion by ice
+  diffusional growth) as a top-to-bottom falling-crystal mass-integration `lax.scan`. `tests/test_ice_dfsn.py`:
+  vs literal NumPy loop (**rcm rel 1.2e-16**) + cap/branch coverage. New helper `thlm2T_in_K_jax` **bit-exact vs
+  `f2py_thlm2t_in_k_1d`**; added `Lf`/`Ls`/`cm_per_m` constants.
+
+Net over iters 1–6: in-scope ported 107→113, unported 23→17; `CLUBB_core/` reduced to 1 unported file.
+
 ### 2026-06-02 — Refactor iter 35: faithfulness reconciliation + completion-status synthesis
 
 - **Reconciled the two completion clauses against the suite:**
