@@ -690,6 +690,121 @@ def xpyp_term_ta_pdf_rhs_upwind_jax(
     return jnp.concatenate([zeros_bnd, rhs_int, zeros_bnd], axis=1)
 
 
+def xpyp_term_ta_pdf_lhs_godunov_jax(
+    coef_wpxpyp_implicit: jnp.ndarray,
+    invrs_rho_ds_zm: jnp.ndarray,
+    rho_ds_zm: jnp.ndarray,
+    gr,
+    grid_dir: float = 1.0,
+) -> jnp.ndarray:
+    """Godunov-like upwind LHS for turbulent advection of xp2/xpyp.
+
+    Faithful port of Fortran xpyp_term_ta_pdf_lhs_godunov (turbulent_adv_pdf.F90).
+    Unlike the centered/upwind variants this uses 1/dzm directly (gr%invrs_dzm) and a
+    flux-split upwind stencil keyed on the *sign of the implicit coef* itself.
+
+    For each interior k_py=1..nzm-2 (Fortran k=2..nzm-1), with gd = grid_dir:
+      super[k_py] = irho[k] * idzm[k] * rho[k+1] * gd * min(0, gd*coef_zt[k])
+      main[k_py]  = irho[k] * idzm[k] * rho[k]   * gd * ( max(0, gd*coef_zt[k])
+                                                          - min(0, gd*coef_zt[k-1]) )
+      sub[k_py]   = -irho[k] * idzm[k] * rho[k-1] * gd * max(0, gd*coef_zt[k-1])
+    where coef_zt[k]→coef[:,1:], coef_zt[k-1]→coef[:,:-1] (coef on zt levels).
+    Boundaries (k=0, k=nzm-1) are zero.
+
+    Args:
+        coef_wpxpyp_implicit: Coef. of <x'y'> in <w'x'y'> on zt levels, (ngrdcol, nzt).
+        invrs_rho_ds_zm:      1/rho_ds on zm levels, (ngrdcol, nzm).
+        rho_ds_zm:            Dry, static density on zm levels, (ngrdcol, nzm).
+        gr:                   Grid with .invrs_dzm (ngrdcol, nzm).
+        grid_dir:             +1 for ascending grid (default).
+
+    Returns:
+        lhs: shape (3, ngrdcol, nzm).  [0=super(kp1), 1=main(k), 2=sub(km1)].
+    """
+    gd = grid_dir
+    invrs_dzm = gr.invrs_dzm                 # (ngrdcol, nzm)
+    ngrdcol = rho_ds_zm.shape[0]
+
+    irho   = invrs_rho_ds_zm[:, 1:-1]        # (ngrdcol, nzm-2)
+    idzm   = invrs_dzm[:, 1:-1]
+    rho_k   = rho_ds_zm[:, 1:-1]
+    rho_kp1 = rho_ds_zm[:, 2:]
+    rho_km1 = rho_ds_zm[:, :-2]
+    coef_k   = coef_wpxpyp_implicit[:, 1:]   # Fortran coef(i,k),   k=2..nzm-1
+    coef_km1 = coef_wpxpyp_implicit[:, :-1]  # Fortran coef(i,k-1), k-1=1..nzm-2
+
+    zero = jnp.zeros_like(rho_k)
+    super_int = irho * idzm * rho_kp1 * gd * jnp.minimum(zero, gd * coef_k)
+    main_int  = irho * idzm * rho_k * gd * (
+        jnp.maximum(zero, gd * coef_k) - jnp.minimum(zero, gd * coef_km1))
+    sub_int   = -irho * idzm * rho_km1 * gd * jnp.maximum(zero, gd * coef_km1)
+
+    zeros_bnd = jnp.zeros((ngrdcol, 1), dtype=rho_ds_zm.dtype)
+    superdiag = jnp.concatenate([zeros_bnd, super_int, zeros_bnd], axis=1)
+    maindiag  = jnp.concatenate([zeros_bnd, main_int,  zeros_bnd], axis=1)
+    subdiag   = jnp.concatenate([zeros_bnd, sub_int,   zeros_bnd], axis=1)
+    return jnp.stack([superdiag, maindiag, subdiag], axis=0)
+
+
+def xpyp_term_ta_pdf_rhs_godunov_jax(
+    term_wpxpyp_explicit_zm: jnp.ndarray,
+    invrs_rho_ds_zm: jnp.ndarray,
+    sgn_turbulent_vel: jnp.ndarray,
+    rho_ds_zm: jnp.ndarray,
+    gr,
+    grid_dir: float = 1.0,
+) -> jnp.ndarray:
+    """Godunov-like upwind RHS for turbulent advection of xp2/xpyp.
+
+    Faithful port of Fortran xpyp_term_ta_pdf_rhs_godunov (turbulent_adv_pdf.F90).
+    The explicit term lives on zm levels here (unlike the centered RHS, which is on zt).
+
+    For each interior k_py=1..nzm-2 (Fortran k=2..nzm-1), with gd = grid_dir:
+      rhs[k] = -irho[k] * idzm[k] * gd * (
+                 min(0, gd*sgn[k])   * rho[k+1]*term[k+1]
+               + max(0, gd*sgn[k])   * rho[k]  *term[k]
+               - min(0, gd*sgn[k-1]) * rho[k]  *term[k]
+               - max(0, gd*sgn[k-1]) * rho[k-1]*term[k-1] )
+    where sgn[k]→sgn[:,1:], sgn[k-1]→sgn[:,:-1] (sgn on zt levels).
+    Boundaries (k=0, k=nzm-1) are zero.
+
+    Args:
+        term_wpxpyp_explicit_zm: Explicit <w'x'y'> term on zm levels, (ngrdcol, nzm).
+        invrs_rho_ds_zm:         1/rho_ds on zm levels, (ngrdcol, nzm).
+        sgn_turbulent_vel:       Sign of turbulent velocity on zt levels, (ngrdcol, nzt).
+        rho_ds_zm:               Dry, static density on zm levels, (ngrdcol, nzm).
+        gr:                      Grid with .invrs_dzm (ngrdcol, nzm).
+        grid_dir:                +1 for ascending grid (default).
+
+    Returns:
+        rhs: shape (ngrdcol, nzm).  Boundaries (k=0, k=nzm-1) are zero.
+    """
+    gd = grid_dir
+    invrs_dzm = gr.invrs_dzm
+    ngrdcol = rho_ds_zm.shape[0]
+
+    irho   = invrs_rho_ds_zm[:, 1:-1]
+    idzm   = invrs_dzm[:, 1:-1]
+    rho_k   = rho_ds_zm[:, 1:-1]
+    rho_kp1 = rho_ds_zm[:, 2:]
+    rho_km1 = rho_ds_zm[:, :-2]
+    term_k   = term_wpxpyp_explicit_zm[:, 1:-1]
+    term_kp1 = term_wpxpyp_explicit_zm[:, 2:]
+    term_km1 = term_wpxpyp_explicit_zm[:, :-2]
+    sgn_k   = sgn_turbulent_vel[:, 1:]       # Fortran sgn(i,k),   k=2..nzm-1
+    sgn_km1 = sgn_turbulent_vel[:, :-1]      # Fortran sgn(i,k-1), k-1=1..nzm-2
+
+    zero = jnp.zeros_like(rho_k)
+    rhs_int = -irho * idzm * gd * (
+        jnp.minimum(zero, gd * sgn_k)   * rho_kp1 * term_kp1
+        + jnp.maximum(zero, gd * sgn_k)   * rho_k * term_k
+        - jnp.minimum(zero, gd * sgn_km1) * rho_k * term_k
+        - jnp.maximum(zero, gd * sgn_km1) * rho_km1 * term_km1)
+
+    zeros_bnd = jnp.zeros((ngrdcol, 1), dtype=rho_ds_zm.dtype)
+    return jnp.concatenate([zeros_bnd, rhs_int, zeros_bnd], axis=1)
+
+
 __all__ = [
     "diffusion_zt_lhs_jax",
     "diffusion_zm_lhs_jax",
@@ -711,4 +826,6 @@ __all__ = [
     "xp2_xpyp_rhs",
     "xpyp_term_ta_pdf_lhs_upwind_jax",
     "xpyp_term_ta_pdf_rhs_upwind_jax",
+    "xpyp_term_ta_pdf_lhs_godunov_jax",
+    "xpyp_term_ta_pdf_rhs_godunov_jax",
 ]

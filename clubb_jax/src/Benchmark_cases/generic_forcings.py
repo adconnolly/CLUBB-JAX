@@ -254,18 +254,26 @@ def _apply_time_dependent_forcings(state: dict, time_current: float) -> None:
         return _time_interp(times, arr, time_current)  # (nzt,)
 
     thlm_f = _interp_col('thlm_f')
+    T_f    = _interp_col('T_f')          # absolute-temperature forcing (CGILS cases): thlm_f = T_f/exner
     rtm_f  = _interp_col('rtm_f')
     sp_hmdty_f = _interp_col('sp_hmdty_f')
     w_zt   = _interp_col('w')
     omega  = _interp_col('omega')
     um_f   = _interp_col('um_f')
     vm_f   = _interp_col('vm_f')
+    um_ref = _interp_col('um_ref')       # time-dependent u/v nudging targets (CGILS cases; l_uv_nudge)
+    vm_ref = _interp_col('vm_ref')
     ug_zt  = _interp_col('ug')
     vg_zt  = _interp_col('vg')
 
     if thlm_f is not None:
         state['thlm_forcing'][:, :] = thlm_f[np.newaxis, :]
         state['thlm_forcing'][:, -1] = 0.0  # zero at top (Fortran convention)
+    elif T_f is not None:
+        # Absolute-temperature forcing → thlm forcing: thlm_f = T_f / exner (time_dependent_input.F90:671).
+        exner = np.asarray(state['exner'], dtype=np.float64)
+        state['thlm_forcing'][:, :] = T_f[np.newaxis, :] / exner
+        state['thlm_forcing'][:, -1] = 0.0
     if rtm_f is not None:
         state['rtm_forcing'][:, :] = rtm_f[np.newaxis, :]
         state['rtm_forcing'][:, -1] = 0.0
@@ -301,6 +309,12 @@ def _apply_time_dependent_forcings(state: dict, time_current: float) -> None:
         state['um_forcing'][:, :] = um_f[np.newaxis, :]
     if vm_f is not None and 'vm_forcing' in state:
         state['vm_forcing'][:, :] = vm_f[np.newaxis, :]
+    # Time-dependent nudging targets (time_dependent_input.F90:762-776). Gated cases either don't nudge or
+    # have blank um_ref columns (→ _interp_col None), so this is a no-op for them.
+    if um_ref is not None and state.get('um_ref') is not None:
+        state['um_ref'][:, :] = um_ref[np.newaxis, :]
+    if vm_ref is not None and state.get('vm_ref') is not None:
+        state['vm_ref'][:, :] = vm_ref[np.newaxis, :]
     if ug_zt is not None and state.get('ug') is not None:
         state['ug'][:, :] = ug_zt[np.newaxis, :]
     if vg_zt is not None and state.get('vg') is not None:
@@ -1076,11 +1090,17 @@ def _fill_blanks_2d(z_grid: np.ndarray, time_grid: np.ndarray,
     return out
 
 
-def _parse_forcings_file(path: str, zt: np.ndarray) -> dict:
+def _parse_forcings_file(path: str, zt: np.ndarray, p_in_Pa: np.ndarray = None) -> dict:
     """Parse a {case}_forcings.in file. Same format as arm_forcings.in.
 
     Applies fill_blanks_two_dim_vars (port of Fortran) before interpolating
     to model grid, so -999.9 sentinel values are filled by interpolation.
+
+    The first column is the vertical coordinate, either height (`z[m]`/`Height[m]`) or pressure (`Press[Pa]`).
+    For a pressure coordinate the forcing is interpolated against the model pressure profile `p_in_Pa` (the
+    Fortran negates both so the interpolation runs on an ascending coordinate; np.interp only needs the SOURCE
+    ascending, which ascending pressure already is, so no negation is needed here). The height path is unchanged
+    when `p_in_Pa` is None or the coordinate is height — so every height-coordinate (gated) case is byte-identical.
     """
     nzt = zt.shape[0]
     with open(path) as fh:
@@ -1088,7 +1108,12 @@ def _parse_forcings_file(path: str, zt: np.ndarray) -> dict:
     if not lines:
         return {}
 
-    col_names = [c.strip("'\"") for c in lines[0].split()][1:]  # skip z[m]
+    first_tokens = lines[0].split()
+    vcoord_name = first_tokens[0].strip("'\"").split('[')[0].strip().lower()
+    l_pressure_coord = vcoord_name in ('press', 'pressure')
+    # Target coordinate for the final interpolation: model pressure (Pa) for a pressure file, else height (zt).
+    target_coord = np.asarray(p_in_Pa) if (l_pressure_coord and p_in_Pa is not None) else zt
+    col_names = [c.strip("'\"") for c in first_tokens][1:]  # skip the vertical-coordinate column
 
     raw_times, raw_z, raw_data = [], [], {n: [] for n in col_names}
     i = 1
@@ -1145,9 +1170,15 @@ def _parse_forcings_file(path: str, zt: np.ndarray) -> dict:
                 arr[:, it] = 0.0
             else:
                 valid = col > _BLANK
-                arr[:, it] = np.interp(zt, all_z[valid], col[valid],
-                                       left=float(col[valid][0]),
-                                       right=float(col[valid][-1]))
+                # Interpolate to the model grid: against height (zt) or model pressure (target_coord). np.interp
+                # requires the SOURCE (all_z) ascending — true for both ascending height and ascending pressure.
+                # ZERO-FILL outside the forcing's range (left=right=0), matching the Fortran reader, which
+                # interpolates with `zlinterp_fnc` (interpolation.F90, left=0/right=0) via read_to_grid — NOT
+                # constant edge-extrapolation. This was the cloud_feedback step-1 forcing bug (Iter97): its forcing
+                # bottom (100731 Pa) is above the model's lowest levels, so those out-of-range levels were
+                # edge-extrapolated (≈ −1.6e-5) instead of zeroed. Gated cases' forcings cover the model range
+                # (no out-of-range region exercised), so this is byte-identical for them.
+                arr[:, it] = np.interp(target_coord, all_z[valid], col[valid], left=0.0, right=0.0)
         interp[name] = arr
 
     def _col(prefix):
@@ -1173,6 +1204,8 @@ def _parse_forcings_file(path: str, zt: np.ndarray) -> dict:
     return {
         'times':  times,
         'thlm_f': interp.get('thlm_f[K/s]'),
+        'T_f':    _col('T_f'),   # absolute-temperature forcing (CGILS) — converted to thlm_f=T_f/exner at apply
+
         # moisture forcing: 'rtm_f' (mixing-ratio) or 'sp_hmdty_f' (specific humidity) — converted at apply
         'rtm_f':  interp.get('rtm_f[kg/kg/s]'),
         'sp_hmdty_f': _col('sp_hmdty_f'),
@@ -1226,11 +1259,15 @@ def _parse_sfc_file(path: str) -> dict:
     }
 
 
-def load_generic_forcings_data(runtype: str, case_dir: str, zt: np.ndarray) -> dict:
+def load_generic_forcings_data(runtype: str, case_dir: str, zt: np.ndarray,
+                               p_in_Pa: np.ndarray = None) -> dict:
     """Load forcing and surface files for a non-ARM benchmark case.
 
     Looks for {case_dir}/{runtype}_forcings.in and {case_dir}/{runtype}_sfc.in.
     Returns a dict with 'times', 'thlm_f', 'rtm_f', 'w', 'sfc'.
+
+    `p_in_Pa` (the model pressure profile on the zt grid) is needed only for forcing files with a `Press[Pa]`
+    vertical coordinate (the CGILS / cloud-feedback cases); height-coordinate files ignore it.
     """
     forcings_path = os.path.join(case_dir, f'{runtype}_forcings.in')
     sfc_path = os.path.join(case_dir, f'{runtype}_sfc.in')
@@ -1242,7 +1279,7 @@ def load_generic_forcings_data(runtype: str, case_dir: str, zt: np.ndarray) -> d
         return fd
 
     if os.path.isfile(forcings_path):
-        parsed = _parse_forcings_file(forcings_path, zt)
+        parsed = _parse_forcings_file(forcings_path, zt, p_in_Pa=p_in_Pa)
         fd.update(parsed)
 
     if os.path.isfile(sfc_path):

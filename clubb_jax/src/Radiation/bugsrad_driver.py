@@ -64,6 +64,50 @@ def load_std_atmosphere(path=None):
                 p_in_mb=np.array(p), o3l=np.array(o3))
 
 
+def read_ozone_sounding(path):
+    """Read a `{case}_ozone_sounding.in` file → (nlev,) ozone mixing ratio [kg/kg], one value per main-sounding
+    level (the file is a single `'o3[kg/kg]'` column with no vertical coordinate)."""
+    vals = []
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("!"):
+                continue
+            tok = s.split()[0].strip("'\"")
+            if tok.lower().startswith("o3") or tok.lower().startswith("'o3"):
+                continue
+            try:
+                vals.append(float(s.split()[0]))
+            except ValueError:
+                continue
+    return np.array(vals)
+
+
+def build_case_extended_atmosphere(z, theta_col, theta_type, rt, p_in_Pa, p_sfc, o3l):
+    """Build the radiation extended atmosphere from a case's OWN deep sounding + ozone sounding — the path taken
+    when `l_use_default_std_atmosphere = .false.` (CGILS/cloud_feedback/astex/twp_ice). Port of sounding.F90:
+    convert_snd2extended_atm. Returns a dict with the same keys/shape conventions as `load_std_atmosphere`
+    (alt[m], T_in_K, sp_hmdty[kg/kg], p_in_mb, o3l[kg/kg]) at the full sounding levels (ascending in altitude),
+    so it drops straight into `build_rad_grid_setup`.
+
+      T_in_K = the T column itself when theta_type is 'T[K]', else θ·exner (exner level-1 from p_sfc, the rest
+               from p_in_Pa — matching the Fortran);  sp_hmdty = rt/(1+rt);  p_in_mb = p_in_Pa/100;  o3l = the
+               ozone sounding column.
+    """
+    from clubb_jax.src.CLUBB_core.constants_clubb import p0 as _P0, kappa as _KAPPA
+    z = np.asarray(z, dtype=np.float64); theta_col = np.asarray(theta_col, dtype=np.float64)
+    rt = np.asarray(rt, dtype=np.float64); p_in_Pa = np.asarray(p_in_Pa, dtype=np.float64)
+    o3l = np.asarray(o3l, dtype=np.float64)
+    if str(theta_type).strip().lower() == 't[k]':
+        T_in_K = theta_col.copy()
+    else:
+        exner = (p_in_Pa / _P0) ** _KAPPA
+        exner[0] = (p_sfc / _P0) ** _KAPPA          # Fortran uses p_sfc for the first level
+        T_in_K = theta_col * exner
+    return dict(alt=z, T_in_K=T_in_K, sp_hmdty=rt / (1.0 + rt),
+                p_in_mb=p_in_Pa / PASCAL_PER_MB, o3l=o3l)
+
+
 def determine_extended_atmos_bounds(zm_grid, zm_grid_spacing, p_in_Pa_zm, radiation_top, ext):
     """Port of extended_atmosphere_module.F90:determine_extended_atmos_bounds. `zm_grid`=(nzm,) momentum
     altitudes [m]; `zm_grid_spacing`=(nzm-1,) Δz; `p_in_Pa_zm`=(nzm,) momentum-level pressure [Pa];

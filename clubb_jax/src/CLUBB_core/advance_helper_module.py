@@ -4,6 +4,7 @@ Merged from: advance_helper.py, splat.py, brunt_vaisala.py
 Fortran source: src/CLUBB_core/advance_helper_module.F90
 """
 
+import jax
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.constants_clubb import (
@@ -86,6 +87,46 @@ def compute_cx_fnc_richardson_jax(
 def smooth_max_jax(a, b, smth_coef):
     """Smooth approximation to max(a, b) (advance_helper_module.F90:smooth_max)."""
     return 0.5 * ((a + b) + jnp.sqrt((a - b) ** 2 + smth_coef ** 2))
+
+
+def smooth_min_jax(a, b, smth_coef):
+    """Smooth approximation to min(a, b) (advance_helper_module.F90:smooth_min).
+    Complement of smooth_max: 0.5*((a+b) - sqrt((a-b)^2 + smth_coef^2))."""
+    return 0.5 * ((a + b) - jnp.sqrt((a - b) ** 2 + smth_coef ** 2))
+
+
+def pvertinterp(p_mid, p_out, input_var):
+    """Interpolate input_var (on pressure levels p_mid) to a single output pressure p_out, per grid column
+    (advance_helper_module.F90:pvertinterp). Pressure decreases with height (p_mid descending in k): below the
+    lowest level (p_out >= surface pressure) it clamps to the bottom value, above the highest level (p_out <=
+    top pressure) to the top value, and linearly interpolates in pressure between the bracketing levels — i.e.
+    a pressure-weighted linear interpolation with constant-endpoint extrapolation.
+
+    p_mid and input_var are (ngrdcol, nzt); p_out is a scalar. Returns (ngrdcol,). Pure-jnp → differentiable."""
+    p_mid = jnp.asarray(p_mid, dtype=jnp.float64)
+    input_var = jnp.asarray(input_var, dtype=jnp.float64)
+    p_out = jnp.asarray(p_out, dtype=jnp.float64)
+    # Reverse k so the pressure axis is ascending for jnp.interp (constant left/right extrapolation
+    # reproduces the Fortran p_out>=p_mid[bottom] / p_out<=p_mid[top] clamps).
+    xp = p_mid[:, ::-1]
+    fp = input_var[:, ::-1]
+    return jax.vmap(lambda x, f: jnp.interp(p_out, x, f))(xp, fp)
+
+
+def calc_xpwp(Km_zm, xm, invrs_dzm):
+    """Down-gradient eddy flux x'w' on momentum levels (advance_helper_module.F90:calc_xpwp_2D):
+      xpwp[k] = Km_zm[k] * invrs_dzm[k] * (xm[k] - xm[k-1])  for the interior momentum levels k=1..nzm-2
+      (0-based); the top and bottom boundary levels are left at zero.
+
+    Km_zm and invrs_dzm are (ngrdcol, nzm); xm is (ngrdcol, nzt) with nzt = nzm-1. Pure-jnp → differentiable."""
+    Km_zm = jnp.asarray(Km_zm, dtype=jnp.float64)
+    xm = jnp.asarray(xm, dtype=jnp.float64)
+    invrs_dzm = jnp.asarray(invrs_dzm, dtype=jnp.float64)
+    ng, nzm = Km_zm.shape
+    # Interior k=1..nzm-2 use thermo levels k and k-1: xm[:,1:nzm-1] - xm[:,0:nzm-2].
+    interior = Km_zm[:, 1:nzm - 1] * invrs_dzm[:, 1:nzm - 1] * (xm[:, 1:] - xm[:, :-1])
+    xpwp = jnp.zeros((ng, nzm))
+    return xpwp.at[:, 1:nzm - 1].set(interior)
 
 
 def calc_stability_correction_jax(

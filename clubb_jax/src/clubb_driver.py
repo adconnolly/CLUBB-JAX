@@ -49,6 +49,7 @@ from clubb_jax.src.Input_fields.namelist import read_namelist
 from clubb_jax.src.Input_fields.sounding import (
     read_sounding,
     interpolate_sounding,
+    convert_pressure_sounding_to_z,
     read_scalar_sounding,
     interpolate_scalar_sounding,
 )
@@ -442,6 +443,11 @@ def init_clubb_case(namelist_path: str) -> dict:
     # ── 3. Read sounding ────────────────────────────────────────────────
     snd_path = _resolve_case_input_path(namelist_dir, runtype, "_sounding.in")
     snd = read_sounding(str(snd_path))
+    # Pressure-coordinate soundings (CGILS/cloud_feedback): derive level altitudes hydrostatically from the
+    # sounding's own thermodynamics before interpolating to the grid. Height-coordinate cases are untouched.
+    if str(snd['alt_type']).strip().lower() == 'press[pa]':
+        snd = convert_pressure_sounding_to_z(
+            snd, float(cfg['p_sfc_nl']), float(cfg['zm_init_nl']), flags.saturation_formula)
     theta_type = snd['theta_type']
     subs_type = snd['subs_type']
 
@@ -522,6 +528,16 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     # Build 2D arrays (ngrdcol, nzt) by broadcasting 1D profile
     thlm = np.tile(snd_interp['theta'], (ngrdcol, 1))
+    # Absolute-temperature sounding column (theta_type 'T[K]', the CGILS/cloud_feedback cases): convert
+    # T → potential temperature θ using the sounding's OWN pressure interpolated to the grid, BEFORE the
+    # hydrostatic bootstrap — faithful to clubb_driver.F90:5499-5524 (thlm = thlm/(p_in_Pa/p0)**kappa). After
+    # this θ sits in `thlm` and the `theta_type in ('thm[K]','T[K]')` branch below treats it exactly like a
+    # thm[K] (θ) sounding. The Fortran errors on a z-coordinate T[K] sounding, so this only fires for pressure
+    # soundings (which carry snd['p_in_Pa'] from convert_pressure_sounding_to_z). Without it thlm was left as
+    # the raw absolute temperature → a ~69 K init error (Iter90 cgils_s11 diagnosis).
+    if str(theta_type).strip() == 'T[K]' and snd.get('p_in_Pa') is not None:
+        p_snd_zt = np.interp(zt_1d, np.asarray(snd['z']), np.asarray(snd['p_in_Pa']))
+        thlm = thlm / (p_snd_zt[np.newaxis, :] / p0) ** kappa
     rtm = np.tile(snd_interp['rt'], (ngrdcol, 1))
     # NO IC floor (Iter186): the Fortran does NOT floor the initial rtm — its rtm_old entering step 1 is
     # the bare sounding value (~0/2e-19 at rico's dry top, NOT 1e-8). It is the per-step fill_holes inside
@@ -795,7 +811,9 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     sc_dim_transport = max(sclr_dim, 1)
     edsc_dim_transport = max(edsclr_dim, 1)
-    sclr_tol = np.array(cfg.get('sclr_tol_nl', [])[:sclr_dim], dtype=np.float64)
+    # sclr_tol_nl may be parsed as a scalar float (single value, e.g. astex_a209) or a list
+    # (e.g. atex: "1.e-2, 1.e-8"); normalise to a 1-D array before slicing.
+    sclr_tol = np.atleast_1d(np.asarray(cfg.get('sclr_tol_nl', []), dtype=np.float64)).ravel()[:sclr_dim]
     if len(sclr_tol) < sclr_dim:
         sclr_tol = np.pad(sclr_tol, (0, sclr_dim - len(sclr_tol)), constant_values=1e-8)
     sclrm = np.zeros((ngrdcol, nzt, sc_dim_transport))
@@ -1036,8 +1054,24 @@ def init_clubb_case(namelist_path: str) -> dict:
         # Generic cases: load {runtype}_forcings.in and {runtype}_sfc.in if present
         case_setups_dir = str(_CLUBB_RELEASE_ROOT / "input" / "case_setups")
         state['_forcings_data'] = load_generic_forcings_data(
-            runtype, case_setups_dir, gr.zt[0, :]
+            runtype, case_setups_dir, gr.zt[0, :], p_in_Pa=np.asarray(p_in_Pa)[0, :]
         )
+
+    # Radiation extended atmosphere from the case's OWN sounding + ozone sounding when
+    # l_use_default_std_atmosphere=.false. (CGILS/cloud_feedback/astex/twp_ice). The Fortran
+    # (convert_snd2extended_atm) builds the above-model-top T/q/p/o3 radiation profile from the deep case
+    # sounding + {case}_ozone_sounding.in rather than the default US-standard atmosphere; without this those
+    # cases get a model-top radht bias (Iter91 diagnosis). Gated cases keep the flag true → std atmosphere.
+    if rad_scheme == 'bugsrad' and not bool(cfg.get('l_use_default_std_atmosphere', True)) \
+            and snd.get('p_in_Pa') is not None:
+        _oz_path = _CLUBB_RELEASE_ROOT / "input" / "case_setups" / f"{runtype}_ozone_sounding.in"
+        if _oz_path.exists():
+            from clubb_jax.src.Radiation.bugsrad_driver import (
+                read_ozone_sounding, build_case_extended_atmosphere)
+            _o3l = read_ozone_sounding(str(_oz_path))
+            state['_rad_ext_atm'] = build_case_extended_atmosphere(
+                snd['z'], snd['theta'], theta_type, snd['rt'], snd['p_in_Pa'],
+                float(cfg['p_sfc_nl']), _o3l)
 
     print(f"Initialized {runtype} case: nzm={nzm}, nzt={nzt}, ngrdcol={ngrdcol}")
     print(f"  dt_main={dt_main}s, time={time_initial}s to {time_final}s, {ifinal} steps")

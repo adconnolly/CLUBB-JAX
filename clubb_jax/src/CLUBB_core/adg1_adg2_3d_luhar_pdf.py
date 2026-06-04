@@ -380,3 +380,288 @@ def calc_wpxpyp_pdf_jax(wm, xm, ym, w_1, w_2, x_1, x_2, y_1, y_2,
              + corr_w_x_2 * _safe_sqrt(varnce_w_2 * varnce_x_2) * dy_2)
 
     return mixt_frac * term1 + one_minus_mf * term2
+
+
+def calc_w_up_in_cloud(mixt_frac, cloud_frac_1, cloud_frac_2,
+                       w_1, w_2, varnce_w_1, varnce_w_2):
+    """Mean cloudy updraft / downdraft vertical velocity from the binormal w-PDF
+    (pdf_closure_module.F90:calc_w_up_in_cloud). For aerosol activation, this gives a w representative of
+    cloudy updrafts (an alternative to sqrt(wp2)). Per PDF component, the truncated-Gaussian updraft integral is
+      w_up = 1/2 w (1+erf(r)) + sigma/sqrt(2pi) exp(-r^2),  r = w/(sqrt(2) sigma),  updraft_frac = 1/2(1+erf(r)),
+    with all-updraft / all-downdraft shortcuts when |w| > max_num_stdevs*sigma. The cloudy means weight the two
+    components by mixt_frac*cloud_frac. Returns
+    (w_up_in_cloud, w_down_in_cloud, cloudy_updraft_frac, cloudy_downdraft_frac). Pure-jnp → differentiable.
+
+    All inputs are (ngrdcol, nz). varnce_w_* are variances (sigma^2)."""
+    import jax.scipy.special as jsp
+    from clubb_jax.src.CLUBB_core.constants_clubb import sqrt_2, sqrt_2pi, max_num_stdevs
+
+    def _component(w, varnce):
+        w = jnp.asarray(w, dtype=jnp.float64)
+        stdev = jnp.sqrt(jnp.asarray(varnce, dtype=jnp.float64))
+        all_up = w > max_num_stdevs * stdev
+        all_down = w < -max_num_stdevs * stdev
+        ratio = w / (sqrt_2 * jnp.maximum(eps, stdev))
+        erf_r = jsp.erf(ratio)
+        exp_neg = jnp.exp(-ratio ** 2)
+        w_up_mid = 0.5 * w * (1.0 + erf_r) + (stdev / sqrt_2pi) * exp_neg
+        uf_mid = 0.5 * (1.0 + erf_r)
+        w_down_mid = 0.5 * w * (1.0 - erf_r) - (stdev / sqrt_2pi) * exp_neg
+        w_up = jnp.where(all_up, w, jnp.where(all_down, 0.0, w_up_mid))
+        uf = jnp.where(all_up, 1.0, jnp.where(all_down, 0.0, uf_mid))
+        w_down = jnp.where(all_up, 0.0, jnp.where(all_down, w, w_down_mid))
+        df = 1.0 - uf   # holds in all three branches (Fortran: 1, 0, 1-uf_mid)
+        return w_up, uf, w_down, df
+
+    a = jnp.asarray(mixt_frac, dtype=jnp.float64)
+    cf1 = jnp.asarray(cloud_frac_1, dtype=jnp.float64); cf2 = jnp.asarray(cloud_frac_2, dtype=jnp.float64)
+    w_up_1, uf_1, w_down_1, df_1 = _component(w_1, varnce_w_1)
+    w_up_2, uf_2, w_down_2, df_2 = _component(w_2, varnce_w_2)
+
+    cloudy_updraft_frac = a * cf1 * uf_1 + (1.0 - a) * cf2 * uf_2
+    cloudy_downdraft_frac = a * cf1 * df_1 + (1.0 - a) * cf2 * df_2
+    w_up_in_cloud = ((a * cf1 * w_up_1 + (1.0 - a) * cf2 * w_up_2)
+                     / jnp.maximum(eps, cloudy_updraft_frac))
+    w_down_in_cloud = ((a * cf1 * w_down_1 + (1.0 - a) * cf2 * w_down_2)
+                       / jnp.maximum(eps, cloudy_downdraft_frac))
+    return w_up_in_cloud, w_down_in_cloud, cloudy_updraft_frac, cloudy_downdraft_frac
+
+
+def calc_wp4_pdf(wm, w_1, w_2, varnce_w_1, varnce_w_2, mixt_frac):
+    """<w'^4> integrated over the two-component-normal PDF of w (pdf_closure_module.F90:calc_wp4_pdf):
+      <w'^4> = Σ_i weight_i (3 σ_w_i^4 + 6 (μ_w_i-<w>)^2 σ_w_i^2 + (μ_w_i-<w>)^4). Pure-jnp → differentiable."""
+    wm = jnp.asarray(wm); a = jnp.asarray(mixt_frac)
+    d1 = jnp.asarray(w_1) - wm; d2 = jnp.asarray(w_2) - wm
+    v1 = jnp.asarray(varnce_w_1); v2 = jnp.asarray(varnce_w_2)
+    return (a * (3.0 * v1 ** 2 + 6.0 * d1 ** 2 * v1 + d1 ** 4)
+            + (1.0 - a) * (3.0 * v2 ** 2 + 6.0 * d2 ** 2 * v2 + d2 ** 4))
+
+
+def calc_wp2xp_pdf(wm, xm, w_1, w_2, x_1, x_2, varnce_w_1, varnce_w_2,
+                   varnce_x_1, varnce_x_2, corr_w_x_1, corr_w_x_2, mixt_frac):
+    """<w'^2 x'> integrated over the binormal PDF of (w, x) (pdf_closure_module.F90:calc_wp2xp_pdf):
+      Σ_i weight_i [ ((μ_w_i-<w>)^2 + σ_w_i^2)(μ_x_i-<x>) + 2 corr_i σ_w_i σ_x_i (μ_w_i-<w>) ]."""
+    wm = jnp.asarray(wm); xm = jnp.asarray(xm); a = jnp.asarray(mixt_frac)
+    dw1 = jnp.asarray(w_1) - wm; dw2 = jnp.asarray(w_2) - wm
+    dx1 = jnp.asarray(x_1) - xm; dx2 = jnp.asarray(x_2) - xm
+    vw1 = jnp.asarray(varnce_w_1); vw2 = jnp.asarray(varnce_w_2)
+    vx1 = jnp.asarray(varnce_x_1); vx2 = jnp.asarray(varnce_x_2)
+    c1 = jnp.asarray(corr_w_x_1); c2 = jnp.asarray(corr_w_x_2)
+    return (a * ((dw1 ** 2 + vw1) * dx1 + 2.0 * c1 * _safe_sqrt(vw1 * vx1) * dw1)
+            + (1.0 - a) * ((dw2 ** 2 + vw2) * dx2 + 2.0 * c2 * _safe_sqrt(vw2 * vx2) * dw2))
+
+
+def calc_wpxp2_pdf(wm, xm, w_1, w_2, x_1, x_2, varnce_w_1, varnce_w_2,
+                   varnce_x_1, varnce_x_2, corr_w_x_1, corr_w_x_2, mixt_frac):
+    """<w'x'^2> integrated over the binormal PDF of (w, x) (pdf_closure_module.F90:calc_wpxp2_pdf):
+      Σ_i weight_i [ (μ_w_i-<w>)((μ_x_i-<x>)^2 + σ_x_i^2) + 2 corr_i σ_w_i σ_x_i (μ_x_i-<x>) ]."""
+    wm = jnp.asarray(wm); xm = jnp.asarray(xm); a = jnp.asarray(mixt_frac)
+    dw1 = jnp.asarray(w_1) - wm; dw2 = jnp.asarray(w_2) - wm
+    dx1 = jnp.asarray(x_1) - xm; dx2 = jnp.asarray(x_2) - xm
+    vw1 = jnp.asarray(varnce_w_1); vw2 = jnp.asarray(varnce_w_2)
+    vx1 = jnp.asarray(varnce_x_1); vx2 = jnp.asarray(varnce_x_2)
+    c1 = jnp.asarray(corr_w_x_1); c2 = jnp.asarray(corr_w_x_2)
+    return (a * (dw1 * (dx1 ** 2 + vx1) + 2.0 * c1 * _safe_sqrt(vw1 * vx1) * dx1)
+            + (1.0 - a) * (dw2 * (dx2 ** 2 + vx2) + 2.0 * c2 * _safe_sqrt(vw2 * vx2) * dx2))
+
+
+def calc_wpxpyp_pdf(wm, xm, ym, w_1, w_2, x_1, x_2, y_1, y_2,
+                    varnce_w_1, varnce_w_2, varnce_x_1, varnce_x_2, varnce_y_1, varnce_y_2,
+                    corr_w_x_1, corr_w_x_2, corr_w_y_1, corr_w_y_2, corr_x_y_1, corr_x_y_2, mixt_frac):
+    """<w'x'y'> integrated over the trinormal PDF of (w, x, y) (pdf_closure_module.F90:calc_wpxpyp_pdf):
+      Σ_i weight_i [ (μ_w-<w>)(μ_x-<x>)(μ_y-<y>) + corr_xy σ_x σ_y (μ_w-<w>)
+                     + corr_wy σ_w σ_y (μ_x-<x>) + corr_wx σ_w σ_x (μ_y-<y>) ]_i."""
+    wm = jnp.asarray(wm); xm = jnp.asarray(xm); ym = jnp.asarray(ym); a = jnp.asarray(mixt_frac)
+    dw1 = jnp.asarray(w_1) - wm; dw2 = jnp.asarray(w_2) - wm
+    dx1 = jnp.asarray(x_1) - xm; dx2 = jnp.asarray(x_2) - xm
+    dy1 = jnp.asarray(y_1) - ym; dy2 = jnp.asarray(y_2) - ym
+    vw1 = jnp.asarray(varnce_w_1); vw2 = jnp.asarray(varnce_w_2)
+    vx1 = jnp.asarray(varnce_x_1); vx2 = jnp.asarray(varnce_x_2)
+    vy1 = jnp.asarray(varnce_y_1); vy2 = jnp.asarray(varnce_y_2)
+    cwx1 = jnp.asarray(corr_w_x_1); cwx2 = jnp.asarray(corr_w_x_2)
+    cwy1 = jnp.asarray(corr_w_y_1); cwy2 = jnp.asarray(corr_w_y_2)
+    cxy1 = jnp.asarray(corr_x_y_1); cxy2 = jnp.asarray(corr_x_y_2)
+    comp1 = (dw1 * dx1 * dy1 + cxy1 * _safe_sqrt(vx1 * vy1) * dw1
+             + cwy1 * _safe_sqrt(vw1 * vy1) * dx1 + cwx1 * _safe_sqrt(vw1 * vx1) * dy1)
+    comp2 = (dw2 * dx2 * dy2 + cxy2 * _safe_sqrt(vx2 * vy2) * dw2
+             + cwy2 * _safe_sqrt(vw2 * vy2) * dx2 + cwx2 * _safe_sqrt(vw2 * vx2) * dy2)
+    return a * comp1 + (1.0 - a) * comp2
+
+
+def calc_Luhar_params(Skx, wpxp, xp2, x_tol_sqd):
+    """Luhar PDF parameters mixt_frac, big_m (M), small_m (m) from skewness and the w-x covariance
+    (adg1_adg2_3d_luhar_pdf.F90:calc_Luhar_params; Larson, Golaz & Cotton 2002). Where xp2 > x_tol_sqd:
+      m = max(2/3 |Skx|^(1/3), 0.05);  M = (1+m²)³ / ((3+m²)² m²);
+      mixt_frac = 1/2 (1 − sgn(wpxp)·Skx·√(1/((4/M) + Skx²))).
+    Otherwise (x effectively constant) mixt_frac = 1/2, m = M = 0. Pure-jnp (finite-grad cube root) →
+    differentiable. Returns (mixt_frac, big_m, small_m)."""
+    Skx = jnp.asarray(Skx, dtype=jnp.float64)
+    wpxp = jnp.asarray(wpxp, dtype=jnp.float64)
+    xp2 = jnp.asarray(xp2, dtype=jnp.float64)
+
+    # Guarded cube root (cbrt'(0)=inf otherwise; masked by the max floor but would poison grad as 0*inf).
+    absS = jnp.abs(Skx)
+    cbrt = jnp.where(absS > 0.0, jnp.cbrt(jnp.where(absS > 0.0, absS, 1.0)), 0.0)
+    small_m = jnp.maximum((2.0 / 3.0) * cbrt, 0.05)
+    m_sqd = small_m ** 2
+    big_m = (1.0 + m_sqd) ** 3 / ((3.0 + m_sqd) ** 2 * m_sqd)
+
+    sgn = jnp.where(wpxp >= 0.0, 1.0, -1.0)
+    mixt_frac_vary = 0.5 * (1.0 - sgn * Skx * jnp.sqrt(1.0 / ((4.0 / big_m) + Skx ** 2)))
+
+    vary = xp2 > x_tol_sqd
+    mixt_frac = jnp.where(vary, mixt_frac_vary, 0.5)
+    big_m = jnp.where(vary, big_m, 0.0)
+    small_m = jnp.where(vary, small_m, 0.0)
+    return mixt_frac, big_m, small_m
+
+
+def close_Luhar_pdf(xm, xp2, mixt_frac, small_m, wpxp, x_tol_sqd):
+    """PDF component normalized widths/means/variances for the Luhar closure (adg1_adg2_3d_luhar_pdf.F90:
+    close_Luhar_pdf). Where xp2 > x_tol_sqd:
+      sigma_sqd_x_1 = (1−mf)/(mf(1+m²)),  sigma_sqd_x_2 = mf/((1−mf)(1+m²)),  varnce_x_i = sigma_sqd_x_i·xp2,
+      x_i_n = ±sgn(wpxp)·m·√(sigma_sqd_x_i),  x_i = xm + √xp2·x_i_n.
+    Where x is effectively constant, sigma_sqd_x_i = 1/(1+m²), varnce_x_i = 0, x_i = xm (sgn computed normally
+    here — the Fortran leaves it uninitialized in that degenerate branch). Pure-jnp → differentiable. Returns
+    (sigma_sqd_x_1, sigma_sqd_x_2, varnce_x_1, varnce_x_2, x_1_n, x_2_n, x_1, x_2)."""
+    xm = jnp.asarray(xm, dtype=jnp.float64); xp2 = jnp.asarray(xp2, dtype=jnp.float64)
+    mf = jnp.asarray(mixt_frac, dtype=jnp.float64); m = jnp.asarray(small_m, dtype=jnp.float64)
+    wpxp = jnp.asarray(wpxp, dtype=jnp.float64)
+    omf = 1.0 - mf
+    msq = 1.0 + m ** 2
+    sgn = jnp.where(wpxp >= 0.0, 1.0, -1.0)
+
+    vary = xp2 > x_tol_sqd
+    sigma_sqd_x_1 = jnp.where(vary, omf / (mf * msq), 1.0 / msq)
+    sigma_sqd_x_2 = jnp.where(vary, mf / (omf * msq), 1.0 / msq)
+    varnce_x_1 = jnp.where(vary, sigma_sqd_x_1 * xp2, 0.0)
+    varnce_x_2 = jnp.where(vary, sigma_sqd_x_2 * xp2, 0.0)
+    x_1_n = sgn * m * _safe_sqrt(sigma_sqd_x_1)
+    x_2_n = -sgn * m * _safe_sqrt(sigma_sqd_x_2)
+    sqrt_xp2 = _safe_sqrt(xp2)
+    x_1 = jnp.where(vary, xm + sqrt_xp2 * x_1_n, xm)
+    x_2 = jnp.where(vary, xm + sqrt_xp2 * x_2_n, xm)
+    return sigma_sqd_x_1, sigma_sqd_x_2, varnce_x_1, varnce_x_2, x_1_n, x_2_n, x_1, x_2
+
+
+def max_cubic_root(a_coef, b_coef, c_coef, d_coef):
+    """Largest real root of a·x³ + b·x² + c·x + d = 0 (adg1_adg2_3d_luhar_pdf.F90:max_cubic_root). Falls back to
+    the quadratic solver when |a| is negligible vs the other coefficients, and to the linear solution when |a|
+    and |b| are both negligible. For a true cubic: if the 2nd/3rd roots are real (negligible imaginary part) the
+    max over all three real parts, else the always-real first root. Pure-jnp (uses the iter-71-corrected
+    cubic_solve) → differentiable away from the root-multiplicity branch points. Inputs broadcast elementwise."""
+    from clubb_jax.src.CLUBB_core.calc_roots import cubic_solve, quadratic_solve
+    from clubb_jax.src.CLUBB_core.constants_clubb import eps
+    a = jnp.asarray(a_coef, dtype=jnp.float64); b = jnp.asarray(b_coef, dtype=jnp.float64)
+    c = jnp.asarray(c_coef, dtype=jnp.float64); d = jnp.asarray(d_coef, dtype=jnp.float64)
+
+    a_thresh = 0.001 * jnp.maximum(jnp.maximum(jnp.abs(b), jnp.abs(c)), jnp.abs(d))
+    b_thresh = 0.001 * jnp.maximum(jnp.abs(c), jnp.abs(d))
+
+    cr = cubic_solve(a, b, c, d)                      # (..., 3) complex
+    r0, r1, r2 = jnp.real(cr[..., 0]), jnp.real(cr[..., 1]), jnp.real(cr[..., 2])
+    is_3real = (jnp.abs(jnp.imag(cr[..., 1])) < eps) & (jnp.abs(jnp.imag(cr[..., 2])) < eps)
+    cubic_max = jnp.where(is_3real, jnp.maximum(jnp.maximum(r0, r1), r2), r0)
+
+    qr = quadratic_solve(b, c, d)                     # (..., 2) complex
+    quad_max = jnp.maximum(jnp.real(qr[..., 0]), jnp.real(qr[..., 1]))
+
+    c_safe = jnp.where(c != 0.0, c, 1.0)
+    linear = -d / c_safe
+
+    return jnp.where(jnp.abs(a) > a_thresh, cubic_max,
+                     jnp.where(jnp.abs(b) > b_thresh, quad_max, linear))
+
+
+def backsolve_Luhar_params(Sk_max, Skx, big_m_max, mixt_frac):
+    """Backsolve Luhar's m (and M) for a responding variable given the setter's mixt_frac and the variable's
+    skewness (adg1_adg2_3d_luhar_pdf.F90:backsolve_Luhar_params, cubic branch — l_use_cubic_backsolve is
+    hardcoded true; Sk_max/big_m_max are then unused). When mixt_frac≈0.5 → m=0.05; when |Skx|<eps → m=0;
+    otherwise alpha = mf(1−mf)/(1−2mf)²·Skx², and m² is the largest real root of
+    (alpha−1)(m²)³ + (3alpha−6)(m²)² + (3alpha−9)(m²) + alpha = 0 (floored at 0.05²). Pure-jnp → differentiable.
+    Returns (big_m_x, small_m_x)."""
+    from clubb_jax.src.CLUBB_core.constants_clubb import eps
+    Skx = jnp.asarray(Skx, dtype=jnp.float64)
+    mf = jnp.asarray(mixt_frac, dtype=jnp.float64)
+
+    near_half = jnp.abs(mf - 0.5) < 0.001
+    skx_zero = jnp.abs(Skx) < eps
+
+    m_nh = 0.05
+    bigm_nh = (1.0 + m_nh ** 2) ** 3 / ((3.0 + m_nh ** 2) ** 2 * m_nh ** 2)
+
+    denom = jnp.where(near_half, 1.0, (1.0 - 2.0 * mf) ** 2)        # guard the 1/(1-2mf)^2 at mf=0.5
+    alpha = mf * (1.0 - mf) / denom * Skx ** 2
+    alpha_safe = jnp.where(alpha > 0.0, alpha, 1.0)
+    bigm_else = 1.0 / alpha_safe
+    m2 = max_cubic_root(alpha - 1.0, 3.0 * alpha - 6.0, 3.0 * alpha - 9.0, alpha)
+    m_else = jnp.sqrt(jnp.maximum(m2, 0.05 ** 2))
+
+    small_m_x = jnp.where(near_half, m_nh, jnp.where(skx_zero, 0.0, m_else))
+    big_m_x = jnp.where(near_half, bigm_nh, jnp.where(skx_zero, jnp.inf, bigm_else))
+    return big_m_x, small_m_x
+
+
+def Luhar_3D_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, Skrt, Skthl, wprtp, wpthlp):
+    """3-D Luhar PDF driver (adg1_adg2_3d_luhar_pdf.F90:Luhar_3D_pdf_driver). The variable with the greatest
+    |skewness| sets the PDF (calc_Luhar_params → mixt_frac); the other two backsolve their m from the setter's
+    mixt_frac (backsolve_Luhar_params); each variable's PDF component means/variances follow from close_Luhar_pdf.
+    Pure-jnp (vectorized 3-way setter select) → differentiable. Returns (w_1, w_2, rt_1, rt_2, thl_1, thl_2,
+    varnce_w_1, varnce_w_2, varnce_rt_1, varnce_rt_2, varnce_thl_1, varnce_thl_2, mixt_frac)."""
+    Skw = jnp.asarray(Skw, dtype=jnp.float64); Skrt = jnp.asarray(Skrt, dtype=jnp.float64)
+    Skthl = jnp.asarray(Skthl, dtype=jnp.float64)
+    wp2 = jnp.asarray(wp2, dtype=jnp.float64); rtp2 = jnp.asarray(rtp2, dtype=jnp.float64); thlp2 = jnp.asarray(thlp2, dtype=jnp.float64)
+    wprtp = jnp.asarray(wprtp, dtype=jnp.float64); wpthlp = jnp.asarray(wpthlp, dtype=jnp.float64)
+    w_tsq, rt_tsq, thl_tsq = w_tol_sqd, rt_tol ** 2, thl_tol ** 2
+
+    # calc_Luhar_params for each variable as a potential setter (w uses wp2 as the covariance -> sgn = +1).
+    mf_w, bigm_w, m_w = calc_Luhar_params(Skw, wp2, wp2, w_tsq)
+    mf_rt, bigm_rt, m_rt = calc_Luhar_params(Skrt, wprtp, rtp2, rt_tsq)
+    mf_thl, bigm_thl, m_thl = calc_Luhar_params(Skthl, wpthlp, thlp2, thl_tsq)
+
+    aw, art, athl = jnp.abs(Skw), jnp.abs(Skrt), jnp.abs(Skthl)
+    w_set = (aw >= athl) & (aw >= art)
+    thl_set = (~w_set) & (athl > aw) & (athl >= art)
+    rt_set = (~w_set) & (~thl_set)
+
+    mixt_frac = jnp.where(w_set, mf_w, jnp.where(thl_set, mf_thl, mf_rt))
+    setter_Sk = jnp.where(w_set, Skw, jnp.where(thl_set, Skthl, Skrt))
+    setter_bigm = jnp.where(w_set, bigm_w, jnp.where(thl_set, bigm_thl, bigm_rt))
+
+    # Each variable: its own m if it is the setter, else backsolve from the setter.
+    _, bm_w_resp = backsolve_Luhar_params(setter_Sk, Skw, setter_bigm, mixt_frac)
+    _, bm_rt_resp = backsolve_Luhar_params(setter_Sk, Skrt, setter_bigm, mixt_frac)
+    _, bm_thl_resp = backsolve_Luhar_params(setter_Sk, Skthl, setter_bigm, mixt_frac)
+    m_w_f = jnp.where(w_set, m_w, bm_w_resp)
+    m_rt_f = jnp.where(rt_set, m_rt, bm_rt_resp)
+    m_thl_f = jnp.where(thl_set, m_thl, bm_thl_resp)
+
+    _, _, vw1, vw2, _, _, w1, w2 = close_Luhar_pdf(wm, wp2, mixt_frac, m_w_f, wp2, w_tsq)
+    _, _, vrt1, vrt2, _, _, rt1, rt2 = close_Luhar_pdf(rtm, rtp2, mixt_frac, m_rt_f, wprtp, rt_tsq)
+    _, _, vthl1, vthl2, _, _, thl1, thl2 = close_Luhar_pdf(thlm, thlp2, mixt_frac, m_thl_f, wpthlp, thl_tsq)
+
+    return (w1, w2, rt1, rt2, thl1, thl2, vw1, vw2, vrt1, vrt2, vthl1, vthl2, mixt_frac)
+
+
+def ADG2_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, wprtp, wpthlp, sqrt_wp2, beta):
+    """ADG2 PDF driver (adg1_adg2_3d_luhar_pdf.F90:ADG2_pdf_driver), PDF-parameter outputs for w/rt/thl
+    (the passive-scalar branch is omitted; the gated config uses sclr_dim=0). w's PDF comes from the Luhar
+    closure (calc_Luhar_params + close_Luhar_pdf, with sigma_sqd_w overwritten to min(1/(1+m²), 0.99) for ADG1
+    consistency); rt and thl are responders via ADG1_ADG2_responder_params_jax. Pure-jnp → differentiable.
+    Returns (w_1, w_2, rt_1, rt_2, thl_1, thl_2, varnce_w_1, varnce_w_2, varnce_rt_1, varnce_rt_2,
+    varnce_thl_1, varnce_thl_2, mixt_frac, alpha_rt, alpha_thl, sigma_sqd_w)."""
+    wm = jnp.asarray(wm, dtype=jnp.float64); wp2 = jnp.asarray(wp2, dtype=jnp.float64)
+    Skw = jnp.asarray(Skw, dtype=jnp.float64); sqrt_wp2 = jnp.asarray(sqrt_wp2, dtype=jnp.float64)
+    w_tsq = w_tol_sqd
+
+    mixt_frac, _, small_m_w = calc_Luhar_params(Skw, wp2, wp2, w_tsq)
+    _, _, vw1, vw2, w_1_n, w_2_n, w1, w2 = close_Luhar_pdf(wm, wp2, mixt_frac, small_m_w, wp2, w_tsq)
+    sigma_sqd_w = jnp.minimum(1.0 / (1.0 + small_m_w ** 2), 0.99)
+
+    rt1, rt2, vrt1, vrt2, alpha_rt = ADG1_ADG2_responder_params_jax(
+        rtm, rtp2, wp2, sqrt_wp2, wprtp, w_1_n, w_2_n, mixt_frac, sigma_sqd_w, beta)
+    thl1, thl2, vthl1, vthl2, alpha_thl = ADG1_ADG2_responder_params_jax(
+        thlm, thlp2, wp2, sqrt_wp2, wpthlp, w_1_n, w_2_n, mixt_frac, sigma_sqd_w, beta)
+
+    return (w1, w2, rt1, rt2, thl1, thl2, vw1, vw2, vrt1, vrt2, vthl1, vthl2,
+            mixt_frac, alpha_rt, alpha_thl, sigma_sqd_w)

@@ -27,8 +27,9 @@ chi, eta, w, Ncn, <hydrometeors in hydromet-array order>, matching the iiPDF ind
 import jax
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.constants_clubb import Ncn_tol
-from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N
+from clubb_jax.src.CLUBB_core.constants_clubb import Ncn_tol, max_mag_correlation, w_tol, rc_tol
+from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N, corr_NN2NL, corr_NN2LL
+from clubb_jax.src.CLUBB_core.matrix_operations import cholesky_factor
 
 jax.config.update("jax_enable_x64", True)
 
@@ -283,3 +284,375 @@ def norm_transform_mean_stdev(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2,
         sigma_x_2_n = sigma_x_2_n.at[..., ivar].set(s2n)
 
     return mu_x_1_n, mu_x_2_n, sigma_x_1_n, sigma_x_2_n
+
+
+def calc_corr_w_hm_n(wm, wphydrometp, mu_w_1, mu_w_2, mu_hm_1, mu_hm_2,
+                     sigma_w_1, sigma_w_2, sigma_hm_1, sigma_hm_2, sigma_hm_1_n, sigma_hm_2_n,
+                     mixt_frac, precip_frac_1, precip_frac_2, hm_tol):
+    """PDF-component correlation of w and ln(hm) in-precip, diagnosed from the overall w-hm flux
+    (setup_clubb_pdf_params.F90:calc_corr_w_hm_n) — the inverse of the flux assembly.
+
+    corr = (wphydrometp - Σ_i mixt_i precip_frac_i (μ_w_i - <w>) μ_hm_i) / (Σ_i mixt_i precip_frac_i σ_w_i σ_hm_i_n μ_hm_i),
+    clamped to ±max_mag_correlation, with a 4-way branch on whether w and hm vary (σ > tol) in each component:
+    both vary → corr_1 = corr_2; only comp i varies → that component's corr, the other 0; neither → 0,0.
+    Pure jnp → differentiable (degenerate denominators guarded). Returns (corr_w_hm_1_n, corr_w_hm_2_n).
+    """
+    w1, w2 = mixt_frac * precip_frac_1, (1.0 - mixt_frac) * precip_frac_2
+    num = wphydrometp - w1 * (mu_w_1 - wm) * mu_hm_1 - w2 * (mu_w_2 - wm) * mu_hm_2
+    den_both = w1 * sigma_w_1 * sigma_hm_1_n * mu_hm_1 + w2 * sigma_w_2 * sigma_hm_2_n * mu_hm_2
+    den_1 = w1 * sigma_w_1 * sigma_hm_1_n * mu_hm_1
+    den_2 = w2 * sigma_w_2 * sigma_hm_2_n * mu_hm_2
+
+    def _clamp(x):
+        return jnp.clip(x, -max_mag_correlation, max_mag_correlation)
+
+    def _safe_div(n, d):
+        return n / jnp.where(d != 0.0, d, 1.0)
+
+    c1_vary = (sigma_w_1 > w_tol) & (sigma_hm_1 > hm_tol)
+    c2_vary = (sigma_w_2 > w_tol) & (sigma_hm_2 > hm_tol)
+    both = c1_vary & c2_vary
+
+    cn = _clamp(_safe_div(num, den_both))
+    c1v = _clamp(_safe_div(num, den_1))
+    c2v = _clamp(_safe_div(num, den_2))
+
+    corr_1 = jnp.where(both, cn, jnp.where(c1_vary, c1v, 0.0))
+    corr_2 = jnp.where(both, cn, jnp.where(c1_vary, 0.0, jnp.where(c2_vary, c2v, 0.0)))
+    return corr_1, corr_2
+
+
+def _corr_cloud_below(rc_1, rc_2, corr_cloud, corr_below):
+    """Per-component in-precip correlation by cloud presence: rc_i > rc_tol → cloud value, else below-cloud
+    value (the shared body of component_corr_{x_hm,hmx_hmy,w_hm}_n_ip). rc_1/rc_2 are (ngrdcol,nzt)."""
+    rc_1 = jnp.asarray(rc_1)
+    rc_2 = jnp.asarray(rc_2)
+    c1 = jnp.where(rc_1 > rc_tol, corr_cloud, corr_below)
+    c2 = jnp.where(rc_2 > rc_tol, corr_cloud, corr_below)
+    return c1, c2
+
+
+def component_corr_w_hm_n_ip(corr_w_hm_1_n_in, rc_1, corr_w_hm_2_n_in, rc_2,
+                             corr_w_hm_n_NL_cloud, corr_w_hm_n_NL_below, l_calc_w_corr):
+    """In-precip correlation of w and ln(hm) per PDF component
+    (setup_clubb_pdf_params.F90:component_corr_w_hm_n_ip). If l_calc_w_corr, pass through the diagnosed
+    corr_w_hm_i_n_in (from calc_corr_w_hm_n); otherwise select the prescribed cloud/below-cloud value by rc_i.
+    Returns (corr_w_hm_1_n, corr_w_hm_2_n)."""
+    if l_calc_w_corr:
+        return jnp.asarray(corr_w_hm_1_n_in), jnp.asarray(corr_w_hm_2_n_in)
+    return _corr_cloud_below(rc_1, rc_2, corr_w_hm_n_NL_cloud, corr_w_hm_n_NL_below)
+
+
+def component_corr_x_hm_n_ip(rc_1, rc_2, corr_x_hm_n_NL_cloud, corr_x_hm_n_NL_below):
+    """In-precip correlation of a normal variable x (chi or eta) and ln(hm) per PDF component
+    (setup_clubb_pdf_params.F90:component_corr_x_hm_n_ip): cloud/below-cloud value selected by rc_i."""
+    return _corr_cloud_below(rc_1, rc_2, corr_x_hm_n_NL_cloud, corr_x_hm_n_NL_below)
+
+
+def component_corr_hmx_hmy_n_ip(rc_1, rc_2, corr_hmx_hmy_n_LL_cloud, corr_hmx_hmy_n_LL_below):
+    """In-precip correlation of ln(hmx) and ln(hmy) per PDF component
+    (setup_clubb_pdf_params.F90:component_corr_hmx_hmy_n_ip): cloud/below-cloud value selected by rc_i."""
+    return _corr_cloud_below(rc_1, rc_2, corr_hmx_hmy_n_LL_cloud, corr_hmx_hmy_n_LL_below)
+
+
+def component_corr_eta_hm_n_ip(corr_chi_eta_1, corr_chi_hm_n_1, corr_chi_eta_2, corr_chi_hm_n_2):
+    """Estimate the component correlation of eta and ln(hm) as corr_chi_eta·corr_chi_hm_n
+    (setup_clubb_pdf_params.F90:component_corr_eta_hm_n_ip). This product keeps the correlation array
+    Cholesky-decomposable for SILHS. Returns (corr_eta_hm_n_1, corr_eta_hm_n_2)."""
+    return (jnp.asarray(corr_chi_eta_1) * jnp.asarray(corr_chi_hm_n_1),
+            jnp.asarray(corr_chi_eta_2) * jnp.asarray(corr_chi_hm_n_2))
+
+
+# iiPDF_type enumeration (model_flags.F90:31) — the PDF types whose ADG standards fix corr(w,x)=0.
+IIPDF_TYPE_ADG1 = 1
+IIPDF_TYPE_ADG2 = 2
+IIPDF_TYPE_NEW_HYBRID = 7
+
+
+def component_corr_w_x(rc_1, rc_2, corr_w_x_NN_cloud, corr_w_x_NN_below,
+                       iiPDF_type, l_follow_ADG1_PDF_standards):
+    """In-precip correlation of w and a normal variable x (chi or eta) per PDF component
+    (setup_clubb_pdf_params.F90:component_corr_w_x). The ADG1/ADG2/new_hybrid PDFs fix corr(w,rt)=corr(w,thl)=0
+    (so corr(w,chi)=corr(w,eta)=0) when l_follow_ADG1_PDF_standards; otherwise the prescribed cloud/below-cloud
+    value is selected by rc_i > rc_tol. Returns (corr_w_x_1, corr_w_x_2)."""
+    if l_follow_ADG1_PDF_standards and iiPDF_type in (IIPDF_TYPE_ADG1, IIPDF_TYPE_ADG2, IIPDF_TYPE_NEW_HYBRID):
+        rc_1 = jnp.asarray(rc_1)
+        return jnp.zeros_like(rc_1), jnp.zeros_like(rc_1)
+    return _corr_cloud_below(rc_1, rc_2, corr_w_x_NN_cloud, corr_w_x_NN_below)
+
+
+def component_corr_chi_eta(rc_1, rc_2, corr_chi_eta_NN_cloud, corr_chi_eta_NN_below,
+                           l_limit_corr_chi_eta):
+    """Correlation of chi and eta per PDF component (setup_clubb_pdf_params.F90:component_corr_chi_eta):
+    cloud/below-cloud value selected by rc_i > rc_tol, optionally clamped to ±max_mag_correlation when
+    l_limit_corr_chi_eta (a perfect chi–eta correlation is unrealizable for the Cholesky decomposition).
+    Returns (corr_chi_eta_1, corr_chi_eta_2)."""
+    c1, c2 = _corr_cloud_below(rc_1, rc_2, corr_chi_eta_NN_cloud, corr_chi_eta_NN_below)
+    if l_limit_corr_chi_eta:
+        c1 = jnp.clip(c1, -max_mag_correlation, max_mag_correlation)
+        c2 = jnp.clip(c2, -max_mag_correlation, max_mag_correlation)
+    return c1, c2
+
+
+def comp_corr_norm(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2, sigma_x_1_n, sigma_x_2_n,
+                   wm_zt, rc_1, rc_2, mixt_frac, precip_frac_1, precip_frac_2,
+                   wpNcnp_zt, wphydrometp_zt, corr_array_n_cloud, corr_array_n_below,
+                   iiPDF_chi, iiPDF_eta, iiPDF_w, iiPDF_Ncn, pdf2hydromet, hydromet_tol, Ncn_tol_val,
+                   iiPDF_type, l_calc_w_corr, l_fix_w_chi_eta_correlations,
+                   pdf_params_corr=None):
+    """Assemble the normal-space PDF correlation arrays (setup_clubb_pdf_params.F90:comp_corr_norm).
+
+    Builds the lower-triangular (then symmetrized) (ngrdcol, nzt, pdf_dim, pdf_dim) correlation arrays for the
+    two PDF components from the component_corr_* routines plus calc_corr_w_hm_n (for the w-correlations when
+    l_calc_w_corr). The prescribed-array index layout is chi, eta, w, Ncn, <hydrometeors> (iiPDF indices).
+
+    Arrays: mu_x_*/sigma_x_* are (ngrdcol, nzt, pdf_dim); wm_zt/rc_*/mixt_frac/precip_frac_*/wpNcnp_zt are
+    (ngrdcol, nzt); wphydrometp_zt is (ngrdcol, nzt, hydromet_dim); corr_array_n_cloud/below are
+    (pdf_dim, pdf_dim). pdf2hydromet maps a pdf index to its hydromet index. pdf_params_corr (with keys
+    corr_chi_eta_1/2, corr_w_chi_1/2) is required only for the l_fix_w_chi_eta_correlations=False path.
+
+    Returns (corr_array_1_n, corr_array_2_n), each (ngrdcol, nzt, pdf_dim, pdf_dim), symmetric, unit diagonal.
+
+    Faithfulness note: the l_fix_w_chi_eta_correlations=False ("preferred") branch reproduces the Fortran's
+    eta–w block exactly, including its quirk (F90:1560) of writing corr_w_chi into the (w, chi) slot a second
+    time rather than (w, eta) — so (w, eta) is left at 0 on that path, matching the oracle.
+    """
+    mu_x_1 = jnp.asarray(mu_x_1); mu_x_2 = jnp.asarray(mu_x_2)
+    sigma_x_1 = jnp.asarray(sigma_x_1); sigma_x_2 = jnp.asarray(sigma_x_2)
+    sigma_x_1_n = jnp.asarray(sigma_x_1_n); sigma_x_2_n = jnp.asarray(sigma_x_2_n)
+    wm_zt = jnp.asarray(wm_zt); rc_1 = jnp.asarray(rc_1); rc_2 = jnp.asarray(rc_2)
+    mixt_frac = jnp.asarray(mixt_frac)
+    precip_frac_1 = jnp.asarray(precip_frac_1); precip_frac_2 = jnp.asarray(precip_frac_2)
+    wpNcnp_zt = jnp.asarray(wpNcnp_zt); wphydrometp_zt = jnp.asarray(wphydrometp_zt)
+    cc = jnp.asarray(corr_array_n_cloud); cb = jnp.asarray(corr_array_n_below)
+
+    ng, nzt, pdf_dim = mu_x_1.shape
+    ones = jnp.ones((ng, nzt))
+    hm_indices = list(range(iiPDF_Ncn + 1, pdf_dim))   # hydrometeor pdf indices
+
+    A1 = jnp.zeros((ng, nzt, pdf_dim, pdf_dim))
+    A2 = jnp.zeros((ng, nzt, pdf_dim, pdf_dim))
+    idx = jnp.arange(pdf_dim)
+    A1 = A1.at[:, :, idx, idx].set(1.0)
+    A2 = A2.at[:, :, idx, idx].set(1.0)
+
+    def _set(A, r, c, val):
+        return A.at[:, :, r, c].set(val)
+
+    # ---- w-correlations (down-gradient diagnosis) when l_calc_w_corr ----
+    corr_w_Ncn_1 = jnp.zeros((ng, nzt)); corr_w_Ncn_2 = jnp.zeros((ng, nzt))
+    corr_w_hm_1 = {j: jnp.zeros((ng, nzt)) for j in hm_indices}
+    corr_w_hm_2 = {j: jnp.zeros((ng, nzt)) for j in hm_indices}
+    if l_calc_w_corr:
+        corr_w_Ncn_1, corr_w_Ncn_2 = calc_corr_w_hm_n(
+            wm_zt, wpNcnp_zt, mu_x_1[:, :, iiPDF_w], mu_x_2[:, :, iiPDF_w],
+            mu_x_1[:, :, iiPDF_Ncn], mu_x_2[:, :, iiPDF_Ncn],
+            sigma_x_1[:, :, iiPDF_w], sigma_x_2[:, :, iiPDF_w],
+            sigma_x_1[:, :, iiPDF_Ncn], sigma_x_2[:, :, iiPDF_Ncn],
+            sigma_x_1_n[:, :, iiPDF_Ncn], sigma_x_2_n[:, :, iiPDF_Ncn],
+            mixt_frac, ones, ones, Ncn_tol_val)
+        for j in hm_indices:
+            hm_idx = int(pdf2hydromet[j])
+            corr_w_hm_1[j], corr_w_hm_2[j] = calc_corr_w_hm_n(
+                wm_zt, wphydrometp_zt[:, :, hm_idx], mu_x_1[:, :, iiPDF_w], mu_x_2[:, :, iiPDF_w],
+                mu_x_1[:, :, j], mu_x_2[:, :, j], sigma_x_1[:, :, iiPDF_w], sigma_x_2[:, :, iiPDF_w],
+                sigma_x_1[:, :, j], sigma_x_2[:, :, j], sigma_x_1_n[:, :, j], sigma_x_2_n[:, :, j],
+                mixt_frac, precip_frac_1, precip_frac_2, hydromet_tol[hm_idx])
+
+    # ---- (eta, chi) ----
+    if l_fix_w_chi_eta_correlations:
+        c1, c2 = component_corr_chi_eta(rc_1, rc_2, cc[iiPDF_eta, iiPDF_chi],
+                                        cb[iiPDF_eta, iiPDF_chi], True)
+    else:
+        c1 = jnp.asarray(pdf_params_corr['corr_chi_eta_1'])
+        c2 = jnp.asarray(pdf_params_corr['corr_chi_eta_2'])
+    A1 = _set(A1, iiPDF_eta, iiPDF_chi, c1); A2 = _set(A2, iiPDF_eta, iiPDF_chi, c2)
+
+    # ---- (w, chi) ----
+    if l_fix_w_chi_eta_correlations:
+        c1, c2 = component_corr_w_x(rc_1, rc_2, cc[iiPDF_w, iiPDF_chi], cb[iiPDF_w, iiPDF_chi],
+                                    iiPDF_type, True)
+    else:
+        c1 = jnp.asarray(pdf_params_corr['corr_w_chi_1']); c2 = jnp.asarray(pdf_params_corr['corr_w_chi_2'])
+    A1 = _set(A1, iiPDF_w, iiPDF_chi, c1); A2 = _set(A2, iiPDF_w, iiPDF_chi, c2)
+
+    # ---- (Ncn, chi): cloud value used twice (Ncn is inherently in-cloud) ----
+    c1, c2 = component_corr_x_hm_n_ip(rc_1, rc_2, cc[iiPDF_Ncn, iiPDF_chi], cc[iiPDF_Ncn, iiPDF_chi])
+    A1 = _set(A1, iiPDF_Ncn, iiPDF_chi, c1); A2 = _set(A2, iiPDF_Ncn, iiPDF_chi, c2)
+
+    # ---- (hm, chi) ----
+    for j in hm_indices:
+        c1, c2 = component_corr_x_hm_n_ip(rc_1, rc_2, cc[j, iiPDF_chi], cb[j, iiPDF_chi])
+        A1 = _set(A1, j, iiPDF_chi, c1); A2 = _set(A2, j, iiPDF_chi, c2)
+
+    # ---- (w, eta) ----
+    if l_fix_w_chi_eta_correlations:
+        c1, c2 = component_corr_w_x(rc_1, rc_2, cc[iiPDF_w, iiPDF_eta], cb[iiPDF_w, iiPDF_eta],
+                                    iiPDF_type, True)
+        A1 = _set(A1, iiPDF_w, iiPDF_eta, c1); A2 = _set(A2, iiPDF_w, iiPDF_eta, c2)
+    else:
+        # Faithful to F90:1560 quirk: re-writes (w, chi), leaving (w, eta) at 0.
+        c1 = jnp.asarray(pdf_params_corr['corr_w_chi_1']); c2 = jnp.asarray(pdf_params_corr['corr_w_chi_2'])
+        A1 = _set(A1, iiPDF_w, iiPDF_chi, c1); A2 = _set(A2, iiPDF_w, iiPDF_chi, c2)
+
+    # ---- (Ncn, eta): cloud value used twice ----
+    c1, c2 = component_corr_x_hm_n_ip(rc_1, rc_2, cc[iiPDF_Ncn, iiPDF_eta], cc[iiPDF_Ncn, iiPDF_eta])
+    A1 = _set(A1, iiPDF_Ncn, iiPDF_eta, c1); A2 = _set(A2, iiPDF_Ncn, iiPDF_eta, c2)
+
+    # ---- (hm, eta): estimated from (eta, chi) and (hm, chi) ----
+    for j in hm_indices:
+        c1, c2 = component_corr_eta_hm_n_ip(A1[:, :, iiPDF_eta, iiPDF_chi], A1[:, :, j, iiPDF_chi],
+                                            A2[:, :, iiPDF_eta, iiPDF_chi], A2[:, :, j, iiPDF_chi])
+        A1 = _set(A1, j, iiPDF_eta, c1); A2 = _set(A2, j, iiPDF_eta, c2)
+
+    # ---- (Ncn, w) ----
+    c1, c2 = component_corr_w_hm_n_ip(corr_w_Ncn_1, rc_1, corr_w_Ncn_2, rc_2,
+                                      cc[iiPDF_Ncn, iiPDF_w], cb[iiPDF_Ncn, iiPDF_w], l_calc_w_corr)
+    A1 = _set(A1, iiPDF_Ncn, iiPDF_w, c1); A2 = _set(A2, iiPDF_Ncn, iiPDF_w, c2)
+
+    # ---- (hm, w) ----
+    for j in hm_indices:
+        c1, c2 = component_corr_w_hm_n_ip(corr_w_hm_1[j], rc_1, corr_w_hm_2[j], rc_2,
+                                          cc[j, iiPDF_w], cb[j, iiPDF_w], l_calc_w_corr)
+        A1 = _set(A1, j, iiPDF_w, c1); A2 = _set(A2, j, iiPDF_w, c2)
+
+    # ---- (hm, Ncn) ----
+    for j in hm_indices:
+        c1, c2 = component_corr_hmx_hmy_n_ip(rc_1, rc_2, cc[j, iiPDF_Ncn], cb[j, iiPDF_Ncn])
+        A1 = _set(A1, j, iiPDF_Ncn, c1); A2 = _set(A2, j, iiPDF_Ncn, c2)
+
+    # ---- (hmy, hmx) for hydrometeor pairs ----
+    for ii in range(iiPDF_Ncn + 1, pdf_dim - 1):
+        for jj in range(ii + 1, pdf_dim):
+            c1, c2 = component_corr_hmx_hmy_n_ip(rc_1, rc_2, cc[jj, ii], cb[jj, ii])
+            A1 = _set(A1, jj, ii, c1); A2 = _set(A2, jj, ii, c2)
+
+    # ---- Symmetrize (mirror lower triangle): full = L + L^T - I ----
+    eye = jnp.zeros((ng, nzt, pdf_dim, pdf_dim)).at[:, :, idx, idx].set(1.0)
+    A1 = A1 + jnp.swapaxes(A1, -1, -2) - eye
+    A2 = A2 + jnp.swapaxes(A2, -1, -2) - eye
+    return A1, A2
+
+
+def denorm_transform_corr(sigma_x_1_n, sigma_x_2_n, sigma2_on_mu2_ip_1, sigma2_on_mu2_ip_2,
+                          corr_array_1_n, corr_array_2_n,
+                          iiPDF_chi, iiPDF_eta, iiPDF_w, iiPDF_Ncn):
+    """Transform the normal-space PDF correlation arrays to real ("standard") space
+    (setup_clubb_pdf_params.F90:denorm_transform_corr).
+
+    Correlations among the normal variables (chi, eta, w) are unchanged. Correlations between a normal variable
+    and a lognormal one (Ncn or a precipitating hydrometeor) use corr_NN2NL; correlations between two lognormal
+    variables use corr_NN2LL. All arrays are (ngrdcol, nzt, pdf_dim[, pdf_dim]). Returns symmetric
+    (corr_array_1, corr_array_2) with unit diagonal.
+
+    Faithfulness note: matching the Fortran, the component-2 transforms involving Ncn reuse the **component-1**
+    Ncn variance ratio sigma2_on_mu2_ip_1[Ncn] (F90:3332/3338/3344/3392) — Ncn is inherently in-cloud, so its
+    ratio is shared across components.
+    """
+    s1n = jnp.asarray(sigma_x_1_n); s2n = jnp.asarray(sigma_x_2_n)
+    r1 = jnp.asarray(sigma2_on_mu2_ip_1); r2 = jnp.asarray(sigma2_on_mu2_ip_2)
+    Cn1 = jnp.asarray(corr_array_1_n); Cn2 = jnp.asarray(corr_array_2_n)
+
+    ng, nzt, pdf_dim, _ = Cn1.shape
+    idx = jnp.arange(pdf_dim)
+    A1 = jnp.zeros((ng, nzt, pdf_dim, pdf_dim)).at[:, :, idx, idx].set(1.0)
+    A2 = jnp.zeros((ng, nzt, pdf_dim, pdf_dim)).at[:, :, idx, idx].set(1.0)
+    hm_indices = list(range(iiPDF_Ncn + 1, pdf_dim))
+
+    def _s(A, r, c, val):
+        return A.at[:, :, r, c].set(val)
+
+    # Normal-normal pairs (chi/eta/w): correlations carry over unchanged.
+    for (rr, cc_) in ((iiPDF_eta, iiPDF_chi), (iiPDF_w, iiPDF_chi), (iiPDF_w, iiPDF_eta)):
+        A1 = _s(A1, rr, cc_, Cn1[:, :, rr, cc_]); A2 = _s(A2, rr, cc_, Cn2[:, :, rr, cc_])
+
+    # chi/eta/w  x  Ncn (normal-lognormal). Component 2 reuses r1[Ncn].
+    for x in (iiPDF_chi, iiPDF_eta, iiPDF_w):
+        A1 = _s(A1, iiPDF_Ncn, x, corr_NN2NL(Cn1[:, :, iiPDF_Ncn, x], s1n[:, :, iiPDF_Ncn], r1[:, :, iiPDF_Ncn]))
+        A2 = _s(A2, iiPDF_Ncn, x, corr_NN2NL(Cn2[:, :, iiPDF_Ncn, x], s2n[:, :, iiPDF_Ncn], r1[:, :, iiPDF_Ncn]))
+
+    # chi/eta/w  x  hydrometeors (normal-lognormal).
+    for x in (iiPDF_chi, iiPDF_eta, iiPDF_w):
+        for j in hm_indices:
+            A1 = _s(A1, j, x, corr_NN2NL(Cn1[:, :, j, x], s1n[:, :, j], r1[:, :, j]))
+            A2 = _s(A2, j, x, corr_NN2NL(Cn2[:, :, j, x], s2n[:, :, j], r2[:, :, j]))
+
+    # Ncn  x  hydrometeors (lognormal-lognormal). Component 2 reuses r1[Ncn].
+    for j in hm_indices:
+        A1 = _s(A1, j, iiPDF_Ncn, corr_NN2LL(Cn1[:, :, j, iiPDF_Ncn], s1n[:, :, iiPDF_Ncn], s1n[:, :, j],
+                                             r1[:, :, iiPDF_Ncn], r1[:, :, j]))
+        A2 = _s(A2, j, iiPDF_Ncn, corr_NN2LL(Cn2[:, :, j, iiPDF_Ncn], s2n[:, :, iiPDF_Ncn], s2n[:, :, j],
+                                             r1[:, :, iiPDF_Ncn], r2[:, :, j]))
+
+    # hydrometeor x hydrometeor pairs (lognormal-lognormal).
+    for ii in range(iiPDF_Ncn + 1, pdf_dim - 1):
+        for jj in range(ii + 1, pdf_dim):
+            A1 = _s(A1, jj, ii, corr_NN2LL(Cn1[:, :, jj, ii], s1n[:, :, ii], s1n[:, :, jj],
+                                           r1[:, :, ii], r1[:, :, jj]))
+            A2 = _s(A2, jj, ii, corr_NN2LL(Cn2[:, :, jj, ii], s2n[:, :, ii], s2n[:, :, jj],
+                                           r2[:, :, ii], r2[:, :, jj]))
+
+    eye = jnp.zeros((ng, nzt, pdf_dim, pdf_dim)).at[:, :, idx, idx].set(1.0)
+    A1 = A1 + jnp.swapaxes(A1, -1, -2) - eye
+    A2 = A2 + jnp.swapaxes(A2, -1, -2) - eye
+    return A1, A2
+
+
+def calc_corr_norm_and_cholesky_factor(corr_array_n_cloud, corr_array_n_below, rc_1, rc_2,
+                                       iiPDF_type, iiPDF_chi, iiPDF_eta, iiPDF_w, iiPDF_Ncn,
+                                       l_follow_ADG1_PDF_standards):
+    """Compute the normal-space PDF correlation arrays and their Cholesky factors for both PDF components
+    (setup_clubb_pdf_params.F90:calc_corr_norm_and_cholesky_factor).
+
+    Uses the "two unique correlation arrays" optimization: the prescribed in-cloud and below-cloud correlation
+    matrices are each adjusted (ADG zeroing of corr(w,chi)/corr(w,eta); Ncn below-cloud values replaced with
+    in-cloud ones since Ncn is inherently in-cloud; the eta–hm correlation estimated as the chi–eta·chi–hm
+    product for Cholesky-decomposability), Cholesky-factorized once each, then assigned per grid column / level
+    by whether rc_i exceeds rc_tol.
+
+    Args: corr_array_n_cloud/below are symmetric (pdf_dim, pdf_dim); rc_1/rc_2 are (ngrdcol, nzt). Returns
+    (corr_array_1_n, corr_array_2_n, corr_cholesky_mtx_1, corr_cholesky_mtx_2), each
+    (ngrdcol, nzt, pdf_dim, pdf_dim) — the corr arrays symmetric, the Cholesky matrices lower-triangular.
+    """
+    cc = jnp.asarray(corr_array_n_cloud, dtype=jnp.float64)
+    cb = jnp.asarray(corr_array_n_below, dtype=jnp.float64)
+    rc_1 = jnp.asarray(rc_1, dtype=jnp.float64)
+    rc_2 = jnp.asarray(rc_2, dtype=jnp.float64)
+    pdf_dim = cc.shape[0]
+    hm_indices = list(range(iiPDF_Ncn + 1, pdf_dim))
+
+    # ADG standards fix corr(w, chi) = corr(w, eta) = 0.
+    if l_follow_ADG1_PDF_standards and iiPDF_type in (IIPDF_TYPE_ADG1, IIPDF_TYPE_ADG2, IIPDF_TYPE_NEW_HYBRID):
+        for (r, c) in ((iiPDF_w, iiPDF_chi), (iiPDF_w, iiPDF_eta)):
+            cc = cc.at[r, c].set(0.0); cb = cb.at[r, c].set(0.0)
+
+    # Ncn is inherently in-cloud: replace its below-cloud correlations with the in-cloud ones.
+    cb = cb.at[iiPDF_Ncn, iiPDF_chi].set(cc[iiPDF_Ncn, iiPDF_chi])
+    cb = cb.at[iiPDF_Ncn, iiPDF_eta].set(cc[iiPDF_Ncn, iiPDF_eta])
+
+    # eta–hm correlation estimated as chi–eta * chi–hm (keeps the matrix Cholesky-decomposable).
+    for j in hm_indices:
+        cc = cc.at[j, iiPDF_eta].set(cc[iiPDF_eta, iiPDF_chi] * cc[j, iiPDF_chi])
+        cb = cb.at[j, iiPDF_eta].set(cb[iiPDF_eta, iiPDF_chi] * cb[j, iiPDF_chi])
+
+    # Symmetrize from the (modified) lower triangle, then factor.
+    def _symm(M):
+        L = jnp.tril(M)
+        return L + jnp.swapaxes(L, -1, -2) - jnp.diag(jnp.diagonal(M))
+
+    cc_s = _symm(cc); cb_s = _symm(cb)
+    _, chol_cloud, _ = cholesky_factor(cc_s)
+    _, chol_below, _ = cholesky_factor(cb_s)
+    chol_cloud = jnp.tril(chol_cloud)        # zero the upper triangle
+    chol_below = jnp.tril(chol_below)
+
+    # Assign per column/level by rc (the "two unique arrays" selection).
+    def _select(rc):
+        sel = (rc > rc_tol)[:, :, None, None]
+        corr = jnp.where(sel, cc_s, cb_s)
+        chol = jnp.where(sel, chol_cloud, chol_below)
+        return corr, chol
+
+    corr_1, chol_1 = _select(rc_1)
+    corr_2, chol_2 = _select(rc_2)
+    return corr_1, corr_2, chol_1, chol_2

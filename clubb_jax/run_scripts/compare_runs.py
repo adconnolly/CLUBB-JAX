@@ -106,7 +106,13 @@ def compare_nc(fort_path: str, jax_path: str, tier: str = "bit") -> bool:
             continue
         max_diff = float(np.nanmax(np.abs(fv - jv)))
         max_ref  = float(np.nanmax(np.abs(fv)))
-        rel = max_diff / max_ref if max_ref > 0 else 0.0
+        # When the reference is all-zero but the JAX field is not, rel must NOT be reported as 0
+        # (that hides a genuine discrepancy and contradicts the Tier-C verdict, which fails it via
+        # the absolute floor). Report +inf so the row is honestly flagged.
+        if max_ref > 0:
+            rel = max_diff / max_ref
+        else:
+            rel = 0.0 if max_diff == 0.0 else float("inf")
         is_prog = v in PROGNOSTIC
         # allclose convention: pass on relative OR absolute agreement.
         status = "PASS" if max_diff <= ABS_TOL + REL_TOL * max_ref else "FAIL"

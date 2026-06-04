@@ -112,10 +112,22 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
             advance_morrison_microphysics(state)
 
         # ── Driver-owned stats updates (mirrors Fortran driver) ────────
+        # For Morrison cases the Ncm / Nc_in_cloud stats are written INSIDE advance_microphys
+        # (advance_microphys_module.F90:425-431). That routine early-returns before those writes
+        # whenever time_current < microphys_start_time (line 258), so during the pre-activation
+        # spin-up the Fortran leaves both stats at their zero-initialized fill. Mirror that exactly:
+        # write zeros in that window instead of the init-time Nc_in_cloud*cloud_frac diagnostic.
+        _micro_pending = (state.get('microphys_scheme', 'none') == 'morrison'
+                          and time_current < state.get('microphys_start_time', 0.0))
         if l_stats and l_sample and sw is not None:
-            state['Ncm'] = state['Nc_in_cloud'] * state['cloud_frac']
-            sw.update("Ncm", state['Ncm'])
-            sw.update("Nc_in_cloud", state['Nc_in_cloud'])
+            if _micro_pending:
+                _zero = state['Nc_in_cloud'] * 0.0
+                sw.update("Ncm", _zero)
+                sw.update("Nc_in_cloud", _zero)
+            else:
+                state['Ncm'] = state['Nc_in_cloud'] * state['cloud_frac']
+                sw.update("Ncm", state['Ncm'])
+                sw.update("Nc_in_cloud", state['Nc_in_cloud'])
             if state.get('_morr_rcm_mc') is not None:   # Morrison tendencies (for diagnosis vs oracle)
                 sw.update("rcm_mc", state['_morr_rcm_mc'])
                 sw.update("rvm_mc", state['_morr_rvm_mc'])

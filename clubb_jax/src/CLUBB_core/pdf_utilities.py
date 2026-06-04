@@ -35,6 +35,8 @@ _CHI_TOL = 1.0e-8                     # max(1e-8, epsilon); eta_tol = chi_tol
 _RT_TOL = 1.0e-8                      # max(1e-8, epsilon)
 _THL_TOL = 1.0e-2
 _TINY = jnp.finfo(jnp.float64).tiny  # Fortran tiny(mu_x) for double precision
+_MIN_MAX_SMTH_MAG = 1.0e-9           # constants_clubb.F90 min_max_smth_mag
+_EPS = 1.0e-10                       # constants_clubb.F90 eps = max(1e-10, epsilon)
 
 
 def mean_L2N(mu_x, sigma2_on_mu2):
@@ -158,6 +160,28 @@ def calc_corr_eta_x(crt_i, cthl_i, sigma_rt_i, sigma_thl_i, sigma_eta_i,
     return jnp.clip(corr, -MAX_MAG_CORRELATION, MAX_MAG_CORRELATION)
 
 
+def compute_mean_binormal(mu_x_1, mu_x_2, mixt_frac):
+    """Overall mean of a two-component (binormal) PDF variable (pdf_utilities.F90:compute_mean_binormal).
+
+    xm = mixt_frac * mu_x_1 + (1 - mixt_frac) * mu_x_2
+    """
+    return mixt_frac * mu_x_1 + (1.0 - mixt_frac) * mu_x_2
+
+
+def compute_variance_binormal(xm, mu_x_1, mu_x_2, stdev_x_1, stdev_x_2, mixt_frac):
+    """Overall grid-box variance of a two-component (binormal) PDF variable
+    (pdf_utilities.F90:compute_variance_binormal).
+
+    xp2 = mixt_frac*((mu_x_1 - xm)^2 + stdev_x_1^2) + (1 - mixt_frac)*((mu_x_2 - xm)^2 + stdev_x_2^2)
+    """
+    xm = jnp.asarray(xm, dtype=jnp.float64)
+    mu_x_1 = jnp.asarray(mu_x_1, dtype=jnp.float64); mu_x_2 = jnp.asarray(mu_x_2, dtype=jnp.float64)
+    stdev_x_1 = jnp.asarray(stdev_x_1, dtype=jnp.float64); stdev_x_2 = jnp.asarray(stdev_x_2, dtype=jnp.float64)
+    a = jnp.asarray(mixt_frac, dtype=jnp.float64)
+    return (a * ((mu_x_1 - xm) ** 2 + stdev_x_1 ** 2)
+            + (1.0 - a) * ((mu_x_2 - xm) ** 2 + stdev_x_2 ** 2))
+
+
 def calc_corr_rt_x(crt_i, sigma_rt_i, sigma_chi_i, sigma_eta_i,
                    corr_chi_x_i, corr_eta_x_i):
     """Correlation of rt and x from corr(chi,x), corr(eta,x). pdf_utilities.F90:1106.
@@ -186,3 +210,44 @@ def calc_corr_thl_x(cthl_i, sigma_thl_i, sigma_chi_i, sigma_eta_i,
         (sigma_eta_i * corr_eta_x_i - sigma_chi_i * corr_chi_x_i) / (2.0 * cthl_i * sig_safe),
         0.0)
     return jnp.clip(corr, -MAX_MAG_CORRELATION, MAX_MAG_CORRELATION)
+
+
+def smooth_corr_quotient(numerator, denominator, denom_thresh):
+    """Smoothly bounded correlation quotient num/denom (pdf_utilities.F90:smooth_corr_quotient).
+
+    Two smooth_max operations keep the result a valid correlation: the denominator is first raised to at least
+    |num|/max_mag_correlation (so |quotient| <= max_mag_correlation) and then to at least denom_thresh (so it
+    never divides by ~0). smooth_max(a,b,c)=0.5((a+b)+sqrt((a-b)^2+c^2)); smoothing coef = min(min_max_smth_mag,
+    denom_thresh). Pure-jnp → differentiable."""
+    num = jnp.asarray(numerator, dtype=jnp.float64)
+    den = jnp.asarray(denominator, dtype=jnp.float64)
+    coef = jnp.minimum(_MIN_MAX_SMTH_MAG, denom_thresh)
+
+    def _smax(a, b):
+        return 0.5 * ((a + b) + jnp.sqrt((a - b) ** 2 + coef ** 2))
+
+    tmp = _smax(jnp.abs(num) / MAX_MAG_CORRELATION, den)
+    tmp = _smax(tmp, denom_thresh)
+    return num / tmp
+
+
+def calc_comp_corrs_binormal(xpyp, xm, ym, mu_x_1, mu_x_2, mu_y_1, mu_y_2,
+                             sigma_x_1_sqd, sigma_x_2_sqd, sigma_y_1_sqd, sigma_y_2_sqd, mixt_frac):
+    """PDF-component correlation of two binormal variables x and y, diagnosed from their overall covariance
+    (pdf_utilities.F90:calc_comp_corrs_binormal). The two PDF components share one correlation
+    (corr_x_y_1 = corr_x_y_2), solved from <x'y'> = sum_i w_i[(mu_x_i-<x>)(mu_y_i-<y>) + corr sigma_x_i sigma_y_i]:
+      corr = (<x'y'> - sum_i w_i (mu_x_i-<x>)(mu_y_i-<y>)) / (sum_i w_i sigma_x_i sigma_y_i),
+    bounded by smooth_corr_quotient. All args are (ngrdcol, nz). Returns (corr_x_y_1, corr_x_y_2)."""
+    xpyp = jnp.asarray(xpyp, dtype=jnp.float64); xm = jnp.asarray(xm, dtype=jnp.float64)
+    ym = jnp.asarray(ym, dtype=jnp.float64)
+    mu_x_1 = jnp.asarray(mu_x_1, dtype=jnp.float64); mu_x_2 = jnp.asarray(mu_x_2, dtype=jnp.float64)
+    mu_y_1 = jnp.asarray(mu_y_1, dtype=jnp.float64); mu_y_2 = jnp.asarray(mu_y_2, dtype=jnp.float64)
+    sx1 = jnp.asarray(sigma_x_1_sqd, dtype=jnp.float64); sx2 = jnp.asarray(sigma_x_2_sqd, dtype=jnp.float64)
+    sy1 = jnp.asarray(sigma_y_1_sqd, dtype=jnp.float64); sy2 = jnp.asarray(sigma_y_2_sqd, dtype=jnp.float64)
+    a = jnp.asarray(mixt_frac, dtype=jnp.float64)
+
+    numerator = (xpyp - a * (mu_x_1 - xm) * (mu_y_1 - ym)
+                 - (1.0 - a) * (mu_x_2 - xm) * (mu_y_2 - ym))
+    denominator = a * jnp.sqrt(sx1 * sy1) + (1.0 - a) * jnp.sqrt(sx2 * sy2)
+    corr = smooth_corr_quotient(numerator, denominator, _EPS)
+    return corr, corr

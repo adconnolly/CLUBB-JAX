@@ -62,6 +62,9 @@ max_num_stdevs = 5.0         # Range of standard deviations for PDF truncation
 chi_tol = max(1.0e-8, np.finfo(np.float64).eps)  # Tolerance for chi [kg/kg]
 
 T_freeze_K = 273.15          # Freezing point of water [K] (constants_clubb.F90:219)
+Lf = 3.33e5                  # Latent heat of fusion      [J/kg] (constants_clubb.F90:210)
+Ls = 2.834e6                 # Latent heat of sublimation [J/kg] (constants_clubb.F90:209)
+cm_per_m = 100.0             # Centimeters per meter      (constants_clubb.F90:380)
 
 import math as _math
 sqrt_2   = _math.sqrt(2.0)

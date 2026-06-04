@@ -118,6 +118,22 @@ DEFAULT_CASES = [
     "jun25_altocu",     # bit-faithful (Iter188): cold-cloud altocumulus + simplified radiation; unblocked by the per-step wm_zm (subsidence) recompute fix
     "gabls3",           # bit-faithful (Iter273, 17th case): full BUGSrad correlated-k radiation + interactive soil_veg + omega subsidence. SLOW (~6 s/step → ~3 min at 30 iters) — the BUGSrad path's regression guard.
     "mpace_a",          # bit-faithful (Iter299, 18th case): Morrison (l_ice_microphys) but clear/sub-saturated — the only Morrison signal is the clear-air thlm_mc, which is the Fortran's SINGLE-PRECISION thlm<->T_in_K round-trip residual (module_mp_graupel.py reproduces the real*4 cast).
+    "clex9_nov02",      # bit-faithful (19th case): cold-cloud altocumulus, Morrison microphysics but microphys_start_time=51411 s is BEYOND the 30-step window, so Morrison never activates (clear/closure-only physics, prognostic bit-exact). Tier-C clean once the Ncm/Nc_in_cloud pre-activation diagnostic was fixed to match advance_microphys's early return (no stats written before start time).
+    "clex9_oct14",      # bit-faithful (20th case): sibling of clex9_nov02 (same altocumulus campaign, Morrison pre-activation). Prognostic bit-exact + Tier-C clean at 30 steps.
+]
+
+# Cases that are NOT strictly bit-faithful but ARE physically faithful (Tier-C PASS vs the Fortran oracle).
+# They are FP-limited, not bug-limited: their init + first-step physics are bit-exact, and the residual past
+# step 1 is genuine FP/chaos amplification (cloud-topped boundary layers magnify a sub-tolerance cloud
+# difference). Run with `--cases tier_c` (forces --tier physical).
+TIER_C_CASES = [
+    "cgils_s11",   # Iter89/90/92: Press[Pa]-sounding→z + T[K]→θ init (clubb_driver.F90:5499-5524) +
+                   # convert_snd2extended_atm radiation (case ozone/deep sounding). thlm bit-exact at step 1;
+                   # FP-balanced residual (surface radht / cloud chaos) from step 2. Shared init+rad path for
+                   # the 12 CGILS/cloud_feedback cases.
+    "cgils_s12",   # Iter102: same init+rad path; the Iter97 forcing zero-fill fix was what tipped it to Tier-C
+                   # PASS (its forcing tops out at 101687 Pa, below the model bottom → out-of-range levels that
+                   # were previously edge-extrapolated). FP-limited moments beyond cloud onset.
 ]
 
 # Cases whose JAX driver runs but which are NOT yet bit-faithful, with the missing
@@ -215,12 +231,18 @@ def main():
 
     if args.list:
         print("Bit-faithful regression set:", ", ".join(DEFAULT_CASES))
+        print("\nTier-C physical-fidelity set (run: --cases tier_c):", ", ".join(TIER_C_CASES))
         print("\nBlocked cases (run/diverge; missing feature):")
         for c, why in BLOCKED_CASES.items():
             print(f"  {c:<18} {why}")
         return
 
-    cases = args.cases.split(",") if args.cases else DEFAULT_CASES
+    if args.cases == "tier_c":
+        # Physical-fidelity suite (Tier-C-faithful, FP-limited). Force the physical tier.
+        cases = TIER_C_CASES
+        args.tier = "physical"
+    else:
+        cases = args.cases.split(",") if args.cases else DEFAULT_CASES
 
     print(f"=== Multi-case regression ({args.max_iters} iters) ===\n")
     print(f"{'Case':<16}  {'Status':<8}  {'ProgFail':>8}  {'DiagFail':>8}  Notes")

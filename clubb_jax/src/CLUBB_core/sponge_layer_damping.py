@@ -14,6 +14,7 @@ Reference: clubb_release/src/CLUBB_core/sponge_layer_damping.F90
 from __future__ import annotations
 
 import numpy as np
+import jax.numpy as jnp
 
 
 def initialize_tau_sponge_damp(z, dt, zm_top, tau_min, tau_max, sponge_damp_depth):
@@ -59,3 +60,28 @@ def sponge_damp_xm(xm, xm_ref, z, zm_top, tau, sponge_layer_depth, dt):
     (z/zm_top/sponge_layer_depth are now implicit in ``tau`` and kept only for signature compatibility.)"""
     dt_on_tau = dt / tau                       # 0.0 where tau=inf (outside the sponge), finite inside
     return (xm + dt_on_tau * xm_ref) / (1.0 + dt_on_tau)
+
+
+def sponge_damp_xp2(dt, zm, xp2, x_tol_sqd, tau, sponge_layer_depth):
+    """Damp a variance <x'^2> in the top sponge layer (sponge_layer_damping.F90:sponge_damp_xp2):
+    xp2_damped = max((1 − dt/tau)^2 · xp2, x_tol_sqd) where (zm_top − zm) < sponge_layer_depth, else xp2.
+    zm and xp2 are (ngrdcol, nzm); tau is (ngrdcol, nzm). Pure-jnp → differentiable."""
+    zm = jnp.asarray(zm, dtype=jnp.float64); xp2 = jnp.asarray(xp2, dtype=jnp.float64)
+    tau = jnp.asarray(tau, dtype=jnp.float64)
+    zm_top = zm[:, -1:]
+    in_sponge = (zm_top - zm) < sponge_layer_depth
+    damped = jnp.maximum((1.0 - dt / tau) ** 2 * xp2, x_tol_sqd)
+    return jnp.where(in_sponge, damped, xp2)
+
+
+def sponge_damp_xp3(dt, z, zm, xp3, tau, sponge_layer_depth):
+    """Damp a third moment <x'^3> in the top sponge layer (sponge_layer_damping.F90:sponge_damp_xp3):
+    xp3_damped = (1 − dt/tau)^3 · xp3 where (zm_top − z) < sponge_layer_depth, else xp3.
+    z and xp3 are (ngrdcol, nzt) thermodynamic-level fields; zm is (ngrdcol, nzm); tau is (ngrdcol, nzt).
+    Pure-jnp → differentiable."""
+    z = jnp.asarray(z, dtype=jnp.float64); zm = jnp.asarray(zm, dtype=jnp.float64)
+    xp3 = jnp.asarray(xp3, dtype=jnp.float64); tau = jnp.asarray(tau, dtype=jnp.float64)
+    zm_top = zm[:, -1:]
+    in_sponge = (zm_top - z) < sponge_layer_depth
+    damped = (1.0 - dt / tau) ** 3 * xp3
+    return jnp.where(in_sponge, damped, xp3)

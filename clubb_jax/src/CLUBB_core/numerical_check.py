@@ -101,6 +101,28 @@ def _check_negative(arr: np.ndarray, name: str, location: str, err_code: np.ndar
         err_code[:] = CLUBB_FATAL_ERROR
 
 
+def sfc_varnce_check(sclr_dim, wp2_sfc, up2_sfc, vp2_sfc, thlp2_sfc, rtp2_sfc, rtpthlp_sfc,
+                     sclrp2_sfc=None, sclrprtp_sfc=None, sclrpthlp_sfc=None):
+    """NaN/Inf-check the calc_surface_varnce outputs (numerical_check.F90:sfc_varnce_check).
+
+    The Fortran NaN-checks each surface variance/covariance and sets err_code=fatal on any non-finite value
+    (then returns; the f2py wrapper does not expose the err_code). The JAX path never error-stops, so this
+    returns True iff every checked field is finite. Concrete validation (not in any gradient path).
+    """
+    fields = [(wp2_sfc, "wp2_sfc"), (up2_sfc, "up2_sfc"), (vp2_sfc, "vp2_sfc"),
+              (thlp2_sfc, "thlp2_sfc"), (rtp2_sfc, "rtp2_sfc"), (rtpthlp_sfc, "rtpthlp_sfc")]
+    if sclr_dim > 0:
+        fields += [(sclrp2_sfc, "sclrp2_sfc"), (sclrprtp_sfc, "sclrprtp_sfc"), (sclrpthlp_sfc, "sclrpthlp_sfc")]
+    valid = True
+    for arr, name in fields:
+        if arr is None:
+            continue
+        if not np.all(np.isfinite(np.asarray(arr, dtype=np.float64))):
+            print(f"{name} is NaN in calc_surface_varnce", file=sys.stderr)
+            valid = False
+    return valid
+
+
 def parameterization_check_jax(
     err_info,
     nzm: int, nzt: int, ngrdcol: int, sclr_dim: int, edsclr_dim: int,

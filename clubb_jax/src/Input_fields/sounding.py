@@ -19,6 +19,65 @@ from pathlib import Path
 MISSING = -999.9
 
 
+def convert_pressure_sounding_to_z(snd: dict, p_sfc: float, zm_init: float,
+                                   saturation_formula: int) -> dict:
+    """Convert a pressure-coordinate (``Press[Pa]``) sounding to altitude (``z[m]``) coordinates.
+
+    Faithful port of input_interpret.F90:read_z_profile (pressure branch). For a sounding whose vertical
+    coordinate is pressure (the CGILS/cloud_feedback cases), the level altitudes are not given and must be
+    derived hydrostatically from the sounding's own thermodynamics:
+      exner = (p/p0)**kappa;  then, by the temperature column type, recover thlm, rcm and theta;
+      thvm = calculate_thvm(thlm, rt, rcm, exner, thv_ds = theta·(1+ep2·(rt−rcm))**kappa);
+      z = inverse_hydrostatic(p_sfc, zm_init, thvm, exner).
+    Returns a NEW sounding dict identical to ``snd`` but with ``z`` replaced by the derived altitudes [m] and
+    ``alt_type`` set to ``z[m]`` so the rest of the pipeline (fill_blanks + interpolate) is unchanged. Gated by
+    the caller on ``alt_type == 'Press[Pa]'`` — height-coordinate cases never enter here.
+
+    Building blocks (each independently f2py-validated): saturation.sat_mixrat_liq / rcm_sat_adj,
+    T_in_K_module.calculate_thvm, calc_pressure.inverse_hydrostatic.
+    """
+    import jax.numpy as jnp
+    from clubb_jax.src.CLUBB_core.calc_pressure import inverse_hydrostatic
+    from clubb_jax.src.CLUBB_core.T_in_K_module import calculate_thvm_jax
+    from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax, rcm_sat_adj_jax
+    from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, p0, kappa, ep2, zero_threshold
+
+    p_in_Pa = np.asarray(snd['z'], dtype=np.float64)
+    theta_col = np.asarray(snd['theta'], dtype=np.float64)
+    rtm = np.asarray(snd['rt'], dtype=np.float64)
+    exner = (p_in_Pa / p0) ** kappa
+    tt = str(snd['theta_type']).strip().lower()
+
+    if tt == 't[k]':                       # absolute temperature
+        T = theta_col
+        rcm = np.maximum(rtm - np.asarray(sat_mixrat_liq_jax(p_in_Pa, T, saturation_formula)),
+                         zero_threshold)
+        theta = T / exner
+        thlm = theta - Lv / (Cp * exner) * rcm
+    elif tt == 'thm[k]':                   # potential temperature
+        theta = theta_col
+        rcm = np.maximum(rtm - np.asarray(sat_mixrat_liq_jax(p_in_Pa, theta * exner, saturation_formula)),
+                         zero_threshold)
+        thlm = theta - Lv / (Cp * exner) * rcm
+    elif tt == 'thlm[k]':                  # liquid-water potential temperature
+        thlm = theta_col
+        rcm = np.asarray(rcm_sat_adj_jax(thlm, rtm, p_in_Pa, exner, saturation_formula))
+        theta = thlm + Lv / (Cp * exner) * rcm
+    else:
+        raise ValueError(f"convert_pressure_sounding_to_z: invalid theta_type {snd['theta_type']!r}")
+
+    thv_ds = theta * (1.0 + ep2 * (rtm - rcm)) ** kappa
+    thvm = np.asarray(calculate_thvm_jax(jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
+                                         jnp.asarray(exner), jnp.asarray(thv_ds)))
+    z = np.asarray(inverse_hydrostatic(float(p_sfc), float(zm_init), thvm, exner))
+
+    out = dict(snd)
+    out['z'] = z
+    out['p_in_Pa'] = p_in_Pa            # keep the original pressures for any pressure-coordinate forcing path
+    out['alt_type'] = 'z[m]'
+    return out
+
+
 def read_sounding(path: str) -> dict:
     """Read a sounding file and return a dict of column arrays + metadata.
 

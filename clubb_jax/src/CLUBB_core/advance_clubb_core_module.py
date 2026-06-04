@@ -314,7 +314,11 @@ def _stats_accumulate_py(sw, *, nzm, nzt, ngrdcol, dt, gr,
 
     # rcm_in_cloud
     if sw.var_on_stats_list("rcm_in_cloud"):
-        rcm_in_cloud = _xp.where(cloud_frac > _CLOUD_FRAC_MIN, rcm / cloud_frac, rcm)
+        # Guard the denominator so the cloud_frac==0 elements don't produce a nan in the unused branch
+        # (the bare `rcm / cloud_frac` divided by zero everywhere cloud_frac==0 → RuntimeWarning + nan that
+        # also poisons reverse-mode gradients through this diagnostic). where-select stays forward-identical.
+        cf_safe = _xp.where(cloud_frac > _CLOUD_FRAC_MIN, cloud_frac, 1.0)
+        rcm_in_cloud = _xp.where(cloud_frac > _CLOUD_FRAC_MIN, rcm / cf_safe, rcm)
         sw.update("rcm_in_cloud", rcm_in_cloud)
 
     # shear (zm-level)

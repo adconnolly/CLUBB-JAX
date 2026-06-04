@@ -7,6 +7,10 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
     grav,
     ibeta,
     iSkw_denom_coef,
+    igamma_coef,
+    igamma_coefb,
+    igamma_coefc,
+    eps,
     ixp3_coef_base,
     ixp3_coef_slope,
     rt_tol,
@@ -203,3 +207,24 @@ def advance_xp3_jax(
                                beta, clubb_params, w_tol)
 
     return rtp3, thlp3, up3, vp3
+
+
+def compute_gamma_Skw_jax(Skw, clubb_params, l_gamma_Skw):
+    """Gamma coefficient as a Gaussian function of w skewness (Skx_module.F90:compute_gamma_Skw).
+
+    When l_gamma_Skw and the two coefficients differ meaningfully
+    (|γ_coef − γ_coefb| > |γ_coef + γ_coefb|·eps/2):
+        gamma = γ_coefb + (γ_coef − γ_coefb)·exp(−½ (Skw/γ_coefc)²),
+    otherwise (degenerate coefficients, or l_gamma_Skw off) gamma = γ_coef (constant). The branch depends only
+    on the per-column tunable parameters, not on Skw. Skw is (ngrdcol, nz) — pass Skw_zm or Skw_zt. Pure-jnp →
+    differentiable. Returns gamma_Skw_fnc with Skw's shape."""
+    Skw = jnp.asarray(Skw, dtype=jnp.float64)
+    cp = jnp.asarray(clubb_params, dtype=jnp.float64)
+    gc = cp[:, igamma_coef - 1:igamma_coef]      # (ngrdcol, 1)
+    gb = cp[:, igamma_coefb - 1:igamma_coefb]
+    gcf = cp[:, igamma_coefc - 1:igamma_coefc]
+    if not l_gamma_Skw:
+        return gc + jnp.zeros_like(Skw)               # broadcast (ngrdcol,1) over (ngrdcol,nz)
+    cond = jnp.abs(gc - gb) > jnp.abs(gc + gb) * eps / 2.0
+    varying = gb + (gc - gb) * jnp.exp(-0.5 * (Skw / gcf) ** 2)
+    return jnp.where(cond, varying, gc + jnp.zeros_like(Skw))

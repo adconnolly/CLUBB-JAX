@@ -203,7 +203,12 @@ def _advance_bugsrad_radiation(state: dict, time_current: float, l_sample: bool 
     # build + cache the static radiation-grid layout (std-atm extension + buffer) on first call
     setup = state.get('_bugsrad_setup')
     if setup is None:
-        ext = load_std_atmosphere()
+        # l_use_default_std_atmosphere=.false. (CGILS/cloud_feedback/astex/twp_ice): the Fortran builds the
+        # radiation extended atmosphere (above the model top, T/q/p/o3) from the case's OWN deep sounding +
+        # {case}_ozone_sounding.in (convert_snd2extended_atm), not the default US-standard atmosphere. The driver
+        # precomputes that into state['_rad_ext_atm'] at init (Iter92). Use it when present; otherwise fall back
+        # to the default std atmosphere (the gated cases, flag true, are unaffected).
+        ext = state.get('_rad_ext_atm') or load_std_atmosphere()
         zm = np.asarray(gr.zm, dtype=np.float64)[0]
         dzt = np.asarray(gr.dzt, dtype=np.float64)[0]          # zm_grid_spacing (Fortran passes gr%dzt)
         rad_top = float(cfg.get('radiation_top', 50000.0))

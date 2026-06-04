@@ -79,6 +79,21 @@ def set_corr_arrays_to_default(pdf_dim, pdf_to_def):
     return cloud, below
 
 
+def assert_corr_symmetric(corr_array_n, tol=1.0e-6, eps=1.0e-10):
+    """Validity check for a normal-space correlation matrix (corr_varnce_module.F90:assert_corr_symmetric).
+
+    Returns True iff the (pdf_dim, pdf_dim) array is symmetric within ``tol`` (1e-6) AND has a unit diagonal
+    within ``eps`` (constants_clubb ``eps`` = 1e-10). The Fortran sets ``err_info%err_code = clubb_fatal_error``
+    and prints when the assertion fails (then ``return`` — it does not error-stop, and the err_code is not
+    exposed by the f2py wrapper); the JAX path never error-stops, so this returns the boolean verdict instead.
+    Pure-numpy concrete check (not in any gradient path).
+    """
+    c = np.asarray(corr_array_n, dtype=np.float64)
+    symmetric = bool(np.all(np.abs(c - c.T) <= tol))
+    unit_diag = bool(np.all(np.abs(np.diagonal(c) - 1.0) <= eps))
+    return symmetric and unit_diag
+
+
 def kk_prescribed_correlations():
     """The normal-space correlations the upscaled-KK rate functions consume, derived from the
     prescribed in-cloud array for the standard KK PDF layout [chi, eta, w, Ncn, rr, Nr].
