@@ -26,17 +26,51 @@ the f2py API (f2py_precip_fraction); see tests/test_precip_fraction.py.
 
 All operations are jnp / lax (differentiable where the max/where branches are smooth).
 """
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
+from clubb_jax.src.CLUBB_core.constants_clubb import cloud_frac_min
 
 jax.config.update("jax_enable_x64", True)
 
-# constants_clubb.F90 / precipitation_fraction.F90 parameters
-_CLOUD_FRAC_MIN = 0.005
+# precipitation_fraction.F90 parameter (cloud_frac_min imported from constants_clubb above)
 _PRECIP_FRAC_TOL_COEF = 0.1
 _MAX_HM_IP_COMP_MEAN = 0.0025
 _EPS = jnp.finfo(jnp.float64).eps
+_CONST_EPS = max(1.0e-10, np.finfo(np.float64).eps)   # constants_clubb.F90:eps
+
+
+def precip_frac_assert_check(hydromet, hydromet_tol, mixt_frac, precip_frac,
+                             precip_frac_1, precip_frac_2, precip_frac_tol):
+    """Validity checks for the precipitation-fraction outputs (precipitation_fraction.F90:precip_frac_assert_check).
+
+    At each level: where any hydrometeor >= its tol, precip_frac in [precip_frac_tol, 1] and precip_frac_1/2 in
+    [0, 1] but not in (0, precip_frac_tol-eps); where all hydrometeors < tol, precip_frac/_1/_2 are all ~0 (|.|<=eps).
+    Always: precip_frac == mixt_frac*precip_frac_1 + (1-mixt_frac)*precip_frac_2 within eps (eps=constants_clubb.eps,
+    ~1e-10). The Fortran sets err_code=fatal on any violation; the JAX path never error-stops, so this returns True
+    iff every check passes. Concrete-numpy check (not in any gradient path). hydromet is (..., hydromet_dim) per
+    level / (nzt, hydromet_dim); hydromet_tol is (hydromet_dim,); the precip_frac arrays and mixt_frac are (nzt,);
+    precip_frac_tol is the per-column scalar."""
+    hm = np.asarray(hydromet, dtype=np.float64)
+    pf = np.asarray(precip_frac, dtype=np.float64)
+    pf1 = np.asarray(precip_frac_1, dtype=np.float64)
+    pf2 = np.asarray(precip_frac_2, dtype=np.float64)
+    mf = np.asarray(mixt_frac, dtype=np.float64)
+    tol = np.asarray(hydromet_tol, dtype=np.float64)
+    pft = float(precip_frac_tol)
+    eps = _CONST_EPS
+
+    has_hm = np.any(hm >= tol, axis=-1)          # (nzt,)
+    # Always: overall == mixt_frac-weighted component sum, within eps.
+    consistent = np.abs(pf - (mf * pf1 + (1.0 - mf) * pf2)) <= eps
+    # Cloudy levels: in-range overall + components (and not sub-tol-but-positive).
+    cloudy_ok = ((pf >= pft) & (pf <= 1.0)
+                 & ~((pf1 > 0.0) & (pf1 < pft - eps)) & (pf1 >= 0.0) & (pf1 <= 1.0)
+                 & ~((pf2 > 0.0) & (pf2 < pft - eps)) & (pf2 >= 0.0) & (pf2 <= 1.0))
+    # Clear levels: everything ~0.
+    clear_ok = (np.abs(pf) <= eps) & (np.abs(pf1) <= eps) & (np.abs(pf2) <= eps)
+    return bool(np.all(consistent) and np.all(np.where(has_hm, cloudy_ok, clear_ok)))
 
 
 def _specify_general(pf, mf, tol, upsilon):
@@ -103,6 +137,20 @@ def _specify_upsilon_one(pf, mf, tol):
     return jnp.where(le, pf1_a, pf1_b), jnp.where(le, pf2_a, pf2_b_out)
 
 
+def component_precip_frac_specify(precip_frac, mixt_frac, tol, upsilon_precip_frac_rat):
+    """Per-component precip fraction via the specified-upsilon method (precip_frac_calc_type=2, the fixed default).
+    precipitation_fraction.F90:component_precip_frac_specify. upsilon = mixt_frac*f_p(1)/f_p is specified
+    (clubb_params iupsilon_precip_frac_rat); only the upsilon==1 and general 0<upsilon<1 branches are reachable
+    (the upsilon==0 branch is dead code). Returns (precip_frac_1, precip_frac_2). The Fortran's max_hm_ip_comp_mean
+    limiter is applied by the caller (precip_fraction), after this split, mirroring the Fortran boundary."""
+    is_one = jnp.abs(upsilon_precip_frac_rat - 1.0) < jnp.abs(upsilon_precip_frac_rat + 1.0) / 2.0 * _EPS
+    pf1_g, pf2_g = _specify_general(precip_frac, mixt_frac, tol, upsilon_precip_frac_rat)
+    pf1_1, pf2_1 = _specify_upsilon_one(precip_frac, mixt_frac, tol)
+    pf1 = jnp.where(is_one, pf1_1, pf1_g)
+    pf2 = jnp.where(is_one, pf2_1, pf2_g)
+    return pf1, pf2
+
+
 def precip_fraction(hydromet, cloud_frac, cloud_frac_1, cloud_frac_2,
                     ice_supersat_frac, ice_supersat_frac_1, ice_supersat_frac_2,
                     mixt_frac, l_mix_rat_hm, l_frozen_hm, hydromet_tol,
@@ -125,7 +173,7 @@ def precip_fraction(hydromet, cloud_frac, cloud_frac_1, cloud_frac_2,
     cf_max = jnp.max(cloud_frac, axis=1)
     if any_frozen:
         cf_max = jnp.maximum(cf_max, jnp.max(isf, axis=1))
-    precip_frac_tol = jnp.maximum(_PRECIP_FRAC_TOL_COEF * cf_max, _CLOUD_FRAC_MIN)  # (ngrdcol,)
+    precip_frac_tol = jnp.maximum(_PRECIP_FRAC_TOL_COEF * cf_max, cloud_frac_min)  # (ngrdcol,)
     tol = precip_frac_tol[:, None]
 
     # 2. Overall precip_frac: greatest cloud_frac (or max with ice) AT OR ABOVE a level.
@@ -137,12 +185,8 @@ def precip_fraction(hydromet, cloud_frac, cloud_frac_1, cloud_frac_2,
     precip_frac = jnp.where(~has_hm, 0.0,
                             jnp.where(precip_frac < tol, tol, precip_frac))
 
-    # 4. Component split (specify; upsilon==1 or general).
-    is_one = jnp.abs(upsilon_precip_frac_rat - 1.0) < jnp.abs(upsilon_precip_frac_rat + 1.0) / 2.0 * _EPS
-    pf1_g, pf2_g = _specify_general(precip_frac, mixt_frac, tol, upsilon_precip_frac_rat)
-    pf1_1, pf2_1 = _specify_upsilon_one(precip_frac, mixt_frac, tol)
-    pf1 = jnp.where(is_one, pf1_1, pf1_g)
-    pf2 = jnp.where(is_one, pf2_1, pf2_g)
+    # 4. Component split (component_precip_frac_specify; upsilon==1 or general).
+    pf1, pf2 = component_precip_frac_specify(precip_frac, mixt_frac, tol, upsilon_precip_frac_rat)
     # No hydrometeors at the level -> both component fractions 0.
     pf1 = jnp.where(has_hm, pf1, 0.0)
     pf2 = jnp.where(has_hm, pf2, 0.0)
@@ -167,3 +211,22 @@ def precip_fraction(hydromet, cloud_frac, cloud_frac_1, cloud_frac_2,
     precip_frac = jnp.where(has_hm, jnp.minimum(jnp.maximum(precip_frac, tol), 1.0), precip_frac)
 
     return precip_frac, pf1, pf2, precip_frac_tol
+
+
+def precip_frac_double_delta_jax(cloud_frac):
+    """Top-down fill: precip_frac = cloud_frac where cloudy, else inherit the value from the level above; the
+    top level is 0 (ascending grid: index 0 = bottom, nzt-1 = top). The double-delta-PDF precip-fraction
+    used by the Morrison rain-evap update_xp2_mc — mirrors the "greatest cloud fraction at or above a grid
+    level" form of precipitation_fraction.F90:precip_fraction. (Relocated here from advance_xp2_xpyp_module.py
+    to its precip-fraction Fortran home, mirror-refactor iter 240.)
+    """
+    cf_rev = cloud_frac[:, ::-1]          # index 0 = top
+    ng = cloud_frac.shape[0]
+
+    def step(carry, cf_lev):
+        pf = jnp.where(cf_lev > cloud_frac_min, cf_lev, carry)
+        return pf, pf
+
+    _, rest = lax.scan(step, jnp.zeros(ng), cf_rev[:, 1:].T)   # levels 1..nzt-1 (top-first)
+    pf_rev = jnp.concatenate([jnp.zeros((1, ng)), rest], axis=0)   # (nzt, ng), top-first
+    return pf_rev.T[:, ::-1]              # (ng, nzt), bottom-first

@@ -1,6 +1,6 @@
 """Pure-Python port of CLUBB_core/model_flags.F90.
 
-Provides get_default_config_flags_jax to replace the Fortran API call.
+Provides get_default_config_flags to replace the Fortran API call.
 """
 from __future__ import annotations
 
@@ -9,8 +9,31 @@ from __future__ import annotations
 # ConfigFlags._fields round-trip in clubb_standalone then becomes a no-op same-type copy.
 from clubb_jax.src.derived_types.config_flags import ConfigFlags
 
+# ── Compile-time enum parameters (model_flags.F90 `integer, parameter`) — the integer codes for PDF type,
+#    PDF-closure placement, and advance ordering. This is their Fortran home; constants_clubb.py re-exports them. ──
+iiPDF_ADG1 = 1                       # PDF-type codes (model_flags.F90:31-37)
+iiPDF_ADG2 = 2
+iiPDF_3D_Luhar = 3
+iiPDF_new = 4
+iiPDF_TSDADG = 5
+iiPDF_LY93 = 6
+iiPDF_new_hybrid = 7
+ipdf_pre_advance_fields = 1          # PDF-closure placement (model_flags.F90)
+ipdf_post_advance_fields = 2
+ipdf_pre_post_advance_fields = 3
+order_xm_wpxp = 1                    # advance ordering (model_flags.F90:22-25)
+order_xp2_xpyp = 2
+order_wp2_wp3 = 3
+order_windm = 4
+saturation_bolton = 1                # saturation_formula codes (model_flags.F90:165-168)
+saturation_gfdl   = 2
+saturation_flatau = 3
+saturation_lookup = 4
+l_gamma_Skw = True                   # use Skw-dependent gamma parameter (model_flags.F90)
+l_advance_xp3 = False                # use predictive xp3 equation (model_flags.F90)
 
-def get_default_config_flags_jax() -> ConfigFlags:
+
+def get_default_config_flags() -> ConfigFlags:
     """Return CLUBB default ConfigFlags matching set_default_clubb_config_flags_api.
 
     Values are faithfully ported from model_flags.F90 lines 576-639.

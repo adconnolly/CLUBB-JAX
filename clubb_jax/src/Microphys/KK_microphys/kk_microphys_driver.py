@@ -21,9 +21,10 @@ import jax.numpy as jnp
 from clubb_jax.src.CLUBB_core.Nc_Ncn_eqns import Nc_in_cloud_to_Ncnm
 from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N
 from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_means import (
-    KK_auto_upscaled_mean, KK_accr_upscaled_mean, KK_evap_upscaled_mean, kk_auto_coef,
+    KK_auto_upscaled_mean, KK_accr_upscaled_mean, KK_evap_upscaled_mean,
 )
-from clubb_jax.src.Microphys.KK_microphys.KK_utilities import kk_evap_coef
+from clubb_jax.src.Microphys.KK_microphys_module import kk_evap_coef, kk_auto_coef
+from clubb_jax.src.Microphys.KK_microphys.parameters_KK import C_evap as _C_EVAP_DEFAULT  # parameters_KK.F90:48
 
 
 def _hm_log_moments(mu_hm, sigma_hm):
@@ -103,55 +104,9 @@ def kk_evaporation_mean(mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi_2,
         corr_rr_Nr_1_n, corr_rr_Nr_2_n, coef, mixt_frac, precip_frac_1, precip_frac_2)
 
 
-def kk_microphys_adjust(dt, exner, rcm, rrm, Nrm,
-                        KK_evap_tndcy, KK_auto_tndcy, KK_accr_tndcy,
-                        KK_Nrm_evap_tndcy, KK_Nrm_auto_tndcy,
-                        l_src_adj_enabled=True, l_evap_adj_enabled=True):
-    """Assemble the KK microphysics state tendencies from the process rates.
-    KK_microphys_module.F90:1196 (the upscaled path enables both adjustments).
-
-    Source adjustment: limit auto+accr so they don't draw more cloud water than available
-    (rate <= rcm/dt). Evaporation adjustment: limit so rain can't go negative (>= -rrm/dt,
-    -Nrm/dt). Returns (rrm_mc, Nrm_mc, rvm_mc, rcm_mc, thlm_mc)."""
-    from clubb_jax.src.Microphys.KK_microphys.KK_Nrm_tendencies import (
-        KK_Nrm_auto_mean, KK_Nrm_evap_local_mean)
-    from clubb_jax.src.CLUBB_core.constants_clubb import Lv, Cp
-    rr_tol, Nr_tol = 1.0e-10, 1.0e-10 / ((4.0 / 3.0) * jnp.pi * 1000.0 * (5.0e-3) ** 3)
-    eps = jnp.finfo(jnp.float64).eps
-
-    rrm_source = KK_auto_tndcy + KK_accr_tndcy
-    Nrm_source = KK_Nrm_auto_tndcy
-
-    if l_src_adj_enabled:
-        # Over a long step auto+accr may over-deplete rcm; cap the total source at rcm/dt.
-        over = (rrm_source * dt) > rcm
-        rrm_src_max = rcm / dt
-        src_safe = jnp.where(rrm_source != 0.0, rrm_source, 1.0)
-        rrm_auto_ratio = KK_auto_tndcy / src_safe
-        rrm_src_adj = rrm_src_max - rrm_source
-        Nrm_src_adj = KK_Nrm_auto_mean(rrm_auto_ratio * rrm_src_adj)
-        rrm_source = jnp.where(over, rrm_src_max, rrm_source)
-        Nrm_source = jnp.where(over, Nrm_source + Nrm_src_adj, Nrm_source)
-
-    if l_evap_adj_enabled:
-        rrm_evap_net = jnp.maximum(KK_evap_tndcy, -rrm / dt)
-        # recompute Nrm evap from the net rrm evap when the rrm evap was limited
-        limited = (jnp.abs(KK_evap_tndcy - rrm_evap_net)
-                   > jnp.abs(KK_evap_tndcy + rrm_evap_net) * eps / 2.0) \
-                  & (rrm > rr_tol) & (Nrm > Nr_tol)
-        Nrm_evap_recomp = KK_Nrm_evap_local_mean(rrm_evap_net, Nrm, rrm, dt)
-        Nrm_evap_net = jnp.where(limited, Nrm_evap_recomp, KK_Nrm_evap_tndcy)
-        Nrm_evap_net = jnp.maximum(Nrm_evap_net, -Nrm / dt)
-    else:
-        rrm_evap_net = KK_evap_tndcy
-        Nrm_evap_net = KK_Nrm_evap_tndcy
-
-    rrm_mc = rrm_evap_net + rrm_source
-    Nrm_mc = Nrm_evap_net + Nrm_source
-    rvm_mc = -rrm_evap_net
-    rcm_mc = -rrm_source
-    thlm_mc = (Lv / (Cp * exner)) * rrm_mc
-    return rrm_mc, Nrm_mc, rvm_mc, rcm_mc, thlm_mc
+# KK_microphys_adjust + KK_sedimentation now live in their Fortran-home module
+# Microphys/KK_microphys_module.py (mirror-refactor iter 112), imported below.
+from clubb_jax.src.Microphys.KK_microphys_module import KK_microphys_adjust
 
 
 # --- prescribed normal-space correlations, derived from the corr_varnce_module default arrays
@@ -163,45 +118,11 @@ _CORR_CHI_NR_N = _KK_CORRS['corr_chi_Nr']    # 0.675
 _CORR_RR_NR_N = _KK_CORRS['corr_rr_Nr']      # 0.821
 
 
-def kk_sedimentation(mvr, cloud_top_level=None, l_clip_positive_sed=True):
-    """Mean KK sedimentation velocities Vrr (rain mass) and VNr (rain number) from the rain-drop
-    mean volume radius. Oracle KK_microphys_module.F90:1542 (KK00 Eq. 37).
-
-      Vrr = -(0.012 * mvr_micron - 0.2),  VNr = -(0.007 * mvr_micron - 0.1)   [m/s, downward<=0]
-
-    `mvr` is the mean volume radius in METERS (ngrdcol, nzt) or (nzt,). With l_clip_positive_sed
-    (true for rico / non-SILHS) the velocities are clipped to <= 0 (no upward sedimentation), and
-    the top model level is set to 0 (zero flux through the model top). If `cloud_top_level` (the
-    0-based thermodynamic index of cloud top, per column) is given, velocities ABOVE cloud top are
-    zeroed (faithful to the Fortran cloud_top_level+1:nzt-1 slice); for rico this is largely a
-    no-op since mvr~0 above cloud already clips to 0. Returns (Vrr, VNr), differentiable in mvr."""
-    from clubb_jax.src.CLUBB_core.constants_clubb import micron_per_m
-    mvr = jnp.asarray(mvr, dtype=jnp.float64)
-    mvr_micron = micron_per_m * mvr
-    Vrr = -(0.012 * mvr_micron - 0.2)
-    VNr = -(0.007 * mvr_micron - 0.1)
-    if l_clip_positive_sed:
-        Vrr = jnp.minimum(Vrr, 0.0)
-        VNr = jnp.minimum(VNr, 0.0)
-        if cloud_top_level is not None:
-            nzt = mvr.shape[-1]
-            k = jnp.arange(nzt)
-            ctl = jnp.asarray(cloud_top_level)[..., None]   # 0-based cloud-top index per column
-            above = (k[None, :] if mvr.ndim > 1 else k) > ctl
-            above = above & (ctl > 0)
-            Vrr = jnp.where(above, 0.0, Vrr)
-            VNr = jnp.where(above, 0.0, VNr)
-    # Zero-flux boundary condition at the model top (highest level).
-    Vrr = Vrr.at[..., -1].set(0.0)
-    VNr = VNr.at[..., -1].set(0.0)
-    return Vrr, VNr
+# KK_sedimentation moved to Microphys/KK_microphys_module.py (mirror-refactor iter 112), imported above.
 
 
-def _hydrometp2_zt(hmm, precip_frac, ratio):
-    """Overall hydrometeor variance from the prescribed in-precip ratio.
-    setup_clubb_pdf_params.F90:449 — = ((ratio+1)/precip_frac - 1) * hm^2 where hm>=tol."""
-    pf = jnp.where(precip_frac > 0.0, precip_frac, 1.0)
-    return ((ratio + 1.0) / pf - 1.0) * hmm ** 2
+# hydrometp2_zt (the overall hydrometeor variance, setup_clubb_pdf_params.F90:449) now lives in its
+# Fortran-home module CLUBB_core/setup_clubb_pdf_params.py (mirror-refactor iter 192), imported where used.
 
 
 def compute_kk_microphysics(rrm, Nrm, mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi_2,
@@ -209,12 +130,12 @@ def compute_kk_microphysics(rrm, Nrm, mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi
                             precip_frac, precip_frac_1, precip_frac_2, precip_frac_tol,
                             rho, T_liq, p_in_Pa, exner, rcm, dt,
                             rr_ratio=1.25, Nr_ratio=1.25, omicron=0.5, zeta=0.0,
-                            C_evap=0.86, hm_tol=1.0e-10, l_return_vel_prereqs=False):
+                            C_evap=_C_EVAP_DEFAULT, hm_tol=1.0e-10, l_return_vel_prereqs=False):
     """Full upscaled-KK microphysics step (PDF state + hydromet fields -> state tendencies).
 
     Composes: hydrometeor in-precip component moments (calc_comp_mu_sigma_hm for r_r and N_r),
     the cloud-nuclei mean (Nc_in_cloud_to_Ncnm), all KK rates (auto/accr/evap mass; auto/evap
-    number), and the tendency assembly (kk_microphys_adjust). Prescribed normal-space correlations
+    number), and the tendency assembly (KK_microphys_adjust). Prescribed normal-space correlations
     are the corr_varnce_module defaults. N_cn is constant (rico: l_const_Nc_in_cloud).
     Returns (rrm_mc, Nrm_mc, rvm_mc, rcm_mc, thlm_mc).
 
@@ -222,18 +143,18 @@ def compute_kk_microphysics(rrm, Nrm, mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi
     from the rrm/Nrm FIELDS carry the documented timing confound (calc_comp_mu_sigma_hm) and are only
     fully validatable in a running rico."""
     from clubb_jax.src.CLUBB_core.setup_clubb_pdf_params import (
-        compute_mean_stdev, norm_transform_mean_stdev, IIPDF_CHI, IIPDF_NCN)
+        compute_mean_stdev, norm_transform_mean_stdev, IIPDF_NCN, hydrometp2_zt)
     from clubb_jax.src.Microphys.KK_microphys.KK_Nrm_tendencies import (
         KK_Nrm_auto_mean, KK_Nrm_evap_upscaled_mean)
     from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_means import KK_evap_upscaled_mean
-    from clubb_jax.src.Microphys.KK_microphys.KK_utilities import kk_evap_coef
+    from clubb_jax.src.Microphys.KK_microphys_module import kk_evap_coef
 
     # In-precip r_r and N_r component moments (linear + normal/log space), assembled via the
     # faithful setup_pdf_parameters orchestration. The hydrometeors follow Ncn in pdf order:
     # [chi, eta, w, Ncn, rr, Nr] -> rr at IIPDF_NCN+1, Nr at IIPDF_NCN+2. Ncn/chi are handled
     # separately by the rate entry points here, so dummy Ncn=0 (l_const) is passed.
-    hmp2_rr = _hydrometp2_zt(rrm, precip_frac, rr_ratio)
-    hmp2_Nr = _hydrometp2_zt(Nrm, precip_frac, Nr_ratio)
+    hmp2_rr = hydrometp2_zt(rrm, precip_frac, rr_ratio)
+    hmp2_Nr = hydrometp2_zt(Nrm, precip_frac, Nr_ratio)
     Nr_tol = hm_tol / ((4.0 / 3.0) * jnp.pi * 1000.0 * (5.0e-3) ** 3)
     iirr, iiNr = IIPDF_NCN + 1, IIPDF_NCN + 2
     mu_x_1, mu_x_2, sigma_x_1, sigma_x_2, hm_1, hm_2, s2m2_1, s2m2_2 = compute_mean_stdev(
@@ -276,13 +197,13 @@ def compute_kk_microphysics(rrm, Nrm, mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi
         srr1n, srr2n, sNr1n, sNr2n, ccr, ccr, ccN, ccN, crN, crN, coef,
         mixt_frac, precip_frac_1, precip_frac_2, dt)
 
-    tendencies = kk_microphys_adjust(dt, exner, rcm, rrm, Nrm, evap, auto, accr, Nrm_evap, Nrm_auto)
+    tendencies = KK_microphys_adjust(dt, exner, rcm, rrm, Nrm, evap, auto, accr, Nrm_evap, Nrm_auto)
     if not l_return_vel_prereqs:
         return tendencies
 
     # Velocity prerequisites for the transport step (advance_one_hydrometeor): the upscaled mean
     # volume radius mvr (KK_upscaled_means.F90:483) + the rr/Nr in-precip component moments (linear +
-    # normal space) that kk_sedimentation / kk_sed_vel_covars consume. Computed from the SAME locals
+    # normal space) that KK_sedimentation / KK_sed_vel_covars consume. Computed from the SAME locals
     # the rates use (zero added physics; constant normal-space corr_rr_Nr = _CORR_RR_NR_N).
     from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_means import KK_mvr_upscaled_mean
     mvr = KK_mvr_upscaled_mean(mu_rr_1, mu_rr_2, mu_Nr_1, mu_Nr_2, mrr1n, mrr2n, mNr1n, mNr2n,

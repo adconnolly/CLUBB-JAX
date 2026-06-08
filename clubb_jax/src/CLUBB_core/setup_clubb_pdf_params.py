@@ -27,9 +27,11 @@ chi, eta, w, Ncn, <hydrometeors in hydromet-array order>, matching the iiPDF ind
 import jax
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.constants_clubb import Ncn_tol, max_mag_correlation, w_tol, rc_tol
-from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N, corr_NN2NL, corr_NN2LL
-from clubb_jax.src.CLUBB_core.matrix_operations import cholesky_factor
+from clubb_jax.src.CLUBB_core.constants_clubb import max_mag_correlation, w_tol, rc_tol
+from clubb_jax.src.CLUBB_core.pdf_utilities import (
+    mean_L2N, stdev_L2N, corr_NN2NL, corr_NN2LL, compute_variance_binormal)
+from clubb_jax.src.CLUBB_core.matrix_operations import Cholesky_factor
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
 
 jax.config.update("jax_enable_x64", True)
 
@@ -41,14 +43,6 @@ IIPDF_ETA = 1
 IIPDF_W = 2
 IIPDF_NCN = 3
 # Precipitating hydrometeors follow Ncn in hydromet-array order (rr, Nr for KK).
-
-
-def _safe_sqrt(x):
-    """sqrt(x) for x>0, 0 otherwise, with a clean (nan-free) gradient at x<=0.
-    The inner where keeps sqrt from ever being evaluated at <=0 in the autodiff graph
-    (avoids the inf*0=nan that a bare jnp.sqrt(max(x,0)) produces at x=0)."""
-    xp = jnp.where(x > 0.0, x, 1.0)
-    return jnp.where(x > 0.0, jnp.sqrt(xp), 0.0)
 
 
 def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
@@ -170,6 +164,14 @@ def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
     s2r = jnp.where(both, R_b, jnp.where(comp2, sigma_hm_2 ** 2 / mu2_safe ** 2, 0.0))
 
     return mu_hm_1, mu_hm_2, sigma_hm_1, sigma_hm_2, hm_1, hm_2, s1r, s2r
+
+
+def hydrometp2_zt(hmm, precip_frac, ratio):
+    """Overall variance <hm'^2> of a precipitating hydrometeor from its prescribed in-precip ratio
+    (setup_clubb_pdf_params.F90:449): ((hmp2_ip_on_hmm2_ip + 1)/precip_frac − 1) · hm^2 where hm ≥ tol
+    (the caller zeroes the sub-tolerance levels). Pure-jnp → differentiable."""
+    pf = jnp.where(precip_frac > 0.0, precip_frac, 1.0)
+    return ((ratio + 1.0) / pf - 1.0) * hmm ** 2
 
 
 def compute_mean_stdev(chi_1, chi_2, stdev_chi_1, stdev_chi_2,
@@ -363,10 +365,11 @@ def component_corr_eta_hm_n_ip(corr_chi_eta_1, corr_chi_hm_n_1, corr_chi_eta_2, 
             jnp.asarray(corr_chi_eta_2) * jnp.asarray(corr_chi_hm_n_2))
 
 
-# iiPDF_type enumeration (model_flags.F90:31) — the PDF types whose ADG standards fix corr(w,x)=0.
-IIPDF_TYPE_ADG1 = 1
-IIPDF_TYPE_ADG2 = 2
-IIPDF_TYPE_NEW_HYBRID = 7
+# iiPDF_type enumeration (model_flags.F90:31-37) — imported from its Fortran-home model_flags.py (the PDF types
+# whose ADG standards fix corr(w,x)=0).
+from clubb_jax.src.CLUBB_core.model_flags import (
+    iiPDF_ADG1 as IIPDF_TYPE_ADG1, iiPDF_ADG2 as IIPDF_TYPE_ADG2, iiPDF_new_hybrid as IIPDF_TYPE_NEW_HYBRID,
+)
 
 
 def component_corr_w_x(rc_1, rc_2, corr_w_x_NN_cloud, corr_w_x_NN_below,
@@ -641,8 +644,8 @@ def calc_corr_norm_and_cholesky_factor(corr_array_n_cloud, corr_array_n_below, r
         return L + jnp.swapaxes(L, -1, -2) - jnp.diag(jnp.diagonal(M))
 
     cc_s = _symm(cc); cb_s = _symm(cb)
-    _, chol_cloud, _ = cholesky_factor(cc_s)
-    _, chol_below, _ = cholesky_factor(cb_s)
+    _, chol_cloud, _ = Cholesky_factor(cc_s)
+    _, chol_below, _ = Cholesky_factor(cb_s)
     chol_cloud = jnp.tril(chol_cloud)        # zero the upper triangle
     chol_below = jnp.tril(chol_below)
 
@@ -656,3 +659,23 @@ def calc_corr_norm_and_cholesky_factor(corr_array_n_cloud, corr_array_n_below, r
     corr_1, chol_1 = _select(rc_1)
     corr_2, chol_2 = _select(rc_2)
     return corr_1, corr_2, chol_1, chol_2
+
+
+def compute_rtp2_from_chi(sigma_chi_1, sigma_chi_2, sigma_eta_1, sigma_eta_2,
+                          rt_1, rt_2, crt_1, crt_2, mixt_frac,
+                          corr_chi_eta_1, corr_chi_eta_2):
+    """Variance of rt reconstructed from the chi/eta PDF (setup_clubb_pdf_params.F90:compute_rtp2_from_chi).
+
+    The per-component rt variance implied by the chi/eta distribution is
+    varnce_rt_i = (corr_chi_eta_i sigma_chi_i sigma_eta_i + 1/2 sigma_chi_i^2 + 1/2 sigma_eta_i^2)/(2 crt_i^2),
+    and rtp2 is the binormal combine of the two components about the overall mean rtm. Consistent with CLUBB's
+    extended chi/eta PDF (incl. l_fix_w_chi_eta_correlations). The Fortran computes this only as the
+    `rtp2_from_chi` stats diagnostic; mirrored here as a pure, differentiable function. Pure-jnp."""
+    varnce_rt_1 = (corr_chi_eta_1 * sigma_chi_1 * sigma_eta_1
+                   + 0.5 * sigma_chi_1 ** 2 + 0.5 * sigma_eta_1 ** 2) / (2.0 * crt_1 ** 2)
+    varnce_rt_2 = (corr_chi_eta_2 * sigma_chi_2 * sigma_eta_2
+                   + 0.5 * sigma_chi_2 ** 2 + 0.5 * sigma_eta_2 ** 2) / (2.0 * crt_2 ** 2)
+    rtm = mixt_frac * rt_1 + (1.0 - mixt_frac) * rt_2
+    sigma_rt_1 = _safe_sqrt(varnce_rt_1)
+    sigma_rt_2 = _safe_sqrt(varnce_rt_2)
+    return compute_variance_binormal(rtm, rt_1, rt_2, sigma_rt_1, sigma_rt_2, mixt_frac)

@@ -4,7 +4,9 @@ The simplified cloud nuclei concentration N_cn has a single lognormal marginal o
 domain; cloud droplet concentration is Nc = Ncn*H(chi). These functions invert the PDF
 integral <Nc> = <Ncn> * SUM_i mixt_frac_i * <H(chi)>_i to get <Ncn> (Ncnm) from the
 in-cloud mean Nc and the chi-PDF parameters — Ncnm is the autoconversion-rate input mu_Ncn.
-Oracle: Nc_Ncn_eqns.F90:251 (Nc_in_cloud_to_Ncnm), :476 (Ncm_to_Ncnm), :856 (bivar_Ncnm_eqn_comp).
+Oracle: Nc_Ncn_eqns.F90:251 (Nc_in_cloud_to_Ncnm), :476 (Ncm_to_Ncnm), :856 (bivar_Ncnm_eqn_comp). The
+forward direction (Ncn → Nc) is also mirrored: :153 (Ncnm_to_Nc_in_cloud), :348 (Ncnm_to_Ncm), :707
+(bivar_NL_chi_Ncn_mean) — used by the Nc_Ncn G-unit test, completing the module mirror (mirror-refactor iter 267).
 
 Verified bit-to-bit against the f2py API (f2py_nc_in_cloud_to_ncnm); see tests/test_Nc_Ncn_eqns.py.
 """
@@ -13,9 +15,10 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-_SQRT_2 = jnp.sqrt(2.0)
-_CHI_TOL = 1.0e-8           # constants_clubb: max(1e-8, eps)
-_CLOUD_FRAC_MIN = 0.005
+# Nc_Ncn_eqns.F90 `use constants_clubb, only: sqrt_2, chi_tol, Ncn_tol, cloud_frac_min`
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    sqrt_2 as _SQRT_2, chi_tol as _CHI_TOL, Ncn_tol as _NCN_TOL, cloud_frac_min as _CLOUD_FRAC_MIN,
+)
 _EPS = jnp.finfo(jnp.float64).eps
 
 
@@ -75,3 +78,45 @@ def Nc_in_cloud_to_Ncnm(mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi_2, mixt_frac,
     cond = (cloud_frac > _CLOUD_FRAC_MIN) & \
            (jnp.abs(const_corr_chi_Ncn * const_Ncnp2_on_Ncnm2) > _EPS)
     return jnp.where(cond, ncnm_vary, Nc_in_cloud)
+
+
+def bivar_NL_chi_Ncn_mean(mu_chi_i, mu_Ncn_i, sigma_chi_i, sigma_Ncn_i,
+                          sigma_Ncn_i_n, corr_chi_Ncn_i_n):
+    """Per-component <Nc>_i = INT INT Ncn*H(chi)*P_i(chi,Ncn) for the normal-lognormal joint PDF.
+    Nc_Ncn_eqns.F90:707 (forward direction, Ncn → Nc). The four Fortran branches:
+      sigma_chi <= chi_tol            : mu_Ncn_i if mu_chi_i>0 else 0 (both var-0 and chi-only-0 cases reduce to this)
+      sigma_Ncn <= Ncn_tol (chi varies): mu_Ncn_i * 0.5 * erfc(-mu_chi_i/(sqrt2*sigma_chi_i))
+      both vary                       : 0.5*mu_Ncn_i*erfc(-(1/sqrt2)*(mu_chi_i/sigma_chi_i + corr*sigma_Ncn_i_n))."""
+    sig_chi_safe = jnp.maximum(sigma_chi_i, _CHI_TOL)
+    const_branch = jnp.where(mu_chi_i > 0.0, mu_Ncn_i, 0.0)
+    ncn_const = mu_Ncn_i * 0.5 * jax.scipy.special.erfc(-(mu_chi_i / (_SQRT_2 * sig_chi_safe)))
+    both_vary = 0.5 * mu_Ncn_i * jax.scipy.special.erfc(
+        -(1.0 / _SQRT_2) * (mu_chi_i / sig_chi_safe + corr_chi_Ncn_i_n * sigma_Ncn_i_n))
+    varies = jnp.where(sigma_Ncn_i <= _NCN_TOL, ncn_const, both_vary)
+    return jnp.where(sigma_chi_i <= _CHI_TOL, const_branch, varies)
+
+
+def Ncnm_to_Ncm(mu_chi_1, mu_chi_2, mu_Ncn_1, mu_Ncn_2, sigma_chi_1, sigma_chi_2,
+                sigma_Ncn_1, sigma_Ncn_2, sigma_Ncn_1_n, sigma_Ncn_2_n,
+                corr_chi_Ncn_1_n, corr_chi_Ncn_2_n, mixt_frac):
+    """Overall mean cloud droplet concentration <Nc> from the Ncn PDF parameters (forward direction).
+    Nc_Ncn_eqns.F90:348 — the mixt_frac-weighted sum of the two per-component bivar_NL_chi_Ncn_mean integrals."""
+    return (mixt_frac * bivar_NL_chi_Ncn_mean(mu_chi_1, mu_Ncn_1, sigma_chi_1,
+                                              sigma_Ncn_1, sigma_Ncn_1_n, corr_chi_Ncn_1_n)
+            + (1.0 - mixt_frac) * bivar_NL_chi_Ncn_mean(mu_chi_2, mu_Ncn_2, sigma_chi_2,
+                                                        sigma_Ncn_2, sigma_Ncn_2_n, corr_chi_Ncn_2_n))
+
+
+def Ncnm_to_Nc_in_cloud(mu_chi_1, mu_chi_2, mu_Ncn_1, mu_Ncn_2, sigma_chi_1, sigma_chi_2,
+                        sigma_Ncn_1, sigma_Ncn_2, sigma_Ncn_1_n, sigma_Ncn_2_n,
+                        corr_chi_Ncn_1_n, corr_chi_Ncn_2_n, mixt_frac,
+                        cloud_frac_1, cloud_frac_2):
+    """In-cloud mean cloud droplet concentration from the Ncn PDF parameters (forward direction).
+    Nc_Ncn_eqns.F90:153. cloud_frac = mixt_frac*cloud_frac_1 + (1-mixt_frac)*cloud_frac_2; when cloudy,
+    Nc_in_cloud = Ncnm_to_Ncm(...)/cloud_frac; in entirely clear air, Nc_in_cloud = <Ncn> = mu_Ncn_1."""
+    cloud_frac = mixt_frac * cloud_frac_1 + (1.0 - mixt_frac) * cloud_frac_2
+    Ncm = Ncnm_to_Ncm(mu_chi_1, mu_chi_2, mu_Ncn_1, mu_Ncn_2, sigma_chi_1, sigma_chi_2,
+                      sigma_Ncn_1, sigma_Ncn_2, sigma_Ncn_1_n, sigma_Ncn_2_n,
+                      corr_chi_Ncn_1_n, corr_chi_Ncn_2_n, mixt_frac)
+    cf_safe = jnp.where(cloud_frac > _CLOUD_FRAC_MIN, cloud_frac, 1.0)
+    return jnp.where(cloud_frac > _CLOUD_FRAC_MIN, Ncm / cf_safe, mu_Ncn_1)

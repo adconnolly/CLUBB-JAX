@@ -6,7 +6,8 @@ from clubb_jax.src.derived_types.common import Array
 
 
 class ErrInfo(NamedTuple):
-    """Subset of err_info_type that is currently bridgeable via F2PY wrappers."""
+    """JAX runtime err_info — the subset of the Fortran err_info_type fields the driver uses (Gunther
+    short-name idiom; the same subset the f2py-oracle tests bridge)."""
 
     ngrdcol: int
     chunk_idx: int = 1

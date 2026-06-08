@@ -3,7 +3,7 @@
 Faithful port of CLUBB_core/advance_wp2_wp3_module.F90.
 
 Functions implemented:
-  advance_wp2_wp3_jax -- full pentadiagonal LHS/RHS assembly and solve
+  advance_wp2_wp3 -- full pentadiagonal LHS/RHS assembly and solve
                          for the coupled wp2/wp3 system (ADG1 PDF, ascending grid).
 
 All functions operate in float64.
@@ -14,16 +14,25 @@ References:
 
 from __future__ import annotations
 
+import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zt2zm_jax, zm2zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zm2zt2zm_jax, zm2zt, zt2zm
 from clubb_jax.src.CLUBB_core.diffusion import (
     diffusion_zm_lhs_jax,
     diffusion_zt_lhs_jax,
-    term_ma_zm_lhs_jax,
 )
-from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import penta_lu_solve_jax
-from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import term_ma_zt_lhs_jax
+from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zm_lhs_jax, term_ma_zt_lhs_jax
+from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve_jax
+from clubb_jax.src.CLUBB_core.fill_holes import (
+    fill_holes_vertical, fill_holes_wp2_from_horz_tke,
+)
+from clubb_jax.src.CLUBB_core.clip_explicit import clip_variance, clip_skewness
+from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import (
+    apply_lhs_band3_interior_jax, apply_lhs_band2_zt2zm_interior_jax,
+    finalize_implicit_budget_interior_jax,
+)
+from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray, _xp, _iset
 
 import clubb_jax.src.CLUBB_core.constants_clubb as cc
 
@@ -37,7 +46,7 @@ _one_third  = 1.0 / 3.0
 # Private helpers
 # ===========================================================================
 
-def _wp2_term_ta_lhs(invrs_rho_ds_zm, rho_ds_zt, gr):
+def wp2_term_ta_lhs(invrs_rho_ds_zm, rho_ds_zt, gr):
     """Turbulent advection LHS for wp2 (zm-level variable).
 
     LHS[0] = coeff of wp3[k_py]   (super1 in pentadiag)
@@ -52,7 +61,7 @@ def _wp2_term_ta_lhs(invrs_rho_ds_zm, rho_ds_zt, gr):
     return lhs
 
 
-def _wp3_term_ta_ADG1_lhs(wp2, a1_coef_zt, a3_coef_zt, wp3_on_wp2,
+def wp3_term_ta_ADG1_lhs(wp2, a1_coef_zt, a3_coef_zt, wp3_on_wp2,
                            rho_ds_zm, invrs_rho_ds_zt, gr):
     """5-band ADG1 turbulent advection LHS for wp3 (zt-level variable).
 
@@ -102,7 +111,7 @@ def _wp3_term_ta_ADG1_lhs(wp2, a1_coef_zt, a3_coef_zt, wp3_on_wp2,
     return lhs
 
 
-def _wp3_term_tp_lhs(coef, wp2, rho_ds_zm, invrs_rho_ds_zt, gr):
+def wp3_term_tp_lhs(coef, wp2, rho_ds_zm, invrs_rho_ds_zt, gr):
     """Turbulent production LHS for wp3.
 
     coef: (ngrdcol,) scalar coefficient per column.
@@ -128,7 +137,7 @@ def _wp3_term_tp_lhs(coef, wp2, rho_ds_zm, invrs_rho_ds_zt, gr):
     return lhs
 
 
-def _wp3_terms_ac_pr2_lhs(C11_Skw_fnc, wm_zm, gr):
+def wp3_terms_ac_pr2_lhs(C11_Skw_fnc, wm_zm, gr):
     """Accumulation + pr2 LHS for wp3. (ngrdcol, nzt). Boundaries are 0."""
     lhs = jnp.zeros(C11_Skw_fnc.shape)
     d_wm = wm_zm[:, 2:-1] - wm_zm[:, 1:-2]   # wm_zm[k_py+1] - wm_zm[k_py]
@@ -138,7 +147,7 @@ def _wp3_terms_ac_pr2_lhs(C11_Skw_fnc, wm_zm, gr):
     return lhs
 
 
-def _wp2_terms_ac_pr2_lhs(C_uu_shr, wm_zt, gr):
+def wp2_terms_ac_pr2_lhs(C_uu_shr, wm_zt, gr):
     """Accumulation + pr2 LHS for wp2. (ngrdcol, nzm). Boundaries are 0.
 
     C_uu_shr: (ngrdcol,)
@@ -151,14 +160,14 @@ def _wp2_terms_ac_pr2_lhs(C_uu_shr, wm_zt, gr):
     return lhs
 
 
-def _wp2_term_dp1_lhs(C1_Skw_fnc, invrs_tau_C1_zm):
+def wp2_term_dp1_lhs(C1_Skw_fnc, invrs_tau_C1_zm):
     """Dissipation term 1 LHS for wp2. (ngrdcol, nzm). Boundaries are 0."""
     lhs = jnp.zeros_like(C1_Skw_fnc)
     lhs = lhs.at[:, 1:-1].set(C1_Skw_fnc[:, 1:-1] * invrs_tau_C1_zm[:, 1:-1])
     return lhs
 
 
-def _wp2_term_pr1_lhs(C4, invrs_tau_C4_zm):
+def wp2_term_pr1_lhs(C4, invrs_tau_C4_zm):
     """Pressure term 1 LHS for wp2 (l_tke_aniso path). (ngrdcol, nzm). Boundaries 0.
 
     C4: (ngrdcol,)
@@ -170,7 +179,7 @@ def _wp2_term_pr1_lhs(C4, invrs_tau_C4_zm):
     return lhs
 
 
-def _wp3_term_pr1_lhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt):
+def wp3_term_pr1_lhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt):
     """Pressure term 1 LHS for wp3 (l_damp_wp3_Skw_squared path). (ngrdcol, nzt). Boundaries 0."""
     lhs = jnp.zeros_like(invrs_tau_wp3_zt)
     lhs = lhs.at[:, 1:-1].set(
@@ -183,7 +192,7 @@ def _wp3_term_pr1_lhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt):
 # RHS sub-functions
 # ---------------------------------------------------------------------------
 
-def _wp2_term_pr_dfsn_rhs(C_wp2_pr_dfsn, rho_ds_zt, invrs_rho_ds_zm, wpup2, wpvp2, wp3, gr):
+def wp2_term_pr_dfsn_rhs(C_wp2_pr_dfsn, rho_ds_zt, invrs_rho_ds_zm, wpup2, wpvp2, wp3, gr):
     """Pressure-diffusion RHS for wp2. (ngrdcol, nzm).
 
     C_wp2_pr_dfsn: (ngrdcol,)
@@ -197,7 +206,7 @@ def _wp2_term_pr_dfsn_rhs(C_wp2_pr_dfsn, rho_ds_zt, invrs_rho_ds_zm, wpup2, wpvp
     return rhs
 
 
-def _wp3_term_pr_turb_rhs(C_wp3_pr_turb, rho_ds_zm, invrs_rho_ds_zt, wp2_smth, em_smth, gr):
+def wp3_term_pr_turb_rhs(C_wp3_pr_turb, rho_ds_zm, invrs_rho_ds_zt, wp2_smth, em_smth, gr):
     """Pressure-turbulence RHS for wp3 (l_use_tke_in_wp3_pr_turb_term=True). (ngrdcol, nzt).
 
     C_wp3_pr_turb: (ngrdcol,)
@@ -213,7 +222,7 @@ def _wp3_term_pr_turb_rhs(C_wp3_pr_turb, rho_ds_zm, invrs_rho_ds_zt, wp2_smth, e
     return rhs
 
 
-def _wp3_term_pr_dfsn_rhs(C_wp3_pr_dfsn, rho_ds_zm, invrs_rho_ds_zt,
+def wp3_term_pr_dfsn_rhs(C_wp3_pr_dfsn, rho_ds_zm, invrs_rho_ds_zt,
                            wp2up2, wp2vp2, wp4, up2, vp2, wp2, gr):
     """Pressure-diffusion RHS for wp3. (ngrdcol, nzt).
 
@@ -230,7 +239,7 @@ def _wp3_term_pr_dfsn_rhs(C_wp3_pr_dfsn, rho_ds_zm, invrs_rho_ds_zt,
     return rhs
 
 
-def _wp2_terms_bp_pr2_rhs(C_uu_buoy, thv_ds_zm, wpthvp):
+def wp2_terms_bp_pr2_rhs(C_uu_buoy, thv_ds_zm, wpthvp):
     """Buoyancy + pressure-2 RHS for wp2. (ngrdcol, nzm). Boundaries 0.
 
     C_uu_buoy: (ngrdcol,)
@@ -243,7 +252,7 @@ def _wp2_terms_bp_pr2_rhs(C_uu_buoy, thv_ds_zm, wpthvp):
     return rhs
 
 
-def _wp2_term_dp1_rhs_em(C1_Skw_fnc, invrs_tau_C1_zm, up2, vp2):
+def wp2_term_dp1_rhs(C1_Skw_fnc, invrs_tau_C1_zm, up2, vp2):
     """Dissipation-1 RHS for wp2 (l_damp_wp2_using_em=True). (ngrdcol, nzm). Boundaries 0."""
     rhs = jnp.zeros_like(C1_Skw_fnc)
     rhs = rhs.at[:, 1:-1].set(
@@ -252,7 +261,7 @@ def _wp2_term_dp1_rhs_em(C1_Skw_fnc, invrs_tau_C1_zm, up2, vp2):
     return rhs
 
 
-def _wp2_term_pr3_rhs(C_uu_shr, C_uu_buoy, thv_ds_zm, wpthvp, upwp, um, vpwp, vm, gr):
+def wp2_term_pr3_rhs(C_uu_shr, C_uu_buoy, thv_ds_zm, wpthvp, upwp, um, vpwp, vm, gr):
     """Pressure-3 RHS for wp2. (ngrdcol, nzm). Boundaries 0.
 
     C_uu_shr, C_uu_buoy: (ngrdcol,)
@@ -274,7 +283,7 @@ def _wp2_term_pr3_rhs(C_uu_shr, C_uu_buoy, thv_ds_zm, wpthvp, upwp, um, vpwp, vm
     return rhs
 
 
-def _wp2_term_pr1_rhs(C4, up2, vp2, invrs_tau_C4_zm):
+def wp2_term_pr1_rhs(C4, up2, vp2, invrs_tau_C4_zm):
     """Pressure-1 RHS for wp2 (l_tke_aniso=True). (ngrdcol, nzm). Boundaries 0.
 
     C4: (ngrdcol,)
@@ -286,7 +295,7 @@ def _wp2_term_pr1_rhs(C4, up2, vp2, invrs_tau_C4_zm):
     return rhs
 
 
-def _wp3_terms_bp1_pr2_rhs(C11_Skw_fnc, thv_ds_zt, wp2thvp):
+def wp3_terms_bp1_pr2_rhs(C11_Skw_fnc, thv_ds_zt, wp2thvp):
     """Buoyancy + pressure-2 RHS for wp3. (ngrdcol, nzt). Boundaries 0."""
     rhs = jnp.zeros_like(thv_ds_zt)
     rhs = rhs.at[:, 1:-1].set(
@@ -296,7 +305,7 @@ def _wp3_terms_bp1_pr2_rhs(C11_Skw_fnc, thv_ds_zt, wp2thvp):
     return rhs
 
 
-def _wp3_term_pr1_rhs_skw2(C8, C8b, invrs_tau_wp3_zt, Skw_zt, wp3):
+def wp3_term_pr1_rhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt, wp3):
     """Pressure-1 RHS for wp3 (l_damp_wp3_Skw_squared=True). (ngrdcol, nzt). Boundaries 0."""
     rhs = jnp.zeros_like(wp3)
     rhs = rhs.at[:, 1:-1].set(
@@ -310,7 +319,165 @@ def _wp3_term_pr1_rhs_skw2(C8, C8b, invrs_tau_wp3_zt, Skw_zt, wp3):
 # Main advance function
 # ===========================================================================
 
-def advance_wp2_wp3_jax(
+def wp23_rhs(*, nzm, ngrdcol, invrs_dt,
+                 rhs_pr_turb_wp3, rhs_pr_dfsn_wp3, rhs_pr_dfsn_wp2,
+                 rhs_pr1_wp2, rhs_bp1_pr2_wp3, rhs_pr1_wp3,
+                 rhs_bp_pr2_wp2, rhs_pr3_wp2, rhs_dp1_wp2,
+                 lhs_pr1_wp2, lhs_tp_wp3, lhs_pr1_wp3, lhs_dp1_wp2, lhs_ta_wp3,
+                 wp2, wp3, wp2up, upwp,
+                 l_ho_nontrad_coriolis, fcor_y, gr):
+    """advance_wp2_wp3_module.F90:wp23_rhs — assemble the coupled wp2/wp3 explicit RHS vector.
+
+    Interleaving: wp2[k] at global index 2k, wp3[k] at 2k+1 (ascending grid). The over-implicit
+    contributions use the lhs_* terms; BCs set the four corner rows. Returns rhs (ngrdcol, 2*nzm-1).
+    """
+    ndim = 2 * nzm - 1
+    rhs  = jnp.zeros((ngrdcol, ndim))
+
+    # --- wp3 interior: global indices 3, 5, ..., 2*nzm-5 (slice 3:-2:2) ---
+    # rhs_pr_turb_wp3 + rhs_pr_dfsn_wp3 (set, not +=)
+    rhs = rhs.at[:, 3:-2:2].set(rhs_pr_turb_wp3[:, 1:-1] + rhs_pr_dfsn_wp3[:, 1:-1])
+
+    # --- wp2 interior: global indices 2, 4, ..., 2*nzm-4 (slice 2:-1:2) ---
+    # rhs_pr_dfsn_wp2 (set, not +=)
+    rhs = rhs.at[:, 2:-1:2].set(rhs_pr_dfsn_wp2[:, 1:-1])
+
+    # --- l_tke_aniso=True: add pr1 and over-implicit pr1 to wp2 rows ---
+    rhs = rhs.at[:, 2:-1:2].add(rhs_pr1_wp2[:, 1:-1])
+    rhs = rhs.at[:, 2:-1:2].add((1.0 - _gamma) * (-lhs_pr1_wp2[:, 1:-1] * wp2[:, 1:-1]))
+
+    # --- Time tendency and main terms ---
+    # wp3:
+    rhs = rhs.at[:, 3:-2:2].add(invrs_dt * wp3[:, 1:-1])
+    rhs = rhs.at[:, 3:-2:2].add(
+        (1.0 - _gamma) * (-lhs_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+                          - lhs_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2])
+    )
+    rhs = rhs.at[:, 3:-2:2].add(rhs_bp1_pr2_wp3[:, 1:-1])
+    rhs = rhs.at[:, 3:-2:2].add(rhs_pr1_wp3[:, 1:-1])
+    rhs = rhs.at[:, 3:-2:2].add((1.0 - _gamma) * (-lhs_pr1_wp3[:, 1:-1] * wp3[:, 1:-1]))
+
+    # wp2:
+    rhs = rhs.at[:, 2:-1:2].add(invrs_dt * wp2[:, 1:-1])
+    rhs = rhs.at[:, 2:-1:2].add(rhs_bp_pr2_wp2[:, 1:-1])
+    rhs = rhs.at[:, 2:-1:2].add(rhs_pr3_wp2[:, 1:-1])
+    rhs = rhs.at[:, 2:-1:2].add(rhs_dp1_wp2[:, 1:-1])
+    rhs = rhs.at[:, 2:-1:2].add((1.0 - _gamma) * (-lhs_dp1_wp2[:, 1:-1] * wp2[:, 1:-1]))
+
+    # --- ADG1 TA for wp3 (implicit, over-implicit) ---
+    # RHS over-implicit contribution: (1-gamma)*(-lhs_ta_wp3 * [wp3/wp2])
+    # bands: 0→wp3[k+1], 1→wp2[k+1], 2→wp3[k], 3→wp2[k], 4→wp3[k-1]
+    rhs = rhs.at[:, 3:-2:2].add(
+        (1.0 - _gamma) * (
+            -lhs_ta_wp3[0, :, 1:-1] * wp3[:, 2:]    # wp3[k_py+1]
+            - lhs_ta_wp3[1, :, 1:-1] * wp2[:, 2:-1] # wp2[k_py+1]
+            - lhs_ta_wp3[2, :, 1:-1] * wp3[:, 1:-1] # wp3[k_py]
+            - lhs_ta_wp3[3, :, 1:-1] * wp2[:, 1:-2] # wp2[k_py]
+            - lhs_ta_wp3[4, :, 1:-1] * wp3[:, :-2]  # wp3[k_py-1]
+        )
+    )
+
+    # --- Non-traditional Coriolis (Iter103); no-op for the 15 cases + rico ---
+    if l_ho_nontrad_coriolis:
+        _fy = jnp.asarray(fcor_y)
+        if _fy.ndim == 1:
+            _fy = _fy[:, None]
+        # wp2 RHS += 2*fcor_y*upwp   (upwp on zm levels, interior)
+        rhs = rhs.at[:, 2:-1:2].add(2.0 * _fy * upwp[:, 1:-1])
+        # wp3 RHS += 3*fcor_y*wp2up  (wp2up on zt levels, interior)
+        rhs = rhs.at[:, 3:-2:2].add(3.0 * _fy * jnp.asarray(wp2up)[:, 1:-1])
+
+    # --- Boundary conditions ---
+    # Lower wp2: global 0
+    k_lb_zm = gr.k_lb_zm   # Python 0-based lower boundary index for zm
+    rhs = rhs.at[:, 0].set(wp2[:, k_lb_zm])
+    # Lower wp3: global 1
+    rhs = rhs.at[:, 1].set(0.0)
+    # Upper wp3: global 2*nzm-3 (= 2*(nzt-1)-1 = 2*nzt-3)
+    rhs = rhs.at[:, 2 * nzm - 3].set(0.0)
+    # Upper wp2: global 2*nzm-2
+    rhs = rhs.at[:, 2 * nzm - 2].set(cc.w_tol_sqd)
+    return rhs
+
+
+def wp23_lhs(*, nzm, ngrdcol, ndim, invrs_dt,
+                 lhs_ma_zm, lhs_diff_zm, lhs_ta_wp2, lhs_ac_pr2_wp2,
+                 lhs_dp1_wp2, lhs_pr1_wp2, lhs_splat_wp2,
+                 lhs_ma_zt, lhs_diff_zt, lhs_tp_wp3, lhs_ac_pr2_wp3,
+                 lhs_pr1_wp3, lhs_splat_wp3, lhs_ta_wp3):
+    """advance_wp2_wp3_module.F90:wp23_lhs — assemble the coupled wp2/wp3 pentadiagonal LHS matrix.
+
+    Interleaving: wp2[k] at global index 2k, wp3[k] at 2k+1 (ascending grid). The over-implicit
+    contributions scale the implicit lhs_* terms by gamma_over_implicit_ts. Identity rows pin the
+    four BC corners. Returns lhs (5, ngrdcol, 2*nzm-1).
+    """
+    lhs = jnp.zeros((5, ngrdcol, ndim))
+
+    # Lower boundary: wp2 (global 0), wp3 (global 1) → identity
+    lhs = lhs.at[2, :, 0].set(1.0)
+    lhs = lhs.at[2, :, 1].set(1.0)
+
+    # wp2 interior rows (global 2*k_py, k_py=1..nzm-2)
+    # Band 0 (super2): lhs_ma_zm[0] + lhs_diff_zm[0]
+    lhs = lhs.at[0, :, 2:-1:2].set(lhs_ma_zm[0, :, 1:-1] + lhs_diff_zm[0, :, 1:-1])
+    # Band 1 (super1): lhs_ta_wp2[0]  (coeff of wp3[k_py])
+    lhs = lhs.at[1, :, 2:-1:2].set(lhs_ta_wp2[0, :, 1:-1])
+    # Band 2 (main): lhs_ma_zm[1] + lhs_diff_zm[1] + lhs_ac_pr2_wp2 + gamma*lhs_dp1_wp2 + invrs_dt
+    lhs = lhs.at[2, :, 2:-1:2].set(
+        lhs_ma_zm[1, :, 1:-1] + lhs_diff_zm[1, :, 1:-1]
+        + lhs_ac_pr2_wp2[:, 1:-1]
+        + _gamma * lhs_dp1_wp2[:, 1:-1]
+        + invrs_dt
+    )
+    # Band 3 (sub1): lhs_ta_wp2[1]  (coeff of wp3[k_py-1])
+    lhs = lhs.at[3, :, 2:-1:2].set(lhs_ta_wp2[1, :, 1:-1])
+    # Band 4 (sub2): lhs_ma_zm[2] + lhs_diff_zm[2]
+    lhs = lhs.at[4, :, 2:-1:2].set(lhs_ma_zm[2, :, 1:-1] + lhs_diff_zm[2, :, 1:-1])
+
+    # l_tke_aniso=True: add gamma*lhs_pr1_wp2 to main diagonal of wp2 rows
+    lhs = lhs.at[2, :, 2:-1:2].add(_gamma * lhs_pr1_wp2[:, 1:-1])
+
+    # lhs_splat_wp2 on main diagonal of wp2 rows
+    lhs = lhs.at[2, :, 2:-1:2].add(lhs_splat_wp2[:, 1:-1])
+
+    # wp3 interior rows (global 2*k_py+1, k_py=1..nzt-2)
+    # Band 0 (super2): lhs_ma_zt[0] + lhs_diff_zt[0]
+    lhs = lhs.at[0, :, 3:-2:2].set(lhs_ma_zt[0, :, 1:-1] + lhs_diff_zt[0, :, 1:-1])
+    # Band 1 (super1): gamma*lhs_tp_wp3[0]  (coeff of wp2[k_py+1])
+    lhs = lhs.at[1, :, 3:-2:2].set(_gamma * lhs_tp_wp3[0, :, 1:-1])
+    # Band 2 (main): lhs_ma_zt[1] + lhs_diff_zt[1] + lhs_ac_pr2_wp3 + gamma*lhs_pr1_wp3 + lhs_splat_wp3 + invrs_dt
+    lhs = lhs.at[2, :, 3:-2:2].set(
+        lhs_ma_zt[1, :, 1:-1] + lhs_diff_zt[1, :, 1:-1]
+        + lhs_ac_pr2_wp3[:, 1:-1]
+        + _gamma * lhs_pr1_wp3[:, 1:-1]
+        + lhs_splat_wp3[:, 1:-1]
+        + invrs_dt
+    )
+    # Band 3 (sub1): gamma*lhs_tp_wp3[1]  (coeff of wp2[k_py])
+    lhs = lhs.at[3, :, 3:-2:2].set(_gamma * lhs_tp_wp3[1, :, 1:-1])
+    # Band 4 (sub2): lhs_ma_zt[2] + lhs_diff_zt[2]
+    lhs = lhs.at[4, :, 3:-2:2].set(lhs_ma_zt[2, :, 1:-1] + lhs_diff_zt[2, :, 1:-1])
+
+    # ADG1 TA for wp3: add gamma * lhs_ta_wp3 to all 5 bands of wp3 rows
+    for b in range(5):
+        lhs = lhs.at[b, :, 3:-2:2].add(_gamma * lhs_ta_wp3[b, :, 1:-1])
+
+    # Upper boundaries: wp3 (global 2*nzm-3), wp2 (global 2*nzm-2) → identity
+    lhs = lhs.at[2, :, 2 * nzm - 3].set(1.0)
+    lhs = lhs.at[2, :, 2 * nzm - 2].set(1.0)
+    # Ensure off-diagonals are zero at upper boundaries (they were zero-initialized)
+    return lhs
+
+
+def wp23_solve(lhs, rhs):
+    """Pentadiagonal solve of the coupled wp2/wp3 system, then de-interleave the solution —
+    the JAX analog of advance_wp2_wp3_module.F90:wp23_solve. The solution vector packs the two
+    prognostics on alternating slots; returns ``(wp2_new, wp3_new)`` (wp2 on even slots, wp3 on odd)."""
+    solution = penta_lu_solve_jax(lhs, rhs)   # (ngrdcol, 2*nzm-1)
+    return solution[:, 0::2], solution[:, 1::2]
+
+
+def advance_wp2_wp3(
     wp2,              # (ngrdcol, nzm)
     wp3,              # (ngrdcol, nzt)
     up2, vp2,         # (ngrdcol, nzm)
@@ -340,6 +507,10 @@ def advance_wp2_wp3_jax(
     nu1: float,       # background diffusivity for wp2
     nu8: float,       # background diffusivity for wp3
     gr,
+    flags=None,
+    sfc_elevation=None,
+    stats_writer=None,
+    l_sample: bool = False,
     l_ho_nontrad_coriolis: bool = False,
     fcor_y=None,
     wp2up=None,
@@ -440,22 +611,22 @@ def advance_wp2_wp3_jax(
     # RHS sub-terms
     # ------------------------------------------------------------------
 
-    rhs_pr_turb_wp3 = _wp3_term_pr_turb_rhs(
+    rhs_pr_turb_wp3 = wp3_term_pr_turb_rhs(
         C_wp3_pr_turb, rho_ds_zm, invrs_rho_ds_zt, wp2_smth, em_smth, gr
     )
-    rhs_pr_dfsn_wp3 = _wp3_term_pr_dfsn_rhs(
+    rhs_pr_dfsn_wp3 = wp3_term_pr_dfsn_rhs(
         C_wp3_pr_dfsn, rho_ds_zm, invrs_rho_ds_zt,
         wp2up2, wp2vp2, wp4, up2, vp2, wp2, gr
     )
-    rhs_pr_dfsn_wp2 = _wp2_term_pr_dfsn_rhs(
+    rhs_pr_dfsn_wp2 = wp2_term_pr_dfsn_rhs(
         C_wp2_pr_dfsn, rho_ds_zt, invrs_rho_ds_zm, wpup2, wpvp2, wp3, gr
     )
-    rhs_bp_pr2_wp2 = _wp2_terms_bp_pr2_rhs(C_uu_buoy, thv_ds_zm, wpthvp)
-    rhs_dp1_wp2    = _wp2_term_dp1_rhs_em(C1_Skw_fnc, invrs_tau_C1_zm, up2, vp2)
-    rhs_pr3_wp2    = _wp2_term_pr3_rhs(C_uu_shr, C_uu_buoy, thv_ds_zm, wpthvp, upwp, um, vpwp, vm, gr)
-    rhs_pr1_wp2    = _wp2_term_pr1_rhs(C4, up2, vp2, invrs_tau_C4_zm)    # l_tke_aniso=True
-    rhs_bp1_pr2_wp3 = _wp3_terms_bp1_pr2_rhs(C11_Skw_fnc, thv_ds_zt, wp2thvp)
-    rhs_pr1_wp3     = _wp3_term_pr1_rhs_skw2(C8, C8b, invrs_tau_wp3_zt, Skw_zt, wp3)
+    rhs_bp_pr2_wp2 = wp2_terms_bp_pr2_rhs(C_uu_buoy, thv_ds_zm, wpthvp)
+    rhs_dp1_wp2    = wp2_term_dp1_rhs(C1_Skw_fnc, invrs_tau_C1_zm, up2, vp2)
+    rhs_pr3_wp2    = wp2_term_pr3_rhs(C_uu_shr, C_uu_buoy, thv_ds_zm, wpthvp, upwp, um, vpwp, vm, gr)
+    rhs_pr1_wp2    = wp2_term_pr1_rhs(C4, up2, vp2, invrs_tau_C4_zm)    # l_tke_aniso=True
+    rhs_bp1_pr2_wp3 = wp3_terms_bp1_pr2_rhs(C11_Skw_fnc, thv_ds_zt, wp2thvp)
+    rhs_pr1_wp3     = wp3_term_pr1_rhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt, wp3)
 
     # ------------------------------------------------------------------
     # LHS sub-terms (computed before wp23_rhs but used in both RHS and LHS)
@@ -467,17 +638,17 @@ def advance_wp2_wp3_jax(
 
     # wp3 turbulent production (two calls: C=1 and C=-C_wp3_pr_tp)
     ones_col = jnp.ones((ngrdcol,))
-    lhs_adv_tp_wp3 = _wp3_term_tp_lhs(ones_col, wp2, rho_ds_zm, invrs_rho_ds_zt, gr)
-    lhs_pr_tp_wp3  = _wp3_term_tp_lhs(-C_wp3_pr_tp, wp2, rho_ds_zm, invrs_rho_ds_zt, gr)
+    lhs_adv_tp_wp3 = wp3_term_tp_lhs(ones_col, wp2, rho_ds_zm, invrs_rho_ds_zt, gr)
+    lhs_pr_tp_wp3  = wp3_term_tp_lhs(-C_wp3_pr_tp, wp2, rho_ds_zm, invrs_rho_ds_zt, gr)
     lhs_tp_wp3     = lhs_adv_tp_wp3 + lhs_pr_tp_wp3   # (2, ngrdcol, nzt)
 
     # wp3 pressure-1 and dissipation
-    lhs_pr1_wp3 = _wp3_term_pr1_lhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt)
-    lhs_dp1_wp2 = _wp2_term_dp1_lhs(C1_Skw_fnc, invrs_tau_C1_zm)
-    lhs_pr1_wp2 = _wp2_term_pr1_lhs(C4, invrs_tau_C4_zm)   # l_tke_aniso=True
+    lhs_pr1_wp3 = wp3_term_pr1_lhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt)
+    lhs_dp1_wp2 = wp2_term_dp1_lhs(C1_Skw_fnc, invrs_tau_C1_zm)
+    lhs_pr1_wp2 = wp2_term_pr1_lhs(C4, invrs_tau_C4_zm)   # l_tke_aniso=True
 
     # ADG1 TA for wp3
-    lhs_ta_wp3 = _wp3_term_ta_ADG1_lhs(
+    lhs_ta_wp3 = wp3_term_ta_ADG1_lhs(
         wp2, a1_coef_zt, a3_coef_zt, wp3_on_wp2,
         rho_ds_zm, invrs_rho_ds_zt, gr
     )
@@ -489,71 +660,16 @@ def advance_wp2_wp3_jax(
     # ------------------------------------------------------------------
 
     ndim = 2 * nzm - 1
-    rhs  = jnp.zeros((ngrdcol, ndim))
-
-    # --- wp3 interior: global indices 3, 5, ..., 2*nzm-5 (slice 3:-2:2) ---
-    # rhs_pr_turb_wp3 + rhs_pr_dfsn_wp3 (set, not +=)
-    rhs = rhs.at[:, 3:-2:2].set(rhs_pr_turb_wp3[:, 1:-1] + rhs_pr_dfsn_wp3[:, 1:-1])
-
-    # --- wp2 interior: global indices 2, 4, ..., 2*nzm-4 (slice 2:-1:2) ---
-    # rhs_pr_dfsn_wp2 (set, not +=)
-    rhs = rhs.at[:, 2:-1:2].set(rhs_pr_dfsn_wp2[:, 1:-1])
-
-    # --- l_tke_aniso=True: add pr1 and over-implicit pr1 to wp2 rows ---
-    rhs = rhs.at[:, 2:-1:2].add(rhs_pr1_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add((1.0 - _gamma) * (-lhs_pr1_wp2[:, 1:-1] * wp2[:, 1:-1]))
-
-    # --- Time tendency and main terms ---
-    # wp3:
-    rhs = rhs.at[:, 3:-2:2].add(invrs_dt * wp3[:, 1:-1])
-    rhs = rhs.at[:, 3:-2:2].add(
-        (1.0 - _gamma) * (-lhs_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
-                          - lhs_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2])
-    )
-    rhs = rhs.at[:, 3:-2:2].add(rhs_bp1_pr2_wp3[:, 1:-1])
-    rhs = rhs.at[:, 3:-2:2].add(rhs_pr1_wp3[:, 1:-1])
-    rhs = rhs.at[:, 3:-2:2].add((1.0 - _gamma) * (-lhs_pr1_wp3[:, 1:-1] * wp3[:, 1:-1]))
-
-    # wp2:
-    rhs = rhs.at[:, 2:-1:2].add(invrs_dt * wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add(rhs_bp_pr2_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add(rhs_pr3_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add(rhs_dp1_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add((1.0 - _gamma) * (-lhs_dp1_wp2[:, 1:-1] * wp2[:, 1:-1]))
-
-    # --- ADG1 TA for wp3 (implicit, over-implicit) ---
-    # RHS over-implicit contribution: (1-gamma)*(-lhs_ta_wp3 * [wp3/wp2])
-    # bands: 0→wp3[k+1], 1→wp2[k+1], 2→wp3[k], 3→wp2[k], 4→wp3[k-1]
-    rhs = rhs.at[:, 3:-2:2].add(
-        (1.0 - _gamma) * (
-            -lhs_ta_wp3[0, :, 1:-1] * wp3[:, 2:]    # wp3[k_py+1]
-            - lhs_ta_wp3[1, :, 1:-1] * wp2[:, 2:-1] # wp2[k_py+1]
-            - lhs_ta_wp3[2, :, 1:-1] * wp3[:, 1:-1] # wp3[k_py]
-            - lhs_ta_wp3[3, :, 1:-1] * wp2[:, 1:-2] # wp2[k_py]
-            - lhs_ta_wp3[4, :, 1:-1] * wp3[:, :-2]  # wp3[k_py-1]
-        )
-    )
-
-    # --- Non-traditional Coriolis (Iter103); no-op for the 15 cases + rico ---
-    if l_ho_nontrad_coriolis:
-        _fy = jnp.asarray(fcor_y)
-        if _fy.ndim == 1:
-            _fy = _fy[:, None]
-        # wp2 RHS += 2*fcor_y*upwp   (upwp on zm levels, interior)
-        rhs = rhs.at[:, 2:-1:2].add(2.0 * _fy * upwp[:, 1:-1])
-        # wp3 RHS += 3*fcor_y*wp2up  (wp2up on zt levels, interior)
-        rhs = rhs.at[:, 3:-2:2].add(3.0 * _fy * jnp.asarray(wp2up)[:, 1:-1])
-
-    # --- Boundary conditions ---
-    # Lower wp2: global 0
-    k_lb_zm = gr.k_lb_zm   # Python 0-based lower boundary index for zm
-    rhs = rhs.at[:, 0].set(wp2[:, k_lb_zm])
-    # Lower wp3: global 1
-    rhs = rhs.at[:, 1].set(0.0)
-    # Upper wp3: global 2*nzm-3 (= 2*(nzt-1)-1 = 2*nzt-3)
-    rhs = rhs.at[:, 2 * nzm - 3].set(0.0)
-    # Upper wp2: global 2*nzm-2
-    rhs = rhs.at[:, 2 * nzm - 2].set(cc.w_tol_sqd)
+    rhs = wp23_rhs(
+        nzm=nzm, ngrdcol=ngrdcol, invrs_dt=invrs_dt,
+        rhs_pr_turb_wp3=rhs_pr_turb_wp3, rhs_pr_dfsn_wp3=rhs_pr_dfsn_wp3,
+        rhs_pr_dfsn_wp2=rhs_pr_dfsn_wp2, rhs_pr1_wp2=rhs_pr1_wp2,
+        rhs_bp1_pr2_wp3=rhs_bp1_pr2_wp3, rhs_pr1_wp3=rhs_pr1_wp3,
+        rhs_bp_pr2_wp2=rhs_bp_pr2_wp2, rhs_pr3_wp2=rhs_pr3_wp2, rhs_dp1_wp2=rhs_dp1_wp2,
+        lhs_pr1_wp2=lhs_pr1_wp2, lhs_tp_wp3=lhs_tp_wp3, lhs_pr1_wp3=lhs_pr1_wp3,
+        lhs_dp1_wp2=lhs_dp1_wp2, lhs_ta_wp3=lhs_ta_wp3,
+        wp2=wp2, wp3=wp3, wp2up=wp2up, upwp=upwp,
+        l_ho_nontrad_coriolis=l_ho_nontrad_coriolis, fcor_y=fcor_y, gr=gr)
 
     # ------------------------------------------------------------------
     # Scale lhs_diff_zt by C12 (AFTER wp23_rhs, BEFORE wp23_lhs)
@@ -567,120 +683,244 @@ def advance_wp2_wp3_jax(
 
     lhs_ma_zm  = term_ma_zm_lhs_jax(wm_zm, gr)             # (3, ngrdcol, nzm)
     lhs_ma_zt  = term_ma_zt_lhs_jax(wm_zt, gr)             # (3, ngrdcol, nzt)
-    lhs_ta_wp2 = _wp2_term_ta_lhs(invrs_rho_ds_zm, rho_ds_zt, gr)   # (2, ngrdcol, nzm)
-    lhs_ac_pr2_wp2 = _wp2_terms_ac_pr2_lhs(C_uu_shr, wm_zt, gr)     # (ngrdcol, nzm)
-    lhs_ac_pr2_wp3 = _wp3_terms_ac_pr2_lhs(C11_Skw_fnc, wm_zm, gr)  # (ngrdcol, nzt)
+    lhs_ta_wp2 = wp2_term_ta_lhs(invrs_rho_ds_zm, rho_ds_zt, gr)   # (2, ngrdcol, nzm)
+    lhs_ac_pr2_wp2 = wp2_terms_ac_pr2_lhs(C_uu_shr, wm_zt, gr)     # (ngrdcol, nzm)
+    lhs_ac_pr2_wp3 = wp3_terms_ac_pr2_lhs(C11_Skw_fnc, wm_zm, gr)  # (ngrdcol, nzt)
 
     # ------------------------------------------------------------------
     # wp23_lhs assembly
     # ------------------------------------------------------------------
 
-    lhs = jnp.zeros((5, ngrdcol, ndim))
-
-    # Lower boundary: wp2 (global 0), wp3 (global 1) → identity
-    lhs = lhs.at[2, :, 0].set(1.0)
-    lhs = lhs.at[2, :, 1].set(1.0)
-
-    # wp2 interior rows (global 2*k_py, k_py=1..nzm-2)
-    # Band 0 (super2): lhs_ma_zm[0] + lhs_diff_zm[0]
-    lhs = lhs.at[0, :, 2:-1:2].set(lhs_ma_zm[0, :, 1:-1] + lhs_diff_zm[0, :, 1:-1])
-    # Band 1 (super1): lhs_ta_wp2[0]  (coeff of wp3[k_py])
-    lhs = lhs.at[1, :, 2:-1:2].set(lhs_ta_wp2[0, :, 1:-1])
-    # Band 2 (main): lhs_ma_zm[1] + lhs_diff_zm[1] + lhs_ac_pr2_wp2 + gamma*lhs_dp1_wp2 + invrs_dt
-    lhs = lhs.at[2, :, 2:-1:2].set(
-        lhs_ma_zm[1, :, 1:-1] + lhs_diff_zm[1, :, 1:-1]
-        + lhs_ac_pr2_wp2[:, 1:-1]
-        + _gamma * lhs_dp1_wp2[:, 1:-1]
-        + invrs_dt
-    )
-    # Band 3 (sub1): lhs_ta_wp2[1]  (coeff of wp3[k_py-1])
-    lhs = lhs.at[3, :, 2:-1:2].set(lhs_ta_wp2[1, :, 1:-1])
-    # Band 4 (sub2): lhs_ma_zm[2] + lhs_diff_zm[2]
-    lhs = lhs.at[4, :, 2:-1:2].set(lhs_ma_zm[2, :, 1:-1] + lhs_diff_zm[2, :, 1:-1])
-
-    # l_tke_aniso=True: add gamma*lhs_pr1_wp2 to main diagonal of wp2 rows
-    lhs = lhs.at[2, :, 2:-1:2].add(_gamma * lhs_pr1_wp2[:, 1:-1])
-
-    # lhs_splat_wp2 on main diagonal of wp2 rows
-    lhs = lhs.at[2, :, 2:-1:2].add(lhs_splat_wp2[:, 1:-1])
-
-    # wp3 interior rows (global 2*k_py+1, k_py=1..nzt-2)
-    # Band 0 (super2): lhs_ma_zt[0] + lhs_diff_zt[0]
-    lhs = lhs.at[0, :, 3:-2:2].set(lhs_ma_zt[0, :, 1:-1] + lhs_diff_zt[0, :, 1:-1])
-    # Band 1 (super1): gamma*lhs_tp_wp3[0]  (coeff of wp2[k_py+1])
-    lhs = lhs.at[1, :, 3:-2:2].set(_gamma * lhs_tp_wp3[0, :, 1:-1])
-    # Band 2 (main): lhs_ma_zt[1] + lhs_diff_zt[1] + lhs_ac_pr2_wp3 + gamma*lhs_pr1_wp3 + lhs_splat_wp3 + invrs_dt
-    lhs = lhs.at[2, :, 3:-2:2].set(
-        lhs_ma_zt[1, :, 1:-1] + lhs_diff_zt[1, :, 1:-1]
-        + lhs_ac_pr2_wp3[:, 1:-1]
-        + _gamma * lhs_pr1_wp3[:, 1:-1]
-        + lhs_splat_wp3[:, 1:-1]
-        + invrs_dt
-    )
-    # Band 3 (sub1): gamma*lhs_tp_wp3[1]  (coeff of wp2[k_py])
-    lhs = lhs.at[3, :, 3:-2:2].set(_gamma * lhs_tp_wp3[1, :, 1:-1])
-    # Band 4 (sub2): lhs_ma_zt[2] + lhs_diff_zt[2]
-    lhs = lhs.at[4, :, 3:-2:2].set(lhs_ma_zt[2, :, 1:-1] + lhs_diff_zt[2, :, 1:-1])
-
-    # ADG1 TA for wp3: add gamma * lhs_ta_wp3 to all 5 bands of wp3 rows
-    for b in range(5):
-        lhs = lhs.at[b, :, 3:-2:2].add(_gamma * lhs_ta_wp3[b, :, 1:-1])
-
-    # Upper boundaries: wp3 (global 2*nzm-3), wp2 (global 2*nzm-2) → identity
-    lhs = lhs.at[2, :, 2 * nzm - 3].set(1.0)
-    lhs = lhs.at[2, :, 2 * nzm - 2].set(1.0)
-    # Ensure off-diagonals are zero at upper boundaries (they were zero-initialized)
+    lhs = wp23_lhs(
+        nzm=nzm, ngrdcol=ngrdcol, ndim=ndim, invrs_dt=invrs_dt,
+        lhs_ma_zm=lhs_ma_zm, lhs_diff_zm=lhs_diff_zm, lhs_ta_wp2=lhs_ta_wp2,
+        lhs_ac_pr2_wp2=lhs_ac_pr2_wp2, lhs_dp1_wp2=lhs_dp1_wp2,
+        lhs_pr1_wp2=lhs_pr1_wp2, lhs_splat_wp2=lhs_splat_wp2,
+        lhs_ma_zt=lhs_ma_zt, lhs_diff_zt=lhs_diff_zt, lhs_tp_wp3=lhs_tp_wp3,
+        lhs_ac_pr2_wp3=lhs_ac_pr2_wp3, lhs_pr1_wp3=lhs_pr1_wp3,
+        lhs_splat_wp3=lhs_splat_wp3, lhs_ta_wp3=lhs_ta_wp3)
 
     # ------------------------------------------------------------------
     # Solve the pentadiagonal system
     # ------------------------------------------------------------------
 
-    solution = penta_lu_solve_jax(lhs, rhs)   # (ngrdcol, 2*nzm-1)
-
-    # Extract wp2 (even global indices) and wp3 (odd global indices)
-    wp2_new = solution[:, 0::2]    # (ngrdcol, nzm)
-    wp3_new = solution[:, 1::2]    # (ngrdcol, nzt)
+    # Solve + de-interleave wp2 (even slots) and wp3 (odd slots) — wp23_solve
+    wp2_new, wp3_new = wp23_solve(lhs, rhs)    # wp2 (ngrdcol, nzm), wp3 (ngrdcol, nzt)
 
     # ------------------------------------------------------------------
     # Budget stats dict — intermediate terms for caller
     # ------------------------------------------------------------------
     # wp2 stats-only terms (C_uu_buoy=0 gives bp, C_uu_buoy+1 gives pr2)
-    rhs_bp_wp2     = _wp2_terms_bp_pr2_rhs(jnp.zeros_like(C_uu_buoy), thv_ds_zm, wpthvp)
-    rhs_pr2_wp2    = _wp2_terms_bp_pr2_rhs(C_uu_buoy + 1.0, thv_ds_zm, wpthvp)
-    lhs_wp2_pr2_term = _wp2_terms_ac_pr2_lhs(C_uu_shr + 1.0, wm_zt, gr)
+    rhs_bp_wp2     = wp2_terms_bp_pr2_rhs(jnp.zeros_like(C_uu_buoy), thv_ds_zm, wpthvp)
+    rhs_pr2_wp2    = wp2_terms_bp_pr2_rhs(C_uu_buoy + 1.0, thv_ds_zm, wpthvp)
+    lhs_wp2_pr2_term = wp2_terms_ac_pr2_lhs(C_uu_shr + 1.0, wm_zt, gr)
 
     # wp3 stats-only terms
-    rhs_bp1_wp3    = _wp3_terms_bp1_pr2_rhs(jnp.zeros_like(C11_Skw_fnc), thv_ds_zt, wp2thvp)
-    rhs_pr2_wp3    = _wp3_terms_bp1_pr2_rhs(C11_Skw_fnc + 1.0, thv_ds_zt, wp2thvp)
-    lhs_wp3_pr2_term = _wp3_terms_ac_pr2_lhs(C11_Skw_fnc + 1.0, wm_zm, gr)
+    rhs_bp1_wp3    = wp3_terms_bp1_pr2_rhs(jnp.zeros_like(C11_Skw_fnc), thv_ds_zt, wp2thvp)
+    rhs_pr2_wp3    = wp3_terms_bp1_pr2_rhs(C11_Skw_fnc + 1.0, thv_ds_zt, wp2thvp)
+    lhs_wp3_pr2_term = wp3_terms_ac_pr2_lhs(C11_Skw_fnc + 1.0, wm_zm, gr)
 
-    stats_dict = {
-        # wp2 budget intermediate terms (all (ngrdcol, nzm))
-        'rhs_bp_wp2':       rhs_bp_wp2,
-        'rhs_pr3_wp2':      rhs_pr3_wp2,
-        'rhs_dp1_wp2':      rhs_dp1_wp2,
-        'rhs_pr1_wp2':      rhs_pr1_wp2,
-        'lhs_dp1_wp2':      lhs_dp1_wp2,
-        'lhs_pr1_wp2':      lhs_pr1_wp2,
-        'lhs_ta_wp2':       lhs_ta_wp2,        # (2, ngrdcol, nzm)
-        'lhs_diff_zm':      lhs_diff_zm,        # (3, ngrdcol, nzm)
-        'lhs_ma_zm':        lhs_ma_zm,          # (3, ngrdcol, nzm)
-        'lhs_ac_pr2_wp2':   lhs_ac_pr2_wp2,    # wp2_ac implicit
-        'rhs_pr2_wp2':      rhs_pr2_wp2,        # for wp2_pr2 begin
-        'lhs_wp2_pr2_term': lhs_wp2_pr2_term,   # for wp2_pr2 finalize
-        # wp3 budget intermediate terms (all (ngrdcol, nzt))
-        'rhs_pr_turb_wp3':  rhs_pr_turb_wp3,
-        'rhs_bp1_wp3':      rhs_bp1_wp3,
-        'rhs_pr1_wp3':      rhs_pr1_wp3,
-        'lhs_pr1_wp3':      lhs_pr1_wp3,
-        'lhs_ta_wp3':       lhs_ta_wp3,         # (5, ngrdcol, nzt)
-        'lhs_adv_tp_wp3':   lhs_adv_tp_wp3,     # (2, ngrdcol, nzt) for wp3_tp stats
-        'lhs_pr_tp_wp3':    lhs_pr_tp_wp3,      # (2, ngrdcol, nzt) for wp3_pr_tp stats
-        'lhs_diff_zt':      lhs_diff_zt,         # (3, ngrdcol, nzt) C12-scaled
-        'lhs_ma_zt':        lhs_ma_zt,           # (3, ngrdcol, nzt)
-        'lhs_ac_pr2_wp3':   lhs_ac_pr2_wp3,     # wp3_ac implicit
-        'rhs_pr2_wp3':      rhs_pr2_wp3,         # for wp3_pr2 begin
-        'lhs_wp3_pr2_term': lhs_wp3_pr2_term,    # for wp3_pr2 finalize
-    }
+    # ------------------------------------------------------------------
+    # Post-solve fill_holes / clip / clip_skewness + budget stats
+    # (advance_wp2_wp3 subroutine tail; mirrors the Fortran in-routine
+    #  fill_holes/clip_variance/clip_skewness + stat_update calls)
+    # ------------------------------------------------------------------
+    _wp2_jax_w23 = _asarray(wp2_new, dtype=np.float64).copy()
+    _wp3_jax_w23 = _asarray(wp3_new, dtype=np.float64).copy()
 
-    return wp2_new, wp3_new, C1_Skw_fnc, C11_Skw_fnc, stats_dict
+    # fill_holes_vertical on wp2
+    _hf_lower_w23 = gr.k_lb_zm + gr.grid_dir_indx   # Python 0-based
+    _hf_upper_w23 = gr.k_ub_zm - gr.grid_dir_indx   # Python 0-based
+    _wp2_jax_w23 = _asarray(fill_holes_vertical(
+        field=jnp.asarray(_wp2_jax_w23),
+        rho_ds=jnp.asarray(rho_ds_zm),
+        dz=jnp.asarray(gr.dzm),
+        threshold=float(cc.w_tol_sqd),
+        lower_k=_hf_lower_w23, upper_k=_hf_upper_w23,
+        fill_holes_type=flags.fill_holes_type,
+    ), dtype=np.float64)
+
+    # fill_holes_wp2_from_horz_tke (ARM: l_wp2_fill_holes_tke=True)
+    _up2_out_w23 = up2
+    _vp2_out_w23 = vp2
+    if flags.l_wp2_fill_holes_tke:
+        # Fortran lower_hf_level=1 (1-based) → Python lower_k=0
+        # Fortran upper_hf_level=nzm-2 (1-based) → Python upper_k=nzm-3
+        (_wp2_jax_w23, _up2_out_w23, _vp2_out_w23) = [
+            _asarray(x, dtype=np.float64)
+            for x in fill_holes_wp2_from_horz_tke(
+                wp2=jnp.asarray(_wp2_jax_w23),
+                up2=jnp.asarray(_asarray(up2, dtype=np.float64)),
+                vp2=jnp.asarray(_asarray(vp2, dtype=np.float64)),
+                threshold=float(cc.w_tol_sqd),
+                lower_k=0,
+                upper_k=nzm - 3,
+            )
+        ]
+
+    # clip_variance on wp2 (solve_type=12, wp2_min=cc.w_tol_sqd for l_min_wp2_from_corr_wx=False)
+    _wp2_min_w23 = _xp.full_like(_wp2_jax_w23, float(cc.w_tol_sqd))
+    if flags.l_min_wp2_from_corr_wx:
+        _corr_max2 = cc.max_mag_correlation_flux ** 2   # wp2_min from corr_wx (advance_wp2_wp3_module.F90:1986-1987)
+        _wprtp_np_w23 = _asarray(wprtp, dtype=np.float64)
+        _wpthlp_np_w23 = _asarray(wpthlp, dtype=np.float64)
+        _upwp_np_w23 = _asarray(upwp, dtype=np.float64)
+        _vpwp_np_w23 = _asarray(vpwp, dtype=np.float64)
+        _rtp2_np_w23 = _asarray(rtp2, dtype=np.float64)
+        _thlp2_np_w23 = _asarray(thlp2, dtype=np.float64)
+        _up2_np_w23 = _asarray(up2, dtype=np.float64)
+        _vp2_np_w23 = _asarray(vp2, dtype=np.float64)
+        _wp2_min_w23 = _xp.minimum(1.0, _xp.maximum(_wp2_min_w23,
+            _wprtp_np_w23 ** 2 / (_rtp2_np_w23 * _corr_max2),
+            _wpthlp_np_w23 ** 2 / (_thlp2_np_w23 * _corr_max2),
+            _upwp_np_w23 ** 2 / (_up2_np_w23 * _corr_max2),
+            _vpwp_np_w23 ** 2 / (_vp2_np_w23 * _corr_max2),
+        ))
+    # clip_variance on wp2
+    _wp2_jax_w23 = _asarray(clip_variance(
+        xp2=jnp.asarray(_wp2_jax_w23),
+        threshold_lo=jnp.asarray(_wp2_min_w23),
+    ), dtype=np.float64)
+
+    # zm2zt to get wp2_zt
+    _wp2_zt_jax_w23 = _asarray(zm2zt(_wp2_jax_w23, gr), dtype=np.float64)
+    _wp2_zt_jax_w23 = _xp.maximum(_wp2_zt_jax_w23, cc.w_tol_sqd)   # positive definite
+
+    # clip_skewness on wp3 — the budget wrapper records the wp3_cl clip tendency internally
+    # (mirroring the Fortran clip_skewness → clip_skewness_core split).
+    _skw_max_w23 = clubb_params[:, cc.iSkw_max_mag - 1]
+    _wp3_jax_w23 = _asarray(clip_skewness(
+        wp3=jnp.asarray(_wp3_jax_w23),
+        wp2_zt=jnp.asarray(_wp2_zt_jax_w23),
+        zt=jnp.asarray(gr.zt),
+        sfc_elevation=jnp.asarray(sfc_elevation),
+        Skw_max_mag=jnp.asarray(_skw_max_w23),
+        dt=float(dt),
+        l_use_wp3_lim_with_smth_Heaviside=flags.l_use_wp3_lim_with_smth_Heaviside,
+        stats_writer=stats_writer, l_sample=l_sample,
+    ), dtype=np.float64)
+
+
+    # advance_wp2_wp3_module.F90 stats writes (C1/C11_Skw_fnc, budgets)
+    if l_sample and stats_writer is not None:
+        stats_writer.update("C1_Skw_fnc",  _asarray(C1_Skw_fnc,  dtype=np.float64))
+        stats_writer.update("C11_Skw_fnc", _asarray(C11_Skw_fnc, dtype=np.float64))
+
+        # ---- post-advance wp2_zt and wp3_zm (fix: written here, not earlier) ----
+        _wp3_zm_jax_w23 = _asarray(zt2zm(jnp.asarray(_wp3_jax_w23), gr), dtype=np.float64)
+        stats_writer.update("wp2_zt", _wp2_zt_jax_w23)
+        stats_writer.update("wp3_zm", _wp3_zm_jax_w23)
+
+        # ---- wp2/wp3 clipping budget stats ----
+        # (wp3_cl is now recorded inside clip_skewness — the Fortran clip_skewness budget wrapper)
+        _dt_w23 = float(dt)
+        stats_writer.update("wp2_pd",
+            (_asarray(_wp2_jax_w23, dtype=np.float64) - _asarray(wp2_new, dtype=np.float64)) / _dt_w23)
+        _up2_out_w23_np = _asarray(_up2_out_w23 if flags.l_wp2_fill_holes_tke else up2, dtype=np.float64)
+        _vp2_out_w23_np = _asarray(_vp2_out_w23 if flags.l_wp2_fill_holes_tke else vp2, dtype=np.float64)
+        # Mirror Fortran: up2_pd/vp2_pd contribution from wp2 block uses
+        # l_count_sample=.false. so nsamples is NOT incremented here.
+        up2_np = _asarray(up2, dtype=np.float64)
+        vp2_np = _asarray(vp2, dtype=np.float64)
+        stats_writer.begin_budget("up2_pd", up2_np / _dt_w23)
+        stats_writer.begin_budget("vp2_pd", vp2_np / _dt_w23)
+        stats_writer.finalize_budget("up2_pd", _up2_out_w23_np / _dt_w23, l_count_sample=False)
+        stats_writer.finalize_budget("vp2_pd", _vp2_out_w23_np / _dt_w23, l_count_sample=False)
+
+        # ---- wp2/wp3 budget terms (pre/post advance values) ----
+        _g = cc.gamma_over_implicit_ts
+        _wp2_pre = _asarray(wp2, dtype=np.float64)
+        _wp3_pre = _asarray(wp3, dtype=np.float64)
+        _wp2_post = _asarray(wp2_new, dtype=np.float64)  # pre-clip post-solve
+        _wp3_post = _asarray(wp3_new, dtype=np.float64)  # pre-clip post-solve
+        _wp2_mix = (1.0 - _g) * _wp2_pre + _g * _wp2_post
+        _wp3_mix = (1.0 - _g) * _wp3_pre + _g * _wp3_post
+
+        # ------ wp2 budget terms ------
+
+        # wp2_bp: C_uu_buoy=0 → 2*g/thv*wpthvp
+        stats_writer.update("wp2_bp",   _asarray(rhs_bp_wp2, dtype=np.float64))
+        # wp2_pr3: explicit RHS pressure term 3
+        stats_writer.update("wp2_pr3",  _asarray(rhs_pr3_wp2, dtype=np.float64))
+        # wp2_splat: in Fortran stats_update("wp2_splat", -lhs_splat_wp2*wp2_old) before solve
+        stats_writer.update("wp2_splat", -(_asarray(lhs_splat_wp2, dtype=np.float64) * _wp2_pre))
+
+        # wp2_dp1: rhs_dp1_wp2 - lhs_dp1_wp2 * wp2_mix — diagonal implicit-budget finalize kernel
+        _lhs_dp1 = _asarray(lhs_dp1_wp2, dtype=np.float64)
+        _rhs_dp1 = _asarray(rhs_dp1_wp2, dtype=np.float64)
+        stats_writer.update("wp2_dp1",
+            finalize_implicit_budget_interior_jax(_rhs_dp1, _lhs_dp1, _wp2_mix))
+
+        # wp2_pr1: rhs_pr1_wp2 - lhs_pr1_wp2 * wp2_mix  (l_tke_aniso=True)
+        _lhs_pr1 = _asarray(lhs_pr1_wp2, dtype=np.float64)
+        _rhs_pr1 = _asarray(rhs_pr1_wp2, dtype=np.float64)
+        stats_writer.update("wp2_pr1",
+            finalize_implicit_budget_interior_jax(_rhs_pr1, _lhs_pr1, _wp2_mix))
+
+        # wp2_pr2: rhs_pr2_wp2 - lhs_wp2_pr2_term * wp2_post
+        _rhs_pr2 = _asarray(rhs_pr2_wp2, dtype=np.float64)
+        _lhs_pr2t = _asarray(lhs_wp2_pr2_term, dtype=np.float64)
+        stats_writer.update("wp2_pr2",
+            finalize_implicit_budget_interior_jax(_rhs_pr2, _lhs_pr2t, _wp2_post))
+
+        # wp2_dp2: fully implicit, -(lhs_diff_zm @ wp2_post) tri-band — the shared 3-band interior
+        # apply kernel (advance_xp2_xpyp_module.apply_lhs_band3_interior_jax), same matrix-vector form
+        # the Fortran budget-finalize uses for the implicit diffusion contribution.
+        _lhs_dz = _asarray(lhs_diff_zm, dtype=np.float64)  # (3, ngrdcol, nzm)
+        _wp2_dp2 = -apply_lhs_band3_interior_jax(_lhs_dz, _wp2_post)
+        stats_writer.update("wp2_dp2", _wp2_dp2)
+
+        # wp2_ta: fully implicit, -(lhs_ta_wp2 @ wp3_post) — shared zt→zm 2-band apply kernel
+        _lhs_ta2 = _asarray(lhs_ta_wp2, dtype=np.float64)  # (2, ngrdcol, nzm)
+        _wp2_ta = -apply_lhs_band2_zt2zm_interior_jax(_lhs_ta2, _wp3_post)
+        stats_writer.update("wp2_ta", _wp2_ta)
+
+        # wp2_pr_dfsn already in stats? Skip (passes). wp2_ac, wp2_ma → already pass.
+
+        # ------ wp3 budget terms ------
+
+        # wp3_bp1: C11_Skw_fnc=0 → 3*g/thv*wp2thvp
+        stats_writer.update("wp3_bp1",     _asarray(rhs_bp1_wp3, dtype=np.float64))
+        # wp3_pr_turb: explicit RHS
+        stats_writer.update("wp3_pr_turb", _asarray(rhs_pr_turb_wp3, dtype=np.float64))
+
+        # wp3_pr1: rhs_pr1_wp3 - lhs_pr1_wp3 * wp3_mix — diagonal implicit-budget finalize kernel
+        _lhs_pr1_3 = _asarray(lhs_pr1_wp3, dtype=np.float64)
+        _rhs_pr1_3 = _asarray(rhs_pr1_wp3, dtype=np.float64)
+        stats_writer.update("wp3_pr1",
+            finalize_implicit_budget_interior_jax(_rhs_pr1_3, _lhs_pr1_3, _wp3_mix))
+
+        # wp3_pr2: rhs_pr2_wp3 - lhs_wp3_pr2_term * wp3_post — diagonal implicit-budget finalize kernel
+        _rhs_pr2_3 = _asarray(rhs_pr2_wp3, dtype=np.float64)
+        _lhs_pr2t_3 = _asarray(lhs_wp3_pr2_term, dtype=np.float64)
+        stats_writer.update("wp3_pr2",
+            finalize_implicit_budget_interior_jax(_rhs_pr2_3, _lhs_pr2t_3, _wp3_post))
+
+        # wp3_dp1: fully implicit (ARM: l_crank_nich_diff=False), -(lhs_diff_zt @ wp3_post) — the same
+        # shared 3-band interior apply kernel (apply_lhs_band3_interior_jax).
+        _lhs_dt = _asarray(lhs_diff_zt, dtype=np.float64)  # (3, ngrdcol, nzt)
+        _wp3_dp1 = -apply_lhs_band3_interior_jax(_lhs_dt, _wp3_post)
+        stats_writer.update("wp3_dp1", _wp3_dp1)
+
+        # wp3_ta: -(lhs_ta_wp3 @ mixed) 5-band
+        _lhs_ta3 = _asarray(lhs_ta_wp3, dtype=np.float64)  # (5, ngrdcol, nzt)
+        _wp3_ta = _xp.zeros_like(_wp3_pre)
+        _wp3_ta = _iset(_wp3_ta, np.s_[:, 1:-1], -(
+            _lhs_ta3[0, :, 1:-1] * _wp3_mix[:, 2:]     # wp3[k+1]
+            + _lhs_ta3[1, :, 1:-1] * _wp2_mix[:, 2:-1]   # wp2[k+1]
+            + _lhs_ta3[2, :, 1:-1] * _wp3_mix[:, 1:-1]   # wp3[k]
+            + _lhs_ta3[3, :, 1:-1] * _wp2_mix[:, 1:-2]   # wp2[k]
+            + _lhs_ta3[4, :, 1:-1] * _wp3_mix[:, :-2]    # wp3[k-1]
+        ))
+        stats_writer.update("wp3_ta", _wp3_ta)
+
+        # wp3_tp: -(lhs_adv_tp_wp3 @ wp2_mix)
+        _lhs_tp3 = _asarray(lhs_adv_tp_wp3, dtype=np.float64)  # (2, ngrdcol, nzt)
+        _wp3_tp = _xp.zeros_like(_wp3_pre)
+        _wp3_tp = _iset(_wp3_tp, np.s_[:, 1:-1], -(
+            _lhs_tp3[0, :, 1:-1] * _wp2_mix[:, 2:-1]   # wp2[k+1]
+            + _lhs_tp3[1, :, 1:-1] * _wp2_mix[:, 1:-2]   # wp2[k]
+        ))
+        stats_writer.update("wp3_tp", _wp3_tp)
+
+    return _wp2_jax_w23, _wp3_jax_w23, _wp2_zt_jax_w23

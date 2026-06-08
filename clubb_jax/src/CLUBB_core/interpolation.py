@@ -93,6 +93,20 @@ def linear_interp_factor(factor, var_high, var_low):
     return factor * (var_high - var_low) + var_low
 
 
+def lin_interp_between_grids(interpolate_altitudes, current_altitudes, current_values):
+    """Interpolate current_values (defined on the sorted current_altitudes grid) onto the
+    interpolate_altitudes grid (interpolation.F90:lin_interp_between_grids).
+
+    Linear interpolation between the two bracketing source levels, with end-point clamping for targets
+    outside the source range (below the lowest → current_values[0]; above the highest → current_values[-1]).
+    That is exactly `np.interp` on a sorted source grid: the Fortran's per-point search + lin_interpolate_two_points
+    + low/high clamp reproduces np.interp's behavior level-for-level. Used by the Fortran host-model (dycore) regrid
+    path; the standalone JAX sounding/forcing interpolations call jnp.interp directly. Pure-jnp → differentiable."""
+    return jnp.interp(jnp.asarray(interpolate_altitudes, dtype=jnp.float64),
+                      jnp.asarray(current_altitudes, dtype=jnp.float64),
+                      jnp.asarray(current_values, dtype=jnp.float64))
+
+
 def zlinterp_fnc(grid_out, grid_src, var_src):
     """Vertical linear interpolation of var_src (on grid_src) onto grid_out
     (interpolation.F90:zlinterp_fnc, "LIN_INT" from WRF-HOC). Values below the lowest / above the highest source
@@ -102,3 +116,14 @@ def zlinterp_fnc(grid_out, grid_src, var_src):
     grid_src = jnp.asarray(grid_src, dtype=jnp.float64)
     var_src = jnp.asarray(var_src, dtype=jnp.float64)
     return jnp.interp(grid_out, grid_src, var_src, left=0.0, right=0.0)
+
+
+def plinterp_fnc(grid_out, grid_src, var_src):
+    """Vertical linear interpolation in PRESSURE coordinates (interpolation.F90:plinterp_fnc).
+
+    Identical to zlinterp_fnc but for grids that decrease monotonically (pressure falls with
+    height): it just negates both grids and defers to zlinterp_fnc, so the source grid becomes
+    increasing and the zero-fill-outside-range semantics carry over. Pure-jnp → differentiable."""
+    grid_out = jnp.asarray(grid_out, dtype=jnp.float64)
+    grid_src = jnp.asarray(grid_src, dtype=jnp.float64)
+    return zlinterp_fnc(-grid_out, -grid_src, var_src)

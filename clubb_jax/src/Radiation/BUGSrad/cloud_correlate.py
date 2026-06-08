@@ -37,8 +37,11 @@ def _midlayer_heights(pl2, tl):
     return z_rev[::-1]
 
 
-def bugs_ctot_column(pl2, tl, acld, l_c):
+def bugs_ctot(pl2, tl, acld, l_c):
     """Total cloud amount for a single column (cloud_correlate.F90:bugs_ctot, per i_domain).
+
+    JAX is per-column (the Fortran `bugs_ctot` batches over the i_domain length); the leading
+    domain-length args (nlen/len_loc/nlm) are dropped per the port's drop-batching-dims convention.
 
     Args:
         pl2: level pressure, shape (nlm+1,).
@@ -86,9 +89,9 @@ def ctot_from_cloudy_layers(cloud, zc, l_c):
     return jnp.sum(jnp.concatenate([head, tail]))
 
 
-def bugs_cloudfit_column(acld, c_tot, tol=1.0e-5):
+def bugs_cloudfit(acld, c_tot, tol=1.0e-5):
     """Split a column's cloud profile into a maximally-overlapped part + a random part
-    (cloud_correlate.F90:bugs_cloudfit, per column).
+    (cloud_correlate.F90:bugs_cloudfit, per column; the Fortran's leading domain-length args are dropped).
 
     Given the total cloud amount `c_tot` (from bugs_ctot), find the stacked (maximally overlapped) cloud
     fraction `cf_stacked` such that the implied total matches `c_tot`, then split each layer's cloud fraction

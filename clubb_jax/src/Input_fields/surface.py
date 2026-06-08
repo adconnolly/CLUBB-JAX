@@ -5,6 +5,9 @@ Typical columns:
     Time[s]  'wpqtp_sfc[(kg/kg)m/s]'  'wpthlp_sfc[mK/s]'  T_sfc[K]
 
 Values are linearly interpolated in time during the simulation.
+
+JAX I/O grouping (no single Fortran file): reorganizes the Fortran surface-forcing input — the `*_sfc.in`
+column reader + time-interpolation that the Fortran does via input_reader.F90 / time_dependent_input.F90.
 """
 import numpy as np
 from pathlib import Path
@@ -44,16 +47,3 @@ def read_surface(path: str) -> dict:
     }
 
     return result
-
-
-def interp_surface(sfc: dict, time: float) -> dict:
-    """Interpolate surface values to a given simulation time.
-
-    Returns:
-        dict with scalar values for each surface variable at time t.
-    """
-    return {
-        'wpqtp_sfc': float(np.interp(time, sfc['time'], sfc['wpqtp_sfc'])),
-        'wpthlp_sfc': float(np.interp(time, sfc['time'], sfc['wpthlp_sfc'])),
-        't_sfc': float(np.interp(time, sfc['time'], sfc['t_sfc'])),
-    }

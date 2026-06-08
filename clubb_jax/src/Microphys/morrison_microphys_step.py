@@ -11,7 +11,7 @@ Iter204 form), so the Morrison sedimentation velocity for the CLUBB transport is
 import numpy as np
 
 from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5: detect a jax.grad trace
-from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import morrison_microphys_driver
+from clubb_jax.src.Microphys.morrison_microphys_module import morrison_microphys_driver
 
 
 def advance_morrison_microphysics(state: dict):
@@ -66,12 +66,12 @@ def advance_morrison_microphysics(state: dict):
     # hydrometeor variance is hydrometp2 = ((ratio+1)/precip_frac − 1)·hm² (setup_clubb_pdf_params:449);
     # the bulk scheme has precip_frac≤0 → pf=1 → hydrometp2 = ratio·hm² (ratio=1.25 for rr/Nr,
     # corr_varnce slope=0/intrcpt=1.25), so K_hm is LARGE (NOT 0 — the Iter239 K_hm=0 was wrong; the
-    # stored rrp2=0 ≠ this internal hydrometp2). This is what sustains the cloud-top rain (Iter240).
+    # stored rrp2=0 ≠ this internal hydrometp2). This is what sustains the cloud-top rain.
     import jax.numpy as jnp
     from clubb_jax.src.Microphys.advance_microphys_module import advance_one_hydrometeor, calculate_K_hm
-    from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical_jax
+    from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical
     from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
-    from clubb_jax.src.CLUBB_core.advance_xp3_module import skx_func_jax
+    from clubb_jax.src.CLUBB_core.Skx_module import Skx_func
     wm_zt = jnp.asarray(g('wm_zt'))
     rho_ds_zm = jnp.asarray(g('rho_ds_zm'))
     invrs_rho_ds_zt = jnp.asarray(g('invrs_rho_ds_zt'))
@@ -87,16 +87,16 @@ def advance_morrison_microphysics(state: dict):
     clubb_params = jnp.asarray(g('clubb_params'))
     w_tol = float(state.get('w_tol', 2.0e-3))
     wp2 = jnp.asarray(g('wp2'))
-    Skw_zm = skx_func_jax(wp2, zt2zm_jax(jnp.asarray(g('wp3')), gr), w_tol, clubb_params)
+    Skw_zm = Skx_func(wp2, zt2zm_jax(jnp.asarray(g('wp3')), gr), w_tol, clubb_params)
     Kh_zm = jnp.asarray(g('Kh_zm'))
     hm_tol = np.asarray(hmm.hydromet_tol).reshape(-1)
     # ★ The overall hydrometeor variance is hydrometp2 = ((ratio_ip+1)/precip_frac − 1)·hm²
     # (setup_clubb_pdf_params:449). precip_frac is NOT 1 — it is the precipitation fraction, set by the
     # max-in-precip-mean limiter to ~hm/(mixt_frac·MAX_HM_IP_COMP_MEAN) ≈ 0.3 for dycoms — so hydrometp2
-    # ≈ 5·hm² (not 1.25·hm²) and K_hm is ~2× larger than precip_frac=1 gives (Iter246). Compute the real
+    # ≈ 5·hm² (not 1.25·hm²) and K_hm is ~2× larger than precip_frac=1 gives. Compute the real
     # precip_frac (the same precip_fraction the KK path uses) from the PDF component fields.
     from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction
-    from clubb_jax.src.Microphys.KK_microphys.kk_microphys_driver import _hydrometp2_zt
+    from clubb_jax.src.CLUBB_core.setup_clubb_pdf_params import hydrometp2_zt
     pdf = state['pdf_params']
     ga = lambda a: np.asarray(getattr(pdf, a), np.float64)
     upsilon = float(np.asarray(state['clubb_params'], np.float64).reshape(np.asarray(state['clubb_params']).shape[0], -1)[0, 64])
@@ -113,13 +113,13 @@ def advance_morrison_microphysics(state: dict):
         # hydrometp2 on zt = ((ratio_ip+1)/precip_frac − 1)·hm² where hm >= tol, else 0 (the per-species
         # guard, setup_clubb_pdf_params.F90:446-455), then interpolated to zm. ratio_ip = hmp2_ip_on_hmm2_ip.
         hmp2_zt = jnp.where(hm >= float(hm_tol[idx]),
-                            _hydrometp2_zt(hm, precip_frac, float(ratio_ip[idx])), 0.0)
+                            hydrometp2_zt(hm, precip_frac, float(ratio_ip[idx])), 0.0)
         hmp2_zm = zt2zm_jax(hmp2_zt, gr)
         K_hm = calculate_K_hm(wp2, Kh_zm, Skw_zm, hm, hmp2_zm, float(hm_tol[idx]), gr)
         adv = advance_one_hydrometeor(
             dt, hm, jnp.asarray(out[key]), K_hm, nu_hm, wm_zt,
             zero_zm, zero_zm, zero_zm, rho_ds_zm, invrs_rho_ds_zt, gr, w_above, l_sed=False)
-        adv = fill_holes_vertical_jax(adv, rho_ds_zt, dzt, 0.0, 0, nzt - 1, fh_type)
+        adv = fill_holes_vertical(adv, rho_ds_zt, dzt, 0.0, 0, nzt - 1, fh_type)
         new_hm[..., idx] = np.maximum(np.asarray(adv), 0.0)
     state['hydromet'] = new_hm
     state['Ncm'] = np.maximum(Ncm + out['Ncm_mc'] * dt, 0.0)

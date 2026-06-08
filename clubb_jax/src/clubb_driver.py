@@ -18,28 +18,26 @@ import jax.numpy as jnp
 import numpy as np
 
 # JAX core
-from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax, rcm_sat_adj_jax
-from clubb_jax.src.CLUBB_core.T_in_K_module import calculate_thvm_jax
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq, rcm_sat_adj
+from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
 from clubb_jax.src.CLUBB_core.sponge_layer_damping import initialize_tau_sponge_damp
-from clubb_jax.src.CLUBB_core.calc_pressure import hydrostatic_jax
+from clubb_jax.src.Input_fields.hydrostatic_module import hydrostatic
 from clubb_jax.src.CLUBB_core.parameters_tunable import (
-    init_clubb_params_jax,
-    calc_derrived_params_jax,
-    get_param_names_jax,
+    init_clubb_params,
+    calc_derrived_params,
+    get_param_names,
+    check_parameters,
 )
-from clubb_jax.src.CLUBB_core.model_flags import get_default_config_flags_jax
-from clubb_jax.src.CLUBB_core.numerical_check import (
-    check_clubb_settings_jax,
-    check_parameters_jax,
-)
+from clubb_jax.src.CLUBB_core.model_flags import get_default_config_flags
+from clubb_jax.src.CLUBB_core.numerical_check import check_clubb_settings
 from clubb_jax.src.derived_types.config_flags import ConfigFlags
-from clubb_jax.src.derived_types.grid_class import setup_grid as py_setup_grid
+from clubb_jax.src.derived_types.grid_class import setup_grid
 from clubb_jax.src.derived_types.sclr_idx import SclrIdx
 from clubb_jax.src.derived_types.err_info import ErrInfo
 from clubb_jax.src.derived_types.pdf_params import (
     init_pdf_implicit_coefs_terms_api,
-    init_pdf_params as init_pdf_params_py,
+    init_pdf_params,
 )
 
 # I/O
@@ -55,27 +53,15 @@ from clubb_jax.src.Input_fields.sounding import (
 )
 from clubb_jax.src.Input_fields.surface import read_surface
 from clubb_jax.src.Benchmark_cases.arm import load_arm_forcings_data
-from clubb_jax.src.Benchmark_cases.generic_forcings import load_generic_forcings_data
+from clubb_jax.src.Benchmark_cases.time_dependent_input import load_generic_forcings_data
 
-# ── Physical constants (from constants_clubb.F90, standalone block) ──────
-Cp = 1004.67
-Lv = 2.5e6
-Rd = 287.04
-Rv = 461.5
-ep = Rd / Rv                # 0.621993...  (must match Fortran's Rd/Rv exactly)
-ep1 = (1.0 - ep) / ep      # ~0.608
-ep2 = 1.0 / ep              # ~1.608
-kappa = Rd / Cp
-grav = 9.81
-p0 = 1.0e5
-omega_planet = 7.292e-5
-radians_per_deg = math.pi / 180.0
-rt_tol = 1.0e-8
-thl_tol = 1.0e-2
-w_tol = 2.0e-2
-em_min = 1.5 * w_tol**2
-cloud_frac_min = 0.005
-Nc0_in_cloud = 100.0e6      # [num/m^3]
+# ── Physical constants — mirror the Fortran clubb_driver.F90 `use constants_clubb` rather than re-defining the
+#    standalone block here (all 16 values verified bit-identical to constants_clubb, iter 599) ──────
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    Cp, Lv, Rd, ep1, ep2, kappa, grav, p0,
+    rt_tol, thl_tol, w_tol, em_min, cloud_frac_min, radians_per_deg, omega_planet,
+)
+Nc0_in_cloud = 100.0e6      # [num/m^3] (driver-local)
 
 _CLOUD_FEEDBACK_CASES = {
     "cloud_feedback_s6",
@@ -315,6 +301,11 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
             "(only 'none', 'khairoutdinov_kogan', and 'morrison' are implemented)."
         )
 
+    # (NB: the JAX Morrison is a COMPLETE M2005 port — warm-rain + the full ice/snow/graupel block; the driver
+    #  advances rgm/Ngm as prognostic species [morrison_microphys_module.py], so l_ice_microphys/l_graupel/
+    #  l_arctic_nucl are all supported. The Morrison *cases* arm_97/twp_ice/lba/mc3e are BLOCKED only because they
+    #  additionally need BUGSrad + SILHS, not because of the microphysics. So no microphysics-flag guard is added.)
+
     # --- Cloud water sedimentation ---
     # cloud_drop_sed is now ported (Microphys/cloud_sed_module.py) and called from
     # the Python driver loop, so l_cloud_sed is supported.
@@ -333,20 +324,25 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
         )
 
     # --- Sponge damping ---
-    # Sponge-layer damping: xm fields (thlm/rtm/uv) are ported
-    # (sponge_layer_damping.sponge_damp_xm, wired into advance_clubb_core).
-    # The xp2/xp3 variants (wp2/wp3/up2_vp2 -> sponge_damp_xp2/xp3) are not yet
-    # ported, so still block those.
-    _UNPORTED_SPONGE_FIELDS = ["wp2", "wp3", "up2_vp2"]
+    # Sponge-layer damping: the xm fields (thlm/rtm/uv) are ported AND wired
+    # (sponge_layer_damping.sponge_damp_xm, applied in the advance path).
+    # The variance/third-moment routines sponge_damp_xp2/xp3 ARE ported and
+    # unit-tested (sponge_layer_damping.py, tests/test_sponge_damp_xp23.py), but
+    # they are NOT wired into the JAX advance_xp2_xpyp (up2/vp2) / advance_wp2_wp3
+    # (wp2/wp3): the wp2/wp3/up2_vp2 damping profiles are not built in init and no
+    # case_setup enables these flags, so there is no validated full-case oracle.
+    # Fail loud (rather than silently ignore the flag) until that path is wired.
+    _UNWIRED_SPONGE_FIELDS = ["wp2", "wp3", "up2_vp2"]
     sponge_enabled = [
-        f for f in _UNPORTED_SPONGE_FIELDS
+        f for f in _UNWIRED_SPONGE_FIELDS
         if bool(cfg.get(f'{f}_sponge_damp_settings%l_sponge_damping', False))
     ]
     if sponge_enabled:
         names = ", ".join(sponge_enabled)
         errors.append(
-            f"Sponge damping is enabled for [{names}] but the xp2/xp3 sponge "
-            "(sponge_damp_xp2/xp3) is not yet ported."
+            f"Sponge damping is enabled for [{names}] but the variance sponge "
+            "(sponge_damp_xp2/xp3) is ported + unit-tested yet not wired into the "
+            "JAX advance_xp2_xpyp / advance_wp2_wp3 (no validated full-case oracle)."
         )
 
     # --- SILHS / Latin Hypercube sampling ---
@@ -359,7 +355,7 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
     if bool(cfg.get('l_silhs_rad', False)):
         errors.append("l_silhs_rad = true is not supported (SILHS is not available).")
 
-    # --- Soil / vegetation --- (ported Iter270, wired Iter271: soil_vegetation.py + gabls3 sfclyr)
+    # --- Soil / vegetation --- (soil_vegetation.py + gabls3 sfclyr)
 
     # --- Restarts ---
     if bool(cfg.get('l_restart', False)):
@@ -369,9 +365,134 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
     if bool(cfg.get('l_input_fields', False)):
         errors.append("l_input_fields = true is not supported.")
 
+    # --- Second (zm-grid) PDF closure ---
+    # When l_call_pdf_closure_twice=true the Fortran calls pdf_closure_driver_zm to compute a second,
+    # zm-grid PDF closure (pdf_params_zm). That routine is not ported (gated, no validated case), so the
+    # JAX would read an uncomputed pdf_params_zm — fail loud rather than silently use zeros.
+    if bool(getattr(flags, 'l_call_pdf_closure_twice', False)) or bool(cfg.get('l_call_pdf_closure_twice', False)):
+        errors.append(
+            "l_call_pdf_closure_twice = true is not supported "
+            "(the second zm-grid PDF closure, pdf_closure_driver_zm, is not ported)."
+        )
+
+    # --- PDF-closure call placement ---
+    # Only ipdf_post_advance_fields (=2, the default) is ported. The pre-advance / pre-and-post
+    # placements (ipdf_pre_advance_fields=1, ipdf_pre_post_advance_fields=3) take a path in
+    # advance_clubb_core that lazily imports the Fortran clubb_python (an unavailable module in this
+    # tree), so they would crash with a cryptic ModuleNotFoundError rather than run. No case_setup
+    # sets a non-default placement; fail loud if one ever does.
+    _ipdf_placement = int(getattr(flags, 'ipdf_call_placement',
+                                  cfg.get('ipdf_call_placement', 2)))
+    if _ipdf_placement != 2:
+        errors.append(
+            f"ipdf_call_placement = {_ipdf_placement} is not supported "
+            "(only ipdf_post_advance_fields = 2 is ported; the pre-advance / pre-post placements "
+            "fall back to the unavailable Fortran clubb_python)."
+        )
+
+    # --- PDF type ---
+    # The JAX pdf_closure_driver wires ONLY ADG1 (iiPDF_type == iiPDF_ADG1 == 1, the default): the block is
+    # `if flags.iiPDF_type == iiPDF_ADG1:` with `_adg1 = None` otherwise, so a non-ADG1 type would skip the
+    # closure and then crash downstream (None used as the ADG1 dict). The other PDF-type modules (ADG2 / 3D_Luhar /
+    # new / TSDADG / LY93 / new_hybrid) are ported as files but not wired into the driver. No case_setup sets a
+    # non-default iiPDF_type; fail loud at init if one ever does.
+    _iipdf = int(getattr(flags, 'iiPDF_type', cfg.get('iipdf_type', 1)))
+    if _iipdf != 1:
+        errors.append(
+            f"iiPDF_type = {_iipdf} is not supported "
+            "(only iiPDF_ADG1 = 1 is wired into the JAX pdf_closure_driver; the ADG2/3D_Luhar/new/TSDADG/"
+            "LY93/new_hybrid PDF modules are ported but not wired)."
+        )
+
+    # --- Banded-matrix solver method ---
+    # The JAX matrix_solver_wrapper only implements the LU solvers (penta_lu / tridiag_lu, both == 2,
+    # the default). The Fortran also offers penta_bicgstab (= 3, penta_bicgstab_solver.F90), which is NOT
+    # ported. The JAX wrapper does not read penta_solve_method / tridiag_solve_method, so a non-LU request
+    # would be silently ignored (the LU solver used instead) — fail loud. No case_setup sets a non-default
+    # method. (penta_lu = tridiag_lu = 2 in model_flags; penta_bicgstab = 3.)
+    for _flag in ('penta_solve_method', 'tridiag_solve_method'):
+        _method = int(getattr(flags, _flag, cfg.get(_flag, 2)))
+        if _method != 2:
+            errors.append(
+                f"{_flag} = {_method} is not supported "
+                "(only the LU solver = 2 is ported; penta_bicgstab = 3 / penta_bicgstab_solver is not)."
+            )
+
+    # --- Other gated PDF-closure / microphysics features that the JAX passes through but does NOT implement ---
+    # (all default-off; the JAX silently ignores them, so fail loud if a case ever turns one on rather than
+    #  producing default behavior under a non-default request — same footgun class as l_call_pdf_closure_twice).
+    for _flag, _routine in (
+        ('l_use_cloud_cover', 'compute_cloud_cover'),
+        ('l_trapezoidal_rule_zt', 'trapezoidal_rule_zt'),
+        ('l_trapezoidal_rule_zm', 'trapezoidal_rule_zm'),
+        ('l_upwind_diff_sed', 'sed_upwind_diff_lhs'),
+        ('l_prevent_hm_ta_above_cloud', 'get_cloud_top_level'),
+        ('l_godunov_upwind_xpyp_ta', 'xpyp_term_ta_pdf_lhs/rhs_godunov'),
+    ):
+        if bool(getattr(flags, _flag, False)) or bool(cfg.get(_flag, False)):
+            errors.append(f"{_flag} = true is not supported ({_routine} is not ported).")
+
+    # --- Default-FALSE flags the JAX never reads (it hardcodes the default-off behavior) ---
+    # Found by the iter-371 "ConfigFlags field never read in src" sweep: these select alternate closure/numerics
+    # branches the JAX does not implement (it is bit-faithful to the default-off path, so the on-path is genuinely
+    # absent). No case_setup sets any of them; fail loud if one ever does rather than silently ignore the request.
+    for _flag, _what in (
+        ('l_C2_cloud_frac', 'cloud-fraction-weighted C2 closure coefficient'),
+        ('l_Lscale_plume_centered', 'plume-centered mixing-length (Lscale) computation'),
+        ('l_do_expldiff_rtm_thlm', 'explicit diffusion of rtm/thlm'),
+        ('l_godunov_upwind_wpxp_ta', 'Godunov-upwind wpxp turbulent advection'),
+        ('l_ho_trad_coriolis', 'higher-order traditional Coriolis terms'),
+        ('l_partial_upwind_wp3', 'partial-upwind wp3 turbulent advection'),
+        ('l_stability_correct_Kh_N2_zm', 'N^2 stability correction to Kh on zm'),
+        ('l_vert_avg_closure', 'vertically-averaged (rather than pointwise) PDF closure'),
+    ):
+        if bool(getattr(flags, _flag, False)) or bool(cfg.get(_flag, False)):
+            errors.append(f"{_flag} = true is not supported (the {_what} path is not ported).")
+
+    # --- wp2/wp3-closure config the JAX hardcodes to the ARM/ADG1 defaults (iter 497) ---
+    # advance_wp2_wp3 (solve_xp2_xpyp_jax docstring) assumes a fixed closure config; these flags are NOT read in
+    # src to dispatch (verified iter 497 — distinct from l_lmm_stepping / l_use_C11_Richardson / l_damp_wp2_using_em,
+    # which ARE dispatched). No case_setup sets any of them. The iter-371 never-read sweep missed them because each
+    # appears in the solve docstring (so the "never referenced" heuristic counted them as read). Default-FALSE here,
+    # True-branch unported → fail loud on a True request.
+    for _flag, _what in (
+        ('l_standard_term_ta', 'standard wp3 turbulent-advection discretization (the JAX uses the non-standard ADG1 form)'),
+        ('l_use_tke_in_wp2_wp3_K_dfsn', 'TKE in the wp2/wp3 eddy-diffusion (K) term'),
+        ('l_crank_nich_diff', 'Crank-Nicolson diffusion in the wp2/wp3 solve'),
+    ):
+        if bool(getattr(flags, _flag, False)) or bool(cfg.get(_flag, False)):
+            errors.append(f"{_flag} = true is not supported (the {_what} path is not ported).")
+
+    # --- Default-TRUE flags whose FALSE branch the JAX does not implement (it hardcodes the default) ---
+    # advance_xm_wpxp.py hardcodes C7 = Cx_fnc_Richardson (l_use_C7_Richardson=True) and C6 = const
+    # (l_diag_Lscale_from_tau=True); the false branches (Skw-damped C7, Lscale-damped C6 via damp_coefficient)
+    # are not ported, so a case turning either off would silently get the default — fail loud. Both default true,
+    # set false by no case.
+    for _flag, _why in (
+        ('l_use_C7_Richardson', 'the JAX hardcodes C7 = Cx_fnc_Richardson; the Skw-damped-C7 path is not ported'),
+        ('l_diag_Lscale_from_tau', 'the JAX hardcodes C6 = const; the Lscale-damped-C6 (damp_coefficient) path is not ported'),
+        # iter 371 never-read sweep: l_use_precip_frac (default true) — the JAX always uses precipitation fractions;
+        # the no-precip-frac path is not ported.
+        ('l_use_precip_frac', 'the JAX always uses precipitation fractions; the l_use_precip_frac=false path is not ported'),
+        # iter 497 wp2/wp3-closure sweep (default-TRUE, FALSE branch unported; not dispatched in src):
+        ('l_use_tke_in_wp3_pr_turb_term', 'the JAX uses the TKE form of the wp3 pr_turb term; the Kh/buoyancy-shear (false) form is not ported'),
+        ('l_damp_wp3_Skw_squared', 'the JAX hardcodes the Skw^2-damped wp3 pr1 term; the false branch is not ported'),
+    ):
+        # default True; only fire if explicitly set false
+        _val = getattr(flags, _flag, cfg.get(_flag, True))
+        if _val is False:
+            errors.append(f"{_flag} = false is not supported ({_why}).")
+
     # --- Generalized grid test ---
     if bool(cfg.get('l_test_grid_generalization', False)):
         errors.append("l_test_grid_generalization = true is not supported.")
+
+    # --- Host dynamical-core grid (iter 498) ---
+    # l_add_dycore_grid (clubb_driver.F90:2201) builds a separate host dycore grid + remaps onto it — a host-coupling
+    # (e.g. CAM) feature with no meaning in the standalone SCM; the JAX driver never reads it (default-False path).
+    if bool(getattr(flags, 'l_add_dycore_grid', False)) or bool(cfg.get('l_add_dycore_grid', False)):
+        errors.append("l_add_dycore_grid = true is not supported (the host dycore-grid remap is a host-coupling "
+                      "feature, not implemented in the standalone JAX driver).")
 
     # --- Adaptive gridding ---
     # grid_adapt_in_time_method > 0 means some form of adaptation is active.
@@ -420,7 +541,7 @@ def init_clubb_case(namelist_path: str) -> dict:
     edsclr_dim = cfg['edsclr_dim']
 
     # ── 1. Get config flags ─────────────────────────────────────────────────
-    flags = get_default_config_flags_jax()
+    flags = get_default_config_flags()
     # Override from namelist (configurable_clubb_flags_nl)
     flag_overrides = {}
     for name in ConfigFlags._fields:
@@ -503,7 +624,7 @@ def init_clubb_case(namelist_path: str) -> dict:
     else:
         raise ValueError(f"Unsupported grid_type: {grid_type}")
 
-    gr = py_setup_grid(
+    gr = setup_grid(
         ngrdcol=ngrdcol,
         deltaz=deltaz,
         zm_init=zm_init,
@@ -539,7 +660,7 @@ def init_clubb_case(namelist_path: str) -> dict:
         p_snd_zt = np.interp(zt_1d, np.asarray(snd['z']), np.asarray(snd['p_in_Pa']))
         thlm = thlm / (p_snd_zt[np.newaxis, :] / p0) ** kappa
     rtm = np.tile(snd_interp['rt'], (ngrdcol, 1))
-    # NO IC floor (Iter186): the Fortran does NOT floor the initial rtm — its rtm_old entering step 1 is
+    # NO IC floor: the Fortran does NOT floor the initial rtm — its rtm_old entering step 1 is
     # the bare sounding value (~0/2e-19 at rico's dry top, NOT 1e-8). It is the per-step fill_holes inside
     # advance_xm_wpxp (rtm_cl budget, advance_clubb_core_module.py:~1700) that raises the sub-rt_tol dry top
     # to 1e-8 each step, mass-conservingly pulling a tiny amount (~4.5e-11) from the topmost moist level.
@@ -565,8 +686,8 @@ def init_clubb_case(namelist_path: str) -> dict:
     # where rv = rtm / (1 + rtm)
     thvm = thlm * (1.0 + ep1 * (rtm / (1.0 + rtm)))
 
-    # Hydrostatic pressure — Iter64: replaced with hydrostatic_jax
-    _hyd = hydrostatic_jax(jnp.asarray(thvm), jnp.asarray(p_sfc), gr)
+    # Hydrostatic pressure (hydrostatic)
+    _hyd = hydrostatic(jnp.asarray(thvm), jnp.asarray(p_sfc), gr)
     p_in_Pa, p_in_Pa_zm, exner, exner_zm, rho, rho_zm = [
         np.array(x, dtype=np.float64) for x in _hyd
     ]
@@ -577,15 +698,15 @@ def init_clubb_case(namelist_path: str) -> dict:
         thm = thlm.copy()
         # rcm = max(rtm - rsat(p, T), 0)
         T_in_K = thm * exner
-        # Iter62: sat_mixrat_liq replaced with sat_mixrat_liq_jax
-        rsat = np.asarray(sat_mixrat_liq_jax(
+        # sat_mixrat_liq replaced with sat_mixrat_liq
+        rsat = np.asarray(sat_mixrat_liq(
             jnp.asarray(p_in_Pa), jnp.asarray(T_in_K), saturation_formula,
         ), dtype=np.float64)
         rcm = np.maximum(rtm - rsat, 0.0)
         thlm = thm - Lv / (Cp * exner) * rcm
     elif theta_type == 'thlm[K]':
-        # Already liquid potential temperature — Iter64: rcm_sat_adj_jax
-        rcm = np.asarray(rcm_sat_adj_jax(
+        # Already liquid potential temperature — rcm_sat_adj
+        rcm = np.asarray(rcm_sat_adj(
             jnp.asarray(thlm), jnp.asarray(rtm),
             jnp.asarray(p_in_Pa), jnp.asarray(exner),
             saturation_formula,
@@ -596,14 +717,14 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     # Recompute thvm and hydrostatic with corrected thlm
     # NOTE: Fortran passes thm (not thlm) as the 5th arg to calculate_thvm
-    # Iter62: calculate_thvm replaced with calculate_thvm_jax
+    # calculate_thvm replaced with calculate_thvm
     _thv_ds_zt = thm * (1.0 + ep2 * (rtm - rcm))**kappa
-    thvm = np.asarray(calculate_thvm_jax(
+    thvm = np.asarray(calculate_thvm(
         jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
         jnp.asarray(exner), jnp.asarray(_thv_ds_zt),
     ), dtype=np.float64)
-    # Iter64: second hydrostatic call also replaced with hydrostatic_jax
-    _hyd2 = hydrostatic_jax(jnp.asarray(thvm), jnp.asarray(p_sfc), gr)
+    # second hydrostatic call also replaced with hydrostatic
+    _hyd2 = hydrostatic(jnp.asarray(thvm), jnp.asarray(p_sfc), gr)
     p_in_Pa, p_in_Pa_zm, exner, exner_zm, rho, rho_zm = [
         np.array(x, dtype=np.float64) for x in _hyd2
     ]
@@ -624,7 +745,7 @@ def init_clubb_case(namelist_path: str) -> dict:
     invrs_rho_ds_zt = 1.0 / rho_ds_zt
 
     # Momentum level versions via zt2zm interpolation
-    # Iter62: zt2zm calls replaced with zt2zm_jax
+    # zt2zm calls replaced with zt2zm_jax
     rv_zm = np.maximum(np.asarray(zt2zm_jax(jnp.asarray(rv), gr), dtype=np.float64), 0.0)
     thm_zm = np.asarray(zt2zm_jax(jnp.asarray(thm), gr), dtype=np.float64)
 
@@ -671,12 +792,12 @@ def init_clubb_case(namelist_path: str) -> dict:
     _tunable_params_path = str(
         (_CLUBB_RELEASE_ROOT / "input/tunable_parameters/tunable_parameters.in").resolve()
     )
-    clubb_params = init_clubb_params_jax(ngrdcol, filename=_tunable_params_path)
+    clubb_params = init_clubb_params(ngrdcol, filename=_tunable_params_path)
     # Apply per-column parameter overrides from &clubb_params_nl (multicol runs).
     # cfg contains lowercased keys; build case-insensitive name→index map.
     # Scalars from the namelist apply to all columns (ngrdcol=1 or uniform override).
     # Lists of length ngrdcol give per-column values.
-    _param_names = get_param_names_jax()
+    _param_names = get_param_names()
     _name_to_idx = {n.lower(): i for i, n in enumerate(_param_names)}
     for _key, _val in cfg.items():
         if _key not in _name_to_idx:
@@ -688,8 +809,8 @@ def init_clubb_case(namelist_path: str) -> dict:
         elif not isinstance(_val, list) and isinstance(_val, (int, float)):
             # Scalar override applies to all columns
             clubb_params[:, _pidx] = float(_val)
-    pdf_params = init_pdf_params_py(nzt, ngrdcol)
-    pdf_params_zm = init_pdf_params_py(nzm, ngrdcol)   # NB: Fortran uses nzm for pdf_params_zm
+    pdf_params = init_pdf_params(nzt, ngrdcol)
+    pdf_params_zm = init_pdf_params(nzm, ngrdcol)   # NB: Fortran uses nzm for pdf_params_zm
     pdf_implicit_coefs_terms = init_pdf_implicit_coefs_terms_api(nzt, ngrdcol, sclr_dim)
 
     # Scalar indices (mirror initialize_clubb defaults/namelist overrides).
@@ -707,7 +828,7 @@ def init_clubb_case(namelist_path: str) -> dict:
         iiedsclr_thl=iiedsclr_thl,
         iiedsclr_CO2=iiedsclr_co2,
     )
-    nu_vert_res_dep, lmin, mixt_frac_max_mag = calc_derrived_params_jax(
+    nu_vert_res_dep, lmin, mixt_frac_max_mag = calc_derrived_params(
         gr=gr,
         ngrdcol=ngrdcol,
         grid_type=grid_type,
@@ -717,7 +838,7 @@ def init_clubb_case(namelist_path: str) -> dict:
     )
     err_info = ErrInfo(ngrdcol=ngrdcol)
 
-    err_info = check_clubb_settings_jax(
+    err_info = check_clubb_settings(
         ngrdcol=ngrdcol,
         params=clubb_params,
         config_flags=flags,
@@ -725,7 +846,7 @@ def init_clubb_case(namelist_path: str) -> dict:
         l_implemented=False,
         l_input_fields=False,
     )
-    err_info = check_parameters_jax(
+    err_info = check_parameters(
         ngrdcol=ngrdcol,
         clubb_params=clubb_params,
         lmin=lmin,
@@ -763,8 +884,10 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     # Sponge-layer damping config: precompute the per-field damping-timescale
     # profile once (sponge_layer_damping.initialize_tau_sponge_damp). Applied
-    # inside advance_clubb_core after each xm solve. Only xm fields (rtm/thlm/uv)
-    # are ported; xp2/xp3 sponge (wp2/wp3/up2_vp2) is gated off in check_clubb_settings.
+    # inside advance_clubb_core after each xm solve. Only the xm-field (rtm/thlm/uv)
+    # profiles are built + wired; the variance sponge (wp2/wp3/up2_vp2 → sponge_damp_xp2/xp3)
+    # is ported + unit-tested but unwired (no profiles built here), so it is gated off in
+    # _check_unsupported_features above.
     sponge_cfg = {}
     _zt_col = np.asarray(gr.zt, dtype=np.float64)[0, :]
     _zm_top = float(np.asarray(gr.zm, dtype=np.float64)[0, -1])
@@ -785,8 +908,8 @@ def init_clubb_case(namelist_path: str) -> dict:
     cloud_frac = np.zeros((ngrdcol, nzt))
     Ncm = np.where(rcm > 0, Nc_in_cloud, Nc_in_cloud * cloud_frac_min)
 
-    # Transport scalar/hydromet arrays across F2PY with a padded trailing extent.
-    # The logical *_dim values remain authoritative and are used inside Fortran.
+    # Scalar/hydromet arrays carry a padded trailing extent (max(dim, 1)) so a dim=0 case still has a
+    # well-formed (…, 1) trailing axis; the logical *_dim values remain authoritative for the active extent.
     # KK microphysics predicts 2 hydrometeors (rrm at idx 0, Nrm at idx 1); all other supported
     # cases are hydromet_dim=0. The hydromet means are initialised to 0 (rico's sounding has no rain).
     hm_metadata = None
@@ -907,14 +1030,14 @@ def init_clubb_case(namelist_path: str) -> dict:
             year=int(cfg['year']),
             time_initial=float(time_initial),
             clubb_params_vals=clubb_params,
-            param_names=get_param_names_jax(),
+            param_names=get_param_names(),
             sclr_dim=sclr_dim,
             edsclr_dim=edsclr_dim,
         )
 
     # ── 14. Zero PDF params ─────────────────────────────────────────────
-    pdf_params = init_pdf_params_py(nzt, ngrdcol)
-    pdf_params_zm = init_pdf_params_py(nzm, ngrdcol)
+    pdf_params = init_pdf_params(nzt, ngrdcol)
+    pdf_params_zm = init_pdf_params(nzm, ngrdcol)
 
     # ── Build state dict ────────────────────────────────────────────────
     state = dict(
@@ -930,7 +1053,7 @@ def init_clubb_case(namelist_path: str) -> dict:
         saturation_formula=saturation_formula,
         sfctype=int(cfg['sfctype']),
         microphys_scheme=microphys_scheme,
-        # Apply the full KK rain microphysics (rates + hydrometeor transport) for KK cases (Iter157).
+        # Apply the full KK rain microphysics (rates + hydrometeor transport) for KK cases.
         l_kk_micro_apply=(microphys_scheme == "khairoutdinov_kogan"),
         # The microphysics is skipped until this time (microphys_driver.F90:389; nov11=64800 → 60-step
         # spinup); default 0 = active from the start.
@@ -1066,10 +1189,10 @@ def init_clubb_case(namelist_path: str) -> dict:
             and snd.get('p_in_Pa') is not None:
         _oz_path = _CLUBB_RELEASE_ROOT / "input" / "case_setups" / f"{runtype}_ozone_sounding.in"
         if _oz_path.exists():
-            from clubb_jax.src.Radiation.bugsrad_driver import (
-                read_ozone_sounding, build_case_extended_atmosphere)
+            from clubb_jax.src.Input_fields.sounding import (
+                read_ozone_sounding, convert_snd2extended_atm)
             _o3l = read_ozone_sounding(str(_oz_path))
-            state['_rad_ext_atm'] = build_case_extended_atmosphere(
+            state['_rad_ext_atm'] = convert_snd2extended_atm(
                 snd['z'], snd['theta'], theta_type, snd['rt'], snd['p_in_Pa'],
                 float(cfg['p_sfc_nl']), _o3l)
 

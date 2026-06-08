@@ -31,9 +31,8 @@ def calc_L_x_Skx_fnc(Skx, sgn_wpxp, small_l_x_1, small_l_x_2):
 from clubb_jax.src.CLUBB_core.constants_clubb import eps as _EPS  # noqa: E402
 
 
-def _ssqrt(x):
-    xp = jnp.where(x > 0.0, x, 1.0)
-    return jnp.where(x > 0.0, jnp.sqrt(xp), 0.0)
+# grad-safe sqrt(max(x,0)) — the canonical tracer-toolkit helper.
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt as _ssqrt
 
 
 def calc_setter_parameters(xm, xp2, Skx, sgn_wpxp, big_L_x_1, big_L_x_2):
@@ -74,8 +73,10 @@ def calc_setter_parameters(xm, xp2, Skx, sgn_wpxp, big_L_x_1, big_L_x_2):
     return mu_x_1, mu_x_2, coef1 * xp2, coef2 * xp2, mixt_frac, coef1, coef2
 
 
-def calc_responder_parameters(xm, xp2, Skx, sgn_wpxp, mixt_frac, big_L_x_1):
-    """PDF component means/variances for a variable responding to the new-TSDADG PDF set by another variable
+def calc_respnder_parameters(xm, xp2, Skx, sgn_wpxp, mixt_frac, big_L_x_1):
+    """new_tsdadg_pdf.F90:calc_respnder_parameters (the misspelling "respnder" is deliberate — it mirrors the
+    Fortran subroutine name exactly, like the preserved "derrived" typo in parameters_tunable).
+    PDF component means/variances for a variable responding to the new-TSDADG PDF set by another variable
     (new_tsdadg_pdf.F90:calc_respnder_parameters [sic]; takes the setter's mixt_frac). Same factor±/normalized-
     mean-1 and variance-coefficient formulas as `calc_setter_parameters`, but the 2nd component normalized mean
     follows the overall-mean constraint mu_x_2_nrmlized = −(mf/(1−mf))·mu_x_1_nrmlized. Pure-jnp → differentiable.
@@ -102,7 +103,7 @@ def calc_responder_parameters(xm, xp2, Skx, sgn_wpxp, mixt_frac, big_L_x_1):
 def tsdadg_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, Skrt, Skthl, wprtp, wpthlp):
     """New-TSDADG PDF driver (new_tsdadg_pdf.F90:tsdadg_pdf_driver). The variable with the greatest |skewness|
     among w/rt/thl SETS the mixture fraction (calc_setter_parameters); the other two are RESPONDERS
-    (calc_responder_parameters) using that mixt_frac. Tunable spread params l_x_1=0.75, l_x_2=0.5 for all three.
+    (calc_respnder_parameters) using that mixt_frac. Tunable spread params l_x_1=0.75, l_x_2=0.5 for all three.
     Negative PDF-component variances are clipped to 0. Pure-jnp (vectorized 3-way select) → differentiable.
     Returns (mu_w_1, mu_w_2, mu_rt_1, mu_rt_2, mu_thl_1, mu_thl_2, sigma_w_1_sqd, sigma_w_2_sqd,
              sigma_rt_1_sqd, sigma_rt_2_sqd, sigma_thl_1_sqd, sigma_thl_2_sqd, mixt_frac)."""
@@ -129,9 +130,9 @@ def tsdadg_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, Skrt, Skthl, wprtp, 
     sthl = calc_setter_parameters(thlm, thlp2, Skthl, sgn_wpthlp, bLthl1, bLthl2)
     mixt_frac = jnp.where(w_set, sw[4], jnp.where(rt_set, srt[4], sthl[4]))
 
-    rw = calc_responder_parameters(wm, wp2, Skw, sgn_wp2, mixt_frac, bLw1)
-    rrt = calc_responder_parameters(rtm, rtp2, Skrt, sgn_wprtp, mixt_frac, bLrt1)
-    rthl = calc_responder_parameters(thlm, thlp2, Skthl, sgn_wpthlp, mixt_frac, bLthl1)
+    rw = calc_respnder_parameters(wm, wp2, Skw, sgn_wp2, mixt_frac, bLw1)
+    rrt = calc_respnder_parameters(rtm, rtp2, Skrt, sgn_wprtp, mixt_frac, bLrt1)
+    rthl = calc_respnder_parameters(thlm, thlp2, Skthl, sgn_wpthlp, mixt_frac, bLthl1)
 
     def _sel(mask, setter, responder, i):
         return jnp.where(mask, setter[i], responder[i])

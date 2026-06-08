@@ -5,8 +5,9 @@ form and derives the friction velocity from the resulting buoyancy flux via the 
 Self-contained + differentiable. The ARM-97 *case* is otherwise blocked by interactive SILHS + Morrison/bugsrad,
 but this surface scheme is a faithful, tested port of the oracle.
 """
-from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, grav
-from clubb_jax.src.Benchmark_cases.arm import _diag_ustar_jax
+from clubb_jax.src.CLUBB_core.constants_clubb import grav
+from clubb_jax.src.Benchmark_cases.diag_ustar_module import diag_ustar
+from clubb_jax.src.Benchmark_cases.sfc_flux import convert_sens_ht_to_km_s, convert_latent_ht_to_m_s
 
 _Z0 = 0.035   # ARM Cu momentum roughness height [m]
 
@@ -24,8 +25,8 @@ def arm_97_sfclyr(heat_flx, moisture_flx, z, rho_sfc, thlm_sfc, ubar):
     Returns:
         (wpthlp_sfc, wprtp_sfc, ustar).
     """
-    wpthlp_sfc = heat_flx / (rho_sfc * Cp)        # W/m^2 -> K m/s
-    wprtp_sfc = moisture_flx / (rho_sfc * Lv)     # W/m^2 -> kg/kg m/s
+    wpthlp_sfc = convert_sens_ht_to_km_s(heat_flx, rho_sfc)     # W/m^2 -> K m/s
+    wprtp_sfc = convert_latent_ht_to_m_s(moisture_flx, rho_sfc)  # W/m^2 -> kg/kg m/s
     bflx = grav / thlm_sfc * wpthlp_sfc
-    ustar = _diag_ustar_jax(z, bflx, ubar, _Z0)
+    ustar = diag_ustar(z, bflx, ubar, _Z0)
     return wpthlp_sfc, wprtp_sfc, ustar

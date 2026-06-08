@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.new_pdf import (
-    _ssqrt, calculate_w_params, calculate_responder_params)
+from clubb_jax.src.CLUBB_core.new_pdf import _ssqrt
+from clubb_jax.src.CLUBB_core.new_hybrid_pdf import (
+    calculate_w_params, calculate_responder_params)
 
-# constants_clubb.F90
-_MAX_MAG_CORRELATION_FLUX = 0.99    # max_mag_correlation_flux
-_LAMBDA = 0.5                       # calc_F_w_zeta_w lambda (unused: only the commented-out F_w form needs it)
+# new_hybrid_pdf_main.F90 `use constants_clubb, only: max_mag_correlation_flux` (line 903)
+from clubb_jax.src.CLUBB_core.constants_clubb import max_mag_correlation_flux as _MAX_MAG_CORRELATION_FLUX
+# (the calc_F_w_zeta_w lambda=0.5 constant was removed iter 609 — the JAX uses the ADG1-like gamma form, not the
+#  lambda form, so it was never referenced; cf. the lambda form new_pdf_main.py uses via its own _LAMBDA_W.)
 
 
 def calc_F_w_zeta_w(Skw, wprtp, wpthlp, upwp, vpwp, wp2, rtp2, thlp2, up2, vp2,

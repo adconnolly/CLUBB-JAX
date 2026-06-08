@@ -22,6 +22,9 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
     rc_tol,
     zero_threshold,
     min_max_smth_mag,
+    w_tol_sqd,
+    one_half,
+    three,
 )
 from clubb_jax.src.CLUBB_core.grid_class import (
     zm2zt_jax,
@@ -29,29 +32,26 @@ from clubb_jax.src.CLUBB_core.grid_class import (
     zt2zm_jax,
     ddzt_jax,
 )
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt  # REFACTOR B5: finite grad for sqrt(max(0,·))
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt, _xp  # REFACTOR B5: finite grad for sqrt(max(0,·)); _xp tracer-transparent
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq, SATURATION_FLATAU
 
 # ── advance_helper_module constants ─────────────────────────────────────────
 _RICHARDSON_DIV_THRESH = 1.0e-6  # Richardson_num_divisor_threshold
 
 # ── splat constants ──────────────────────────────────────────────────────────
-_SMTH_TYPE2_HALF_WIDTH = 60.0  # [m] — from Fortran local parameter, smth_type=2
-
-# ── brunt_vaisala constants ──────────────────────────────────────────────────
-_T_FREEZE_K = 273.15   # Freezing point of water [K]
-_MIN_T_IN_C = -85.0    # Minimum T used in Flatau polynomial [°C]
+_SMTH_TYPE2_HALF_WIDTH = 60.0  # [m] — Lscale_width_vert_avg smth_type==2 inline value (advance_helper_module.F90:999)
 
 
 # ============================================================================
 # Richardson / stability helpers  (advance_helper_module.F90)
 # ============================================================================
 
-def calc_ri_zm_jax(bv_freq_sqd, shear, lim_bv, lim_shear):
+def calc_Ri_zm(bv_freq_sqd, shear, lim_bv, lim_shear):
     """Richardson number (advance_helper_module.F90:calc_Ri_zm)."""
     return jnp.maximum(bv_freq_sqd, lim_bv) / jnp.maximum(shear, lim_shear)
 
 
-def compute_cx_fnc_richardson_jax(
+def compute_Cx_fnc_Richardson(
     brunt_vaisala_freq_sqd,
     brunt_vaisala_freq_sqd_mixed,
     ddzt_umvm_sqd,
@@ -66,7 +66,7 @@ def compute_cx_fnc_richardson_jax(
     Ri_max = clubb_params[:, iRichardson_num_max - 1:iRichardson_num_max]
 
     if l_use_shear_Richardson:
-        Ri_zm_Cx = calc_ri_zm_jax(brunt_vaisala_freq_sqd_mixed, ddzt_umvm_sqd, 1.0e-7, 1.0e-7)
+        Ri_zm_Cx = calc_Ri_zm(brunt_vaisala_freq_sqd_mixed, ddzt_umvm_sqd, 1.0e-7, 1.0e-7)
     else:
         Ri_zm_Cx = brunt_vaisala_freq_sqd * (1.0 / _RICHARDSON_DIV_THRESH)
 
@@ -84,15 +84,27 @@ def compute_cx_fnc_richardson_jax(
     return jnp.maximum(0.0, jnp.minimum(1.0, Cx_fnc))
 
 
-def smooth_max_jax(a, b, smth_coef):
+def smooth_max(a, b, smth_coef):
     """Smooth approximation to max(a, b) (advance_helper_module.F90:smooth_max)."""
     return 0.5 * ((a + b) + jnp.sqrt((a - b) ** 2 + smth_coef ** 2))
 
 
-def smooth_min_jax(a, b, smth_coef):
+def smooth_min(a, b, smth_coef):
     """Smooth approximation to min(a, b) (advance_helper_module.F90:smooth_min).
     Complement of smooth_max: 0.5*((a+b) - sqrt((a-b)^2 + smth_coef^2))."""
     return 0.5 * ((a + b) - jnp.sqrt((a - b) ** 2 + smth_coef ** 2))
+
+
+def smooth_heaviside_peskin(x, smth_range):
+    """Peskin smooth Heaviside function (advance_helper_module.F90:smooth_heaviside_peskin).
+
+    H = 0   if x < -smth_range
+    H = 1   if x >  smth_range
+    H = 0.5*(1 + x/r + (1/pi)*sin(pi*x/r))  otherwise
+    """
+    x_over_r = x / smth_range
+    mid = 0.5 * (1.0 + x_over_r + jnp.sin(jnp.pi * x_over_r) / jnp.pi)
+    return jnp.where(x < -smth_range, 0.0, jnp.where(x > smth_range, 1.0, mid))
 
 
 def pvertinterp(p_mid, p_out, input_var):
@@ -113,6 +125,21 @@ def pvertinterp(p_mid, p_out, input_var):
     return jax.vmap(lambda x, f: jnp.interp(p_out, x, f))(xp, fp)
 
 
+def calc_wp3_on_wp2(wp2, wp3, gr):
+    """advance_helper_module.F90:calc_wp3_on_wp2.
+
+    Smoothed ratio wp3/wp2 on the thermodynamic and momentum levels. wp2 is floored to
+    w_tol_sqd on the zt grid, the ratio is clipped to [-1000, 1000], then round-tripped
+    zt→zm→zt to suppress spikes. Returns (wp3_on_wp2, wp3_on_wp2_zt). Pure-jnp → differentiable.
+    """
+    wp2_zt = jnp.maximum(zm2zt_jax(jnp.asarray(wp2), gr), w_tol_sqd)
+    wp3_on_wp2_zt = jnp.asarray(wp3) / jnp.maximum(wp2_zt, w_tol_sqd)
+    wp3_on_wp2_zt = jnp.clip(wp3_on_wp2_zt, -1000.0, 1000.0)
+    wp3_on_wp2 = zt2zm_jax(wp3_on_wp2_zt, gr)
+    wp3_on_wp2_zt = zm2zt_jax(wp3_on_wp2, gr)
+    return wp3_on_wp2, wp3_on_wp2_zt
+
+
 def calc_xpwp(Km_zm, xm, invrs_dzm):
     """Down-gradient eddy flux x'w' on momentum levels (advance_helper_module.F90:calc_xpwp_2D):
       xpwp[k] = Km_zm[k] * invrs_dzm[k] * (xm[k] - xm[k-1])  for the interior momentum levels k=1..nzm-2
@@ -129,7 +156,7 @@ def calc_xpwp(Km_zm, xm, invrs_dzm):
     return xpwp.at[:, 1:nzm - 1].set(interior)
 
 
-def calc_stability_correction_jax(
+def calc_stability_correction(
     brunt_vaisala_freq_sqd,
     Lscale_zm,
     em,
@@ -155,7 +182,7 @@ def _smooth_min_scalar_array(scalar, array):
 # Splat term  (advance_helper_module.F90:wp23_term_splat_lhs)
 # ============================================================================
 
-def _lscale_width_vert_avg_jax(var_profile, rho_ds_zm, below_grnd_val, gr):
+def Lscale_width_vert_avg(var_profile, rho_ds_zm, below_grnd_val, gr):
     """Lscale_width_vert_avg with smth_type=2 (fixed half-width=60m)."""
     zm  = gr.zm
     dzm = gr.dzm
@@ -200,7 +227,7 @@ def _lscale_width_vert_avg_jax(var_profile, rho_ds_zm, below_grnd_val, gr):
     return (numer_sum + numer_below) / denom_safe
 
 
-def wp23_term_splat_lhs_jax(
+def wp23_term_splat_lhs(
     brunt_vaisala_freq_sqd_mixed,
     Lscale_zm,
     rho_ds_zm,
@@ -209,7 +236,7 @@ def wp23_term_splat_lhs_jax(
     gr,
 ):
     """wp23_term_splat_lhs: LHS coefficients for wp2 and wp3 splatting terms."""
-    bv_sqd_splat = _lscale_width_vert_avg_jax(
+    bv_sqd_splat = Lscale_width_vert_avg(
         var_profile=brunt_vaisala_freq_sqd_mixed,
         rho_ds_zm=rho_ds_zm,
         below_grnd_val=below_grnd_val,
@@ -224,7 +251,7 @@ def wp23_term_splat_lhs_jax(
     brunt_freq_splat_zt = zm2zt_jax(brunt_freq_splat, gr)
 
     lhs_splat_wp2 = C_wp2_splat[:, None] * brunt_freq_splat_smooth
-    lhs_splat_wp3 = 1.5 * C_wp2_splat[:, None] * brunt_freq_splat_zt
+    lhs_splat_wp3 = one_half * three * C_wp2_splat[:, None] * brunt_freq_splat_zt   # advance_helper_module.F90:1215
 
     return lhs_splat_wp2, lhs_splat_wp3, bv_sqd_splat
 
@@ -233,24 +260,7 @@ def wp23_term_splat_lhs_jax(
 # Brunt-Väisälä frequency  (advance_helper_module.F90:calc_brunt_vaisala_freq_sqd)
 # ============================================================================
 
-def _sat_mixrat_liq_flatau_jax(p_in_Pa, T_in_K):
-    """Saturation mixing ratio via Flatau polynomial (saturation_formula=3)."""
-    T_in_C = jnp.maximum(T_in_K - _T_FREEZE_K, _MIN_T_IN_C)
-    T_in_C_sqd = T_in_C ** 2
-
-    esat = (
-        -3.21582393e-14
-        * (T_in_C - 646.5835252598777)
-        * (T_in_C + 90.72381630364440)
-        * (T_in_C_sqd + 111.0976961559954 * T_in_C + 6459.629194243118)
-        * (T_in_C_sqd + 152.3131930092453 * T_in_C + 6499.774954705265)
-        * (T_in_C_sqd + 174.4279584934021 * T_in_C + 7721.679732114084)
-    )
-
-    return ep * esat / (p_in_Pa - esat)
-
-
-def calc_brunt_vaisala_freq_sqd_jax(
+def calc_brunt_vaisala_freq_sqd(
     thlm,
     exner,
     rtm,
@@ -278,7 +288,7 @@ def calc_brunt_vaisala_freq_sqd_jax(
     T_in_K = thlm * exner + (Lv / Cp) * rcm
     T_in_K_zm = zt2zm_jax(T_in_K, gr, zm_min=zero_threshold)
 
-    rsat     = _sat_mixrat_liq_flatau_jax(p_in_Pa, T_in_K)
+    rsat     = sat_mixrat_liq(p_in_Pa, T_in_K, SATURATION_FLATAU)
     rsat_zm  = zt2zm_jax(rsat, gr, zm_min=zero_threshold)
     ddzt_rsat = ddzt_jax(rsat, gr)
 
@@ -314,7 +324,7 @@ def calc_brunt_vaisala_freq_sqd_jax(
     return brunt_vaisala_freq_sqd, bv_mixed, bv_smth, bv_dry, bv_moist
 
 
-def calculate_thlp2_rad_jax(rcm, thlprcp, radht, clubb_params, gr):
+def calculate_thlp2_rad(rcm, thlprcp, radht, clubb_params, gr):
     """Compute radiative cooling contribution to thlp2 forcing.
 
     Faithful port of advance_helper_module.F90:calculate_thlp2_rad (lines 2170-2255).
@@ -342,3 +352,16 @@ def calculate_thlp2_rad_jax(rcm, thlprcp, radht, clubb_params, gr):
         0.0,
     )
     return increment
+
+
+def vertical_avg(rho_ds, field, dz):
+    """Density-weighted vertical average (advance_helper_module.F90:vertical_avg). All args shape (nz,)."""
+    denom = _xp.sum(rho_ds * dz)
+    if denom == 0.0:
+        return 0.0
+    return _xp.sum(rho_ds * dz * field) / denom
+
+
+def vertical_integral(rho_ds, field, dz):
+    """Vertical integral (advance_helper_module.F90:vertical_integral). All args shape (nz,)."""
+    return _xp.sum(field * rho_ds * dz)

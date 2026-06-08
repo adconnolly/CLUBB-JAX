@@ -23,27 +23,11 @@ D_v, supplied by parabolic_cylinder.dv_parabolic_cylinder.
 import jax.numpy as jnp
 
 from clubb_jax.src.Microphys.KK_microphys.parabolic_cylinder import (
-    dv_parabolic_cylinder,
     _gamma_real,
+    _dvc,          # clamped parabolic-cylinder D_v (its home, next to dv_parabolic_cylinder)
 )
 
 _INV_SQRT_2PI = 1.0 / jnp.sqrt(2.0 * jnp.pi)
-# D_v argument bound: the dispatch only SELECTS these forms when |s_c| <= parab_cyl_max_input
-# (=49); beyond that the const-PDF approximation is used instead. Clamping the (unused) extreme
-# argument keeps every selected/tested case exact while preventing the large-negative-z series
-# overflow (->nan) from poisoning the autodiff graph. See KK_upscaled_means dispatch. (This is a
-# differentiability guard, NOT a bit-faithfulness contrivance — retained.)
-_DV_ARG_MAX = 50.0
-
-
-def _dvc(order, arg):
-    # Accurate float64 DLMF parabolic-cylinder D_v over the whole (clamped) range.
-    # REFACTOR A1 (iter7): the previous `arg >= 15` branch reproduced the oracle's deliberately
-    # low-accuracy `expax` at epss=1e-4 purely to bit-match do/ds in the SCM run. That contrivance
-    # (parabolic_expax.py) has been DELETED — float64-accurate is simpler and strictly more correct;
-    # do/ds are judged under Tier-C/D, not bit-faithfulness. The bit-faithful KK case dycoms2_rf02_so
-    # makes no dvc calls in that region, so it is unaffected.
-    return dv_parabolic_cylinder(order, jnp.clip(arg, -_DV_ARG_MAX, _DV_ARG_MAX))
 
 
 def bivar_NL_mean(mu_x1, mu_x2_n, sigma_x1, sigma_x2_n,

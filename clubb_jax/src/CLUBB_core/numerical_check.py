@@ -1,9 +1,16 @@
 """Pure-Python port of CLUBB_core/numerical_check.F90 and related validation.
 
 Provides:
-  parameterization_check_jax  — replaces clubb_api.parameterization_check
-  check_clubb_settings_jax    — replaces clubb_api.check_clubb_settings
-  check_parameters_jax        — replaces clubb_api.check_parameters
+  check_nan / check_negative — the elemental NaN / negativity field checks (numerical_check.F90 generic check_nan + check_negative)
+  length_check            — NaN-check the mixing-length outputs (numerical_check.F90:length_check)
+  pdf_closure_check       — NaN-check the pdf_closure outputs + pdf_params (numerical_check.F90:pdf_closure_check)
+  sfc_varnce_check        — NaN-check the surface-variance outputs (numerical_check.F90:sfc_varnce_check)
+  rad_check               — negativity-check the radiation inputs (numerical_check.F90:rad_check)
+  invalid_model_arrays    — NaN/Inf-check the prognostic arrays, True if invalid (numerical_check.F90:invalid_model_arrays)
+  parameterization_check  — replaces clubb_api.parameterization_check
+  check_clubb_settings    — replaces clubb_api.check_clubb_settings
+
+(check_parameters lives in parameters_tunable.py, mirroring its Fortran home parameters_tunable.F90.)
 """
 from __future__ import annotations
 
@@ -12,89 +19,49 @@ import sys
 import numpy as np
 
 from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5: detect jax.grad trace
+# order_*/ipdf_*/saturation_* are model_flags.F90 enum parameters — import from their Fortran-home model_flags.py
+from clubb_jax.src.CLUBB_core.model_flags import (
+    order_xm_wpxp as _order_xm_wpxp, order_xp2_xpyp as _order_xp2_xpyp,
+    order_wp2_wp3 as _order_wp2_wp3, order_windm as _order_windm,
+    ipdf_pre_advance_fields as _ipdf_pre_advance, ipdf_pre_post_advance_fields as _ipdf_pre_post_advance,
+    saturation_bolton as _sat_bolton, saturation_gfdl as _sat_gfdl,
+    saturation_flatau as _sat_flatau, saturation_lookup as _sat_lookup,
+    iiPDF_ADG1 as _iiPDF_ADG1, iiPDF_ADG2 as _iiPDF_ADG2, iiPDF_3D_Luhar as _iiPDF_3D_Luhar,
+    iiPDF_new as _iiPDF_new, iiPDF_TSDADG as _iiPDF_TSDADG, iiPDF_LY93 as _iiPDF_LY93,
+    iiPDF_new_hybrid as _iiPDF_new_hybrid,
+)
 
 CLUBB_NO_ERROR    = 0
 CLUBB_FATAL_ERROR = 99
 
-# ── model_flags constants (compile-time in Fortran, fixed here) ──────────────
-_iiPDF_ADG1            = 1
-_iiPDF_ADG2            = 2
-_iiPDF_3D_Luhar        = 3
-_iiPDF_new             = 4
-_iiPDF_TSDADG          = 5
-_iiPDF_LY93            = 6
-_iiPDF_new_hybrid      = 7
-_ipdf_pre_advance      = 1
-_ipdf_post_advance     = 2
-_ipdf_pre_post_advance = 3
-_sat_bolton            = 1
-_sat_gfdl              = 2
-_sat_flatau            = 3
-_sat_lookup            = 4
-_order_xm_wpxp         = 1   # module constants from model_flags.F90 lines 22-25
-_order_xp2_xpyp        = 2
-_order_wp2_wp3         = 3
-_order_windm           = 4
+# (iiPDF_*/saturation_*/order_*/ipdf_* enums all imported from model_flags.py above — their Fortran home.)
 _l_explicit_turb_adv   = False  # model_flags.F90 line 127
 
-# ── Parameter name → 0-based index map (matches PARAM_NAMES in parameters_tunable.py) ─
-_PNAME_IDX: dict[str, int] = {
-    "C1": 0, "C1b": 1, "C1c": 2,
-    "C2rt": 3, "C2thl": 4, "C2rtthl": 5,
-    "C4": 6, "C_uu_shr": 7, "C_uu_buoy": 8,
-    "C6rt": 9, "C6rtb": 10, "C6rtc": 11,
-    "C6thl": 12, "C6thlb": 13, "C6thlc": 14,
-    "C7": 15, "C7b": 16, "C7c": 17,
-    "C8": 18, "C8b": 19,
-    "C10": 20,
-    "C11": 21, "C11b": 22, "C11c": 23,
-    "C12": 24, "C13": 25, "C14": 26,
-    "C_wp2_pr_dfsn": 27, "C_wp3_pr_tp": 28, "C_wp3_pr_turb": 29,
-    "C_wp3_pr_dfsn": 30, "C_wp2_splat": 31,
-    "C6rt_Lscale0": 32, "C6thl_Lscale0": 33, "C7_Lscale0": 34,
-    "wpxp_L_thresh": 35,
-    "c_K": 36, "c_K1": 37, "nu1": 38,
-    "c_K2": 39, "nu2": 40,
-    "c_K6": 41, "nu6": 42,
-    "c_K8": 43, "nu8": 44,
-    "c_K9": 45, "nu9": 46, "nu10": 47,
-    "c_K_hm": 48, "c_K_hmb": 49, "K_hm_min_coef": 50, "nu_hm": 51,
-    "slope_coef_spread_DG_means_w": 52, "pdf_component_stdev_factor_w": 53,
-    "coef_spread_DG_means_rt": 54, "coef_spread_DG_means_thl": 55,
-    "gamma_coef": 56, "gamma_coefb": 57, "gamma_coefc": 58,
-    "mu": 59, "beta": 60, "lmin_coef": 61,
-    "omicron": 62, "zeta_vrnce_rat": 63, "upsilon_precip_frac_rat": 64,
-    "lambda0_stability_coef": 65, "mult_coef": 66,
-    "taumin": 67, "taumax": 68,
-    "Lscale_mu_coef": 69, "Lscale_pert_coef": 70,
-    "alpha_corr": 71, "Skw_denom_coef": 72,
-    "c_K10": 73, "c_K10h": 74,
-    "thlp2_rad_coef": 75, "thlp2_rad_cloud_frac_thresh": 76,
-    "up2_sfc_coef": 77,
-    "Skw_max_mag": 78,
-    "C_invrs_tau_bkgnd": 79, "C_invrs_tau_sfc": 80, "C_invrs_tau_shear": 81,
-    "C_invrs_tau_N2": 82, "C_invrs_tau_N2_wp2": 83, "C_invrs_tau_N2_xp2": 84,
-    "C_invrs_tau_N2_wpxp": 85, "C_invrs_tau_N2_clear_wp3": 86,
-    "C_invrs_tau_wpxp_Ri": 87, "C_invrs_tau_wpxp_N2_thresh": 88,
-    "xp3_coef_base": 89, "xp3_coef_slope": 90,
-    "altitude_threshold": 91, "rtp2_clip_coef": 92,
-    "Cx_min": 93, "Cx_max": 94,
-    "Richardson_num_min": 95, "Richardson_num_max": 96,
-    "a3_coef_min": 97, "a_const": 98, "bv_efold": 99,
-    "wpxp_Ri_exp": 100, "z_displace": 101,
-}
+# Parameter name → 0-based index map (single source of truth: parameters_tunable.PARAM_NAMES). Used by
+# check_clubb_settings; check_parameters itself lives in parameters_tunable.py (its Fortran home).
+from clubb_jax.src.CLUBB_core.parameters_tunable import PNAME_IDX as _PNAME_IDX
 
 _EPS64 = np.finfo(np.float64).eps  # machine epsilon for float64 ≈ 2.22e-16
 
 
-def _check_nan(arr: np.ndarray, name: str, location: str, err_code: np.ndarray) -> None:
+def calculate_spurious_source(integral_after, integral_before,
+                               flux_top, flux_sfc, integral_forcing, dt):
+    """Spurious source/sink of a conserved column integral (numerical_check.F90:calculate_spurious_source).
+
+    The residual = d(column integral)/dt + top flux - surface flux - integrated forcing; a nonzero value
+    flags non-conservation. Pure arithmetic → differentiable. f2py bit-match (tests/test_spurious_source.py)."""
+    return ((integral_after - integral_before) / dt
+            + flux_top - flux_sfc - integral_forcing)
+
+
+def check_nan(arr: np.ndarray, name: str, location: str, err_code: np.ndarray) -> None:
     """Set err_code to CLUBB_FATAL_ERROR if any element of arr is NaN or Inf."""
     if not np.all(np.isfinite(arr)):
         print(f"{name} is NaN in {location}", file=sys.stderr)
         err_code[:] = CLUBB_FATAL_ERROR
 
 
-def _check_negative(arr: np.ndarray, name: str, location: str, err_code: np.ndarray) -> None:
+def check_negative(arr: np.ndarray, name: str, location: str, err_code: np.ndarray) -> None:
     """Set err_code to CLUBB_FATAL_ERROR if any element of arr is < 0."""
     if np.any(arr < 0.0):
         print(f"{name} < 0 in {location}", file=sys.stderr)
@@ -123,7 +90,123 @@ def sfc_varnce_check(sclr_dim, wp2_sfc, up2_sfc, vp2_sfc, thlp2_sfc, rtp2_sfc, r
     return valid
 
 
-def parameterization_check_jax(
+def length_check(Lscale, Lscale_up, Lscale_down):
+    """NaN/Inf-check the mixing-length outputs (numerical_check.F90:length_check).
+
+    The Fortran NaN-checks Lscale/Lscale_up/Lscale_down (proc_name "compute_mixing_length") and sets
+    err_code=fatal on any non-finite value. The JAX path never error-stops, so this returns True iff every
+    checked field is finite. Concrete validation (not in any gradient path).
+    """
+    valid = True
+    for arr, name in [(Lscale, "Lscale"), (Lscale_up, "Lscale_up"), (Lscale_down, "Lscale_down")]:
+        if not np.all(np.isfinite(np.asarray(arr, dtype=np.float64))):
+            print(f"{name} is NaN in compute_mixing_length", file=sys.stderr)
+            valid = False
+    return valid
+
+
+# pdf_params components NaN-checked by pdf_closure_check, in Fortran order (numerical_check.F90:215-333).
+_PDF_CLOSURE_CHECK_FIELDS = (
+    "w_1", "w_2", "varnce_w_1", "varnce_w_2", "rt_1", "rt_2", "varnce_rt_1", "varnce_rt_2",
+    "thl_1", "thl_2", "varnce_thl_1", "varnce_thl_2", "mixt_frac",
+    "corr_w_rt_1", "corr_w_rt_2", "corr_w_thl_1", "corr_w_thl_2", "corr_rt_thl_1", "corr_rt_thl_2",
+    "rc_1", "rc_2", "rsatl_1", "rsatl_2", "cloud_frac_1", "cloud_frac_2", "chi_1", "chi_2",
+    "stdev_chi_1", "stdev_chi_2", "stdev_eta_1", "stdev_eta_2", "covar_chi_eta_1", "covar_chi_eta_2",
+    "corr_w_chi_1", "corr_w_chi_2", "corr_w_eta_1", "corr_w_eta_2", "corr_chi_eta_1", "corr_chi_eta_2",
+    "alpha_thl", "alpha_rt", "ice_supersat_frac_1", "ice_supersat_frac_2",
+)
+
+
+def pdf_closure_check(closure_fields, pdf_params, sclr_dim=0, sclr_fields=None):
+    """NaN/Inf-check the pdf_closure outputs + every pdf_params component (numerical_check.F90:pdf_closure_check).
+
+    `closure_fields` is a name→array dict of the higher-order-moment outputs (wp4, wprtp2, wp2rtp, …, crt_1,
+    crt_2, cthl_1, cthl_2); `pdf_params` is the pdf_parameter NamedTuple (each component checked at the first
+    grid column, mirroring the Fortran's `%field(1,:)`); `sclr_fields` is the optional name→array dict of the
+    sclr_dim>0 scalar arrays. The Fortran sets err_code=fatal on any non-finite value (proc_name "pdf_closure");
+    the JAX path never error-stops, so this returns True iff every checked field is finite. Concrete validation
+    (not in any gradient path). The Fortran gates a few checks (wp4/wprtp2/wpthlp2/rcp2/wprtpthlp) on the stats
+    list; here every supplied field is checked unconditionally.
+    """
+    proc = "pdf_closure"
+    valid = True
+
+    def _chk(arr, name):
+        nonlocal valid
+        if arr is None:
+            return
+        if not np.all(np.isfinite(np.asarray(arr, dtype=np.float64))):
+            print(f"{name} is NaN in {proc}", file=sys.stderr)
+            valid = False
+
+    for name, arr in closure_fields.items():
+        _chk(arr, name)
+    for field in _PDF_CLOSURE_CHECK_FIELDS:
+        comp = getattr(pdf_params, field, None)
+        if comp is not None:
+            _chk(np.asarray(comp)[0], f"pdf_params%{field}(1,:)")
+    if sclr_dim > 0 and sclr_fields:
+        for name, arr in sclr_fields.items():
+            _chk(arr, name)
+    return valid
+
+
+def rad_check(thlm, rcm, rtm, rim, cloud_frac, p_in_Pa, exner, rho_zm):
+    """Negativity-check the radiation input variables (numerical_check.F90:rad_check).
+
+    The Fortran `check_negative`-checks thlm/rcm/rtm/rvm(=rtm-rcm)/rim/cloud_frac/p_in_Pa/exner/rho_zm (proc_name
+    "Before BUGSrad.") and sets err_code=fatal on any value < 0. The JAX path never error-stops, so this returns
+    True iff every checked field is >= 0 everywhere. Concrete validation (not in any gradient path).
+    """
+    rvm = np.asarray(rtm, dtype=np.float64) - np.asarray(rcm, dtype=np.float64)
+    fields = [(thlm, "thlm"), (rcm, "rcm"), (rtm, "rtm"), (rvm, "rvm"), (rim, "rim"),
+              (cloud_frac, "cloud_frac"), (p_in_Pa, "p_in_Pa"), (exner, "exner"), (rho_zm, "rho_zm")]
+    valid = True
+    for arr, name in fields:
+        if np.any(np.asarray(arr, dtype=np.float64) < 0.0):
+            print(f"{name} < 0 in Before BUGSrad.", file=sys.stderr)
+            valid = False
+    return valid
+
+
+def invalid_model_arrays(um, vm, rtm, wprtp, thlm, wpthlp, rtp2, thlp2, rtpthlp,
+                         wp2, wp3, wp2thvp, wp2up, rtpthvp, thlpthvp,
+                         hydromet=None, hydromet_list=None, sclrm=None, edsclrm=None):
+    """Check select prognostic model arrays for non-finite (NaN/Inf) values
+    (numerical_check.F90:invalid_model_arrays — called from clubb_driver each step).
+
+    Returns **True if ANY checked array is invalid** (non-finite), matching the Fortran function's name and
+    return semantics (the driver does `if invalid_model_arrays(...) -> fatal`); this is the inverse polarity of
+    the *_check routines above (which return True iff valid). hydromet (shape (..., hydromet_dim)) / sclrm /
+    edsclrm (shape (..., dim)) are optional — checked per component, with names from hydromet_list when given.
+    Concrete validation (not in any gradient path)."""
+    invalid = False
+    base = [(um, "um"), (vm, "vm"), (wp2, "wp2"), (wp3, "wp3"), (rtm, "rtm"), (thlm, "thlm"),
+            (rtp2, "rtp2"), (thlp2, "thlp2"), (wprtp, "wprtp"), (wpthlp, "wpthlp"),
+            (rtpthlp, "rtpthlp"), (wp2thvp, "wp2thvp"), (wp2up, "wp2up"),
+            (rtpthvp, "rtpthvp"), (thlpthvp, "thlpthvp")]
+    for arr, name in base:
+        if not np.all(np.isfinite(np.asarray(arr, dtype=np.float64))):
+            print(f"NaN in {name} model array", file=sys.stderr)
+            invalid = True
+    if hydromet is not None:
+        hm = np.asarray(hydromet, dtype=np.float64)
+        for i in range(hm.shape[-1]):
+            if not np.all(np.isfinite(hm[..., i])):
+                nm = hydromet_list[i] if hydromet_list is not None and i < len(hydromet_list) else str(i)
+                print(f"NaN in a hydrometeor model array {nm}", file=sys.stderr)
+                invalid = True
+    for label, block in (("sclrm", sclrm), ("edsclrm", edsclrm)):
+        if block is not None:
+            b = np.asarray(block, dtype=np.float64)
+            for i in range(b.shape[-1]):
+                if not np.all(np.isfinite(b[..., i])):
+                    print(f"NaN in {label} {i} model array", file=sys.stderr)
+                    invalid = True
+    return invalid
+
+
+def parameterization_check(
     err_info,
     nzm: int, nzt: int, ngrdcol: int, sclr_dim: int, edsclr_dim: int,
     thlm_forcing, rtm_forcing, um_forcing, vm_forcing,
@@ -165,45 +248,45 @@ def parameterization_check_jax(
     err_code = np.zeros(ngrdcol, dtype=np.int32)
 
     # ── 1. NaN checks (all arrays) ────────────────────────────────────────────
-    _check_nan(np.asarray(thlm_forcing),    "thlm_forcing",    location, err_code)
-    _check_nan(np.asarray(rtm_forcing),     "rtm_forcing",     location, err_code)
-    _check_nan(np.asarray(um_forcing),      "um_forcing",      location, err_code)
-    _check_nan(np.asarray(vm_forcing),      "vm_forcing",      location, err_code)
+    check_nan(np.asarray(thlm_forcing),    "thlm_forcing",    location, err_code)
+    check_nan(np.asarray(rtm_forcing),     "rtm_forcing",     location, err_code)
+    check_nan(np.asarray(um_forcing),      "um_forcing",      location, err_code)
+    check_nan(np.asarray(vm_forcing),      "vm_forcing",      location, err_code)
 
-    _check_nan(np.asarray(wm_zm),           "wm_zm",           location, err_code)
-    _check_nan(np.asarray(wm_zt),           "wm_zt",           location, err_code)
-    _check_nan(np.asarray(p_in_Pa),         "p_in_Pa",         location, err_code)
-    _check_nan(np.asarray(rho_zm),          "rho_zm",          location, err_code)
-    _check_nan(np.asarray(rho),             "rho",             location, err_code)
-    _check_nan(np.asarray(exner),           "exner",           location, err_code)
-    _check_nan(np.asarray(rho_ds_zm),       "rho_ds_zm",       location, err_code)
-    _check_nan(np.asarray(rho_ds_zt),       "rho_ds_zt",       location, err_code)
-    _check_nan(np.asarray(invrs_rho_ds_zm), "invrs_rho_ds_zm", location, err_code)
-    _check_nan(np.asarray(invrs_rho_ds_zt), "invrs_rho_ds_zt", location, err_code)
-    _check_nan(np.asarray(thv_ds_zm),       "thv_ds_zm",       location, err_code)
-    _check_nan(np.asarray(thv_ds_zt),       "thv_ds_zt",       location, err_code)
+    check_nan(np.asarray(wm_zm),           "wm_zm",           location, err_code)
+    check_nan(np.asarray(wm_zt),           "wm_zt",           location, err_code)
+    check_nan(np.asarray(p_in_Pa),         "p_in_Pa",         location, err_code)
+    check_nan(np.asarray(rho_zm),          "rho_zm",          location, err_code)
+    check_nan(np.asarray(rho),             "rho",             location, err_code)
+    check_nan(np.asarray(exner),           "exner",           location, err_code)
+    check_nan(np.asarray(rho_ds_zm),       "rho_ds_zm",       location, err_code)
+    check_nan(np.asarray(rho_ds_zt),       "rho_ds_zt",       location, err_code)
+    check_nan(np.asarray(invrs_rho_ds_zm), "invrs_rho_ds_zm", location, err_code)
+    check_nan(np.asarray(invrs_rho_ds_zt), "invrs_rho_ds_zt", location, err_code)
+    check_nan(np.asarray(thv_ds_zm),       "thv_ds_zm",       location, err_code)
+    check_nan(np.asarray(thv_ds_zt),       "thv_ds_zt",       location, err_code)
 
-    _check_nan(np.asarray(um),      "um",      location, err_code)
-    _check_nan(np.asarray(upwp),    "upwp",    location, err_code)
-    _check_nan(np.asarray(vm),      "vm",      location, err_code)
-    _check_nan(np.asarray(vpwp),    "vpwp",    location, err_code)
-    _check_nan(np.asarray(up2),     "up2",     location, err_code)
-    _check_nan(np.asarray(vp2),     "vp2",     location, err_code)
-    _check_nan(np.asarray(rtm),     "rtm",     location, err_code)
-    _check_nan(np.asarray(wprtp),   "wprtp",   location, err_code)
-    _check_nan(np.asarray(thlm),    "thlm",    location, err_code)
-    _check_nan(np.asarray(wpthlp),  "wpthlp",  location, err_code)
-    _check_nan(np.asarray(wp2),     "wp2",     location, err_code)
-    _check_nan(np.asarray(wp3),     "wp3",     location, err_code)
-    _check_nan(np.asarray(rtp2),    "rtp2",    location, err_code)
-    _check_nan(np.asarray(thlp2),   "thlp2",   location, err_code)
-    _check_nan(np.asarray(rtpthlp), "rtpthlp", location, err_code)
+    check_nan(np.asarray(um),      "um",      location, err_code)
+    check_nan(np.asarray(upwp),    "upwp",    location, err_code)
+    check_nan(np.asarray(vm),      "vm",      location, err_code)
+    check_nan(np.asarray(vpwp),    "vpwp",    location, err_code)
+    check_nan(np.asarray(up2),     "up2",     location, err_code)
+    check_nan(np.asarray(vp2),     "vp2",     location, err_code)
+    check_nan(np.asarray(rtm),     "rtm",     location, err_code)
+    check_nan(np.asarray(wprtp),   "wprtp",   location, err_code)
+    check_nan(np.asarray(thlm),    "thlm",    location, err_code)
+    check_nan(np.asarray(wpthlp),  "wpthlp",  location, err_code)
+    check_nan(np.asarray(wp2),     "wp2",     location, err_code)
+    check_nan(np.asarray(wp3),     "wp3",     location, err_code)
+    check_nan(np.asarray(rtp2),    "rtp2",    location, err_code)
+    check_nan(np.asarray(thlp2),   "thlp2",   location, err_code)
+    check_nan(np.asarray(rtpthlp), "rtpthlp", location, err_code)
 
-    _check_nan(np.asarray(wpthlp_sfc), "wpthlp_sfc", location, err_code)
-    _check_nan(np.asarray(wprtp_sfc),  "wprtp_sfc",  location, err_code)
-    _check_nan(np.asarray(upwp_sfc),   "upwp_sfc",   location, err_code)
-    _check_nan(np.asarray(vpwp_sfc),   "vpwp_sfc",   location, err_code)
-    _check_nan(np.asarray(p_sfc),      "p_sfc",      location, err_code)
+    check_nan(np.asarray(wpthlp_sfc), "wpthlp_sfc", location, err_code)
+    check_nan(np.asarray(wprtp_sfc),  "wprtp_sfc",  location, err_code)
+    check_nan(np.asarray(upwp_sfc),   "upwp_sfc",   location, err_code)
+    check_nan(np.asarray(vpwp_sfc),   "vpwp_sfc",   location, err_code)
+    check_nan(np.asarray(p_sfc),      "p_sfc",      location, err_code)
 
     sclrm_arr         = np.asarray(sclrm)
     wpsclrp_sfc_arr   = np.asarray(wpsclrp_sfc)
@@ -213,44 +296,44 @@ def parameterization_check_jax(
     sclrpthlp_arr     = np.asarray(sclrpthlp)
     sclrm_forcing_arr = np.asarray(sclrm_forcing)
     for s in range(sclr_dim):
-        _check_nan(sclrm_forcing_arr[..., s], "sclrm_forcing", location, err_code)
-        _check_nan(wpsclrp_sfc_arr[:, s],     "wpsclrp_sfc",   location, err_code)
-        _check_nan(sclrm_arr[..., s],          "sclrm",         location, err_code)
-        _check_nan(wpsclrp_arr[..., s],        "wpsclrp",       location, err_code)
-        _check_nan(sclrp2_arr[..., s],         "sclrp2",        location, err_code)
-        _check_nan(sclrprtp_arr[..., s],       "sclrprtp",      location, err_code)
-        _check_nan(sclrpthlp_arr[..., s],      "sclrpthlp",     location, err_code)
+        check_nan(sclrm_forcing_arr[..., s], "sclrm_forcing", location, err_code)
+        check_nan(wpsclrp_sfc_arr[:, s],     "wpsclrp_sfc",   location, err_code)
+        check_nan(sclrm_arr[..., s],          "sclrm",         location, err_code)
+        check_nan(wpsclrp_arr[..., s],        "wpsclrp",       location, err_code)
+        check_nan(sclrp2_arr[..., s],         "sclrp2",        location, err_code)
+        check_nan(sclrprtp_arr[..., s],       "sclrprtp",      location, err_code)
+        check_nan(sclrpthlp_arr[..., s],      "sclrpthlp",     location, err_code)
 
     edsclrm_arr         = np.asarray(edsclrm)
     edsclrm_forcing_arr = np.asarray(edsclrm_forcing)
     wpedsclrp_sfc_arr   = np.asarray(wpedsclrp_sfc)
     for e in range(edsclr_dim):
-        _check_nan(edsclrm_forcing_arr[..., e], "edsclrm_forcing", location, err_code)
-        _check_nan(wpedsclrp_sfc_arr[:, e],     "wpedsclrp_sfc",   location, err_code)
-        _check_nan(edsclrm_arr[..., e],          "edsclrm",         location, err_code)
+        check_nan(edsclrm_forcing_arr[..., e], "edsclrm_forcing", location, err_code)
+        check_nan(wpedsclrp_sfc_arr[:, e],     "wpedsclrp_sfc",   location, err_code)
+        check_nan(edsclrm_arr[..., e],          "edsclrm",         location, err_code)
 
     # ── 2. Return early if NaN fatal error found ──────────────────────────────
     if np.any(err_code == CLUBB_FATAL_ERROR):
         return err_info._replace(err_code=err_code)
 
     # ── 3. Negativity checks ──────────────────────────────────────────────────
-    _check_negative(np.asarray(rtm),           "rtm",           location, err_code)
-    _check_negative(np.asarray(p_in_Pa),       "p_in_Pa",       location, err_code)
-    _check_negative(np.asarray(rho),           "rho",           location, err_code)
-    _check_negative(np.asarray(rho_zm),        "rho_zm",        location, err_code)
-    _check_negative(np.asarray(exner),         "exner",         location, err_code)
-    _check_negative(np.asarray(rho_ds_zm),     "rho_ds_zm",     location, err_code)
-    _check_negative(np.asarray(rho_ds_zt),     "rho_ds_zt",     location, err_code)
-    _check_negative(np.asarray(invrs_rho_ds_zm), "invrs_rho_ds_zm", location, err_code)
-    _check_negative(np.asarray(invrs_rho_ds_zt), "invrs_rho_ds_zt", location, err_code)
-    _check_negative(np.asarray(thv_ds_zm),     "thv_ds_zm",     location, err_code)
-    _check_negative(np.asarray(thv_ds_zt),     "thv_ds_zt",     location, err_code)
-    _check_negative(np.asarray(up2),           "up2",           location, err_code)
-    _check_negative(np.asarray(vp2),           "vp2",           location, err_code)
-    _check_negative(np.asarray(wp2),           "wp2",           location, err_code)
-    _check_negative(np.asarray(thlm),          "thlm",          location, err_code)
-    _check_negative(np.asarray(rtp2),          "rtp2",          location, err_code)
-    _check_negative(np.asarray(thlp2),         "thlp2",         location, err_code)
+    check_negative(np.asarray(rtm),           "rtm",           location, err_code)
+    check_negative(np.asarray(p_in_Pa),       "p_in_Pa",       location, err_code)
+    check_negative(np.asarray(rho),           "rho",           location, err_code)
+    check_negative(np.asarray(rho_zm),        "rho_zm",        location, err_code)
+    check_negative(np.asarray(exner),         "exner",         location, err_code)
+    check_negative(np.asarray(rho_ds_zm),     "rho_ds_zm",     location, err_code)
+    check_negative(np.asarray(rho_ds_zt),     "rho_ds_zt",     location, err_code)
+    check_negative(np.asarray(invrs_rho_ds_zm), "invrs_rho_ds_zm", location, err_code)
+    check_negative(np.asarray(invrs_rho_ds_zt), "invrs_rho_ds_zt", location, err_code)
+    check_negative(np.asarray(thv_ds_zm),     "thv_ds_zm",     location, err_code)
+    check_negative(np.asarray(thv_ds_zt),     "thv_ds_zt",     location, err_code)
+    check_negative(np.asarray(up2),           "up2",           location, err_code)
+    check_negative(np.asarray(vp2),           "vp2",           location, err_code)
+    check_negative(np.asarray(wp2),           "wp2",           location, err_code)
+    check_negative(np.asarray(thlm),          "thlm",          location, err_code)
+    check_negative(np.asarray(rtp2),          "rtp2",          location, err_code)
+    check_negative(np.asarray(thlp2),         "thlp2",         location, err_code)
 
     # ── 4. Clear error if prefix=="beginning of " (host model generated it) ───
     if prefix == "beginning of " and np.any(err_code == CLUBB_FATAL_ERROR):
@@ -271,9 +354,9 @@ def parameterization_check_jax(
     return err_info._replace(err_code=err_code)
 
 
-# ── check_clubb_settings_jax ─────────────────────────────────────────────────
+# ── check_clubb_settings ─────────────────────────────────────────────────
 
-def check_clubb_settings_jax(
+def check_clubb_settings(
     ngrdcol: int,
     params: np.ndarray,
     config_flags,
@@ -399,117 +482,3 @@ def check_clubb_settings_jax(
             _fatal("l_uv_nudge must be set to .false. when l_implemented = .true.")
 
     return err_info._replace(err_code=err_code)
-
-
-# ── check_parameters_jax ─────────────────────────────────────────────────────
-
-def check_parameters_jax(
-    ngrdcol: int,
-    clubb_params: np.ndarray,
-    lmin: float,
-    err_info,
-):
-    """Port of parameters_tunable.F90:check_parameters_api.
-
-    Validates that tunable parameter values satisfy required constraints.
-    Returns updated err_info.
-    """
-    err_code = np.zeros(ngrdcol, dtype=np.int32)
-
-    def _err(msg: str, col: int) -> None:
-        print(msg, file=sys.stderr)
-        err_code[col] = CLUBB_FATAL_ERROR
-
-    # ── lmin must be >= 1.0 ──────────────────────────────────────────────────
-    if lmin < 1.0:
-        print(f"lmin = {lmin}", file=sys.stderr)
-        print("lmin is < 1.0", file=sys.stderr)
-        err_code[ngrdcol - 1] = CLUBB_FATAL_ERROR
-
-    izeta = _PNAME_IDX["zeta_vrnce_rat"]
-    for i in range(ngrdcol):
-        p = clubb_params[i, :]
-
-        # All params >= 0 (except zeta_vrnce_rat which requires >= -1)
-        for k in range(len(p)):
-            if k != izeta and p[k] < 0.0:
-                pname = _idx_to_name(k)
-                _err(f"{pname} = {p[k]}  ({pname} must satisfy 0.0 <= {pname})", i)
-            elif k == izeta and p[k] < -1.0:
-                _err(f"zeta_vrnce_rat = {p[k]}  (must satisfy -1.0 <= zeta_vrnce_rat)", i)
-
-        C1                          = p[_PNAME_IDX["C1"]]
-        C6rt                        = p[_PNAME_IDX["C6rt"]]
-        C6rtb                       = p[_PNAME_IDX["C6rtb"]]
-        C6rtc                       = p[_PNAME_IDX["C6rtc"]]
-        C6thl                       = p[_PNAME_IDX["C6thl"]]
-        C6thlb                      = p[_PNAME_IDX["C6thlb"]]
-        C6thlc                      = p[_PNAME_IDX["C6thlc"]]
-        C6rt_Lscale0                = p[_PNAME_IDX["C6rt_Lscale0"]]
-        C6thl_Lscale0               = p[_PNAME_IDX["C6thl_Lscale0"]]
-        C7                          = p[_PNAME_IDX["C7"]]
-        C7b                         = p[_PNAME_IDX["C7b"]]
-        C11                         = p[_PNAME_IDX["C11"]]
-        C11b                        = p[_PNAME_IDX["C11b"]]
-        C_wp2_splat                 = p[_PNAME_IDX["C_wp2_splat"]]
-        slope_coef_spread_DG_means_w = p[_PNAME_IDX["slope_coef_spread_DG_means_w"]]
-        pdf_component_stdev_factor_w = p[_PNAME_IDX["pdf_component_stdev_factor_w"]]
-        coef_spread_DG_means_rt     = p[_PNAME_IDX["coef_spread_DG_means_rt"]]
-        coef_spread_DG_means_thl    = p[_PNAME_IDX["coef_spread_DG_means_thl"]]
-        omicron                     = p[_PNAME_IDX["omicron"]]
-        zeta_vrnce_rat              = p[_PNAME_IDX["zeta_vrnce_rat"]]
-        upsilon_precip_frac_rat     = p[_PNAME_IDX["upsilon_precip_frac_rat"]]
-        mu                          = p[_PNAME_IDX["mu"]]
-        beta                        = p[_PNAME_IDX["beta"]]
-
-        if beta < 0.0 or beta > 3.0:
-            _err(f"beta = {beta}  (beta cannot be < 0 or > 3)", i)
-        if slope_coef_spread_DG_means_w <= 0.0:
-            _err(f"slope_coef_spread_DG_means_w = {slope_coef_spread_DG_means_w} (must be > 0)", i)
-        if pdf_component_stdev_factor_w <= 0.0:
-            _err(f"pdf_component_stdev_factor_w = {pdf_component_stdev_factor_w} (must be > 0)", i)
-        if coef_spread_DG_means_rt < 0.0 or coef_spread_DG_means_rt >= 1.0:
-            _err(f"coef_spread_DG_means_rt = {coef_spread_DG_means_rt} (must be 0 <= x < 1)", i)
-        if coef_spread_DG_means_thl < 0.0 or coef_spread_DG_means_thl >= 1.0:
-            _err(f"coef_spread_DG_means_thl = {coef_spread_DG_means_thl} (must be 0 <= x < 1)", i)
-        if omicron <= 0.0 or omicron > 1.0:
-            _err(f"omicron = {omicron}  (omicron cannot be <= 0 or > 1)", i)
-        if zeta_vrnce_rat <= -1.0:
-            _err(f"zeta_vrnce_rat = {zeta_vrnce_rat}  (cannot be <= -1)", i)
-        if upsilon_precip_frac_rat < 0.0 or upsilon_precip_frac_rat > 1.0:
-            _err(f"upsilon_precip_frac_rat = {upsilon_precip_frac_rat} (must be 0 <= x <= 1)", i)
-        if mu < 0.0:
-            _err(f"mu = {mu}  (mu cannot be < 0)", i)
-
-        def _check_equal(a, b, aname, bname):
-            denom = abs(a + b) / 2.0
-            if abs(a - b) > (denom * _EPS64 if denom > 0 else _EPS64):
-                _err(f"{aname} = {a}, {bname} = {b}  ({aname} and {bname} must be equal)", i)
-
-        _check_equal(C6rt, C6thl, "C6rt", "C6thl")
-        _check_equal(C6rtb, C6thlb, "C6rtb", "C6thlb")
-        _check_equal(C6rtc, C6thlc, "C6rtc", "C6thlc")
-        _check_equal(C6rt_Lscale0, C6thl_Lscale0, "C6rt_Lscale0", "C6thl_Lscale0")
-
-        if C1 < 0.0:
-            _err(f"C1 = {C1}  (C1 must satisfy 0.0 <= C1)", i)
-        if C7 < 0.0 or C7 > 1.0:
-            _err(f"C7 = {C7}  (C7 must satisfy 0.0 <= C7 <= 1.0)", i)
-        if C7b < 0.0 or C7b > 1.0:
-            _err(f"C7b = {C7b}  (C7b must satisfy 0.0 <= C7b <= 1.0)", i)
-        if C11 < 0.0 or C11 > 1.0:
-            _err(f"C11 = {C11}  (C11 must satisfy 0.0 <= C11 <= 1.0)", i)
-        if C11b < 0.0 or C11b > 1.0:
-            _err(f"C11b = {C11b}  (C11b must satisfy 0.0 <= C11b <= 1.0)", i)
-        if C_wp2_splat < 0.0:
-            _err(f"C_wp2_splat = {C_wp2_splat}  (must satisfy C_wp2_splat >= 0)", i)
-
-    return err_info._replace(err_code=err_code)
-
-
-def _idx_to_name(k: int) -> str:
-    """Reverse lookup: 0-based parameter index → parameter name."""
-    for name, idx in _PNAME_IDX.items():
-        if idx == k:
-            return name
-    return f"param[{k}]"

@@ -5,6 +5,9 @@ one per line. Used for stretched grids (grid_type 2 or 3).
 
 For grid_type = 1 (evenly-spaced), no grid file is needed — the grid is
 generated from deltaz, zm_init, and zm_top.
+
+JAX I/O grouping (no single Fortran file): reorganizes the Fortran grid-heights reading —
+grid_class.F90 `read_grid_heights` / `setup_grid_heights`.
 """
 import numpy as np
 from pathlib import Path

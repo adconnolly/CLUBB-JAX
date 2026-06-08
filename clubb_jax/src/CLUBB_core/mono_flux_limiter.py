@@ -23,8 +23,9 @@ import jax
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zt2zm_jax
-from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import term_ma_zt_lhs_jax
-from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import tridiag_lu_solve_jax
+from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax
+from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve_jax
+from clubb_jax.src.CLUBB_core.constants_clubb import sqrt_2, sqrt_2pi  # mono_flux_limiter.F90:2052-2053
 
 # solve_type tags
 MFL_RTM = "rtm"
@@ -34,35 +35,45 @@ MFL_VM = "vm"
 
 _MAX_XP2 = {MFL_RTM: 5.0e-6, MFL_THLM: 5.0, MFL_UM: 10.0, MFL_VM: 10.0}
 _EPS = np.finfo(np.float64).eps
-_UNUSED = -999.9
-_SQRT2 = np.sqrt(2.0)
-_SQRT2PI = np.sqrt(2.0 * np.pi)
 
 
-def _mean_w_up_down(w_i, varnce_w_i, wm):
-    """mean_vert_vel_up_down for one PDF component (zm grid).
+def calc_mean_w_up_down_component(w_i, varnce_w_i, wm):
+    """Mean up/down vertical velocity of ONE PDF component (zm grid).
 
-    Port of mono_flux_limiter.F90:mean_vert_vel_up_down. Returns (mwd, mwu):
+    Port of mono_flux_limiter.F90:calc_mean_w_up_down_component. Returns (mwd, mwu):
     the mean downward and upward vertical velocity of the component, with the
-    domain boundaries zeroed. Matches the stats-block `_mwc_mfl`.
+    domain boundaries zeroed. The overall mixt_frac-weighted combine is
+    `mean_vert_vel_up_down` below.
     """
     import jax
     wi = jnp.asarray(w_i)
     sig = jnp.sqrt(jnp.maximum(jnp.asarray(varnce_w_i), 0.0))
     sig_s = jnp.where(sig > 0.0, sig, 1.0)
-    z = (0.0 - wi) / (_SQRT2 * sig_s)
+    z = (0.0 - wi) / (sqrt_2 * sig_s)
     ev = jnp.exp(-z ** 2)
     ef = jax.scipy.special.erf(z)
     too_weak = jnp.abs(wi) + 3.0 * sig <= wm
     all_dn = (~too_weak) & (wi + 3.0 * sig <= 0.0)
     all_up = (~too_weak) & (~all_dn) & (wi - 3.0 * sig >= 0.0)
-    mwd_m = -sig / _SQRT2PI * ev + wi * 0.5 * (1.0 + ef)
-    mwu_m = sig / _SQRT2PI * ev + wi * 0.5 * (1.0 - ef)
+    mwd_m = -sig / sqrt_2pi * ev + wi * 0.5 * (1.0 + ef)
+    mwu_m = sig / sqrt_2pi * ev + wi * 0.5 * (1.0 - ef)
     mwd = jnp.where(too_weak, 0.0, jnp.where(all_dn, wi, jnp.where(all_up, 0.0, mwd_m)))
     mwu = jnp.where(too_weak, 0.0, jnp.where(all_dn, 0.0, jnp.where(all_up, wi, mwu_m)))
     mwd = mwd.at[:, 0].set(0.0).at[:, -1].set(0.0)
     mwu = mwu.at[:, 0].set(0.0).at[:, -1].set(0.0)
     return np.asarray(mwd, dtype=np.float64), np.asarray(mwu, dtype=np.float64)
+
+
+def mean_vert_vel_up_down(w_1, w_2, varnce_w_1, varnce_w_2, mixt_frac, wm):
+    """Overall mean up/down vertical velocity (mono_flux_limiter.F90:mean_vert_vel_up_down):
+    the mixt_frac-weighted combination of the two PDF components'
+    `calc_mean_w_up_down_component` results. Returns (mean_w_down, mean_w_up) on the zm grid."""
+    mwd1, mwu1 = calc_mean_w_up_down_component(w_1, varnce_w_1, wm)
+    mwd2, mwu2 = calc_mean_w_up_down_component(w_2, varnce_w_2, wm)
+    mf = np.asarray(mixt_frac, dtype=np.float64)
+    mean_w_down = mf * mwd1 + (1.0 - mf) * mwd2
+    mean_w_up   = mf * mwu1 + (1.0 - mf) * mwu2
+    return mean_w_down, mean_w_up
 
 
 def calc_turb_adv_range(w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm,
@@ -78,11 +89,8 @@ def calc_turb_adv_range(w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm,
     gd = float(gr.grid_dir)
     dzm = np.asarray(gr.dzm, dtype=np.float64)
     wm = gd * dzm * (1.0 / dt)   # w_min(k) = grid_dir * dzm * invrs_dt
-    mwd1, mwu1 = _mean_w_up_down(w_1_zm, varnce_w_1_zm, wm)
-    mwd2, mwu2 = _mean_w_up_down(w_2_zm, varnce_w_2_zm, wm)
-    mf = np.asarray(mixt_frac_zm, dtype=np.float64)
-    vvd = mf * mwd1 + (1.0 - mf) * mwd2   # mean_w_down (zm)
-    vvu = mf * mwu1 + (1.0 - mf) * mwu2   # mean_w_up   (zm)
+    vvd, vvu = mean_vert_vel_up_down(   # mean_w_down / mean_w_up (zm), mf-weighted
+        w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm, mixt_frac_zm, wm)
 
     lle = np.zeros((ngrdcol, nzt), dtype=np.int64)
     hle = np.zeros((ngrdcol, nzt), dtype=np.int64)
@@ -118,7 +126,7 @@ def calc_turb_adv_range(w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm,
     return lle, hle
 
 
-def monotonic_turbulent_flux_limit(
+def _monotonic_turbulent_flux_limit_numpy(
     solve_type, xm, wpxp, xm_old, xp2, wm_zt, xm_forcing,
     rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
     xp2_threshold, xm_tol, low_lev_effect, high_lev_effect,
@@ -249,7 +257,33 @@ def monotonic_turbulent_flux_limit(
     return xm, wpxp
 
 
-def monotonic_turbulent_flux_limit_jax(
+def mfl_xm_lhs(wm_zt, invrs_dt, gr):
+    """LHS of the MFL xm re-solve tridiagonal system (mono_flux_limiter.F90:mfl_xm_lhs).
+
+    The re-solve advances xm alone (w'x' is now known), so unlike the band-diagonal xm/w'x' advance this is a
+    tridiagonal system: the mean-advection operator term_ma_zt_lhs plus the 1/dt time tendency on the main
+    diagonal (k_tdiag, index 1 in the 3-band layout). Standalone config: l_implemented=.false. → MA included."""
+    return term_ma_zt_lhs_jax(wm_zt, gr).at[1, :, :].add(invrs_dt)
+
+
+def mfl_xm_rhs(xm_old, wpxp, xm_forcing, invrs_dt, invrs_rho_ds_zt, invrs_dzt, rho_ds_zm):
+    """RHS of the MFL xm re-solve (mono_flux_limiter.F90:mfl_xm_rhs).
+
+    xm_old/dt + xm_forcing - (1/rho_ds_zt) * d( rho_ds_zm * w'x' )/dz, with the limited w'x' (wpxp)."""
+    return (xm_old * invrs_dt + xm_forcing
+            - invrs_rho_ds_zt * invrs_dzt
+            * (rho_ds_zm[:, 1:] * wpxp[:, 1:] - rho_ds_zm[:, :-1] * wpxp[:, :-1]))
+
+
+def mfl_xm_solve(lhs, rhs):
+    """Solve the MFL xm re-solve tridiagonal system (mono_flux_limiter.F90:mfl_xm_solve).
+
+    Standalone config: l_mfl_xm_imp_adj=.true. (implicit tridiagonal re-solve); the LU tridiag solver mirrors
+    the Fortran tridiag_solve dispatched by mfl_xm_solve."""
+    return tridiag_lu_solve_jax(lhs, rhs)
+
+
+def monotonic_turbulent_flux_limit(
     solve_type, xm, wpxp, xm_old, xp2, wm_zt, xm_forcing,
     rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
     xp2_threshold, xm_tol, low_lev_effect, high_lev_effect,
@@ -327,12 +361,10 @@ def monotonic_turbulent_flux_limit_jax(
     wpxp_new = jnp.concatenate([wpxp[:, :1], wk_new_T.T, wpxp[:, -1:]], axis=1)
     adj_needed = jnp.any(adj_T, axis=0)                    # (ngrdcol,)
 
-    # Re-solve xm implicitly with the limited wpxp; apply per-column where adjustment was needed.
-    lhs = term_ma_zt_lhs_jax(wm_zt, gr).at[1, :, :].add(invrs_dt)
-    rhs = (xm_old * invrs_dt + xm_forcing
-           - invrs_rho_ds_zt * invrs_dzt
-           * (rho_ds_zm[:, 1:] * wpxp_new[:, 1:] - rho_ds_zm[:, :-1] * wpxp_new[:, :-1]))
-    xm_mfl = tridiag_lu_solve_jax(lhs, rhs)
+    # Re-solve xm implicitly with the limited wpxp (mfl_xm_lhs/rhs/solve); apply per-column where adjustment needed.
+    lhs = mfl_xm_lhs(wm_zt, invrs_dt, gr)
+    rhs = mfl_xm_rhs(xm_old, wpxp_new, xm_forcing, invrs_dt, invrs_rho_ds_zt, invrs_dzt, rho_ds_zm)
+    xm_mfl = mfl_xm_solve(lhs, rhs)
     xm = jnp.where(adj_needed[:, None], xm_mfl, xm)
 
     # Spike fix at the domain top: conserve column xm if the top level moved a lot.

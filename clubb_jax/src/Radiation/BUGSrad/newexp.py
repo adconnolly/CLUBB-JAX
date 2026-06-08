@@ -23,3 +23,10 @@ def newexp(x):
     y2 = y1 * y1
     y4 = y2 * y2
     return 1.0 / y4
+
+
+# Exact Fortran name: `newexp.f90` declares this as `function exp` (it shadows the intrinsic exp
+# inside `module newexp`). The JAX primary name is `newexp` to avoid shadowing jnp.exp at call
+# sites; this module-scoped alias makes the bare Fortran name available (`from ...newexp import exp`,
+# mirroring the solvers' `use newexp, only: exp`) — same convention as the jit-aliased raws.
+exp = newexp

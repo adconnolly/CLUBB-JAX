@@ -1,15 +1,20 @@
 """JAX port of Morrison 2-moment microphysics special functions (module_mp_graupel.F90).
 
 Foundational, independently-verifiable pieces (port these first, KK-playbook):
-  - polysvp_jax  : saturation vapor pressure [Pa] (Flatau 1992 Table 4, the "V1.7" coeffs)
-  - gamma_jax    : the complete gamma function Γ(x) (W. J. Cody algorithm)
-  - derf1_jax    : the error function erf(x) (Morrison's DERF1 rational approximation)
+  - polysvp  : saturation vapor pressure [Pa] (Flatau 1992 Table 4, the "V1.7" coeffs)
+  - gamma    : the complete gamma function Γ(x) (W. J. Cody algorithm)
+  - derf1    : the error function erf(x) (Morrison's DERF1 rational approximation)
 
 Each mirrors the Fortran exactly (Horner nesting / branch structure preserved) so the
 later process rates that call them are bit-faithful. Validated vs scipy + known values
 in tests/test_morrison_special.py. Morrison runs FLOAT64 in the CLUBB build (the inner WRF
 graupel scheme's bare `REAL` is promoted by -fdefault-real-8; see DESIGN), so these float64
 ports can be bit-faithful — reproduce the single-precision literals as their decimal values.
+
+Mirror scope: module_mp_graupel.F90's `calc_refl10cm` + `rayleigh_soak_wetgraupel` are deliberately NOT
+ported — they compute a radar-reflectivity (dBZ) DIAGNOSTIC for the WRF post-processor only, with no CLUBB
+coupling (they don't feed any prognostic tendency) and no oracle path. The prognostic microphysics rates +
+sedimentation + the CLUBB interface ARE all mirrored.
 """
 import jax.numpy as jnp
 
@@ -24,7 +29,7 @@ _POLYSVP_ICE = (6.11147274, 0.503160820, 0.188439774e-1, 0.420895665e-3,
                 0.146898966e-11, 0.252751365e-14)
 
 
-def polysvp_jax(T, itype):
+def polysvp(T, itype):
     """Saturation vapor pressure [Pa]. T in K. itype: 0=liquid, 1=ice (static int).
 
     Faithful to module_mp_graupel.F90:POLYSVP — `dt = max(-80, T-273.16)`, Horner-nested
@@ -119,7 +124,7 @@ def _horner13(coeffs, t):
     return y
 
 
-def derf1_jax(x):
+def derf1(x):
     """Error function erf(x), faithful to module_mp_graupel.F90:DERF1 (Ooura approximation).
     Array-capable; the coefficient block is gathered per element by the argument range.
     """
@@ -168,7 +173,7 @@ _GAMMA_C = (-1.910444077728e-3, 8.4171387781295e-4, -5.952379913043012e-4,
 _GAMMA_NMAX = 11   # INT(Y)-1 for Y<12 is at most 10
 
 
-def gamma_jax(x):
+def gamma(x):
     """Complete gamma function Γ(x), faithful to module_mp_graupel.F90:GAMMA (Cody).
     Array-capable; all argument-range branches masked with jnp.where. Negative integers
     (poles) and overflow return XINF=3.4e38, as in the Fortran.
@@ -340,7 +345,7 @@ def cloud_slope(qc, nc, rho, dofix_pgam=False, pgam_fixed=5.0):
         pgam = 1.0 / (pgam ** 2) - 1.0
         pgam = jnp.clip(pgam, 2.0, 10.0)
     qc_s = jnp.where(on, qc, 1.0)
-    lamc = (_M_CONS26 * nc * gamma_jax(pgam + 4.0) / (qc_s * gamma_jax(pgam + 1.0))) ** (1.0 / 3.0)
+    lamc = (_M_CONS26 * nc * gamma(pgam + 4.0) / (qc_s * gamma(pgam + 1.0))) ** (1.0 / 3.0)
     lammin = (pgam + 1.0) / 60.0e-6
     lammax = (pgam + 1.0) / 1.0e-6
     lamc = jnp.clip(lamc, lammin, lammax)
@@ -350,12 +355,14 @@ def cloud_slope(qc, nc, rho, dofix_pgam=False, pgam_fixed=5.0):
 # ── Rain evaporation PRE (Rutledge & Hobbs 1983) ─────────────────────────────────────
 # module_mp_graupel.F90: ventilation/thermo factors ~1739-1799, EPSR+PRE ~2215-2231.
 # XXLV=Lv, CPM=Cp (the moist-cp correction is commented out in the Fortran). EVS=POLYSVP.
-from clubb_jax.src.CLUBB_core.constants_clubb import Cp as _CP, Lv as _LV, Rd as _RD, Rv as _RV
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    Cp as _CP, Lv as _LV, Rd as _RD, Rv as _RV, grav as _M_G,
+    Ls as _M_LS, T_freeze_K as _M_TMELT,
+)   # module_mp_graupel.F90:78 `use clubb_api_module` (Cp/Lv/Rd/Rv/Ls/grav/T_freeze_K via constants_clubb)
 _M_EP2 = _RD / _RV
 _M_AR = 841.99667          # rain fall-speed coefficient (V·D^BR), BR=0.8
 _M_BR = 0.8
-_M_TMELT = 273.15          # T_freeze_K
-_M_RHOSU = 85000.0 / (_RD * _M_TMELT)
+_M_RHOSU = 85000.0 / (_RD * _M_TMELT)   # _M_TMELT = T_freeze_K (imported); module_mp_graupel.F90:481-482
 _M_F1R = 0.78
 _M_F2R = 0.308
 
@@ -368,10 +375,10 @@ def rain_evap_rate(qr, nr, qv, T, pres, rho):
     qv = jnp.asarray(qv, dtype=jnp.float64); T = jnp.asarray(T, dtype=jnp.float64)
     pres = jnp.asarray(pres, dtype=jnp.float64); rho = jnp.asarray(rho, dtype=jnp.float64)
 
-    cons9 = gamma_jax(jnp.asarray(2.5 + _M_BR / 2.0))   # = Γ(2.9)
+    cons9 = gamma(jnp.asarray(2.5 + _M_BR / 2.0))   # = Γ(2.9)
     cons34 = 2.5 + _M_BR / 2.0                            # = 2.9
     # saturation (over liquid), clipped at 0.99*pres
-    evs = jnp.minimum(0.99 * pres, polysvp_jax(T, 0))
+    evs = jnp.minimum(0.99 * pres, polysvp(T, 0))
     qvs = _M_EP2 * evs / (pres - evs)
     # ventilation / thermodynamic factors
     mu = 1.496e-6 * T ** 1.5 / (T + 120.0)
@@ -397,7 +404,7 @@ def rain_evap_rate(qr, nr, qv, T, pres, rho):
 # graupel are ventilated (EPSS/EPSG). The ice tail < DCS deposits as ice, the rest to snow.
 # A SUM_DEP/FUDGEF limiter caps total deposition to the available (super)saturation, then
 # negative rates split off as sublimation (EPRD/EPRDS/EPRDG).
-_M_LS = 2.834e6            # latent heat of sublimation [J/kg] (CLUBB constants_clubb.F90:209)
+# _M_LS (latent heat of sublimation) = Ls from constants_clubb (imported above; constants_clubb.F90:209)
 _M_AS, _M_BS = 11.72, 0.41     # snow fall speed V=AS·D^BS
 _M_AG, _M_BG = 19.3, 0.37      # graupel (default, not hail)
 _M_F1S, _M_F2S = 0.86, 0.28
@@ -412,8 +419,8 @@ def ice_deposition(qi, ni, qs, ns, qg, ng, qv, T, pres, rho, mnuccd, dt):
     qi, ni, qs, ns, qg, ng = a(qi), a(ni), a(qs), a(ns), a(qg), a(ng)
     qv, T, pres, rho, mnuccd = a(qv), a(T), a(pres), a(rho), a(mnuccd)
     # ice saturation (EIS capped at the liquid value EVS), thermo factor ABI
-    evs = jnp.minimum(0.99 * pres, polysvp_jax(T, 0))
-    eis = jnp.minimum(jnp.minimum(0.99 * pres, polysvp_jax(T, 1)), evs)
+    evs = jnp.minimum(0.99 * pres, polysvp(T, 0))
+    eis = jnp.minimum(jnp.minimum(0.99 * pres, polysvp(T, 1)), evs)
     qvi = _M_EP2 * eis / (pres - eis)
     abi = 1.0 + (_M_LS * qvi / (_RV * T ** 2)) * _M_LS / _CP
     # ventilation factors
@@ -422,8 +429,8 @@ def ice_deposition(qi, ni, qs, ns, qg, ng, qv, T, pres, rho, mnuccd, dt):
     sc = mu / (rho * dv)
     dcorr = (_M_RHOSU / rho) ** 0.54
     asn, agn = dcorr * _M_AS, dcorr * _M_AG
-    cons10 = gamma_jax(jnp.asarray(2.5 + _M_BS / 2.0)); cons35 = 2.5 + _M_BS / 2.0
-    cons11 = gamma_jax(jnp.asarray(2.5 + _M_BG / 2.0)); cons36 = 2.5 + _M_BG / 2.0
+    cons10 = gamma(jnp.asarray(2.5 + _M_BS / 2.0)); cons35 = 2.5 + _M_BS / 2.0
+    cons11 = gamma(jnp.asarray(2.5 + _M_BG / 2.0)); cons36 = 2.5 + _M_BG / 2.0
     # slopes
     lami, n0i = ice_slope(qi, ni)
     lams, n0s = snow_slope(qs, ns)
@@ -479,7 +486,7 @@ def snow_collection_rates(qc, nc, qi, ni, qs, ns, rho, dt):
     lams, n0s = snow_slope(qs, ns)
     ls_ = jnp.where(lams > 0.0, lams, 1.0)
     asn = (_M_RHOSU / rho) ** 0.54 * _M_AS
-    g = float(gamma_jax(jnp.asarray(_M_BS + 3.0)))   # Γ(3.41), a constant
+    g = float(gamma(jnp.asarray(_M_BS + 3.0)))   # Γ(3.41), a constant
     cons13 = g * _GAMMA_PI / 4.0 * _M_ECI
     cons23 = _GAMMA_PI / 4.0 * _M_EII * g
     base = asn * rho * n0s / ls_ ** (_M_BS + 3.0)
@@ -498,8 +505,8 @@ def ice_autoconv_to_snow(qi, ni, qv, T, pres, rho, dt):
     Occurs only where ice is supersaturated (qv≥qvi). Returns (prci, nprci). Deficit-driven."""
     a = lambda x: jnp.asarray(x, dtype=jnp.float64)
     qi, ni, qv, T, pres, rho = a(qi), a(ni), a(qv), a(T), a(pres), a(rho)
-    evs = jnp.minimum(0.99 * pres, polysvp_jax(T, 0))
-    eis = jnp.minimum(jnp.minimum(0.99 * pres, polysvp_jax(T, 1)), evs)
+    evs = jnp.minimum(0.99 * pres, polysvp(T, 0))
+    eis = jnp.minimum(jnp.minimum(0.99 * pres, polysvp(T, 1)), evs)
     qvi = _M_EP2 * eis / (pres - eis)
     abi = 1.0 + (_M_LS * qvi / (_RV * T ** 2)) * _M_LS / _CP
     dv = 8.794e-5 * T ** 1.81 / pres
@@ -549,8 +556,8 @@ def deposition_nucleation(qv, T, ni, ns, ng, pres, rho, dt, nnuccd_reduce_coef=_
     (default 1.0; 0.01 for clex9_oct14). Returns (mnuccd, nnuccd). Inputs per-kg."""
     a = lambda x: jnp.asarray(x, dtype=jnp.float64)
     qv, T, ni, ns, ng, pres, rho = a(qv), a(T), a(ni), a(ns), a(ng), a(pres), a(rho)
-    evs = jnp.minimum(0.99 * pres, polysvp_jax(T, 0))
-    eis = jnp.minimum(jnp.minimum(0.99 * pres, polysvp_jax(T, 1)), evs)
+    evs = jnp.minimum(0.99 * pres, polysvp(T, 0))
+    eis = jnp.minimum(jnp.minimum(0.99 * pres, polysvp(T, 1)), evs)
     qvqvs = qv / (_M_EP2 * evs / (pres - evs))
     qvqvsi = qv / (_M_EP2 * eis / (pres - eis))
     guard = ((qvqvs >= 0.999) & (T <= 265.15)) | (qvqvsi >= 1.08)
@@ -615,19 +622,19 @@ def cloud_contact_immersion_freezing(qc, nc, T, pres, rho, dt):
     qc, nc, T, pres, rho = a(qc), a(nc), a(T), a(pres), a(rho)
     pgam, lamc = cloud_slope(qc, nc, rho)
     lc = jnp.where(lamc > 0.0, lamc, 1.0)
-    cd = jnp.where(qc >= _M_QSMALL, nc / gamma_jax(pgam + 1.0), 1.0)   # CDIST1
+    cd = jnp.where(qc >= _M_QSMALL, nc / gamma(pgam + 1.0), 1.0)   # CDIST1
     mu = 1.496e-6 * T ** 1.5 / (T + 120.0)
     nacnt = jnp.exp(-2.80 + 0.262 * (273.15 - T)) * 1000.0
     mfp = 7.37 * T / (288.0 * 10.0 * pres) / 100.0                     # mean free path
     dap = _M_CONS37 * T * (1.0 + mfp / _M_RIN) / mu
     lncd, lnlc = jnp.log(cd), jnp.log(lc)
     # contact freezing (CONS38·DAP·NACNT · CDIST1·Γ(PGAM+5)/LAMC^4)
-    mnuccc = _M_CONS38 * dap * nacnt * jnp.exp(lncd + jnp.log(gamma_jax(pgam + 5.0)) - 4.0 * lnlc)
-    nnuccc = 2.0 * _GAMMA_PI * dap * nacnt * cd * gamma_jax(pgam + 2.0) / lc
+    mnuccc = _M_CONS38 * dap * nacnt * jnp.exp(lncd + jnp.log(gamma(pgam + 5.0)) - 4.0 * lnlc)
+    nnuccc = 2.0 * _GAMMA_PI * dap * nacnt * cd * gamma(pgam + 2.0) / lc
     # immersion (Bigg)
     eb = jnp.exp(_M_AIMM * (273.15 - T))
-    mnuccc = mnuccc + _M_CONS39 * jnp.exp(lncd + jnp.log(gamma_jax(7.0 + pgam)) - 6.0 * lnlc) * eb
-    nnuccc = nnuccc + _M_CONS40 * jnp.exp(lncd + jnp.log(gamma_jax(pgam + 4.0)) - 3.0 * lnlc) * eb
+    mnuccc = mnuccc + _M_CONS39 * jnp.exp(lncd + jnp.log(gamma(7.0 + pgam)) - 6.0 * lnlc) * eb
+    nnuccc = nnuccc + _M_CONS40 * jnp.exp(lncd + jnp.log(gamma(pgam + 4.0)) - 3.0 * lnlc) * eb
     on = (qc >= _M_QSMALL) & (T < 269.15)
     return jnp.where(on, mnuccc, 0.0), jnp.where(on, jnp.minimum(nnuccc, nc / dt), 0.0)
 
@@ -645,27 +652,6 @@ def rain_self_collection(qr, nr, rho):
     dum = jnp.where(inv < 300.0e-6, 1.0, 2.0 - jnp.exp(2300.0 * (inv - 300.0e-6)))
     nragg = -5.78 * dum * nr * qr * rho
     return jnp.where(qr >= 1.0e-8, nragg, 0.0)
-
-
-# ── M2005 tendency assembly (process-rate sum into q/N tendencies) ───────────────────
-# module_mp_graupel.F90:3956-3998 (cold branch). The in-cloud process tendency for each
-# prognostic = the signed sum of the relevant rates. NB the GRID-MEAN tendency the CLUBB
-# driver outputs (rim_mc etc.) is this × a cloud-fraction weighting (CF3D, with a threshold)
-# + the conservation limiters — to be assembled in the full driver. Validated to ~1-4% vs the
-# oracle's rim_mc/rsm_mc at the fully-cloudy (CF3D≈1) points where the weighting is identity.
-def assemble_q_tendencies(prc, pra, pre, prd, eprd, prds, eprds, prci, prai, psacws, psacwi,
-                          mnuccc, mnuccr, mnuccd, nsagg, nprci, nsubi, nsubs):
-    """In-cloud process tendencies for the nov11-active species (no graupel, QMULT*=PIACR*=PRAC*=0).
-    Returns dict with qc/qi/qr/qni mass tendencies + ni/ns number tendencies. Faithful to
-    module_mp_graupel.F90:3974-3988 (+ the NSUB additions :4346-4351). PCC (QC) is added by the driver."""
-    return {
-        "qc": -pra - prc - mnuccc - psacws - psacwi,                       # + PCC (driver)
-        "qi": prd + eprd + psacwi + mnuccc - prci - prai + mnuccd,
-        "qr": pre + pra + prc - mnuccr,
-        "qni": prai + psacws + prds + prci + eprds,
-        "ni": nsubi,                                                       # + nucleation/etc. numbers
-        "ns": nsagg + nprci + nsubs,
-    }
 
 
 # ── Conservation limiters (scale sink rates so they don't over-deplete each species) ──
@@ -723,7 +709,7 @@ def saturation_adjustment_pcc(T, qv, qc, t_ten, qv_ten, qc_ten, pres, dt):
     T, qv, qc, t_ten, qv_ten, qc_ten, pres = (a(v) for v in (T, qv, qc, t_ten, qv_ten, qc_ten, pres))
     dumt = T + dt * t_ten
     dumqv = qv + dt * qv_ten
-    dum = jnp.minimum(0.99 * pres, polysvp_jax(dumt, 0))
+    dum = jnp.minimum(0.99 * pres, polysvp(dumt, 0))
     dumqss = _M_EP2 * dum / (pres - dum)
     dums = dumqv - dumqss
     pcc = dums / (1.0 + _LV ** 2 * dumqss / (_CP * _RV * dumt ** 2)) / dt
@@ -774,8 +760,8 @@ def rain_fall_speed(qr, nr, rho):
     lr = jnp.where(lamr > 0.0, lamr, 1.0)
     dcorr = (_M_RHOSU / rho) ** 0.54
     arn = dcorr * _M_AR
-    cons4 = gamma_jax(jnp.asarray(4.0 + _M_BR)) / 6.0   # Γ(4.8)/6
-    cons6 = gamma_jax(jnp.asarray(1.0 + _M_BR))         # Γ(1.8)
+    cons4 = gamma(jnp.asarray(4.0 + _M_BR)) / 6.0   # Γ(4.8)/6
+    cons6 = gamma(jnp.asarray(1.0 + _M_BR))         # Γ(1.8)
     cap = 9.1 * dcorr
     on = qr >= _M_QSMALL
     umr = jnp.where(on, jnp.minimum(arn * cons4 / lr ** _M_BR, cap), 0.0)
@@ -830,12 +816,6 @@ def rain_sedimentation(qr, nr, rho, dzq, dt):
     qr_f = _sediment(qr * rho, fmr, dzq, dt, nstep) / rho
     nr_f = _sediment(nr * rho, fnr, dzq, dt, nstep) / rho
     return (qr_f - qr) / dt, (nr_f - nr) / dt
-
-
-def rain_sedimentation_mass(qr, nr, rho, dzq, dt):
-    """Rain-mass sedimentation tendency only [kg/kg/s] (compatibility wrapper around
-    rain_sedimentation; returns just qrsten)."""
-    return rain_sedimentation(qr, nr, rho, dzq, dt)[0]
 
 
 # ── M2005 cold-branch (T<273.15) tendency assembly ───────────────────────────────────
@@ -1122,7 +1102,7 @@ def cloud_ice_collect_droplets(qc, nc, qi, ni, rho):
     lami, n0i = ice_slope(qi, ni)
     li = jnp.where(lami > 0.0, lami, 1.0)
     ain = (_M_RHOSU / rho) ** 0.35 * _M_AI
-    cons16 = gamma_jax(jnp.asarray(_M_BI + 3.0)) * _GAMMA_PI / 4.0 * _M_ECI  # Γ(4)·π/4·ECI
+    cons16 = gamma(jnp.asarray(_M_BI + 3.0)) * _GAMMA_PI / 4.0 * _M_ECI  # Γ(4)·π/4·ECI
     base = cons16 * ain * rho * n0i / li ** (_M_BI + 3.0)
     on = (qi >= 1.0e-8) & (qc >= _M_QSMALL) & (1.0 / li >= 100.0e-6)
     return jnp.where(on, base * qc, 0.0), jnp.where(on, base * nc, 0.0)
@@ -1138,8 +1118,8 @@ def rain_ice_collision_snow(qr, nr, qi, ni, T, rho, dt):
     lamr, n0rr = rain_slope(qr, nr)
     lr = jnp.where(lamr > 0.0, lamr, 1.0)
     arn = (_M_RHOSU / rho) ** 0.54 * _M_AR
-    cons24 = _GAMMA_PI / 4.0 * _M_ECR * gamma_jax(jnp.asarray(_M_BR + 3.0))          # π/4·Γ(3.8)
-    cons25 = _GAMMA_PI ** 2 / 24.0 * _KK_RHOW * _M_ECR * gamma_jax(jnp.asarray(_M_BR + 6.0))  # π²/24·ρw·Γ(6.8)
+    cons24 = _GAMMA_PI / 4.0 * _M_ECR * gamma(jnp.asarray(_M_BR + 3.0))          # π/4·Γ(3.8)
+    cons25 = _GAMMA_PI ** 2 / 24.0 * _KK_RHOW * _M_ECR * gamma(jnp.asarray(_M_BR + 6.0))  # π²/24·ρw·Γ(6.8)
     niacrs = cons24 * ni * n0rr * arn / lr ** (_M_BR + 3.0) * rho
     piacrs = cons25 * ni * n0rr * arn / lr ** (_M_BR + 3.0) / lr ** 3 * rho
     pracis = cons24 * qi * n0rr * arn / lr ** (_M_BR + 3.0) * rho
@@ -1160,8 +1140,8 @@ def rain_accrete_snow(qr, nr, qs, ns, rho):
     lr = jnp.where(lamr > 0.0, lamr, 1.0); ls = jnp.where(lams > 0.0, lams, 1.0)
     dcorr = (_M_RHOSU / rho) ** 0.54
     arn, asn = dcorr * _M_AR, dcorr * _M_AS
-    cons3 = gamma_jax(jnp.asarray(4.0 + _M_BS)) / 6.0   # Γ(4.41)/6
-    cons4 = gamma_jax(jnp.asarray(4.0 + _M_BR)) / 6.0   # Γ(4.8)/6
+    cons3 = gamma(jnp.asarray(4.0 + _M_BS)) / 6.0   # Γ(4.41)/6
+    cons4 = gamma(jnp.asarray(4.0 + _M_BR)) / 6.0   # Γ(4.8)/6
     cons31 = _GAMMA_PI ** 2 * _M_ECR * _M_RHOSN
     ums = jnp.minimum(asn * cons3 / ls ** _M_BS, 1.2 * dcorr)
     umr = jnp.minimum(arn * cons4 / lr ** _M_BR, 9.1 * dcorr)
@@ -1187,7 +1167,7 @@ def m2005_driver(qc, nc, qr, nr, qi, ni, qs, ns, qg, ng, qv, T, pres, rho, cf3d,
     qi, ni, qs, ns, qg, ng = a(qi), a(ni), a(qs), a(ns), a(qg), a(ng)
     qv, T, pres, rho = a(qv), a(T), a(pres), a(rho)
     # saturation mixing ratio w.r.t. liquid (for the in-cloud vapor set), low-pressure-capped
-    evs = jnp.minimum(0.99 * pres, polysvp_jax(T, 0))
+    evs = jnp.minimum(0.99 * pres, polysvp(T, 0))
     qvs = _M_EP2 * evs / (pres - evs)
     # grid-mean → in-cloud (÷CF3D, qv→QVS where CF3D>thresh)
     (qc_i, nc_i, qr_i, nr_i, qi_i, ni_i, qs_i, ns_i, qg_i, ng_i), qv_i = to_in_cloud(
@@ -1214,7 +1194,7 @@ def m2005_driver(qc, nc, qr, nr, qi, ni, qs, ns, qg, ng, qv, T, pres, rho, cf3d,
 
 # ── Cloud + ice + snow terminal fall speeds + multi-species sedimentation ────────────
 # module_mp_graupel.F90:4648-4672 (fall speeds) + the shared-NSTEP sub-step loop (:4647-4834).
-_M_G = 9.81   # gravitational acceleration (constants_clubb.F90:234)
+# _M_G (gravitational acceleration) = grav from constants_clubb (module_mp_graupel.F90:519 `G = grav`), imported above.
 
 
 def cloud_fall_speed(qc, nc, T, rho):
@@ -1231,8 +1211,8 @@ def cloud_fall_speed(qc, nc, T, rho):
     # no droplets → no defined size → no sedimentation (nc>0 guard, like PRC). The oracle has
     # rcm>0 & Ncm=0 at ~40% of cloudy points (phantom cloud water) and rcm_sd_mg_morr=0 there.
     on = (qc >= _M_QSMALL) & (nc > 0.0)
-    umc = jnp.where(on, acn * gamma_jax(4.0 + bc + pgam) / (lc ** bc * gamma_jax(pgam + 4.0)), 0.0)
-    unc = jnp.where(on, acn * gamma_jax(1.0 + bc + pgam) / (lc ** bc * gamma_jax(pgam + 1.0)), 0.0)
+    umc = jnp.where(on, acn * gamma(4.0 + bc + pgam) / (lc ** bc * gamma(pgam + 4.0)), 0.0)
+    unc = jnp.where(on, acn * gamma(1.0 + bc + pgam) / (lc ** bc * gamma(pgam + 1.0)), 0.0)
     return umc, unc
 
 
@@ -1244,7 +1224,7 @@ def ice_fall_speed(qi, ni, rho):
     lami, _ = ice_slope(qi, ni)
     li = jnp.where(lami > 0.0, lami, 1.0)
     ain = (_M_RHOSU / rho) ** 0.35 * _M_AI
-    cons27 = gamma_jax(jnp.asarray(1.0 + _M_BI)); cons28 = gamma_jax(jnp.asarray(4.0 + _M_BI)) / 6.0
+    cons27 = gamma(jnp.asarray(1.0 + _M_BI)); cons28 = gamma(jnp.asarray(4.0 + _M_BI)) / 6.0
     cap = 1.2 * (_M_RHOSU / rho) ** 0.35
     on = qi >= _M_QSMALL
     umi = jnp.where(on, jnp.minimum(ain * cons28 / li ** _M_BI, cap), 0.0)
@@ -1261,7 +1241,7 @@ def snow_fall_speed(qs, ns, rho):
     ls = jnp.where(lams > 0.0, lams, 1.0)
     dcorr = (_M_RHOSU / rho) ** 0.54
     asn = dcorr * _M_AS
-    cons3 = gamma_jax(jnp.asarray(4.0 + _M_BS)) / 6.0; cons5 = gamma_jax(jnp.asarray(1.0 + _M_BS))
+    cons3 = gamma(jnp.asarray(4.0 + _M_BS)) / 6.0; cons5 = gamma(jnp.asarray(1.0 + _M_BS))
     cap = 1.2 * dcorr
     on = qs >= _M_QSMALL
     ums = jnp.where(on, jnp.minimum(asn * cons3 / ls ** _M_BS, cap), 0.0)
@@ -1333,7 +1313,7 @@ def _sizefix_cloud_number(qc, nc, rho, dofix_pgam=False, pgam_fixed=5.0):
     else:
         pgam = 0.0005714 * (nc / 1.0e6 * rho) + 0.2714
         pgam = jnp.clip(1.0 / (pgam ** 2) - 1.0, 2.0, 10.0)
-    g1, g4 = gamma_jax(pgam + 1.0), gamma_jax(pgam + 4.0)
+    g1, g4 = gamma(pgam + 1.0), gamma(pgam + 4.0)
     qc_s = jnp.where(on, qc, 1.0)
     lamc = (_M_CONS26 * nc * g4 / (qc_s * g1)) ** (1.0 / 3.0)
     lammin, lammax = (pgam + 1.0) / 60.0e-6, (pgam + 1.0) / 1.0e-6
@@ -1352,61 +1332,5 @@ def _size_clamp_numbers(qc, nc, qr, nr, qi, ni, qs, ns, qg, ng, rho):
             _sizefix_exp_number(qg, ng, _M_CONS_GRAUPEL, _M_LAMMING, _M_LAMMAXG))
 
 
-def morrison_microphys_driver(rcm, Ncm, rrm, Nrm, rim, Nim, rsm, Nsm, rgm, Ngm,
-                              thlm, rvm, T_in_K, exner, pres, rho, cf3d, dzq, dt, igraup=0):
-    """JAX CLUBB-Morrison interface. Returns a dict of the CLUBB-form tendencies:
-    {rcm_mc, rvm_mc, thlm_mc, Ncm_mc, rrm_mc, Nrm_mc, rim_mc, Nim_mc, rsm_mc, Nsm_mc, rgm_mc, Ngm_mc}.
-    Inputs are the grid-mean CLUBB fields (rcm/Ncm cloud from the PDF; rrm…Ngm hydrometeors; thlm/rvm
-    prognostics; T_in_K=absolute temperature). Sedimentation (rain+ice+snow) is folded into the
-    hydrometeor *_mc via (field_final−field_initial)/dt; cloud-droplet sedimentation is the separate
-    CLUBB cloud_drop_sed (not here)."""
-    a = lambda x: jnp.asarray(x, dtype=jnp.float64)
-    rcm, Ncm, rvm, thlm = a(rcm), a(Ncm), a(rvm), a(thlm)
-    rrm, Nrm, rim, Nim = a(rrm), a(Nrm), a(rim), a(Nim)
-    rsm, Nsm, rgm, Ngm = a(rsm), a(Nsm), a(rgm), a(Ngm)
-    T_in_K, exner, pres, rho, dzq = a(T_in_K), a(exner), a(pres), a(rho), a(dzq)
-    # process tendencies (grid-mean) from the full single-column driver
-    ten = m2005_driver(rcm, Ncm, rrm, Nrm, rim, Nim, rsm, Nsm, rgm, Ngm,
-                       rvm, T_in_K, pres, rho, cf3d, dt, igraup=igraup)
-    # post-process fields (DUM = field + tendency·dt), then sedimentation on these. Cloud water is
-    # sedimented too (its tendency folds into rcm_mc/Ncm_mc — QC3DTEN += QCSTEN, :4885).
-    qr_p = rrm + ten['qr'] * dt; nr_p = Nrm + ten['nr'] * dt
-    qi_p = rim + ten['qi'] * dt; ni_p = Nim + ten['ni'] * dt
-    qs_p = rsm + ten['qni'] * dt; ns_p = Nsm + ten['ns'] * dt
-    qc_p = rcm + ten['qc'] * dt; nc_p = Ncm + ten['nc'] * dt
-    sed = morrison_sedimentation(qr_p, nr_p, qi_p, ni_p, qs_p, ns_p, rho, dzq, dt,
-                                 qc=qc_p, nc=nc_p, T=T_in_K)
-    clip = lambda x: jnp.maximum(x, 0.0)
-    # final fields = post-process + sedimentation, clipped ≥ 0
-    rrm_f = clip(qr_p + sed['qr'] * dt); Nrm_f = clip(nr_p + sed['nr'] * dt)
-    # The slope clamps are applied PRE-RATE inside m2005_driver (faithful to F90:1881-2002 — affects the
-    # rate inputs + all 5 species). The rain post-sed clamp is ALSO kept: the stored stats reflect the
-    # Fortran's NEXT-step pre-rate clamp on the (unclamped) post-sed output, so a per-step driver must
-    # clamp its OUTPUT to match (removing it regresses dycoms Nrm 1.0→1.15; Iter235/250).
-    Nrm_f = _sizefix_exp_number(rrm_f, Nrm_f, _M_CONS_RAIN, _M_LAMMINR, _M_LAMMAXR)
-    rim_f = clip(qi_p + sed['qi'] * dt); Nim_f = clip(ni_p + sed['ni'] * dt)
-    rsm_f = clip(qs_p + sed['qs'] * dt); Nsm_f = clip(ns_p + sed['ns'] * dt)
-    rgm_f = clip(rgm + ten['qg'] * dt); Ngm_f = clip(Ngm + ten['ng'] * dt)
-    Ncm_f = clip(nc_p + sed['nc'] * dt)
-    rcm_mc = ten['qc'] + sed['qc']   # rcm tendency = process (QC3DTEN, incl. PCC) + cloud sedimentation
-    # M2005 integrates the fields at the end (QC3D+=QC3DTEN·dt, T3D+=T3DTEN·dt, :4911-4929), so rcm_r4 =
-    # rcm + rcm_mc·dt and T_in_K = T + ten['T']·dt → thlm_mc = (ten['T'] − Lv/Cp·rcm_mc)/exner. The PCC
-    # parts of ten['T'] and rcm_mc cancel (thlm conserved under condensation); the cloud-sed rcm change
-    # remains — that is the strong WBF-like heating at cloud-top mixed-phase points (the 184-pt signal).
-    # thlm_mc: the float64-exact form. The Fortran computes this through a single-precision
-    # thlm<->T_in_K round-trip (morrison_microphys_module.F90:399/416/793, `real(...)`=REAL(4)), which
-    # algebraically reduces to (ten['T'] − Lv/Cp·rcm_mc)/exner once the T_in_K_init and rcm terms cancel
-    # (thlm is conserved under condensation; only the cloud-sed rcm change survives as the cloud-top heating).
-    # The REFACTOR drops the deliberate `real*4` round-trip (its sole effect was a ~1e-7 single-precision
-    # residual reproduced for bit-faithfulness, REFACTOR.md §3.1 A2) — float64 is simpler and more accurate;
-    # the clear-air case (mpace_a) now correctly gives thlm_mc≈0 instead of the ~2.8e-7 artifact.
-    thlm_mc = (ten['T'] - _LV / _CP * rcm_mc) / exner
-    return {
-        'rcm_mc': rcm_mc, 'rvm_mc': ten['qv'],
-        'thlm_mc': thlm_mc,
-        'Ncm_mc': (Ncm_f - Ncm) / dt,
-        'rrm_mc': (rrm_f - rrm) / dt, 'Nrm_mc': (Nrm_f - Nrm) / dt,
-        'rim_mc': (rim_f - rim) / dt, 'Nim_mc': (Nim_f - Nim) / dt,
-        'rsm_mc': (rsm_f - rsm) / dt, 'Nsm_mc': (Nsm_f - Nsm) / dt,
-        'rgm_mc': (rgm_f - rgm) / dt, 'Ngm_mc': (Ngm_f - Ngm) / dt,
-    }
+# morrison_microphys_driver now lives in its Fortran-home module
+# Microphys/morrison_microphys_module.py (mirror-refactor iter 114).

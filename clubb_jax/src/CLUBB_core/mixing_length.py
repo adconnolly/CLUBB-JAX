@@ -1,91 +1,39 @@
 """JAX implementations of mixing_length.F90.
 
-diagnose_lscale_from_tau_jax:
+diagnose_Lscale_from_tau:
   ARM flags: l_e3sm_config=False, l_smooth_Heaviside_tau_wpxp=True,
              l_smooth_min_max=False (local Fortran constant)
 
-compute_mixing_length_jax:
+compute_mixing_length:
   Golaz et al. (2002) nonlocal parcel length scale.
   Faithful port of compute_mixing_length (ascending grid only).
 
-calc_lscale_directly_jax:
-  Wrapper calling compute_mixing_length_jax once (l_avg_Lscale=False).
+calc_Lscale_directly:
+  Wrapper calling compute_mixing_length once (l_avg_Lscale=False).
 """
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow  # REFACTOR B5: finite grad for max(x,0)**p
-from clubb_jax.src.CLUBB_core.constants_clubb import (
-    Cp,
-    em_min,
-    ep,
-    ep1,
-    ep2,
-    eps,
-    grav,
-    Lv,
-    Rd,
-    min_max_smth_mag,
-    rt_tol,
-    thl_tol,
-    vonk,
-    zero_threshold,
-    iC_invrs_tau_bkgnd,
-    iC_invrs_tau_sfc,
-    iC_invrs_tau_shear,
-    iC_invrs_tau_N2,
-    iC_invrs_tau_N2_wp2,
-    iC_invrs_tau_N2_xp2,
-    iC_invrs_tau_N2_wpxp,
-    iC_invrs_tau_N2_clear_wp3,
-    iC_invrs_tau_wpxp_Ri,
-    iC_invrs_tau_wpxp_N2_thresh,
-    ialtitude_threshold,
-    iwpxp_Ri_exp,
-    iz_displace,
-    iLscale_mu_coef,
-    iLscale_pert_coef,
-    imu,
-)
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow, _safe_sqrt, _asarray, _xp  # REFACTOR B5: finite grad for max(x,0)**p / sqrt
+from clubb_jax.src.CLUBB_core.constants_clubb import Cp, em_min, ep, ep1, ep2, eps, grav, Lv, Rd, min_max_smth_mag, vonk, zero_threshold, itaumax, iC_invrs_tau_bkgnd, iC_invrs_tau_sfc, iC_invrs_tau_shear, iC_invrs_tau_N2, iC_invrs_tau_N2_wp2, iC_invrs_tau_N2_xp2, iC_invrs_tau_N2_wpxp, iC_invrs_tau_N2_clear_wp3, iC_invrs_tau_wpxp_Ri, iC_invrs_tau_wpxp_N2_thresh, ialtitude_threshold, iwpxp_Ri_exp, iz_displace, imu
 from clubb_jax.src.CLUBB_core.grid_class import (
     zt2zm_jax,
     zm2zt_jax,
     zm2zt2zm_jax,
+    zt2zm,
 )
-from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
 
 # Local Fortran constant: smoothing range for Peskin Heaviside
 _HEAVISIDE_SMTH_RANGE = 1.0
 
 
-def _smooth_max_jax(arr, scalar, smth_coef):
-    """smooth_max_array_scalar: 0.5*(a + b + sqrt((a-b)^2 + smth_coef^2))."""
-    return 0.5 * ((arr + scalar) + jnp.sqrt((arr - scalar) ** 2 + smth_coef ** 2))
-
-
-def _smooth_heaviside_peskin_jax(x, smth_range):
-    """Peskin smooth Heaviside function (advance_helper_module.F90).
-
-    H = 0   if x < -smth_range
-    H = 1   if x >  smth_range
-    H = 0.5*(1 + x/r + (1/pi)*sin(pi*x/r))  otherwise
-    """
-    x_over_r = x / smth_range
-    mid = 0.5 * (1.0 + x_over_r + jnp.sin(jnp.pi * x_over_r) / jnp.pi)
-    return jnp.where(x < -smth_range, 0.0, jnp.where(x > smth_range, 1.0, mid))
-
-
-def _safe_sqrt(x):
-    """``sqrt(max(x,0))`` with a finite (0) gradient at x<=0 (double-where).
-
-    Plain ``jnp.sqrt(jnp.maximum(0.0, x))`` is forward-correct but its reverse-mode gradient is
-    ``inf`` at the clipped boundary (d/dx sqrt = 1/(2*sqrt) -> inf as the arg -> 0). REFACTOR B3 (iter9):
-    needed once the parcel-ascent became ``jax.grad``-able — the CAPE-fraction discriminants legitimately
-    clip to 0, which previously produced a nan gradient. Forward-identical to the clipped sqrt."""
-    xp = jnp.maximum(x, 0.0)
-    safe = jnp.where(xp > 0.0, xp, 1.0)
-    return jnp.where(xp > 0.0, jnp.sqrt(safe), 0.0)
+# smooth_max lives only in advance_helper_module.F90; mixing_length.F90 `use`s it. Import the one
+# implementation rather than keeping a duplicate (`smooth_max(a, b, smth_coef)` is the same formula).
+from clubb_jax.src.CLUBB_core.advance_helper_module import smooth_max
+from clubb_jax.src.CLUBB_core.advance_helper_module import smooth_heaviside_peskin
 
 
 def _bounded_while(cond_fn, body_fn, init_state, max_iters):
@@ -108,7 +56,7 @@ def _bounded_while(cond_fn, body_fn, init_state, max_iters):
     return final
 
 
-def diagnose_lscale_from_tau_jax(
+def diagnose_Lscale_from_tau(
     upwp_sfc,                   # (ngrdcol,)
     vpwp_sfc,                   # (ngrdcol,)
     ddzt_umvm_sqd,              # (ngrdcol, nzm)
@@ -165,7 +113,7 @@ def diagnose_lscale_from_tau_jax(
     C_shear = clubb_params[:, iC_invrs_tau_shear - 1]
     invrs_tau_shear_smooth = C_shear[:, None] * smooth_norm   # (ngrdcol, nzm)
     # smooth_max(array, zero_threshold, min_max_smth_mag) ≈ max(array, 0)
-    invrs_tau_shear = _smooth_max_jax(invrs_tau_shear_smooth, zero_threshold, min_max_smth_mag)
+    invrs_tau_shear = smooth_max(invrs_tau_shear_smooth, zero_threshold, min_max_smth_mag)
 
     # --- Step 6: invrs_tau_sfc ---
     C_sfc = clubb_params[:, iC_invrs_tau_sfc - 1]            # (ngrdcol,)
@@ -233,7 +181,7 @@ def diagnose_lscale_from_tau_jax(
 
     if l_smooth_Heaviside_tau_wpxp:
         bvf_thresh = brunt_vaisala_freq_sqd_smth / C_N2_thresh[:, None] - 1.0
-        H = _smooth_heaviside_peskin_jax(bvf_thresh, _HEAVISIDE_SMTH_RANGE)
+        H = smooth_heaviside_peskin(bvf_thresh, _HEAVISIDE_SMTH_RANGE)
     else:
         H = jnp.where(brunt_vaisala_freq_sqd_smth > C_N2_thresh[:, None], 1.0, 0.0)
 
@@ -298,7 +246,7 @@ def diagnose_lscale_from_tau_jax(
 
 
 # ---------------------------------------------------------------------------
-# compute_mixing_length_jax
+# compute_mixing_length
 # Golaz et al. (2002) nonlocal parcel length scale.
 # Faithful port of mixing_length.F90:compute_mixing_length.
 # Ascending grid only (grid_dir_indx = +1).
@@ -314,7 +262,7 @@ def _parcel_thv(thl_par, rt_par, exner_j, p_j, thv_ds_j, Lv_coef_j, saturation_f
     Lewellen-Yoh (1993) condensate formula inside the parcel.
     """
     tl_j = thl_par * exner_j
-    rsat_j = sat_mixrat_liq_jax(
+    rsat_j = sat_mixrat_liq(
         jnp.reshape(p_j, (1, 1)),
         jnp.reshape(tl_j, (1, 1)),
         saturation_formula,
@@ -692,7 +640,19 @@ def _compute_lscale_down_col(
     return Lscale_down_col
 
 
-def compute_mixing_length_jax(
+def set_Lscale_max(l_implemented, host_dx, host_dy, ngrdcol):
+    """mixing_length.F90:set_Lscale_max.
+
+    Maximum allowable value for Lscale [m]. When CLUBB runs inside a host model the cap is
+    0.25*min(host_dx, host_dy) (smaller grid → smaller Lscale); standalone it is 1.0e5.
+    Returns a (ngrdcol,) array.
+    """
+    if l_implemented:
+        return 0.25 * jnp.minimum(jnp.asarray(host_dx), jnp.asarray(host_dy))
+    return jnp.full((ngrdcol,), 1.0e5)
+
+
+def compute_mixing_length(
     thvm, thlm, rtm, em, Lscale_max, p_in_Pa, exner, thv_ds,
     mu, lmin, saturation_formula, l_implemented, gr,
 ):
@@ -754,7 +714,7 @@ def compute_mixing_length_jax(
     rt_par_1_up_int  = rtm[:, 1:]  - rt_diff_up  * ec_init_up
 
     tl_par_1_up_int = thl_par_1_up_int * exner[:, 1:]           # (ngrdcol, nzt-1)
-    rsat_1_up_int   = sat_mixrat_liq_jax(p_in_Pa[:, 1:], tl_par_1_up_int, saturation_formula)
+    rsat_1_up_int   = sat_mixrat_liq(p_in_Pa[:, 1:], tl_par_1_up_int, saturation_formula)
     tl_sqd_up       = tl_par_1_up_int ** 2
     s_1_up          = ((rt_par_1_up_int - rsat_1_up_int) * tl_sqd_up
                        / (tl_sqd_up + _LV2_COEF * rsat_1_up_int))
@@ -793,7 +753,7 @@ def compute_mixing_length_jax(
     rt_par_1_dn_int  = rtm[:, :-1]  - rt_diff_dn  * ec_init_dn
 
     tl_par_1_dn_int = thl_par_1_dn_int * exner[:, :-1]
-    rsat_1_dn_int   = sat_mixrat_liq_jax(p_in_Pa[:, :-1], tl_par_1_dn_int, saturation_formula)
+    rsat_1_dn_int   = sat_mixrat_liq(p_in_Pa[:, :-1], tl_par_1_dn_int, saturation_formula)
     tl_sqd_dn       = tl_par_1_dn_int ** 2
     s_1_dn          = ((rt_par_1_dn_int - rsat_1_dn_int) * tl_sqd_dn
                        / (tl_sqd_dn + _LV2_COEF * rsat_1_dn_int))
@@ -866,14 +826,14 @@ def compute_mixing_length_jax(
     return Lscale, Lscale_up, Lscale_down
 
 
-def calc_lscale_directly_jax(
+def calc_Lscale_directly(
     thvm, thlm, rtm, em, Lscale_max, p_in_Pa, exner, thv_ds,
     clubb_params, lmin, saturation_formula, l_implemented, gr,
 ):
     """JAX port of mixing_length.F90:calc_Lscale_directly.
 
     l_avg_Lscale = False (Fortran compile-time constant).
-    Calls compute_mixing_length_jax once with mean values.
+    Calls compute_mixing_length once with mean values.
 
     Inputs:
       clubb_params: (ngrdcol, nparams+1) — 1-indexed
@@ -881,7 +841,126 @@ def calc_lscale_directly_jax(
       Lscale, Lscale_up, Lscale_down: (ngrdcol, nzt)
     """
     mu = clubb_params[:, imu]   # imu = 60 (1-indexed, column 0 unused)
-    return compute_mixing_length_jax(
+    return compute_mixing_length(
         thvm, thlm, rtm, em, Lscale_max, p_in_Pa, exner, thv_ds,
         mu, lmin, saturation_formula, l_implemented, gr,
+    )
+
+
+def calc_Lscale(*, thvm, thlm, rtm, em, sqrt_em_zt, Lscale_max, p_in_Pa, exner, thv_ds_zt,
+    clubb_params, lmin, l_implemented, upwp_sfc, vpwp_sfc, ddzt_umvm_sqd,
+    ice_supersat_frac, ufmin, tau_const, sfc_elevation, Ri_zm,
+    brunt_vaisala_freq_sqd_smth, flags, gr, ngrdcol, nzm, nzt):
+    """mixing_length.F90:calc_Lscale — the top-level mixing-length / dissipation-time-scale
+    dispatcher. Branches on flags.l_diag_Lscale_from_tau: diagnose_lscale_from_tau (returns the
+    tau fields directly) OR calc_lscale_directly (the parcel method) + derive tau from Lscale.
+    Relocated verbatim from advance_clubb_core's inline Block L; returns a dict of the Lscale /
+    Lscale_up/down + tau / invrs_tau fields (+ the two brunt-frequency diagnostics for the tau
+    branch, None in the directly branch). advance_clubb_core does the Lscale/tau stat_updates."""
+    one = 1.0
+    if not flags.l_diag_Lscale_from_tau:
+        # calc_lscale_directly (l_avg_Lscale=False, ascending grid)
+        _Lscale_j, _Lscale_up_j, _Lscale_down_j = calc_Lscale_directly(
+            jnp.asarray(thvm), jnp.asarray(thlm), jnp.asarray(rtm),
+            jnp.asarray(em), jnp.asarray(Lscale_max),
+            jnp.asarray(p_in_Pa), jnp.asarray(exner), jnp.asarray(thv_ds_zt),
+            jnp.asarray(clubb_params), lmin,
+            flags.saturation_formula, l_implemented, gr,
+        )
+        Lscale      = _asarray(_Lscale_j,      dtype=np.float64)
+        Lscale_up   = _asarray(_Lscale_up_j,   dtype=np.float64)
+        Lscale_down = _asarray(_Lscale_down_j, dtype=np.float64)
+
+        # tau from Lscale
+        tau_zt = _xp.minimum(Lscale / sqrt_em_zt,
+                            clubb_params[:, itaumax - 1:itaumax])
+
+        Lscale_zm = _xp.maximum(
+            _asarray(zt2zm(Lscale, gr)),
+            zero_threshold,
+        )
+
+        tau_zm = _xp.minimum(
+            Lscale_zm / _xp.sqrt(_xp.maximum(em_min, em)),
+            clubb_params[:, itaumax - 1:itaumax],
+        )
+
+        invrs_tau_zm = one / tau_zm
+        invrs_tau_wp2_zm = invrs_tau_zm.copy()
+        invrs_tau_xp2_zm = invrs_tau_zm.copy()
+        invrs_tau_wpxp_zm = invrs_tau_zm.copy()
+        invrs_tau_wp3_zm = invrs_tau_zm.copy()
+        tau_max_zm = _xp.broadcast_to(
+            clubb_params[:, itaumax - 1:itaumax], (ngrdcol, nzm)).copy()
+
+        invrs_tau_zt = one / tau_zt
+        invrs_tau_wp3_zt = invrs_tau_zt.copy()
+        tau_max_zt = _xp.broadcast_to(
+            clubb_params[:, itaumax - 1:itaumax], (ngrdcol, nzt)).copy()
+
+        # Placeholder variables not computed in this branch
+        invrs_tau_no_N2_zm = np.zeros((ngrdcol, nzm))
+        invrs_tau_bkgnd = np.zeros((ngrdcol, nzm))
+        invrs_tau_shear = np.zeros((ngrdcol, nzm))
+        invrs_tau_sfc = np.zeros((ngrdcol, nzm))
+        invrs_tau_N2_iso = np.zeros((ngrdcol, nzm))
+        _j_brunt_freq_pos = None
+        _j_brunt_freq_out_cloud = None
+    else:
+        # diagnose_lscale_from_tau
+        (_j_invrs_tau_zt, _j_invrs_tau_zm,
+         _j_invrs_tau_sfc, _j_invrs_tau_no_N2, _j_invrs_tau_bkgnd,
+         _j_invrs_tau_shear, _j_invrs_tau_N2_iso,
+         _j_invrs_tau_wp2, _j_invrs_tau_xp2,
+         _j_invrs_tau_wp3_zm, _j_invrs_tau_wp3_zt, _j_invrs_tau_wpxp,
+         _j_tau_max_zm, _j_tau_max_zt, _j_tau_zm, _j_tau_zt,
+         _j_Lscale, _j_Lscale_up, _j_Lscale_down,
+         _j_brunt_freq_pos, _j_brunt_freq_out_cloud) = diagnose_Lscale_from_tau(
+            upwp_sfc=jnp.asarray(upwp_sfc),
+            vpwp_sfc=jnp.asarray(vpwp_sfc),
+            ddzt_umvm_sqd=jnp.asarray(ddzt_umvm_sqd),
+            ice_supersat_frac=jnp.asarray(ice_supersat_frac),
+            em=jnp.asarray(em),
+            sqrt_em_zt=jnp.asarray(sqrt_em_zt),
+            ufmin=ufmin,
+            tau_const=tau_const,
+            sfc_elevation=jnp.asarray(sfc_elevation),
+            Lscale_max=jnp.asarray(Lscale_max),
+            clubb_params=jnp.asarray(clubb_params),
+            Ri_zm=jnp.asarray(Ri_zm),
+            brunt_vaisala_freq_sqd_smth=jnp.asarray(brunt_vaisala_freq_sqd_smth),
+            l_e3sm_config=flags.l_e3sm_config,
+            l_smooth_Heaviside_tau_wpxp=flags.l_smooth_Heaviside_tau_wpxp,
+            gr=gr,
+        )
+        invrs_tau_zt     = _asarray(_j_invrs_tau_zt,     dtype=np.float64)
+        invrs_tau_zm     = _asarray(_j_invrs_tau_zm,     dtype=np.float64)
+        invrs_tau_sfc    = _asarray(_j_invrs_tau_sfc,    dtype=np.float64)
+        invrs_tau_no_N2_zm = _asarray(_j_invrs_tau_no_N2, dtype=np.float64)
+        invrs_tau_bkgnd  = _asarray(_j_invrs_tau_bkgnd,  dtype=np.float64)
+        invrs_tau_shear  = _asarray(_j_invrs_tau_shear,  dtype=np.float64)
+        invrs_tau_N2_iso = _asarray(_j_invrs_tau_N2_iso, dtype=np.float64)
+        invrs_tau_wp2_zm = _asarray(_j_invrs_tau_wp2,    dtype=np.float64)
+        invrs_tau_xp2_zm = _asarray(_j_invrs_tau_xp2,    dtype=np.float64)
+        invrs_tau_wp3_zm = _asarray(_j_invrs_tau_wp3_zm, dtype=np.float64)
+        invrs_tau_wp3_zt = _asarray(_j_invrs_tau_wp3_zt, dtype=np.float64)
+        invrs_tau_wpxp_zm = _asarray(_j_invrs_tau_wpxp,  dtype=np.float64)
+        tau_max_zm       = _asarray(_j_tau_max_zm,       dtype=np.float64)
+        tau_max_zt       = _asarray(_j_tau_max_zt,       dtype=np.float64)
+        tau_zm           = _asarray(_j_tau_zm,           dtype=np.float64)
+        tau_zt           = _asarray(_j_tau_zt,           dtype=np.float64)
+        Lscale           = _asarray(_j_Lscale,           dtype=np.float64)
+        Lscale_up        = _asarray(_j_Lscale_up,        dtype=np.float64)
+        Lscale_down      = _asarray(_j_Lscale_down,      dtype=np.float64)
+    return dict(
+        Lscale=Lscale, Lscale_up=Lscale_up, Lscale_down=Lscale_down,
+        tau_zt=tau_zt, tau_zm=tau_zm, tau_max_zm=tau_max_zm, tau_max_zt=tau_max_zt,
+        invrs_tau_zm=invrs_tau_zm, invrs_tau_zt=invrs_tau_zt,
+        invrs_tau_wp2_zm=invrs_tau_wp2_zm, invrs_tau_xp2_zm=invrs_tau_xp2_zm,
+        invrs_tau_wpxp_zm=invrs_tau_wpxp_zm, invrs_tau_wp3_zm=invrs_tau_wp3_zm,
+        invrs_tau_wp3_zt=invrs_tau_wp3_zt,
+        invrs_tau_no_N2_zm=invrs_tau_no_N2_zm, invrs_tau_bkgnd=invrs_tau_bkgnd,
+        invrs_tau_shear=invrs_tau_shear, invrs_tau_sfc=invrs_tau_sfc,
+        invrs_tau_N2_iso=invrs_tau_N2_iso,
+        brunt_freq_pos=_j_brunt_freq_pos, brunt_freq_out_cloud=_j_brunt_freq_out_cloud,
     )

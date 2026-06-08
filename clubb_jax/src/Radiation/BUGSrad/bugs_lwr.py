@@ -16,10 +16,11 @@ jax.config.update("jax_enable_x64", True)
 from clubb_jax.src.Radiation.BUGSrad.cloudg import cloudg
 from clubb_jax.src.Radiation.BUGSrad.gascon import gascon
 from clubb_jax.src.Radiation.BUGSrad.bugsrad_planck import planck
-from clubb_jax.src.Radiation.BUGSrad.comscp import comscp1, comscp2
+from clubb_jax.src.Radiation.BUGSrad.comscp1 import comscp1
+from clubb_jax.src.Radiation.BUGSrad.comscp2 import comscp2
 from clubb_jax.src.Radiation.BUGSrad.gases_ckd import gases
 from clubb_jax.src.Radiation.BUGSrad.two_rt_lw import two_rt_lw
-from clubb_jax.src.Radiation.BUGSrad.gases_ckd_tables import STANPIR, KG
+from clubb_jax.src.Radiation.BUGSrad.gases_ckd_data import STANPIR, KG
 
 _MB, _MBS, _MBIR = 18, 6, 12
 _EPS, _TMAX, _PDIST = 1.0e-5, 340.0, 2.0

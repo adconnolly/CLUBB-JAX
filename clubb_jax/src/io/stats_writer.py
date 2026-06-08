@@ -39,7 +39,6 @@ GRID_RAD_ZT = "rad_zt"
 GRID_RAD_ZM = "rad_zm"
 
 _PROFILE_GRIDS = {GRID_ZT, GRID_ZM, GRID_LH_ZT, GRID_RAD_ZT, GRID_RAD_ZM}
-_SFC_GRIDS = {GRID_SFC, GRID_LH_SFC}
 
 
 def _parse_registry(registry_path: str, sclr_dim: int = 0, edsclr_dim: int = 0) -> Dict:

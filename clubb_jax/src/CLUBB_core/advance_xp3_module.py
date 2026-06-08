@@ -1,4 +1,7 @@
-"""JAX implementation of compute_xp3/advance_xp3 from advance_xp3_module.F90."""
+"""JAX implementation of compute_xp3/advance_xp3 from advance_xp3_module.F90.
+
+The skewness diagnostics (Skx_func, compute_gamma_Skw, LG_2005_ansatz, xp3_LG_2005_ansatz) live in
+Skx_module.py, mirroring the Fortran advance_xp3_module's `use Skx_module`."""
 
 import jax.numpy as jnp
 
@@ -7,10 +10,6 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
     grav,
     ibeta,
     iSkw_denom_coef,
-    igamma_coef,
-    igamma_coefb,
-    igamma_coefc,
-    eps,
     ixp3_coef_base,
     ixp3_coef_slope,
     rt_tol,
@@ -19,19 +18,27 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
     w_tol_sqd,
     zero_threshold,
 )
+from clubb_jax.src.CLUBB_core.Skx_module import xp3_LG_2005_ansatz
 
 
-def skx_func_jax(xp2, xp3, x_tol, clubb_params):
-    """Compute skewness of x with sensitivity-reduction formula (Skx_module.F90).
+def term_tp_rhs(xp2_zt, wpxpp1, wpxp, rho_ds_zmp1, rho_ds_zm, invrs_rho_ds_zt, invrs_dzt):
+    """Turbulent production of <x'^3>, explicit portion (advance_xp3_module.F90:term_tp_rhs).
 
-    Skx = xp3 * (xp2 + denom_tol)^(-3/2)
-    where denom_tol = iSkw_denom_coef * x_tol^2
-    """
-    denom_tol = clubb_params[:, iSkw_denom_coef - 1:iSkw_denom_coef] * x_tol ** 2
-    return xp3 * (xp2 + denom_tol) ** (-1.5)
+    + 3 * ( <x'^2>|_zt / rho_ds ) * d( rho_ds * <w'x'> )/dz, on the central thermo level: xp2 interp. to zt,
+    rho_ds_zm*wpxp differenced over zt, scaled by invrs_rho_ds_zt and 3*xp2_zt. Element-wise (vectorized over the
+    column); mirrors the Fortran scalar function applied per level."""
+    return 3.0 * xp2_zt * invrs_rho_ds_zt * invrs_dzt * (rho_ds_zmp1 * wpxpp1 - rho_ds_zm * wpxp)
 
 
-def compute_xp3_jax(
+def term_ac_rhs(xm_zmp1, xm_zm, wpxp2, invrs_dzt):
+    """Accumulation of <x'^3>, explicit portion (advance_xp3_module.F90:term_ac_rhs).
+
+    - 3 * <w'x'^2> * d<x>/dz, with <x> interp. to momentum levels and differenced over the central thermo level.
+    Element-wise (vectorized over the column); mirrors the Fortran scalar function applied per level."""
+    return -3.0 * wpxp2 * invrs_dzt * (xm_zmp1 - xm_zm)
+
+
+def compute_xp3(
     wp2,          # (ngrdcol, nzm) zm-level
     wp3,          # (ngrdcol, nzt)
     wprtp,        # (ngrdcol, nzm)
@@ -75,40 +82,19 @@ def compute_xp3_jax(
 
     beta = clubb_params[:, ibeta - 1:ibeta]  # (ngrdcol, 1)
 
-    thlp3 = _xp3_lg_2005_ansatz(
+    thlp3 = xp3_LG_2005_ansatz(
         Skw_zt, wpthlp_zt, wp2_zt, thlp2_zt, sigma_sqd_w_zt, beta, clubb_params, thl_tol)
-    rtp3  = _xp3_lg_2005_ansatz(
+    rtp3  = xp3_LG_2005_ansatz(
         Skw_zt, wprtp_zt,  wp2_zt, rtp2_zt,  sigma_sqd_w_zt, beta, clubb_params, rt_tol)
-    up3   = _xp3_lg_2005_ansatz(
+    up3   = xp3_LG_2005_ansatz(
         Skw_zt, upwp_zt,   wp2_zt, up2_zt,   sigma_sqd_w_zt, beta, clubb_params, w_tol)
-    vp3   = _xp3_lg_2005_ansatz(
+    vp3   = xp3_LG_2005_ansatz(
         Skw_zt, vpwp_zt,   wp2_zt, vp2_zt,   sigma_sqd_w_zt, beta, clubb_params, w_tol)
 
     return rtp3, thlp3, up3, vp3
 
 
-def _xp3_lg_2005_ansatz(Skw_zt, wpxp_zt, wp2_zt, xp2_zt, sigma_sqd_w_zt,
-                         beta, clubb_params, x_tol):
-    """Compute <x'^3> via LG05 ansatz (Skx module, xp3_LG_2005_ansatz)."""
-    Skx_denom_tol = clubb_params[:, iSkw_denom_coef - 1:iSkw_denom_coef] * x_tol ** 2
-    Skx_zt = _lg_2005_ansatz(Skw_zt, wpxp_zt, wp2_zt, xp2_zt, sigma_sqd_w_zt, beta, x_tol)
-    # Reverse of Skx_func: xp3 = Skx * (xp2 + denom_tol)^(3/2)
-    xp3 = Skx_zt * (xp2_zt + Skx_denom_tol) * jnp.sqrt(xp2_zt + Skx_denom_tol)
-    return xp3
-
-
-def _lg_2005_ansatz(Skw, wpxp, wp2, xp2, sigma_sqd_w, beta, x_tol):
-    """LG 2005 eq. 11, 16, 33 — compute skewness of x from skewness of w."""
-    one_minus_ssw = 1.0 - sigma_sqd_w
-    nrmlzd_corr_wx = wpxp / jnp.sqrt(
-        jnp.maximum(wp2, w_tol_sqd) * jnp.maximum(xp2, x_tol ** 2) * one_minus_ssw
-    )
-    nrmlzd_Skw = Skw / (one_minus_ssw * jnp.sqrt(one_minus_ssw))
-    Skx = nrmlzd_Skw * nrmlzd_corr_wx * (beta + (1.0 - beta) * nrmlzd_corr_wx ** 2)
-    return Skx
-
-
-def _advance_xp3_simplified_jax(xm, xp2, wpxp, wpxp2, rho_ds_zm, invrs_rho_ds_zt,
+def advance_xp3_simplified(xm, xp2, wpxp, wpxp2, rho_ds_zm, invrs_rho_ds_zt,
                                   invrs_tau_zt, tau_max_zt, x_tol, gr):
     """Steady-state xp3 (advance_xp3_module.F90:advance_xp3_simplified, l_predict_xp3=False).
 
@@ -124,7 +110,14 @@ def _advance_xp3_simplified_jax(xm, xp2, wpxp, wpxp2, rho_ds_zm, invrs_rho_ds_zt
     xp2_zt = zm2zt_jax(xp2, gr)                        # (ngrdcol, nzt)
     xp2_zt = jnp.maximum(xp2_zt, x_tol ** 2)
 
-    # Interior k_py=0..nzt-2; kp1_py=min(k_py+1, nzt-1)
+    # Interior k_py=0..nzt-2; kp1_py=min(k_py+1, nzt-1) — the level above, clamped to the top.
+    # NB (iter 491): the Fortran advance_xp3_simplified writes this clamp as `kp1 = max( k+1, nzt )`
+    # (advance_xp3_module.F90:812), which evaluates to the CONSTANT nzt for every k in the 1..nzt-1 loop — an
+    # apparent typo (the analogous clamps elsewhere, pdf_closure_module.F90:5556 / interpolation.F90:480, use
+    # `min(k+1, nzt)`). This JAX uses the correct `min` (the level above). This path is GATED OFF (non-ADG1; the
+    # iiPDF_type init-guard rejects it, l_advance_xp3=False by default), so neither the Fortran typo nor this
+    # deviation is ever exercised — the JAX is intentionally NOT bit-faithful to the Fortran's `max` here. Do not
+    # "correct" the JAX to match the Fortran bug.
     k_idx   = jnp.arange(nzt - 1)
     kp1_idx = jnp.minimum(k_idx + 1, nzt - 1)
 
@@ -142,8 +135,8 @@ def _advance_xp3_simplified_jax(xm, xp2, wpxp, wpxp2, rho_ds_zm, invrs_rho_ds_zt
     xm_k     = xm_zm[:, k_idx]
     xm_kp1   = xm_zm[:, kp1_idx]
 
-    term_tp = 3.0 * xp2_zt_int * irho_int * idzt_int * (rho_kp1 * wpxp_kp1 - rho_k * wpxp_k)
-    term_ac = -3.0 * wpxp2_int * idzt_int * (xm_kp1 - xm_k)
+    term_tp = term_tp_rhs(xp2_zt_int, wpxp_kp1, wpxp_k, rho_kp1, rho_k, irho_int, idzt_int)
+    term_ac = term_ac_rhs(xm_kp1, xm_k, wpxp2_int, idzt_int)
 
     tau_int = jnp.minimum(1.0 / invrs_tau_zt[:, :nzt - 1], tau_max_zt[:, :nzt - 1])
     xp3_int = tau_int * (term_tp + term_ac)
@@ -152,7 +145,7 @@ def _advance_xp3_simplified_jax(xm, xp2, wpxp, wpxp2, rho_ds_zm, invrs_rho_ds_zt
     return jnp.concatenate([xp3_int, top_zeros], axis=1)  # (ngrdcol, nzt)
 
 
-def advance_xp3_jax(
+def advance_xp3(
     rtm, thlm, rtp2, thlp2, wprtp, wpthlp, wprtp2, wpthlp2, rho_ds_zm,
     invrs_rho_ds_zt, invrs_tau_zt, tau_max_zt,
     wp2, wp3, upwp, vpwp, up2, vp2,
@@ -166,11 +159,11 @@ def advance_xp3_jax(
     Returns: (rtp3, thlp3, up3, vp3), all shape (ngrdcol, nzt).
     """
     # rtp3 and thlp3 via steady-state advance_xp3_simplified
-    rtp3 = _advance_xp3_simplified_jax(
+    rtp3 = advance_xp3_simplified(
         rtm, rtp2, wprtp, wprtp2, rho_ds_zm, invrs_rho_ds_zt,
         invrs_tau_zt, tau_max_zt, rt_tol, gr,
     )
-    thlp3 = _advance_xp3_simplified_jax(
+    thlp3 = advance_xp3_simplified(
         thlm, thlp2, wpthlp, wpthlp2, rho_ds_zm, invrs_rho_ds_zt,
         invrs_tau_zt, tau_max_zt, thl_tol, gr,
     )
@@ -201,30 +194,9 @@ def advance_xp3_jax(
 
     # up3, vp3 via xp3_LG_2005_ansatz with xp3_coef_fnc
     beta = clubb_params[:, ibeta - 1:ibeta]
-    up3 = _xp3_lg_2005_ansatz(Skw_zt, upwp_zt, wp2_zt, up2_zt, xp3_coef_fnc,
+    up3 = xp3_LG_2005_ansatz(Skw_zt, upwp_zt, wp2_zt, up2_zt, xp3_coef_fnc,
                                beta, clubb_params, w_tol)
-    vp3 = _xp3_lg_2005_ansatz(Skw_zt, vpwp_zt, wp2_zt, vp2_zt, xp3_coef_fnc,
+    vp3 = xp3_LG_2005_ansatz(Skw_zt, vpwp_zt, wp2_zt, vp2_zt, xp3_coef_fnc,
                                beta, clubb_params, w_tol)
 
     return rtp3, thlp3, up3, vp3
-
-
-def compute_gamma_Skw_jax(Skw, clubb_params, l_gamma_Skw):
-    """Gamma coefficient as a Gaussian function of w skewness (Skx_module.F90:compute_gamma_Skw).
-
-    When l_gamma_Skw and the two coefficients differ meaningfully
-    (|γ_coef − γ_coefb| > |γ_coef + γ_coefb|·eps/2):
-        gamma = γ_coefb + (γ_coef − γ_coefb)·exp(−½ (Skw/γ_coefc)²),
-    otherwise (degenerate coefficients, or l_gamma_Skw off) gamma = γ_coef (constant). The branch depends only
-    on the per-column tunable parameters, not on Skw. Skw is (ngrdcol, nz) — pass Skw_zm or Skw_zt. Pure-jnp →
-    differentiable. Returns gamma_Skw_fnc with Skw's shape."""
-    Skw = jnp.asarray(Skw, dtype=jnp.float64)
-    cp = jnp.asarray(clubb_params, dtype=jnp.float64)
-    gc = cp[:, igamma_coef - 1:igamma_coef]      # (ngrdcol, 1)
-    gb = cp[:, igamma_coefb - 1:igamma_coefb]
-    gcf = cp[:, igamma_coefc - 1:igamma_coefc]
-    if not l_gamma_Skw:
-        return gc + jnp.zeros_like(Skw)               # broadcast (ngrdcol,1) over (ngrdcol,nz)
-    cond = jnp.abs(gc - gb) > jnp.abs(gc + gb) * eps / 2.0
-    varying = gb + (gc - gb) * jnp.exp(-0.5 * (Skw / gcf) ** 2)
-    return jnp.where(cond, varying, gc + jnp.zeros_like(Skw))

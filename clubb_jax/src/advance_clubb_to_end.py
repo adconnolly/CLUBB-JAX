@@ -1,7 +1,8 @@
 """CLUBB time-loop driver utilities.
 
-This module contains the timestep advancement logic that was split out from
-the previous monolithic Python driver file.
+Mirrors the timestep loop of the Fortran `advance_clubb_to_end` subroutine (clubb_driver.F90): per step it
+applies forcings, adds the micro/radiation tendencies, calls the closure advance (advance_clubb_core), then
+radiation and microphysics, and accumulates stats. Split out from the previous monolithic Python driver file.
 """
 
 import gc
@@ -9,11 +10,12 @@ import gc
 import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.T_in_K_module import calculate_thvm_jax
-from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad_jax
-from clubb_jax.src.Benchmark_cases.arm import prescribe_forcings_arm, _Cp as _ARM_Cp, _Lv as _ARM_Lv
-from clubb_jax.src.Benchmark_cases.generic_forcings import prescribe_forcings_generic
-from clubb_jax.src.CLUBB_core.advance_clubb_core_module import advance_clubb_core as _advance_clubb_core_py
+from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
+from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
+from clubb_jax.src.CLUBB_core.constants_clubb import Cp as _ARM_Cp, Lv as _ARM_Lv
+from clubb_jax.src.Benchmark_cases.prescribe_forcings import prescribe_forcings_arm, prescribe_forcings_generic
+from clubb_jax.src.CLUBB_core.advance_clubb_core_module import advance_clubb_core
+from clubb_jax.src.Microphys.microphys_driver import calc_microphys_scheme_tendcies
 # Tracer-transparent shim (REFACTOR B5): _asarray behaves exactly like np.asarray for concrete
 # arrays (normal runs bit-identical) but routes to jnp under a jax.grad trace so the whole-driver
 # autodiff graph survives the imperative `state[k] = ...` writebacks. See CLUBB_core/tracer_numpy.py.
@@ -31,7 +33,7 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
 
     rad_interval = int(dt_rad / dt_main)
     n_steps = ifinal if max_steps is None else min(ifinal, max_steps)
-    sw = state.get('stats_writer')  # Python stats writer; None → fall back to Fortran API
+    sw = state.get('stats_writer')  # Python stats writer; None → stats sampling is skipped (no Fortran fallback)
 
     _GC_INTERVAL = 10          # force a cyclic-GC pass every N sampled steps (Iter325 OOM fix)
     _samples_since_gc = 0
@@ -93,23 +95,10 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         if state.get('l_cloud_sed', False):
             _cloud_drop_sed(state, l_sample=(l_stats and l_sample))
 
-        # ── KK (Khairoutdinov-Kogan) rain microphysics ─────────────────
-        # Staged rollout (Iter155): computes + stores the KK tendencies on live state for
-        # shadow-comparison vs the oracle; transport + feedback gated behind l_kk_micro_apply
-        # (default off) so the running KK cases are unchanged until the transport stage lands.
-        if state.get('microphys_scheme', 'none') == 'khairoutdinov_kogan':
-            from clubb_jax.src.Microphys.kk_microphys_step import advance_kk_microphysics
-            advance_kk_microphysics(state)
-
-        # ── Morrison (M2005 2-moment) microphysics ─────────────────────
-        # Computes the CLUBB-form *_mc (rcm/rvm/thlm + 8 hydrometeors) via morrison_microphys_driver
-        # and advances the hydrometeor fields (first-pass Euler; full transport to follow).
-        if state.get('microphys_scheme', 'none') == 'morrison' \
-                and time_current >= state.get('microphys_start_time', 0.0):
-            # The microphysics is skipped until microphys_start_time (microphys_driver.F90:389) — e.g.
-            # nov11 has a 60-step spinup; before it, no *_mc and no hydrometeor advance.
-            from clubb_jax.src.Microphys.morrison_microphys_step import advance_morrison_microphysics
-            advance_morrison_microphysics(state)
+        # ── Microphysics scheme dispatch (microphys_driver.F90:calc_microphys_scheme_tendcies) ──
+        # KK / Morrison per-scheme tendency computation + application, now in its Fortran-home module
+        # Microphys/microphys_driver.py (mirror-refactor iter 212).
+        calc_microphys_scheme_tendcies(state, time_current)
 
         # ── Driver-owned stats updates (mirrors Fortran driver) ────────
         # For Morrison cases the Ncm / Nc_in_cloud stats are written INSIDE advance_microphys
@@ -155,7 +144,7 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         # ── Update time ─────────────────────────────────────────────────
         time_current = time_initial + itime * dt_main
 
-        # Periodic cyclic-GC collection on sampled steps (Iter325). The per-step diagnostic
+        # Periodic cyclic-GC collection on sampled steps. The per-step diagnostic
         # JAX arrays produced when l_sample=True form reference cycles (Array↔traceback/aval),
         # which CPython's generational GC does not reclaim promptly inside this tight numeric
         # loop → orphaned device buffers accumulate (~78/sampled step on mpace_a) → OOM on long
@@ -168,20 +157,14 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
                 gc.collect()
                 _samples_since_gc = 0
 
-        import os as _os
-        if _os.environ.get('CLUBB_LEAK'):
-            import jax as _jax, resource as _res
-            _rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss / 1024.0
-            print(f"  [LEAK] step {itime}: live_arrays={len(_jax.live_arrays())}  maxRSS={_rss:.0f}MB", flush=True)
-
         if l_stdout:
             print(f"iteration: {itime:8d} / {ifinal:8d}"
                   f" -- time = {time_current:10.1f} / {state['time_final']:10.1f}")
 
 
 def _calculate_thvm(state: dict):
-    """Update virtual potential temperature diagnostic. Iter65: JAX-only."""
-    state['thvm'] = _asarray(calculate_thvm_jax(
+    """Update virtual potential temperature diagnostic (calculate_thvm)."""
+    state['thvm'] = _asarray(calculate_thvm(
         jnp.asarray(state['thlm']),
         jnp.asarray(state['rtm']),
         jnp.asarray(state['rcm']),
@@ -195,7 +178,7 @@ def _calculate_thlp2_rad(state: dict):
     if not state['l_calc_thlp2_rad']:
         return
 
-    increment = calculate_thlp2_rad_jax(
+    increment = calculate_thlp2_rad(
         rcm=state['rcm'],
         thlprcp=state['thlprcp'],
         radht=state['radht'],
@@ -226,15 +209,7 @@ def _cloud_drop_sed(state: dict, l_sample: bool = False):
 
 
 def _advance_clubb_core(state: dict):
-    """Advance the CLUBB core using either the API wrapper or Python port."""
-    # Python port with JAX shadow comparisons active for Iteration 4 testing.
-    _advance_clubb_core_python(state)
-    # Fortran API path (default outside of testing):
-    #_advance_clubb_core_api(state)
-
-
-def _advance_clubb_core_python(state: dict):
-    """Advance the CLUBB core using the translated Python port."""
+    """Advance the CLUBB core using the translated Python port (mirrors advance_clubb_core)."""
     (
         state['um'],
         state['vm'],
@@ -324,7 +299,7 @@ def _advance_clubb_core_python(state: dict):
         state['_sclrprcp'],
         state['_wpsclrprtp'],
         state['_wpsclrpthlp'],
-    ) = _advance_clubb_core_py(
+    ) = advance_clubb_core(
         gr=state['gr'],
         nzm=state['nzm'],
         nzt=state['nzt'],
@@ -465,10 +440,10 @@ def _advance_clubb_core_python(state: dict):
 def _prescribe_forcings(state: dict, itime: int, l_sample: bool = False):
     """Set forcings for the current timestep.
 
-    ARM: pure-Python port (Iter66).
-    Supported non-ARM cases: bomex, fire, generic, neutral, coriolis_test, ekman,
-      and any case with l_t_dependent=True and a {runtype}_forcings.in file.
-    Unsupported cases: lazy Fortran fallback via clubb_python.clubb_api.
+    ARM: pure-Python port. Non-ARM cases: the prescribe_forcings_generic dispatcher (bomex, fire,
+    generic, neutral, coriolis_test, ekman, and any case with l_t_dependent=True + a {runtype}_forcings.in).
+    An unported runtype fails loud with prescribe_forcings_generic's NotImplementedError (the old dead
+    clubb_python Fortran fallback was removed iter 388).
     """
     time_current = state['time_initial'] + (itime - 1) * state['dt_main']
 
@@ -489,108 +464,11 @@ def _prescribe_forcings(state: dict, itime: int, l_sample: bool = False):
             sw.update("T_sfc", T_sfc)
         return
 
-    # Try the generic Python dispatcher first
-    try:
-        prescribe_forcings_generic(state, time_current, l_sample=l_sample)
-        return
-    except NotImplementedError:
-        pass  # fall through to Fortran for unsupported cases
-
-    # Fortran fallback for cases not yet ported to Python
-    from clubb_python import clubb_api  # lazy import
-
-    (
-        state['rtm'],
-        state['wm_zm'],
-        state['wm_zt'],
-        state['ug'],
-        state['vg'],
-        state['um_ref'],
-        state['vm_ref'],
-        state['thlm_forcing'],
-        state['rtm_forcing'],
-        state['um_forcing'],
-        state['vm_forcing'],
-        state['wprtp_forcing'],
-        state['wpthlp_forcing'],
-        state['rtp2_forcing'],
-        state['thlp2_forcing'],
-        state['rtpthlp_forcing'],
-        state['wpsclrp'],
-        state['sclrm_forcing'],
-        state['edsclrm_forcing'],
-        state['wpthlp_sfc'],
-        state['wprtp_sfc'],
-        state['upwp_sfc'],
-        state['vpwp_sfc'],
-        state['T_sfc'],
-        state['p_sfc'],
-        state['sens_ht'],
-        state['latent_ht'],
-        state['wpsclrp_sfc'],
-        state['wpedsclrp_sfc'],
-        state['err_info'],
-    ) = clubb_api.prescribe_forcings(
-        gr=state['gr'],
-        nzm=state['nzm'],
-        nzt=state['nzt'],
-        ngrdcol=state['ngrdcol'],
-        sclr_dim=state['sclr_dim'],
-        edsclr_dim=state['edsclr_dim'],
-        runtype=state['runtype'],
-        sfctype=state['sfctype'],
-        time_current=time_current,
-        time_initial=state['time_initial'],
-        dt=state['dt_main'],
-        um=state['um'],
-        vm=state['vm'],
-        thlm=state['thlm'],
-        p_in_Pa=state['p_in_Pa'],
-        exner=state['exner'],
-        rho=state['rho'],
-        rho_zm=state['rho_zm'],
-        thvm=state['thvm'],
-        zt_in=state['gr'].zt,
-        l_t_dependent=state['l_t_dependent'],
-        l_ignore_forcings=state['l_ignore_forcings'],
-        l_input_xpwp_sfc=state['l_input_xpwp_sfc'],
-        l_modify_bc_for_cnvg_test=state['l_modify_bc_for_cnvg_test'],
-        saturation_formula=state['flags'].saturation_formula,
-        l_add_dycore_grid=state['flags'].l_add_dycore_grid,
-        grid_remap_method=state['flags'].grid_remap_method,
-        grid_adapt_in_time_method=state['flags'].grid_adapt_in_time_method,
-        rtm=state['rtm'],
-        wm_zm=state['wm_zm'],
-        wm_zt=state['wm_zt'],
-        ug=state['ug'],
-        vg=state['vg'],
-        um_ref=state['um_ref'],
-        vm_ref=state['vm_ref'],
-        thlm_forcing=state['thlm_forcing'],
-        rtm_forcing=state['rtm_forcing'],
-        um_forcing=state['um_forcing'],
-        vm_forcing=state['vm_forcing'],
-        wprtp_forcing=state['wprtp_forcing'],
-        wpthlp_forcing=state['wpthlp_forcing'],
-        rtp2_forcing=state['rtp2_forcing'],
-        thlp2_forcing=state['thlp2_forcing'],
-        rtpthlp_forcing=state['rtpthlp_forcing'],
-        wpsclrp=state['wpsclrp'],
-        sclrm_forcing=state['sclrm_forcing'],
-        edsclrm_forcing=state['edsclrm_forcing'],
-        wpthlp_sfc=state['wpthlp_sfc'],
-        wprtp_sfc=state['wprtp_sfc'],
-        upwp_sfc=state['upwp_sfc'],
-        vpwp_sfc=state['vpwp_sfc'],
-        T_sfc=state['T_sfc'],
-        p_sfc=state['p_sfc'],
-        sens_ht=state['sens_ht'],
-        latent_ht=state['latent_ht'],
-        wpsclrp_sfc=state['wpsclrp_sfc'],
-        wpedsclrp_sfc=state['wpedsclrp_sfc'],
-        sclr_idx=state['sclr_idx'],
-        err_info=state['err_info'],
-    )
+    # Generic Python dispatcher. For an unported runtype it raises a clear NotImplementedError
+    # ("...not yet ported... Add to prescribe_forcings.py"). The old dead clubb_python.clubb_api
+    # Fortran fallback was removed iter 388 — clubb_python is absent in this tree, so it only ever
+    # crashed with a cryptic ModuleNotFoundError that MASKED that clear message.
+    prescribe_forcings_generic(state, time_current, l_sample=l_sample)
 
 
 def _advance_radiation(
@@ -599,6 +477,6 @@ def _advance_radiation(
     l_sample: bool = False,
 ):
     """Advance radiation tendencies for currently supported schemes."""
-    from clubb_jax.src.Radiation.radiation import advance_radiation
+    from clubb_jax.src.Radiation.radiation_module import advance_clubb_radiation
 
-    advance_radiation(state=state, time_current=time_current, l_sample=l_sample)
+    advance_clubb_radiation(state=state, time_current=time_current, l_sample=l_sample)

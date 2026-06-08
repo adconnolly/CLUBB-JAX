@@ -27,13 +27,15 @@ See tests/test_pdf_utilities.py. All functions are jnp and differentiable.
 import jax
 import jax.numpy as jnp
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
+
 jax.config.update("jax_enable_x64", True)
 
-# constants_clubb.F90
-MAX_MAG_CORRELATION = 0.99
-_CHI_TOL = 1.0e-8                     # max(1e-8, epsilon); eta_tol = chi_tol
-_RT_TOL = 1.0e-8                      # max(1e-8, epsilon)
-_THL_TOL = 1.0e-2
+# constants_clubb.F90 (pdf_utilities.F90 `use constants_clubb`)
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    max_mag_correlation as MAX_MAG_CORRELATION,
+    chi_tol as _CHI_TOL, eta_tol as _ETA_TOL, rt_tol as _RT_TOL, thl_tol as _THL_TOL,
+)
 _TINY = jnp.finfo(jnp.float64).tiny  # Fortran tiny(mu_x) for double precision
 _MIN_MAX_SMTH_MAG = 1.0e-9           # constants_clubb.F90 min_max_smth_mag
 _EPS = 1.0e-10                       # constants_clubb.F90 eps = max(1e-10, epsilon)
@@ -151,9 +153,9 @@ def calc_corr_eta_x(crt_i, cthl_i, sigma_rt_i, sigma_thl_i, sigma_eta_i,
     corr_eta_x = crt (sigma_rt/sigma_eta) corr_rt_x + cthl (sigma_thl/sigma_eta) corr_thl_x
     when sigma_eta > eta_tol (= chi_tol), else 0; clipped to +/- max_mag_correlation."""
     sigma_eta_i = jnp.asarray(sigma_eta_i, dtype=jnp.float64)
-    sig_safe = jnp.where(sigma_eta_i > _CHI_TOL, sigma_eta_i, 1.0)
+    sig_safe = jnp.where(sigma_eta_i > _ETA_TOL, sigma_eta_i, 1.0)
     corr = jnp.where(
-        sigma_eta_i > _CHI_TOL,
+        sigma_eta_i > _ETA_TOL,
         crt_i * (sigma_rt_i / sig_safe) * corr_rt_x_i
         + cthl_i * (sigma_thl_i / sig_safe) * corr_thl_x_i,
         0.0)
@@ -248,6 +250,7 @@ def calc_comp_corrs_binormal(xpyp, xm, ym, mu_x_1, mu_x_2, mu_y_1, mu_y_2,
 
     numerator = (xpyp - a * (mu_x_1 - xm) * (mu_y_1 - ym)
                  - (1.0 - a) * (mu_x_2 - xm) * (mu_y_2 - ym))
-    denominator = a * jnp.sqrt(sx1 * sy1) + (1.0 - a) * jnp.sqrt(sx2 * sy2)
+    # _safe_sqrt (finite grad at sigma^2=0) — forward-identical to jnp.sqrt for sigma^2 >= 0
+    denominator = a * _safe_sqrt(sx1 * sy1) + (1.0 - a) * _safe_sqrt(sx2 * sy2)
     corr = smooth_corr_quotient(numerator, denominator, _EPS)
     return corr, corr

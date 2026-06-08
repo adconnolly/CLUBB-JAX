@@ -1,6 +1,6 @@
 """JAX port of matrix_operations.F90 — the linear-algebra helpers CLUBB's PDF/SILHS code needs.
 
-cholesky_factor — a Cholesky factorization with LAPACK-style symmetric equilibration (dpoequ/dlaqsy) and the
+Cholesky_factor — a Cholesky factorization with LAPACK-style symmetric equilibration (dpoequ/dlaqsy) and the
 Fortran's iterative "add tau to the diagonal" fallback for a non-positive-definite input (matrix_operations.F90:109).
 For a correlation matrix (unit diagonal) the equilibration is a no-op (scaling = 1/sqrt(diag) = 1, scond = 1 >
 THRESH), so it reduces to a plain lower-triangular Cholesky — which is the use in calc_corr_norm_and_cholesky_factor.
@@ -43,7 +43,7 @@ def mirror_lower_triangular_matrix(matrix):
     return lower + jnp.tril(m, -1).T          # add strict-lower reflected into the upper triangle
 
 
-def cholesky_factor(a_input):
+def Cholesky_factor(a_input):
     """Lower-triangular Cholesky factor of a symmetric positive-definite matrix, with LAPACK-style
     equilibration (matrix_operations.F90:Cholesky_factor).
 

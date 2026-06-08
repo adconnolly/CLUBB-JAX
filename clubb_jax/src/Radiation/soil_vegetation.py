@@ -15,10 +15,12 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from clubb_jax.src.CLUBB_core.constants_clubb import Cp as _CP, Lv as _LV, kappa as _KAPPA, p0 as _P0
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    Cp as _CP, Lv as _LV, kappa as _KAPPA, p0 as _P0,
+    stefan_boltzmann as _STEFAN_BOLTZMANN,   # soil_vegetation.F90:84 `use constants_clubb`
+)
 
 _PI = math.pi
-_STEFAN_BOLTZMANN = 5.6704e-8        # constants_clubb.F90:216 (W m⁻² K⁻⁴)
 
 # soil parameters (soil_vegetation.F90:154-162) — heat capacity, density, diffusivity + force-restore coeffs
 _CS = 2.00e3

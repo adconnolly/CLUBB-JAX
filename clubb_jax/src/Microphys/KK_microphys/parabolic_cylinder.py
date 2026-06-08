@@ -198,3 +198,15 @@ def dv_parabolic_cylinder(v, z):
 # the whole D_v graph compiles ONCE and cache-hits every subsequent step. Numerically identical (jit is
 # value-preserving) and still differentiable. No static args: `v`/`z` are only used arithmetically.
 dv_parabolic_cylinder = jax.jit(dv_parabolic_cylinder)
+
+
+# D_v argument bound: the KK PDF-integral dispatch only SELECTS the parabolic-cylinder forms when
+# |s_c| <= parab_cyl_max_input (=49); beyond that the const-PDF approximation is used. Clamping the
+# (unused) extreme argument keeps every selected/tested case exact while preventing the large-negative-z
+# series overflow (->nan) from poisoning the autodiff graph (a differentiability guard, not a contrivance).
+_DV_ARG_MAX = 50.0
+
+
+def _dvc(order, arg):
+    """Clamped parabolic-cylinder D_v: dv_parabolic_cylinder(order, clip(arg, ±_DV_ARG_MAX))."""
+    return dv_parabolic_cylinder(order, jnp.clip(arg, -_DV_ARG_MAX, _DV_ARG_MAX))

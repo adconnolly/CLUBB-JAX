@@ -59,6 +59,11 @@ def _parse(text):
     if "grad BLOCKED" in text:
         bm = re.search(r"blocker frame:.*?([^/\s]+\.py)\", line (\d+), in (\S+)", text)
         blocked = f"{bm.group(1)}:{bm.group(2)} {bm.group(3)}" if bm else "BLOCKED"
+    elif "does not support the following enabled features" in text:
+        # init-time reject (clubb_driver._check_unsupported_features) — an unsupported/gated case (e.g. mpace_b's
+        # microphys_scheme='coamps'); it never runs the JAX driver, so it is not a differentiability failure. (iter 515)
+        fm = re.search(r"-\s*(\w+\s*=\s*'[^']+'.*?not supported)", text)
+        blocked = f"unsupported: {fm.group(1)}" if fm else "unsupported feature"
     return fin, worst, blocked
 
 
@@ -92,7 +97,10 @@ def main():
         fin, worst, blocked = _parse(_run_case(case, env))
         if blocked:
             status = f"BLOCKED {blocked}"
-            bad.append(case)
+            # an unsupported/gated case (init-reject) never runs the JAX driver — not a differentiability failure;
+            # a genuine grad blocker / TIMEOUT still fails the gate. (iter 515)
+            if not blocked.startswith("unsupported"):
+                bad.append(case)
         else:
             finite = fin["thlm"] and fin["um"] and all(
                 a == b for a, b in (p.split("/") for p in (fin["thlm"], fin["um"])))

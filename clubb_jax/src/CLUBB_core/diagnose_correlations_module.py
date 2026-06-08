@@ -8,15 +8,31 @@ row/col 1 (`rearrange_corr_array`), fills the missing upper-triangle correlation
 This is a completeness port (the gated config uses PRESCRIBED correlations via `corr_varnce_module`, not this
 dynamic diagnosis; the commented-out `approx_w_corr` w-correlation path is NOT ported, so `l_calc_w_corr=True`
 is unsupported — the Fortran leaves the swapped array uninitialised there). Bit-validated against the f2py
-`f2py_diagnose_correlations` oracle (`tests/test_diagnose_correlations.py`). Pure jnp → `jax.grad`-able.
+`f2pydiagnose_correlations` oracle (`tests/testdiagnose_correlations.py`). Pure jnp → `jax.grad`-able.
 """
+import numpy as np
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.constants_clubb import max_mag_correlation
 from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
 
 
-def _rearrange_corr_array(pdf_dim, iipdf_w, corr_array):
+def corr_array_assertion_checks(corr_array):
+    """Validity checks for a correlation matrix (diagnose_correlations_module.F90:corr_array_assertion_checks).
+
+    The Fortran error-stops at debug level >=1 if any off-diagonal correlation is outside
+    [-max_mag_correlation, max_mag_correlation], and at debug level >=2 if any diagonal element differs from 1
+    by more than 1e-6. The JAX path never error-stops, so this returns True iff both hold. Concrete-numpy check
+    (not in any gradient path)."""
+    c = np.asarray(corr_array, dtype=np.float64)
+    n = c.shape[0]
+    off = c[~np.eye(n, dtype=bool)]
+    in_range = bool(np.all(np.abs(off) <= max_mag_correlation))
+    unit_diag = bool(np.all(np.abs(np.diagonal(c) - 1.0) <= 1.0e-6))
+    return in_range and unit_diag
+
+
+def rearrange_corr_array(pdf_dim, iipdf_w, corr_array):
     """Swap variable `iipdf_w` (1-based) with variable 1 in the (lower-triangular-stored) correlation matrix.
     Faithful 0-based transcription of the Fortran section assignments (all RHS read the ORIGINAL matrix —
     the in-place writes do not alias the reads)."""
@@ -32,7 +48,7 @@ def _rearrange_corr_array(pdf_dim, iipdf_w, corr_array):
     return out
 
 
-def _diagnose_corr(corr_approx, corr_prescribed):
+def diagnose_corr(corr_approx, corr_prescribed):
     """Diagnose the upper-triangle correlations (Larson 2011 eq. 15):
     `c_ij = c_i1*c_j1 + f_ij*sqrt(1-c_i1^2)*sqrt(1-c_j1^2)`, `f_ij = clip(c_ij^prescribed, ±0.99)`,
     for j=2..n-1, i=j+1..n (1-based). `sqrt_sigma2_on_mu2_ip` is unused (always 0 in the driver)."""
@@ -54,9 +70,9 @@ def diagnose_correlations(pdf_dim, iipdf_w, corr_array_pre, l_calc_w_corr=False)
     if l_calc_w_corr:
         raise NotImplementedError("diagnose_correlations: l_calc_w_corr=True (approx_w_corr) is not ported "
                                   "(commented out in the Fortran; it leaves the swapped array uninitialised).")
-    pre_swapped = _rearrange_corr_array(pdf_dim, iipdf_w, corr_array_pre)
-    swapped = _diagnose_corr(pre_swapped, pre_swapped)         # corr_array_swapped = pre_swapped (not l_calc_w_corr)
-    return _rearrange_corr_array(pdf_dim, iipdf_w, swapped)
+    pre_swapped = rearrange_corr_array(pdf_dim, iipdf_w, corr_array_pre)
+    swapped = diagnose_corr(pre_swapped, pre_swapped)         # corr_array_swapped = pre_swapped (not l_calc_w_corr)
+    return rearrange_corr_array(pdf_dim, iipdf_w, swapped)
 
 
 def calc_w_corr(wpxp, stdev_w, stdev_x, w_tol, x_tol):
@@ -125,11 +141,11 @@ def calc_cholesky_corr_mtx_approx(n_variables, iipdf_w, corr_matrix):
     swapped back, with the strict upper triangle zeroed. iipdf_w is 1-based. Returns
     (corr_cholesky_mtx, corr_mtx_approx)."""
     n = int(n_variables)
-    corr_swap = _rearrange_corr_array(n, iipdf_w, corr_matrix)
+    corr_swap = rearrange_corr_array(n, iipdf_w, corr_matrix)
     chol_swap = setup_corr_cholesky_mtx(n, corr_swap)
-    corr_cholesky_mtx = _rearrange_corr_array(n, iipdf_w, chol_swap)
+    corr_cholesky_mtx = rearrange_corr_array(n, iipdf_w, chol_swap)
     approx_swap = cholesky_to_corr_mtx_approx(chol_swap)
-    corr_mtx_approx = _rearrange_corr_array(n, iipdf_w, approx_swap)
+    corr_mtx_approx = rearrange_corr_array(n, iipdf_w, approx_swap)
     # Zero the strict upper triangle (row < col) for conformity.
     rows = jnp.arange(n)[:, None]
     cols = jnp.arange(n)[None, :]

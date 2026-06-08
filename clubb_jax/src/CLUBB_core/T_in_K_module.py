@@ -1,11 +1,12 @@
-"""JAX implementations of thermodynamic routines from calc_pressure.F90 and T_in_K_module.F90."""
+"""JAX implementation of T_in_K_module.F90 — absolute temperature from thlm.
 
-import jax.numpy as jnp
+(`calculate_thvm` lives in calc_pressure.py, mirroring its Fortran home calc_pressure.F90.)
+"""
 
-from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, ep1, ep2
+from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv
 
 
-def thlm2T_in_K_jax(thlm, exner, rcm):
+def thlm2T_in_K(thlm, exner, rcm):
     """Absolute temperature from liquid-water potential temperature (T_in_K_module.F90:thlm2T_in_K).
 
     T_in_K = thlm * exner + Lv * rcm / Cp
@@ -14,9 +15,10 @@ def thlm2T_in_K_jax(thlm, exner, rcm):
     return thlm * exner + Lv * rcm / Cp
 
 
-def calculate_thvm_jax(thlm, rtm, rcm, exner, thv_ds_zt):
-    """Compute mean virtual potential temperature (calc_pressure.F90:calculate_thvm).
+def T_in_K2thlm(T_in_K, exner, rcm):
+    """Liquid-water potential temperature from absolute temperature (T_in_K_module.F90:T_in_K2thlm_api).
 
-    thvm = thlm + ep1*thv_ds_zt*rtm + (Lv/(Cp*exner) - ep2*thv_ds_zt)*rcm
+    thlm = ( T_in_K - Lv/Cp * rcm ) / exner   — the exact inverse of thlm2T_in_K.
+    Elemental in the Fortran (public via clubb_api_module; the Fortran name carries the `_api` suffix).
     """
-    return thlm + ep1 * thv_ds_zt * rtm + (Lv / (Cp * exner) - ep2 * thv_ds_zt) * rcm
+    return (T_in_K - Lv / Cp * rcm) / exner

@@ -164,14 +164,16 @@ BLOCKED_CASES = {
         "zt grid is bit-exact). (do is grid_type=1, _so is grid_type=3 + bit-faithful.) ★ Iter308 CONFIRMED the two "
         "fixes fully resolved the SYSTEMATIC bug: rrm AND Nrm are now bit-exact through step 6 (was diverging from "
         "step 5) and FP-balanced after (no sign bias) — the residual is genuine FP, rico is now FP-limited not bug-limited.",
-    "arm_97":        "morrison microphysics + bugsrad radiation + SILHS (not ported; morrison is 18k lines of WRF "
-        "M2005 ice/snow/graupel — impractical for bit-faithful porting, and most morrison cases also need bugsrad)",
+    "arm_97":        "SILHS interactive sampling (lh_microphys_type='interactive', lh_num_samples=8) — not "
+        "bit-reproducible vs the Fortran RNG, not a target. (NB morrison microphysics AND bugsrad radiation, which "
+        "arm_97 also uses, are BOTH supported now — SILHS is the sole blocker; iter-373 reverify.)",
     "arm_0003":      "COAMPS microphysics — and arm_0003 FATAL-ERRORS in the Fortran itself ('COAMPS does not "
         "support l_predict_Nc=F'), so there is NO ORACLE to validate against. COAMPS is also ~7000 lines (adjtq 1609 "
         "+ conice + ~45 process-rate eqaXX.F files + iterative nrmtqw/nrmtqi saturation adjustments) of ice/snow/"
         "graupel/rain bulk microphysics — impractical for bit-faithful porting (the iterative adjustments are FP-"
         "sensitive). Unviable (no oracle + impractical).",
-    "mc3e":          "morrison microphysics + bugsrad (not ported)",
+    "mc3e":          "SILHS interactive sampling (lh_microphys_type='interactive') — not a target; morrison + "
+        "bugsrad (also used) are supported, so SILHS is the blocker (iter-373 reverify).",
     # mpace_a: BIT-FAITHFUL since Iter299 (18th case, moved to DEFAULT_CASES). It is Morrison (l_ice_microphys)
     # but stays clear/sub-saturated, so the only Morrison signal is the clear-air thlm_mc — which is the Fortran's
     # SINGLE-PRECISION thlm<->T_in_K round-trip residual (morrison_microphys_module.F90 keeps T_in_K/rcm_r4 in

@@ -10,10 +10,8 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 
-def _ssqrt(x):
-    """sqrt(max(x,0)) with a nan-free gradient at x<=0."""
-    xp = jnp.where(x > 0.0, x, 1.0)
-    return jnp.where(x > 0.0, jnp.sqrt(xp), 0.0)
+# grad-safe sqrt(max(x,0)) — the canonical tracer-toolkit helper.
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt as _ssqrt
 
 
 def _scbrt(x):

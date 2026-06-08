@@ -8,14 +8,11 @@ from typing import NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 
-try:
-    from clubb_precision import core_rknd  # type: ignore
-    from constants_clubb import one, zero, one_half  # type: ignore
-except ImportError:
-    core_rknd = np.float64
-    one = 1.0
-    zero = 0.0
-    one_half = 0.5
+# core_rknd mirrors grid_class.F90 `use clubb_precision`; there is no JAX clubb_precision module (the JAX runs
+# x64), so it is np.float64. (iter 391 replaced the dead `try: from clubb_precision/constants_clubb import …
+# except ImportError`; iter 392 then dropped the re-exported one/zero/one_half — they had NO consumer anywhere
+# [unused in grid_class, never re-imported], so the "API mirror" was genuinely dead.)
+core_rknd = np.float64
 
 Array = np.ndarray
 
@@ -99,6 +96,18 @@ def setup_grid(
     if grid_type not in (GRID_TYPE_EVEN, GRID_TYPE_STRETCHED_ZT, GRID_TYPE_STRETCHED_ZM):
         raise ValueError(f"Unsupported grid_type={grid_type}.")
 
+    # The JAX grid operators are ascending-only: `zt2zm_jax`'s boundary handling (azm[0]=azt[0] clamp + the
+    # top-level linear extension) assumes heights increase with index, so on a descending grid (grid_dir=-1) the two
+    # boundary levels are computed for the wrong orientation (verified iter 483 — interior interp is correct, both
+    # boundaries diverge from the Fortran by ~0.5·Δfield). No `case_setup` uses a descending grid (all are ascending),
+    # so rather than silently produce wrong boundary values, fail loud — matching the driver's other unsupported-feature
+    # guards (l_call_pdf_closure_twice / non-LU solver / ipdf_call_placement).
+    if not l_ascending_grid:
+        raise ValueError(
+            "l_ascending_grid=False (descending grid) is not supported: the JAX grid operators (zt2zm boundary "
+            "handling) are ascending-only and would silently mis-compute the boundary levels. No case uses a "
+            "descending grid.")
+
     if grid_type == GRID_TYPE_EVEN:
         # Mirror Fortran standalone calculation (using first column):
         # gr%nzm = floor( (zm_top(1) - zm_init(1) + deltaz(1)) / deltaz(1) )
@@ -165,8 +174,8 @@ def setup_grid(
         nzm, nzt, ngrdcol, zm, zt, l_ascending_grid
     )
 
-    weights_zt2zm = _calc_zt2zm_weights(nzm, nzt, ngrdcol, zm, zt)
-    weights_zm2zt = _calc_zm2zt_weights(nzm, nzt, ngrdcol, zm, zt, dzt)
+    weights_zt2zm = calc_zt2zm_weights(nzm, nzt, ngrdcol, zm, zt)
+    weights_zm2zt = calc_zm2zt_weights(nzm, nzt, ngrdcol, zm, zt, dzt)
 
     if l_ascending_grid:
         # Keep Python-native 0-based bounds inside Grid.
@@ -330,7 +339,7 @@ def _calc_grid_spacings(
     return dzm, dzt, invrs_dzm, invrs_dzt
 
 
-def _calc_zt2zm_weights(
+def calc_zt2zm_weights(
     nzm: int,
     nzt: int,
     ngrdcol: int,
@@ -366,7 +375,7 @@ def _calc_zt2zm_weights(
     return weights
 
 
-def _calc_zm2zt_weights(
+def calc_zm2zt_weights(
     nzm: int,
     nzt: int,
     ngrdcol: int,
@@ -499,7 +508,14 @@ def ddzt(
 
 
 def flip_vertical(x: Array, axis: int = -1) -> Array:
+    """Reverse a vertical array so the first element becomes the last (grid_class.F90:flip) —
+    BUGSrad and CLUBB store altitudes in reverse order. JAX primary name `flip_vertical` (descriptive,
+    avoids clashing with np.flip); `flip` below is the exact Fortran name (callers `use grid_class, only: flip`)."""
     return np.flip(x, axis=axis)
+
+
+# Exact Fortran name (grid_class.F90:flip): module-scoped alias, same convention as newexp.exp / the jit-aliased raws.
+flip = flip_vertical
 
 
 __all__ = [
@@ -512,4 +528,5 @@ __all__ = [
     'ddzm',
     'ddzt',
     'flip_vertical',
+    'flip',
 ]

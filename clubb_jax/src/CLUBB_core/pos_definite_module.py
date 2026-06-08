@@ -15,7 +15,7 @@ from clubb_jax.src.CLUBB_core.constants_clubb import zero_threshold, eps
 from clubb_jax.src.CLUBB_core.grid_class import ddzm_jax
 
 
-def pos_definite_adj_jax(gr, dt, field_np1, flux_np1, field_n):
+def pos_definite_adj(gr, dt, field_np1, flux_np1, field_n):
     """Positive-definite flux adjustment (Smolarkiewicz 1989), flux on zm / field on zt.
 
     Args:
@@ -29,7 +29,7 @@ def pos_definite_adj_jax(gr, dt, field_np1, flux_np1, field_n):
       diagnostic tendencies (zt / zm), matching the Fortran out-args.
     """
     if int(getattr(gr, "grid_dir_indx", 1)) != 1:
-        raise NotImplementedError("pos_definite_adj_jax: only the ascending grid (grid_dir_indx==1) is ported.")
+        raise NotImplementedError("pos_definite_adj: only the ascending grid (grid_dir_indx==1) is ported.")
     field_np1 = jnp.asarray(field_np1); flux_np1 = jnp.asarray(flux_np1); field_n = jnp.asarray(field_n)
     dt = jnp.asarray(dt)
     ngrdcol, nzm = flux_np1.shape

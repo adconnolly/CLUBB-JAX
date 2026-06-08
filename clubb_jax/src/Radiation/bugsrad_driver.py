@@ -1,19 +1,18 @@
-"""CLUBB ↔ BUGSrad interface — port of bugsrad_driver.F90 + the grid-setup pieces it depends on.
+"""CLUBB ↔ BUGSrad interface — port of bugsrad_driver.F90.
 
-Three faithful parts:
-  * `load_std_atmosphere`        ← sounding.F90:load_extended_std_atm (reads input/std_atmosphere/atmosphere.in,
-                                   the 50-level McClatchey 1972 US Standard Atmosphere).
-  * `determine_extended_atmos_bounds` ← extended_atmosphere_module.F90 (picks the std-atm levels that bridge
-                                   the CLUBB model top up to `radiation_top`, plus a linear-interp buffer).
   * `compute_bugsrad_radiation`  ← bugsrad_driver.F90:compute_bugsrad_radiation (maps CLUBB state onto the
                                    top-down radiation grid — vertical flip + buffer + std-atm extension — calls
                                    bugs_rad per column, flips the heating rates back to the CLUBB grid).
+  * `build_rad_grid_setup` / `_assemble_zt` — the grid-setup helpers this driver owns.
+
+The std/extended-atmosphere readers it consumes live in their Fortran-home modules: `load_extended_std_atm` /
+`convert_snd2extended_atm` / `read_ozone_sounding` in Input_fields/sounding.py (sounding.F90), and
+`determine_extended_atmos_bounds` in Radiation/extended_atmosphere_module.py (extended_atmosphere_module.F90).
 
 The radiation grid runs TOA→surface (index 1 = top), opposite to CLUBB's surface→top, hence the `[::-1]`
 flips. `complete_momentum`/`complete_alt` from the Fortran are only used for optional diagnostic output and
 are intentionally omitted. With the CLUBB build (-Dradoffline -Dnooverlap) bugs_rad runs on this grid directly.
 """
-import os
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -24,7 +23,10 @@ import functools
 from clubb_jax.src.Radiation.BUGSrad.bugs_rad import bugs_rad
 # The Fortran driver (bugsrad_driver.F90:357) passes constants_clubb grav/Cp to bugs_rad for the heating
 # rate (heat_fac = grav·0.01/cp), NOT BUGSrad's own physconst (9.80665/1004.0) — a uniform 3.26e-4 factor.
-from clubb_jax.src.CLUBB_core.constants_clubb import grav as _GRAV_CLUBB, Cp as _CP_CLUBB
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    grav as _GRAV_CLUBB, Cp as _CP_CLUBB,
+    pascal_per_mb as PASCAL_PER_MB, g_per_kg as G_PER_KG, cloud_frac_min as CLOUD_FRAC_MIN,
+)   # bugsrad_driver.F90:38-39 `use constants_clubb`
 
 
 @functools.lru_cache(maxsize=None)
@@ -35,125 +37,15 @@ def _jitted_bugs_rad(s0, grav, cp, umco2, umch4, umn2o):
     return jax.jit(functools.partial(bugs_rad, s0=s0, grav=grav, cp=cp,
                                      umco2=umco2, umch4=umch4, umn2o=umn2o))
 
-PASCAL_PER_MB = 100.0
-G_PER_KG = 1000.0
-CLOUD_FRAC_MIN = 0.005
 
-_STD_ATM_REL = "input/std_atmosphere/atmosphere.in"
-
-
-def load_std_atmosphere(path=None):
-    """Parse atmosphere.in → dict of (50,) numpy arrays: alt[m], T_in_K, sp_hmdty[kg/kg], p_in_mb, o3l[kg/kg].
-    Columns are z, T, sp_hmdty, Press, o3 (sounding.F90 reads them by name; here we read by fixed position
-    after skipping the comment/header lines, matching the file layout exactly)."""
-    if path is None:
-        # resolve relative to clubb_release (sibling of clubb_jax), mirroring _CLUBB_RELEASE_ROOT
-        here = os.path.dirname(os.path.abspath(__file__))
-        root = os.path.abspath(os.path.join(here, "..", "..", "..", "clubb_release"))
-        path = os.path.join(root, _STD_ATM_REL)
-    alt, T, q, p, o3 = [], [], [], [], []
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("!") or s.startswith("z["):
-                continue
-            parts = s.split()
-            alt.append(float(parts[0])); T.append(float(parts[1])); q.append(float(parts[2]))
-            p.append(float(parts[3])); o3.append(float(parts[4]))
-    return dict(alt=np.array(alt), T_in_K=np.array(T), sp_hmdty=np.array(q),
-                p_in_mb=np.array(p), o3l=np.array(o3))
+# ── load_extended_std_atm / read_ozone_sounding / convert_snd2extended_atm now live in their Fortran-home
+#    module Input_fields/sounding.py (sounding.F90:load_extended_std_atm / convert_snd2extended_atm, mirror-refactor
+#    iter 215); radiation_module / clubb_driver / tests import them from there directly. ──
 
 
-def read_ozone_sounding(path):
-    """Read a `{case}_ozone_sounding.in` file → (nlev,) ozone mixing ratio [kg/kg], one value per main-sounding
-    level (the file is a single `'o3[kg/kg]'` column with no vertical coordinate)."""
-    vals = []
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("!"):
-                continue
-            tok = s.split()[0].strip("'\"")
-            if tok.lower().startswith("o3") or tok.lower().startswith("'o3"):
-                continue
-            try:
-                vals.append(float(s.split()[0]))
-            except ValueError:
-                continue
-    return np.array(vals)
-
-
-def build_case_extended_atmosphere(z, theta_col, theta_type, rt, p_in_Pa, p_sfc, o3l):
-    """Build the radiation extended atmosphere from a case's OWN deep sounding + ozone sounding — the path taken
-    when `l_use_default_std_atmosphere = .false.` (CGILS/cloud_feedback/astex/twp_ice). Port of sounding.F90:
-    convert_snd2extended_atm. Returns a dict with the same keys/shape conventions as `load_std_atmosphere`
-    (alt[m], T_in_K, sp_hmdty[kg/kg], p_in_mb, o3l[kg/kg]) at the full sounding levels (ascending in altitude),
-    so it drops straight into `build_rad_grid_setup`.
-
-      T_in_K = the T column itself when theta_type is 'T[K]', else θ·exner (exner level-1 from p_sfc, the rest
-               from p_in_Pa — matching the Fortran);  sp_hmdty = rt/(1+rt);  p_in_mb = p_in_Pa/100;  o3l = the
-               ozone sounding column.
-    """
-    from clubb_jax.src.CLUBB_core.constants_clubb import p0 as _P0, kappa as _KAPPA
-    z = np.asarray(z, dtype=np.float64); theta_col = np.asarray(theta_col, dtype=np.float64)
-    rt = np.asarray(rt, dtype=np.float64); p_in_Pa = np.asarray(p_in_Pa, dtype=np.float64)
-    o3l = np.asarray(o3l, dtype=np.float64)
-    if str(theta_type).strip().lower() == 't[k]':
-        T_in_K = theta_col.copy()
-    else:
-        exner = (p_in_Pa / _P0) ** _KAPPA
-        exner[0] = (p_sfc / _P0) ** _KAPPA          # Fortran uses p_sfc for the first level
-        T_in_K = theta_col * exner
-    return dict(alt=z, T_in_K=T_in_K, sp_hmdty=rt / (1.0 + rt),
-                p_in_mb=p_in_Pa / PASCAL_PER_MB, o3l=o3l)
-
-
-def determine_extended_atmos_bounds(zm_grid, zm_grid_spacing, p_in_Pa_zm, radiation_top, ext):
-    """Port of extended_atmosphere_module.F90:determine_extended_atmos_bounds. `zm_grid`=(nzm,) momentum
-    altitudes [m]; `zm_grid_spacing`=(nzm-1,) Δz; `p_in_Pa_zm`=(nzm,) momentum-level pressure [Pa];
-    `radiation_top` [m]; `ext`=load_std_atmosphere() dict. Returns (bottom_level, top_level, range_size,
-    lin_int_buffer) — bottom/top are 1-based Fortran indices into the std-atm arrays."""
-    extended_alt = np.asarray(ext["alt"]); extended_p_in_mb = np.asarray(ext["p_in_mb"])
-    ext_dim = extended_alt.shape[0]
-    grid_size = zm_grid.shape[0]
-    zm_top = float(zm_grid[grid_size - 1])
-    p_top = float(p_in_Pa_zm[grid_size - 1])
-
-    if radiation_top < zm_top:
-        raise ValueError("top of the radiation grid is below the top of the computational grid")
-
-    j = 1  # 1-based
-    while extended_alt[j - 1] < zm_top and j < ext_dim:
-        j += 1
-    while p_top < extended_p_in_mb[j - 1] * PASCAL_PER_MB:
-        j += 1
-    if extended_alt[j - 1] < zm_top:
-        raise ValueError("Extended atmosphere is below the top of the computational grid")
-    if extended_alt[ext_dim - 1] < radiation_top:
-        raise ValueError("extension data does not reach radiation_top")
-    if p_top < extended_p_in_mb[j - 1] * PASCAL_PER_MB:
-        raise ValueError("pressure at top of computational grid less than pressure at base of radiative grid")
-
-    k = 1
-    if j <= ext_dim:
-        while extended_alt[k - 1] < radiation_top and k < ext_dim:
-            k += 1
-        if extended_alt[k - 1] > radiation_top:
-            k -= 1
-    else:
-        k = j
-
-    bottom_level, top_level = j, k
-    range_size = k - j + 1
-    if range_size < 1:
-        raise ValueError("radiation top below computational grid")
-
-    extended_bottom = float(extended_alt[bottom_level - 1])
-    dz10 = (extended_bottom - zm_top) / 10.0
-    dz_model = float(zm_grid_spacing[grid_size - 2])      # zm_grid_spacing(grid_size-1), 1-based
-    dz = max(dz10, dz_model)
-    lin_int_buffer = int((extended_bottom - zm_top) / dz)  # Fortran int() truncates toward zero
-    return bottom_level, top_level, range_size, lin_int_buffer
+# determine_extended_atmos_bounds now lives in its Fortran-home module
+# Radiation/extended_atmosphere_module.py (mirror-refactor iter 113), imported below.
+from clubb_jax.src.Radiation.extended_atmosphere_module import determine_extended_atmos_bounds
 
 
 def build_rad_grid_setup(zm_grid, zm_grid_spacing, p_in_Pa_zm, radiation_top, ext):

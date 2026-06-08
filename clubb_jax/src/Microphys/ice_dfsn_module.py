@@ -17,8 +17,8 @@ import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.constants_clubb import (
     Cp, Lv, ep, Rv, Lf, Ls, T_freeze_K, cm_per_m)
-from clubb_jax.src.CLUBB_core.T_in_K_module import thlm2T_in_K_jax
-from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax
+from clubb_jax.src.CLUBB_core.T_in_K_module import thlm2T_in_K
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
 
 # Constant parameters (ice_dfsn_module.F90)
 _N_I = 2000.0            # Number of ice crystals per unit volume of air [m^-3]
@@ -30,7 +30,7 @@ _A_COEF, _B_EXPN = 2.05e-3, 1.8
 _K_U_COEF, _Q_EXPN, _N_EXPN = 55.0, 0.17, 0.70
 
 
-def diff_denom(T_in_K, p_in_Pa, e_i):
+def Diff_denom(T_in_K, p_in_Pa, e_i):
     """Denominator of the diffusional-growth equation (ice_dfsn_module.F90:Diff_denom; R&Y Eq. 9.4) [m s/kg]."""
     Celsius = T_in_K - T_freeze_K
     Ka = (5.69 + 0.017 * Celsius) * 0.00001          # cal/(cm s C)
@@ -49,7 +49,7 @@ def ice_dfsn(gr, dt, thlm, rcm, exner, p_in_Pa, rho, saturation_formula):
         gr:                 JAX grid (uses gr.invrs_dzm, single column, shape (1, nzm)).
         dt:                 Model timestep [s].
         thlm, rcm, exner, p_in_Pa, rho: 1D arrays, length nzt (thermodynamic grid).
-        saturation_formula: SATURATION_* integer for sat_mixrat_liq_jax.
+        saturation_formula: SATURATION_* integer for sat_mixrat_liq.
 
     Returns:
         (rcm_icedfsn, thlm_icedfsn): 1D tendencies, each length nzt [kg/kg/s], [K/s].
@@ -62,13 +62,13 @@ def ice_dfsn(gr, dt, thlm, rcm, exner, p_in_Pa, rho, saturation_formula):
     nzt = thlm.shape[0]
 
     # --- Vectorized thermodynamic factors (mass-independent) ---
-    T_in_K = thlm2T_in_K_jax(thlm, exner, rcm)
+    T_in_K = thlm2T_in_K(thlm, exner, rcm)
     in_cloud = (rcm >= _RCM_THRESHOLD) & (T_in_K < T_freeze_K)
-    r_s = sat_mixrat_liq_jax(p_in_Pa, T_in_K, saturation_formula)
+    r_s = sat_mixrat_liq(p_in_Pa, T_in_K, saturation_formula)
     e_s = (r_s * p_in_Pa) / (ep + r_s)
     e_i = e_s / jnp.exp((Lf / (Rv * T_freeze_K)) * (T_freeze_K / T_in_K - 1.0))
     S_i = e_s / e_i
-    Denom = diff_denom(T_in_K, p_in_Pa, e_i)
+    Denom = Diff_denom(T_in_K, p_in_Pa, e_i)
     factor = 4.0 * (S_i - 1.0) / Denom   # common 4*(S_i-1)/Denom term
 
     # Lagged momentum-grid spacing used by dmass: Fortran gr%invrs_dzm(1,k-1) -> 0-based [k-2] = [j-1].

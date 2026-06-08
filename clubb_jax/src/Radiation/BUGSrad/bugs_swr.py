@@ -14,10 +14,11 @@ jax.config.update("jax_enable_x64", True)
 
 from clubb_jax.src.Radiation.BUGSrad.rayle import rayle
 from clubb_jax.src.Radiation.BUGSrad.cloudg import cloudg
-from clubb_jax.src.Radiation.BUGSrad.comscp import comscp1, comscp2
+from clubb_jax.src.Radiation.BUGSrad.comscp1 import comscp1
+from clubb_jax.src.Radiation.BUGSrad.comscp2 import comscp2
 from clubb_jax.src.Radiation.BUGSrad.gases_ckd import gases, pscale
 from clubb_jax.src.Radiation.BUGSrad.two_rt_sw import two_rt_sw
-from clubb_jax.src.Radiation.BUGSrad.gases_ckd_tables import STANPS, KG
+from clubb_jax.src.Radiation.BUGSrad.gases_ckd_data import STANPS, KG
 from clubb_jax.src.Radiation.BUGSrad.bugs_lwr import CNRW, CNIW, CNRI, CNII, XLAM   # shared tables
 
 _MBS = 6

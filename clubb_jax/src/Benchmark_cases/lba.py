@@ -8,7 +8,7 @@ tested port of the oracle.
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, grav, sec_per_hr
-from clubb_jax.src.Benchmark_cases.arm import _diag_ustar_jax
+from clubb_jax.src.Benchmark_cases.diag_ustar_module import diag_ustar
 
 _Z0 = 0.035        # ARM momentum roughness height [m]
 _PEAK_HR = 5.25    # diurnal peak time [h] (lba.F90 magic number)
@@ -44,5 +44,5 @@ def lba_sfclyr(time_elapsed, z, rho_sfc, thlm_sfc, ubar):
     wpthlp_sfc = (270.0 * ft_safe ** 1.5) / (rho_sfc * Cp)     # sensible heat flux 270 W/m² · ft^1.5
     wprtp_sfc = (554.0 * ft_safe ** 1.3) / (rho_sfc * Lv)      # latent heat flux 554 W/m² · ft^1.3
     bflx = grav / thlm_sfc * wpthlp_sfc
-    ustar = _diag_ustar_jax(z, bflx, ubar, _Z0)
+    ustar = diag_ustar(z, bflx, ubar, _Z0)
     return wpthlp_sfc, wprtp_sfc, ustar

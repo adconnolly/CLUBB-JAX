@@ -24,17 +24,11 @@ import math
 import jax.numpy as jnp
 
 from clubb_jax.src.Microphys.KK_microphys.parabolic_cylinder import (
-    dv_parabolic_cylinder, _gamma_real)
+    _gamma_real,
+    _dvc,          # clamped parabolic-cylinder D_v (its home, next to dv_parabolic_cylinder)
+)
 
 _INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
-# Match the means/covariance modules' D_v argument clamp (the dispatch only selects this form for |arg|<=49;
-# clamping keeps every tested case exact while preventing the extreme-argument series overflow from poisoning
-# the autodiff graph). Differentiability guard, not a bit-faithfulness contrivance.
-_DV_ARG_MAX = 50.0
-
-
-def _dvc(order, arg):
-    return dv_parabolic_cylinder(order, jnp.clip(arg, -_DV_ARG_MAX, _DV_ARG_MAX))
 
 
 def trivar_NNL_MM(mu_x1, mu_x2, mu_x3_n, sigma_x1, sigma_x2, sigma_x3_n,

@@ -22,6 +22,13 @@ Constants (parameters_KK.F90, constants_clubb.F90):
 """
 import jax.numpy as jnp
 
+# chi_tol/rho_lw/mvr_rain_max/Nc_tol/rr_tol/parab_cyl_max_input all mirror constants_clubb
+# (KK_upscaled_means.F90 `use constants_clubb`).
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    chi_tol as CHI_TOL, rho_lw as _RHO_LW, mvr_rain_max as _MVR_RAIN_MAX,
+    Nc_tol as NC_TOL, rr_tol as RR_TOL, parab_cyl_max_input as PARAB_CYL_MAX_INPUT,
+)
+
 from clubb_jax.src.Microphys.KK_microphys.PDF_integrals_means import (
     bivar_NL_mean,
     bivar_NL_mean_const_x1,
@@ -38,33 +45,19 @@ from clubb_jax.src.Microphys.KK_microphys.PDF_integrals_means import (
     bivar_LL_mean_const_all,
 )
 
-# --- parameters ---------------------------------------------------------------
-KK_AUTO_RC_EXP = 2.47    # exponent on r_c (= chi here) in KK autoconversion
-KK_AUTO_NC_EXP = -1.79   # exponent on N_c in KK autoconversion
-KK_ACCR_RC_EXP = 1.15    # exponent on r_c (= chi) in KK accretion
-KK_ACCR_RR_EXP = 1.15    # exponent on r_r in KK accretion
-KK_ACCR_COEF = 67.0      # KK accretion coefficient (constant). KK_microphys_module.F90:1185
-KK_EVAP_SUPERSAT_EXP = 1.0        # exponent on supersaturation (chi) in KK evaporation
-KK_EVAP_RR_EXP = 1.0 / 3.0        # exponent on r_r in KK evaporation
-KK_EVAP_NR_EXP = 2.0 / 3.0        # exponent on N_r in KK evaporation
-KK_MVR_RR_EXP = 1.0 / 3.0         # exponent on r_r in KK mean volume radius
-KK_MVR_NR_EXP = -1.0 / 3.0        # exponent on N_r in KK mean volume radius
-CHI_TOL = 1.0e-8         # constants_clubb: max(1e-8, epsilon)
-NC_TOL = 1.0e2           # constants_clubb: tolerance on N_c   [#/kg]
-RR_TOL = 1.0e-10         # constants_clubb: tolerance on r_r   [kg/kg]
-# Nr_tol = rr_tol / ((4/3) pi rho_lw mvr_rain_max^3). constants_clubb.F90:306
-_RHO_LW = 1000.0
-_MVR_RAIN_MAX = 5.0e-3
+# --- parameters --- the KK exponents live in their Fortran home parameters_KK.F90 (`use parameters_KK`) ----
+from clubb_jax.src.Microphys.KK_microphys.parameters_KK import (
+    KK_auto_rc_exp as KK_AUTO_RC_EXP, KK_auto_Nc_exp as KK_AUTO_NC_EXP,
+    KK_accr_rc_exp as KK_ACCR_RC_EXP, KK_accr_rr_exp as KK_ACCR_RR_EXP,
+    KK_evap_Supersat_exp as KK_EVAP_SUPERSAT_EXP, KK_evap_rr_exp as KK_EVAP_RR_EXP,
+    KK_evap_Nr_exp as KK_EVAP_NR_EXP, KK_mvr_rr_exp as KK_MVR_RR_EXP, KK_mvr_Nr_exp as KK_MVR_NR_EXP,
+)
+# KK_ACCR_COEF/KK_MVR_COEF live in their Fortran home KK_microphys_module (KK_tendency_coefs, F90:1185/1188).
+from clubb_jax.src.Microphys.KK_microphys_module import KK_ACCR_COEF, KK_MVR_COEF
+# Nr_tol = rr_tol / ((4/3) pi rho_lw mvr_rain_max^3). constants_clubb.F90:306  (rho_lw/mvr_rain_max imported above)
 NR_TOL = RR_TOL / ((4.0 / 3.0) * jnp.pi * _RHO_LW * _MVR_RAIN_MAX ** 3)  # ~1.9099e-7
-# KK_mvr_coef = ((4/3) pi rho_lw)^(-1/3) (constant). KK_microphys_module.F90:1188
-KK_MVR_COEF = ((4.0 / 3.0) * jnp.pi * _RHO_LW) ** (-1.0 / 3.0)
-PARAB_CYL_MAX_INPUT = 49.0
-_CM3_PER_M3 = 1.0e6
-
-
-def kk_auto_coef(rho):
-    """KK_auto_coef = 1350 * (rho/cm3_per_m3)^KK_auto_Nc_exp. KK_microphys_module.F90:1182."""
-    return 1350.0 * (rho / _CM3_PER_M3) ** KK_AUTO_NC_EXP
+# kk_auto_coef lives in its Fortran-home Microphys/KK_microphys_module.py (computed inline at
+# KK_microphys_module.F90:1182), not here — KK_upscaled_means.F90 only takes KK_auto_coef as an input arg.
 
 
 def bivar_NL_mean_eq(mu_chi_i, mu_y_i, mu_y_i_n, sigma_chi_i,

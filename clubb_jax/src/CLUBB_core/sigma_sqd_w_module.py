@@ -14,7 +14,7 @@ from clubb_jax.src.CLUBB_core.grid_class import zm2zt2zm_jax
 _ONE_HUNDRED = 100.0
 
 
-def compute_sigma_sqd_w_jax(
+def compute_sigma_sqd_w(
     gamma_Skw_fnc,      # (ngrdcol, nzm)
     wp2,                # (ngrdcol, nzm)
     thlp2,              # (ngrdcol, nzm)

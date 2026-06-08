@@ -20,11 +20,9 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
 
 # Local parameter constants from sfc_varnce_module.F90
 _Z_CONST = 1.0         # Defined height of 1 m (z_const)
-_SCLR_VAR_COEF = 0.4   # Scalar variance coefficient
-_REDUCE_COEF = 0.2     # Reduction coefficient (Andre 1978 path only)
 
 
-def calc_sfc_varnce_jax(
+def calc_sfc_varnce(
     upwp_sfc,       # (ngrdcol,)   surface u-momentum flux [m^2/s^2]
     vpwp_sfc,       # (ngrdcol,)   surface v-momentum flux [m^2/s^2]
     wpthlp_zm,      # (ngrdcol, nzm) full zm wpthlp; surface = [:, 0]

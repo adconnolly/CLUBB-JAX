@@ -20,6 +20,10 @@ touch the rate-relevant entries.
 """
 import numpy as np
 
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    rho_lw, rho_ice, mvr_rain_max, mvr_ice_max, mvr_snow_max, mvr_graupel_max,
+)
+
 # Default-table indices (0-based) — order: chi, eta, w, Ncn, rr, Nr, ri, Ni, rs, Ns, rg, Ng.
 II_CHI, II_ETA, II_W, II_NCN, II_RR, II_NR = 0, 1, 2, 3, 4, 5
 _D_VAR_TOTAL = 12
@@ -53,8 +57,6 @@ _flat_below[1] = 0.3                      # row chi, column eta (2nd element of 
 CORR_ARRAY_N_BELOW_DEF = np.array(_flat_below, dtype=np.float64).reshape(
     (_D_VAR_TOTAL, _D_VAR_TOTAL), order='F')
 
-# Identity pdf->default-table map for the standard KK PDF layout [chi, eta, w, Ncn, rr, Nr].
-KK_PDF_TO_DEF = (II_CHI, II_ETA, II_W, II_NCN, II_RR, II_NR)
 
 
 def set_corr_arrays_to_default(pdf_dim, pdf_to_def):
@@ -100,7 +102,11 @@ def kk_prescribed_correlations():
 
     Returns dict with corr_chi_rr, corr_chi_Nr, corr_rr_Nr, corr_chi_Ncn. cloud == below for all
     of these (they differ only in chi-eta), so the rc-based cloud/below selection is a no-op."""
-    cloud, _below = set_corr_arrays_to_default(6, KK_PDF_TO_DEF)
+    # KK PDF layout [chi, eta, w, Ncn, rr, Nr]; def_corr_idx maps each PDF variable to its default-table
+    # column (mirrors the Fortran set_corr_arrays_to_default <- def_corr_idx chain).
+    kk_layout = HmMetadata(hydromet_dim=2, iiPDF_rr=II_RR, iiPDF_Nr=II_NR)
+    pdf_to_def = tuple(def_corr_idx(i, kk_layout) for i in range(6))
+    cloud, _below = set_corr_arrays_to_default(6, pdf_to_def)
     return {
         'corr_chi_rr': cloud[II_RR, II_CHI],
         'corr_chi_Nr': cloud[II_NR, II_CHI],
@@ -128,11 +134,10 @@ from dataclasses import dataclass, field   # noqa: E402
 # Hydrometeor tolerances (constants_clubb.F90:290-321). rr/Nr for KK; ice/snow/graupel for Morrison.
 # N*_tol = (1/((4/3)π·ρ·mvr_max³))·r*_tol  (ρ_lw=1000 for rain, ρ_ice=917 for ice/snow/graupel).
 _RR_TOL = _RI_TOL = _RS_TOL = _RG_TOL = 1.0e-10
-_RHO_LW, _RHO_ICE = 1000.0, 917.0
-_NR_TOL = _RR_TOL / ((4.0 / 3.0) * np.pi * _RHO_LW * (5.0e-3) ** 3)     # ~1.9099e-7
-_NI_TOL = _RI_TOL / ((4.0 / 3.0) * np.pi * _RHO_ICE * (1.3e-4) ** 3)
-_NS_TOL = _RS_TOL / ((4.0 / 3.0) * np.pi * _RHO_ICE * (1.0e-2) ** 3)
-_NG_TOL = _RG_TOL / ((4.0 / 3.0) * np.pi * _RHO_ICE * (2.0e-2) ** 3)
+_NR_TOL = _RR_TOL / ((4.0 / 3.0) * np.pi * rho_lw  * mvr_rain_max ** 3)    # ~1.9099e-7
+_NI_TOL = _RI_TOL / ((4.0 / 3.0) * np.pi * rho_ice * mvr_ice_max ** 3)
+_NS_TOL = _RS_TOL / ((4.0 / 3.0) * np.pi * rho_ice * mvr_snow_max ** 3)
+_NG_TOL = _RG_TOL / ((4.0 / 3.0) * np.pi * rho_ice * mvr_graupel_max ** 3)
 
 # Default in-precip variance-ratio linear law: ratio = intrcpt + slope * max(host_dx, host_dy).
 # (corr_varnce_module.F90:51/65). rr and Nr share the same defaults.
@@ -169,6 +174,61 @@ class HmMetadata:
     l_mix_rat_hm: np.ndarray = None
     l_frozen_hm: np.ndarray = None
     hmp2_ip_on_hmm2_ip: np.ndarray = None
+
+
+# Default correlation-table column for each PDF variable, in Fortran table order
+# (chi, eta, w, Ncn, rr, Nr, ri, Ni, rs, Ns, rg, Ng); 0-based here (the Fortran is 1-based).
+_DEF_CORR_TABLE = (
+    ('iiPDF_chi', II_CHI), ('iiPDF_eta', II_ETA), ('iiPDF_w', II_W), ('iiPDF_Ncn', II_NCN),
+    ('iiPDF_rr', II_RR), ('iiPDF_Nr', II_NR), ('iiPDF_ri', 6), ('iiPDF_Ni', 7),
+    ('iiPDF_rs', 8), ('iiPDF_Ns', 9), ('iiPDF_rg', 10), ('iiPDF_Ng', 11),
+)
+
+
+def def_corr_idx(iiPDF_x, hm_metadata):
+    """Map a PDF-variable index to its column in the default correlation arrays
+    (corr_varnce_module.F90:def_corr_idx). Returns the 0-based default-table index, or -1 if iiPDF_x
+    matches no PDF variable. The JAX `HmMetadata` carries only the warm-PDF indices (chi/eta/w/Ncn/rr/Nr);
+    the frozen-species branches (ri/Ni/rs/Ns/rg/Ng) are kept for fidelity (absent → field defaults to -1)."""
+    for field_name, def_idx in _DEF_CORR_TABLE:
+        idx = getattr(hm_metadata, field_name, -1)
+        if idx >= 0 and iiPDF_x == idx:
+            return def_idx
+    return -1
+
+
+# PDF-variable name → HmMetadata field, in Fortran get_corr_var_index select-case order.
+_CORR_VAR_NAMES = (
+    ("chi", "iiPDF_chi"), ("eta", "iiPDF_eta"), ("w", "iiPDF_w"), ("Ncn", "iiPDF_Ncn"),
+    ("rr", "iiPDF_rr"), ("Nr", "iiPDF_Nr"), ("ri", "iiPDF_ri"), ("Ni", "iiPDF_Ni"),
+    ("rs", "iiPDF_rs"), ("Ns", "iiPDF_Ns"), ("rg", "iiPDF_rg"), ("Ng", "iiPDF_Ng"),
+)
+
+
+def get_corr_var_index(var_name, hm_metadata):
+    """Return the iiPDF index of a PDF variable by its name (corr_varnce_module.F90:get_corr_var_index).
+
+    Maps "chi"/"eta"/"w"/"Ncn"/"rr"/"Nr"/"ri"/"Ni"/"rs"/"Ns"/"rg"/"Ng" to the corresponding `HmMetadata`
+    iiPDF index; returns -1 for an unknown name or an absent (frozen-species) field — matching the Fortran,
+    which initializes `i = -1` and leaves it unset for unmatched names. Used by the correlation-array input
+    reader to look up the two variates of each tabulated correlation by name."""
+    for name, field_name in _CORR_VAR_NAMES:
+        if var_name == name:
+            return getattr(hm_metadata, field_name, -1)
+    return -1
+
+
+def print_corr_matrix(corr_array_n, stream=None):
+    """Print a pdf_dim×pdf_dim normal-space correlation matrix to the console
+    (corr_varnce_module.F90:print_corr_matrix). Each entry is formatted F5.2 in a 6-char field,
+    one row per PDF variable — a debug aid (the Fortran writes to stdout; this defaults to stderr,
+    matching the print_pdf_params convention)."""
+    import sys
+    out = sys.stderr if stream is None else stream
+    c = np.asarray(corr_array_n)
+    pdf_dim = c.shape[0]
+    for n in range(pdf_dim):
+        print("".join(f"{c[m, n]:5.2f} " for m in range(pdf_dim)).rstrip(), file=out)
 
 
 def init_pdf_hydromet_arrays(hydromet_dim, iirr=-1, iiNr=-1, iiri=-1, iiNi=-1,

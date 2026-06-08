@@ -1,11 +1,12 @@
 """Pure-Python port of CLUBB_core/parameters_tunable.F90.
 
-Provides init_clubb_params_jax and calc_derrived_params_jax to replace the
+Provides init_clubb_params and calc_derrived_params to replace the
 corresponding Fortran API calls in clubb_standalone.py.
 """
 from __future__ import annotations
 
 import math
+import sys
 from typing import NamedTuple
 
 import numpy as np
@@ -80,6 +81,14 @@ assert len(PARAM_NAMES) == 102, f"Expected 102 params, got {len(PARAM_NAMES)}"
 # Case-insensitive lookup: lower-case name → 0-based index
 _NAME_TO_IDX: dict[str, int] = {n.lower(): i for i, n in enumerate(PARAM_NAMES)}
 
+# Case-sensitive name → 0-based index (the single source of truth for parameter ordering; numerical_check
+# imports this for check_clubb_settings).
+PNAME_IDX: dict[str, int] = {n: i for i, n in enumerate(PARAM_NAMES)}
+
+# Sentinel for a fatal validation error (error_code.F90); used by check_parameters below.
+CLUBB_FATAL_ERROR = 99
+_EPS64 = np.finfo(np.float64).eps
+
 # ---------------------------------------------------------------------------
 # Default parameter values (mirrors set_default_parameters in Fortran)
 # ---------------------------------------------------------------------------
@@ -136,12 +145,12 @@ assert set(_DEFAULTS.keys()) == set(PARAM_NAMES), "Defaults must cover all 102 p
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_param_names_jax() -> list[str]:
+def get_param_names() -> list[str]:
     """Return the 102 parameter names in canonical Fortran ordering."""
     return list(PARAM_NAMES)
 
 
-def init_clubb_params_jax(ngrdcol: int, filename: str) -> np.ndarray:
+def init_clubb_params(ngrdcol: int, filename: str) -> np.ndarray:
     """Read tunable_parameters.in and return clubb_params array.
 
     Parameters
@@ -170,7 +179,7 @@ def init_clubb_params_jax(ngrdcol: int, filename: str) -> np.ndarray:
     return clubb_params
 
 
-def calc_derrived_params_jax(
+def calc_derrived_params(
     gr,
     ngrdcol: int,
     grid_type: int,
@@ -264,3 +273,115 @@ def calc_derrived_params_jax(
     )
 
     return nu_vert_res_dep, lmin, mixt_frac_max_mag
+
+
+def _idx_to_name(k: int) -> str:
+    """Reverse lookup: 0-based parameter index → parameter name."""
+    for name, idx in PNAME_IDX.items():
+        if idx == k:
+            return name
+    return f"param[{k}]"
+
+
+def check_parameters(
+    ngrdcol: int,
+    clubb_params: np.ndarray,
+    lmin: float,
+    err_info,
+):
+    """Port of parameters_tunable.F90:check_parameters_api.
+
+    Validates that tunable parameter values satisfy required constraints.
+    Returns updated err_info.
+    """
+    err_code = np.zeros(ngrdcol, dtype=np.int32)
+
+    def _err(msg: str, col: int) -> None:
+        print(msg, file=sys.stderr)
+        err_code[col] = CLUBB_FATAL_ERROR
+
+    # ── lmin must be >= 1.0 ──────────────────────────────────────────────────
+    if lmin < 1.0:
+        print(f"lmin = {lmin}", file=sys.stderr)
+        print("lmin is < 1.0", file=sys.stderr)
+        err_code[ngrdcol - 1] = CLUBB_FATAL_ERROR
+
+    izeta = PNAME_IDX["zeta_vrnce_rat"]
+    for i in range(ngrdcol):
+        p = clubb_params[i, :]
+
+        # All params >= 0 (except zeta_vrnce_rat which requires >= -1)
+        for k in range(len(p)):
+            if k != izeta and p[k] < 0.0:
+                pname = _idx_to_name(k)
+                _err(f"{pname} = {p[k]}  ({pname} must satisfy 0.0 <= {pname})", i)
+            elif k == izeta and p[k] < -1.0:
+                _err(f"zeta_vrnce_rat = {p[k]}  (must satisfy -1.0 <= zeta_vrnce_rat)", i)
+
+        C1                          = p[PNAME_IDX["C1"]]
+        C6rt                        = p[PNAME_IDX["C6rt"]]
+        C6rtb                       = p[PNAME_IDX["C6rtb"]]
+        C6rtc                       = p[PNAME_IDX["C6rtc"]]
+        C6thl                       = p[PNAME_IDX["C6thl"]]
+        C6thlb                      = p[PNAME_IDX["C6thlb"]]
+        C6thlc                      = p[PNAME_IDX["C6thlc"]]
+        C6rt_Lscale0                = p[PNAME_IDX["C6rt_Lscale0"]]
+        C6thl_Lscale0               = p[PNAME_IDX["C6thl_Lscale0"]]
+        C7                          = p[PNAME_IDX["C7"]]
+        C7b                         = p[PNAME_IDX["C7b"]]
+        C11                         = p[PNAME_IDX["C11"]]
+        C11b                        = p[PNAME_IDX["C11b"]]
+        C_wp2_splat                 = p[PNAME_IDX["C_wp2_splat"]]
+        slope_coef_spread_DG_means_w = p[PNAME_IDX["slope_coef_spread_DG_means_w"]]
+        pdf_component_stdev_factor_w = p[PNAME_IDX["pdf_component_stdev_factor_w"]]
+        coef_spread_DG_means_rt     = p[PNAME_IDX["coef_spread_DG_means_rt"]]
+        coef_spread_DG_means_thl    = p[PNAME_IDX["coef_spread_DG_means_thl"]]
+        omicron                     = p[PNAME_IDX["omicron"]]
+        zeta_vrnce_rat              = p[PNAME_IDX["zeta_vrnce_rat"]]
+        upsilon_precip_frac_rat     = p[PNAME_IDX["upsilon_precip_frac_rat"]]
+        mu                          = p[PNAME_IDX["mu"]]
+        beta                        = p[PNAME_IDX["beta"]]
+
+        if beta < 0.0 or beta > 3.0:
+            _err(f"beta = {beta}  (beta cannot be < 0 or > 3)", i)
+        if slope_coef_spread_DG_means_w <= 0.0:
+            _err(f"slope_coef_spread_DG_means_w = {slope_coef_spread_DG_means_w} (must be > 0)", i)
+        if pdf_component_stdev_factor_w <= 0.0:
+            _err(f"pdf_component_stdev_factor_w = {pdf_component_stdev_factor_w} (must be > 0)", i)
+        if coef_spread_DG_means_rt < 0.0 or coef_spread_DG_means_rt >= 1.0:
+            _err(f"coef_spread_DG_means_rt = {coef_spread_DG_means_rt} (must be 0 <= x < 1)", i)
+        if coef_spread_DG_means_thl < 0.0 or coef_spread_DG_means_thl >= 1.0:
+            _err(f"coef_spread_DG_means_thl = {coef_spread_DG_means_thl} (must be 0 <= x < 1)", i)
+        if omicron <= 0.0 or omicron > 1.0:
+            _err(f"omicron = {omicron}  (omicron cannot be <= 0 or > 1)", i)
+        if zeta_vrnce_rat <= -1.0:
+            _err(f"zeta_vrnce_rat = {zeta_vrnce_rat}  (cannot be <= -1)", i)
+        if upsilon_precip_frac_rat < 0.0 or upsilon_precip_frac_rat > 1.0:
+            _err(f"upsilon_precip_frac_rat = {upsilon_precip_frac_rat} (must be 0 <= x <= 1)", i)
+        if mu < 0.0:
+            _err(f"mu = {mu}  (mu cannot be < 0)", i)
+
+        def _check_equal(a, b, aname, bname):
+            denom = abs(a + b) / 2.0
+            if abs(a - b) > (denom * _EPS64 if denom > 0 else _EPS64):
+                _err(f"{aname} = {a}, {bname} = {b}  ({aname} and {bname} must be equal)", i)
+
+        _check_equal(C6rt, C6thl, "C6rt", "C6thl")
+        _check_equal(C6rtb, C6thlb, "C6rtb", "C6thlb")
+        _check_equal(C6rtc, C6thlc, "C6rtc", "C6thlc")
+        _check_equal(C6rt_Lscale0, C6thl_Lscale0, "C6rt_Lscale0", "C6thl_Lscale0")
+
+        if C1 < 0.0:
+            _err(f"C1 = {C1}  (C1 must satisfy 0.0 <= C1)", i)
+        if C7 < 0.0 or C7 > 1.0:
+            _err(f"C7 = {C7}  (C7 must satisfy 0.0 <= C7 <= 1.0)", i)
+        if C7b < 0.0 or C7b > 1.0:
+            _err(f"C7b = {C7b}  (C7b must satisfy 0.0 <= C7b <= 1.0)", i)
+        if C11 < 0.0 or C11 > 1.0:
+            _err(f"C11 = {C11}  (C11 must satisfy 0.0 <= C11 <= 1.0)", i)
+        if C11b < 0.0 or C11b > 1.0:
+            _err(f"C11b = {C11b}  (C11b must satisfy 0.0 <= C11b <= 1.0)", i)
+        if C_wp2_splat < 0.0:
+            _err(f"C_wp2_splat = {C_wp2_splat}  (must satisfy C_wp2_splat >= 0)", i)
+
+    return err_info._replace(err_code=err_code)

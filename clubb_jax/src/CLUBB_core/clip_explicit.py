@@ -1,23 +1,56 @@
 """JAX implementations of clip_explicit.F90 clipping routines.
 
 Implements:
-  clip_variance_jax          - clip xp2 to [threshold_lo, (optional) threshold_hi]
-  clip_skewness_jax          - clip wp3 via Skewness-of-w limit
-  clip_covars_denom_jax      - clip wprtp/wpthlp/upwp/vpwp after wp2/wp3 solve
-  clip_rcm_jax               - clip cloud water rcm <= rtm
-  fill_holes_wp2_from_horz_tke_jax - TKE-conserving wp2 hole-fill
+  clip_variance          - clip xp2 to [threshold_lo, (optional) threshold_hi]
+  clip_skewness_core     - clip wp3 via Skewness-of-w limit (the pure clip math)
+  clip_skewness          - clip_skewness_core + the wp3_cl budget (Fortran clip_skewness)
+  clip_covars_denom      - clip wprtp/wpthlp/upwp/vpwp after wp2/wp3 solve
+  clip_rcm               - clip cloud water rcm <= rtm
+
+(fill_holes_wp2_from_horz_tke lives in fill_holes.py, mirroring its Fortran home fill_holes.F90.)
 """
 
+import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.constants_clubb import zero_threshold
-from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import clip_covar_jax
-from clubb_jax.src.CLUBB_core.mixing_length import _smooth_heaviside_peskin_jax
+from clubb_jax.src.CLUBB_core.constants_clubb import (
+    zero_threshold, max_mag_correlation, max_mag_correlation_flux,
+)
+from clubb_jax.src.CLUBB_core.advance_helper_module import smooth_heaviside_peskin
+from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray
 
 _F64_EPS = jnp.finfo(jnp.float64).eps
 
 
-def clip_variance_jax(xp2, threshold_lo, threshold_hi=None):
+def clip_covar(
+    wpxp: jnp.ndarray,
+    wp2: jnp.ndarray,
+    xp2: jnp.ndarray,
+    max_mag_corr: float = max_mag_correlation,
+) -> jnp.ndarray:
+    """clip_explicit.F90:clip_covar — covariance clipping applied after the solve.
+
+    Per the Fortran (clip_covariance): clip_wprtp/clip_wpthlp use max_mag_correlation_flux;
+    all other covariances use max_mag_correlation (the default here). Both equal 0.99.
+
+    Clips wpxp at interior levels k=1..nzm-2 (Python 0-based) to within the Cauchy-Schwarz
+    bound; boundaries (k=0, k=nzm-1) are left unchanged:
+        xpyp_bound   = max_mag_corr * sqrt(wp2 * xp2)
+        wpxp_clipped = clip(wpxp, -xpyp_bound, xpyp_bound)
+
+    Args:
+        wpxp, wp2, xp2: (ngrdcol, nzm)
+        max_mag_corr: max magnitude of correlation (0.99 for wprtp/wpthlp)
+    """
+    xpyp_bound = max_mag_corr * jnp.sqrt(wp2 * xp2)   # (ngrdcol, nzm)
+    wpxp_clipped = jnp.clip(wpxp, -xpyp_bound, xpyp_bound)
+    # Preserve boundaries unchanged
+    wpxp_clipped = wpxp_clipped.at[:, 0].set(wpxp[:, 0])
+    wpxp_clipped = wpxp_clipped.at[:, -1].set(wpxp[:, -1])
+    return wpxp_clipped
+
+
+def clip_variance(xp2, threshold_lo, threshold_hi=None):
     """clip_explicit.F90:clip_variance — clamp xp2 to [threshold_lo, threshold_hi].
 
     Operates on levels k=0..nzm-2 (Python 0-based), i.e., all levels except the
@@ -42,9 +75,13 @@ def clip_variance_jax(xp2, threshold_lo, threshold_hi=None):
     return xp2_clipped
 
 
-def clip_skewness_jax(wp3, wp2_zt, zt, sfc_elevation, Skw_max_mag,
-                      l_use_wp3_lim_with_smth_Heaviside=True):
+def clip_skewness_core(wp3, wp2_zt, zt, sfc_elevation, Skw_max_mag,
+                           l_use_wp3_lim_with_smth_Heaviside=True):
     """clip_explicit.F90:clip_skewness_core — limit |Sk_w| = |wp3|/wp2_zt^(3/2).
+
+    The pure clipping math (no timestep / no budget stats); the `clip_skewness`
+    wrapper below adds the `wp3_cl` budget around it, mirroring the Fortran
+    clip_skewness → clip_skewness_core split.
 
     ARM flag: l_use_wp3_lim_with_smth_Heaviside=True.
 
@@ -66,7 +103,7 @@ def clip_skewness_jax(wp3, wp2_zt, zt, sfc_elevation, Skw_max_mag,
     if l_use_wp3_lim_with_smth_Heaviside:
         # Peskin smooth Heaviside with smth_range=0.6 (note: different from tau code's 1.0)
         zagl_thresh = (zt - sfc_elevation[:, None]) / 100.0 - 1.0
-        H_zagl = _smooth_heaviside_peskin_jax(zagl_thresh, 0.6)
+        H_zagl = smooth_heaviside_peskin(zagl_thresh, 0.6)
         skw_sq = Skw_max_mag[:, None] ** 2
         wp3_lim_sqd = wp2_zt_cubed * (
             H_zagl * skw_sq + (1.0 - H_zagl) * 0.0021 * skw_sq
@@ -90,7 +127,23 @@ def clip_skewness_jax(wp3, wp2_zt, zt, sfc_elevation, Skw_max_mag,
     return wp3_clipped
 
 
-def clip_covars_denom_jax(wprtp, wpthlp, upwp, vpwp, wp2, rtp2, thlp2, up2, vp2,
+def clip_skewness(wp3, wp2_zt, zt, sfc_elevation, Skw_max_mag, dt,
+                      l_use_wp3_lim_with_smth_Heaviside=True,
+                      stats_writer=None, l_sample=False):
+    """clip_explicit.F90:clip_skewness — the budget wrapper around `clip_skewness_core`:
+    snapshot wp3, clip it via `clip_skewness_core`, and record the `wp3_cl` clip tendency
+    `(wp3_clipped - wp3_pre)/dt` (the Fortran's begin/finalize "wp3_cl" budget). Returns the
+    clipped wp3. The budget write is a no-op unless `l_sample` and a `stats_writer` are given."""
+    wp3_pre = wp3
+    wp3_clipped = clip_skewness_core(
+        wp3, wp2_zt, zt, sfc_elevation, Skw_max_mag, l_use_wp3_lim_with_smth_Heaviside)
+    if l_sample and stats_writer is not None:
+        stats_writer.update("wp3_cl",
+            (_asarray(wp3_clipped, dtype=np.float64) - _asarray(wp3_pre, dtype=np.float64)) / dt)
+    return wp3_clipped
+
+
+def clip_covars_denom(wprtp, wpthlp, upwp, vpwp, wp2, rtp2, thlp2, up2, vp2,
                           l_tke_aniso=True):
     """clip_explicit.F90:clip_covars_denom — Cauchy-Schwarz clip after wp2/wp3 solve.
 
@@ -108,20 +161,21 @@ def clip_covars_denom_jax(wprtp, wpthlp, upwp, vpwp, wp2, rtp2, thlp2, up2, vp2,
     Returns:
         wprtp, wpthlp, upwp, vpwp: clipped (ngrdcol, nzm)
     """
-    wprtp_new  = clip_covar_jax(wprtp,  wp2, rtp2)
-    wpthlp_new = clip_covar_jax(wpthlp, wp2, thlp2)
+    # clip_wprtp / clip_wpthlp → max_mag_correlation_flux; momentum fluxes → max_mag_correlation (default).
+    wprtp_new  = clip_covar(wprtp,  wp2, rtp2,  max_mag_correlation_flux)
+    wpthlp_new = clip_covar(wpthlp, wp2, thlp2, max_mag_correlation_flux)
 
     if l_tke_aniso:
-        upwp_new = clip_covar_jax(upwp, wp2, up2)
-        vpwp_new = clip_covar_jax(vpwp, wp2, vp2)
+        upwp_new = clip_covar(upwp, wp2, up2)
+        vpwp_new = clip_covar(vpwp, wp2, vp2)
     else:
-        upwp_new = clip_covar_jax(upwp, wp2, wp2)
-        vpwp_new = clip_covar_jax(vpwp, wp2, wp2)
+        upwp_new = clip_covar(upwp, wp2, wp2)
+        vpwp_new = clip_covar(vpwp, wp2, wp2)
 
     return wprtp_new, wpthlp_new, upwp_new, vpwp_new
 
 
-def clip_rcm_jax(rcm, rtm):
+def clip_rcm(rcm, rtm):
     """clip_explicit.F90:clip_rcm — ensure rcm <= rtm.
 
     Clips rcm to max(zero_threshold, rtm - eps_f64) wherever rcm > rtm.
@@ -140,76 +194,3 @@ def clip_rcm_jax(rcm, rtm):
         rcm,
     )
     return rcm_clipped
-
-
-def fill_holes_wp2_from_horz_tke_jax(wp2, up2, vp2, threshold, lower_k, upper_k):
-    """fill_holes.F90:fill_holes_wp2_from_horz_tke — TKE-conserving wp2 hole-fill.
-
-    Where wp2 < threshold AND (up2 > threshold OR vp2 > threshold), borrows TKE
-    from up2 and vp2 proportionally to fill holes in wp2.
-
-    ARM call: lower_hf_level=1 (Fortran 1-based), upper_hf_level=nzm-2 (Fortran 1-based)
-              → Python lower_k=0..1? Let's accept 0-based Python range.
-
-    Args:
-        wp2, up2, vp2: (ngrdcol, nzm)
-        threshold:     scalar
-        lower_k, upper_k: Python 0-based inclusive index range
-
-    Returns:
-        wp2, up2, vp2: (ngrdcol, nzm) modified within [lower_k, upper_k]
-    """
-    nzm = wp2.shape[1]
-    k_idx = jnp.arange(nzm)[None, :]   # (1, nzm)
-    in_range = (k_idx >= lower_k) & (k_idx <= upper_k)
-
-    # Operate only where a hole exists AND there is available TKE
-    has_hole    = wp2 < threshold
-    has_tke_up  = up2 > threshold
-    has_tke_vp  = vp2 > threshold
-    do_fill     = in_range & has_hole & (has_tke_up | has_tke_vp)
-
-    missing     = threshold - wp2            # > 0 where has_hole
-    up2_avail   = jnp.maximum(up2 - threshold, 0.0)
-    vp2_avail   = jnp.maximum(vp2 - threshold, 0.0)
-    total_avail = up2_avail + vp2_avail      # > 0 where (has_tke_up | has_tke_vp)
-
-    # --- Case 1: not enough TKE ---
-    case1 = do_fill & (missing >= total_avail)
-    wp2_c1  = wp2 + total_avail
-    up2_c1  = jnp.minimum(up2, threshold)
-    vp2_c1  = jnp.minimum(vp2, threshold)
-
-    # --- Case 2: enough TKE (missing < total_avail) ---
-    case2 = do_fill & (missing < total_avail)
-
-    # Fortran epsilon threshold for deciding if a component is "zero"
-    eps_thr = _F64_EPS * 1000.0
-
-    case2a = case2 & (jnp.abs(up2_avail) < eps_thr)   # no up2 avail → take all from vp2
-    case2b = case2 & (~case2a) & (jnp.abs(vp2_avail) < eps_thr)  # no vp2 avail → take all from up2
-    case2c = case2 & (~case2a) & (~case2b)              # both available → proportional
-
-    ratio  = jnp.where(total_avail > 0.0, missing / total_avail, 0.0)
-
-    # case2a: up2 unchanged, vp2 -= missing
-    up2_2a = up2
-    vp2_2a = vp2 - missing
-
-    # case2b: up2 -= missing, vp2 unchanged
-    up2_2b = up2 - missing
-    vp2_2b = vp2
-
-    # case2c: proportional
-    up2_2c = threshold + up2_avail * (1.0 - ratio)
-    vp2_2c = threshold + vp2_avail * (1.0 - ratio)
-
-    up2_c2 = jnp.where(case2a, up2_2a, jnp.where(case2b, up2_2b, up2_2c))
-    vp2_c2 = jnp.where(case2a, vp2_2a, jnp.where(case2b, vp2_2b, vp2_2c))
-
-    # --- Assemble ---
-    wp2_new = jnp.where(case1, wp2_c1, jnp.where(case2, threshold, wp2))
-    up2_new = jnp.where(case1, up2_c1, jnp.where(case2, up2_c2, up2))
-    vp2_new = jnp.where(case1, vp2_c1, jnp.where(case2, vp2_c2, vp2))
-
-    return wp2_new, up2_new, vp2_new

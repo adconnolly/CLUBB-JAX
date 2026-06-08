@@ -12,7 +12,12 @@ Header tokens determine what type of temperature and altitude are given:
 
 This module reads the raw columns and returns them as numpy arrays,
 along with the header metadata needed to interpret them.
+
+JAX reorganization of the Fortran sounding I/O (input_reader.F90 `read_sounding_file` + the column
+interpretation of input_interpret.F90 `read_z_profile`); the pressure-branch conversion lives in
+`convert_pressure_sounding_to_z` here (↔ input_interpret.F90:read_z_profile pressure branch).
 """
+import os
 import numpy as np
 from pathlib import Path
 
@@ -37,9 +42,9 @@ def convert_pressure_sounding_to_z(snd: dict, p_sfc: float, zm_init: float,
     T_in_K_module.calculate_thvm, calc_pressure.inverse_hydrostatic.
     """
     import jax.numpy as jnp
-    from clubb_jax.src.CLUBB_core.calc_pressure import inverse_hydrostatic
-    from clubb_jax.src.CLUBB_core.T_in_K_module import calculate_thvm_jax
-    from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax, rcm_sat_adj_jax
+    from clubb_jax.src.Input_fields.hydrostatic_module import inverse_hydrostatic
+    from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
+    from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq, rcm_sat_adj
     from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, p0, kappa, ep2, zero_threshold
 
     p_in_Pa = np.asarray(snd['z'], dtype=np.float64)
@@ -50,24 +55,24 @@ def convert_pressure_sounding_to_z(snd: dict, p_sfc: float, zm_init: float,
 
     if tt == 't[k]':                       # absolute temperature
         T = theta_col
-        rcm = np.maximum(rtm - np.asarray(sat_mixrat_liq_jax(p_in_Pa, T, saturation_formula)),
+        rcm = np.maximum(rtm - np.asarray(sat_mixrat_liq(p_in_Pa, T, saturation_formula)),
                          zero_threshold)
         theta = T / exner
         thlm = theta - Lv / (Cp * exner) * rcm
     elif tt == 'thm[k]':                   # potential temperature
         theta = theta_col
-        rcm = np.maximum(rtm - np.asarray(sat_mixrat_liq_jax(p_in_Pa, theta * exner, saturation_formula)),
+        rcm = np.maximum(rtm - np.asarray(sat_mixrat_liq(p_in_Pa, theta * exner, saturation_formula)),
                          zero_threshold)
         thlm = theta - Lv / (Cp * exner) * rcm
     elif tt == 'thlm[k]':                  # liquid-water potential temperature
         thlm = theta_col
-        rcm = np.asarray(rcm_sat_adj_jax(thlm, rtm, p_in_Pa, exner, saturation_formula))
+        rcm = np.asarray(rcm_sat_adj(thlm, rtm, p_in_Pa, exner, saturation_formula))
         theta = thlm + Lv / (Cp * exner) * rcm
     else:
         raise ValueError(f"convert_pressure_sounding_to_z: invalid theta_type {snd['theta_type']!r}")
 
     thv_ds = theta * (1.0 + ep2 * (rtm - rcm)) ** kappa
-    thvm = np.asarray(calculate_thvm_jax(jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
+    thvm = np.asarray(calculate_thvm(jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
                                          jnp.asarray(exner), jnp.asarray(thv_ds)))
     z = np.asarray(inverse_hydrostatic(float(p_sfc), float(zm_init), thvm, exner))
 
@@ -368,3 +373,76 @@ def interpolate_scalar_sounding(
             out[:, j] = np.interp(grid_z, z_snd, prof[:, j])
 
     return out
+
+
+# ── Std-atmosphere + extended-atmosphere readers (sounding.F90:load_extended_std_atm / convert_snd2extended_atm,
+#    + the ozone-sounding reader) — relocated here from Radiation/bugsrad_driver.py (mirror-refactor iter 215) ──
+PASCAL_PER_MB = 100.0
+
+_STD_ATM_REL = "input/std_atmosphere/atmosphere.in"
+
+
+def load_extended_std_atm(path=None):
+    """Parse atmosphere.in → dict of (50,) numpy arrays: alt[m], T_in_K, sp_hmdty[kg/kg], p_in_mb, o3l[kg/kg].
+    Columns are z, T, sp_hmdty, Press, o3 (sounding.F90 reads them by name; here we read by fixed position
+    after skipping the comment/header lines, matching the file layout exactly)."""
+    if path is None:
+        # resolve relative to clubb_release (sibling of clubb_jax), mirroring _CLUBB_RELEASE_ROOT
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.abspath(os.path.join(here, "..", "..", "..", "clubb_release"))
+        path = os.path.join(root, _STD_ATM_REL)
+    alt, T, q, p, o3 = [], [], [], [], []
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("!") or s.startswith("z["):
+                continue
+            parts = s.split()
+            alt.append(float(parts[0])); T.append(float(parts[1])); q.append(float(parts[2]))
+            p.append(float(parts[3])); o3.append(float(parts[4]))
+    return dict(alt=np.array(alt), T_in_K=np.array(T), sp_hmdty=np.array(q),
+                p_in_mb=np.array(p), o3l=np.array(o3))
+
+
+def read_ozone_sounding(path):
+    """Read a `{case}_ozone_sounding.in` file → (nlev,) ozone mixing ratio [kg/kg], one value per main-sounding
+    level (the file is a single `'o3[kg/kg]'` column with no vertical coordinate)."""
+    vals = []
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("!"):
+                continue
+            tok = s.split()[0].strip("'\"")
+            if tok.lower().startswith("o3") or tok.lower().startswith("'o3"):
+                continue
+            try:
+                vals.append(float(s.split()[0]))
+            except ValueError:
+                continue
+    return np.array(vals)
+
+
+def convert_snd2extended_atm(z, theta_col, theta_type, rt, p_in_Pa, p_sfc, o3l):
+    """Build the radiation extended atmosphere from a case's OWN deep sounding + ozone sounding — the path taken
+    when `l_use_default_std_atmosphere = .false.` (CGILS/cloud_feedback/astex/twp_ice). Port of sounding.F90:
+    convert_snd2extended_atm. Returns a dict with the same keys/shape conventions as `load_extended_std_atm`
+    (alt[m], T_in_K, sp_hmdty[kg/kg], p_in_mb, o3l[kg/kg]) at the full sounding levels (ascending in altitude),
+    so it drops straight into `build_rad_grid_setup`.
+
+      T_in_K = the T column itself when theta_type is 'T[K]', else θ·exner (exner level-1 from p_sfc, the rest
+               from p_in_Pa — matching the Fortran);  sp_hmdty = rt/(1+rt);  p_in_mb = p_in_Pa/100;  o3l = the
+               ozone sounding column.
+    """
+    from clubb_jax.src.CLUBB_core.constants_clubb import p0 as _P0, kappa as _KAPPA
+    z = np.asarray(z, dtype=np.float64); theta_col = np.asarray(theta_col, dtype=np.float64)
+    rt = np.asarray(rt, dtype=np.float64); p_in_Pa = np.asarray(p_in_Pa, dtype=np.float64)
+    o3l = np.asarray(o3l, dtype=np.float64)
+    if str(theta_type).strip().lower() == 't[k]':
+        T_in_K = theta_col.copy()
+    else:
+        exner = (p_in_Pa / _P0) ** _KAPPA
+        exner[0] = (p_sfc / _P0) ** _KAPPA          # Fortran uses p_sfc for the first level
+        T_in_K = theta_col * exner
+    return dict(alt=z, T_in_K=T_in_K, sp_hmdty=rt / (1.0 + rt),
+                p_in_mb=p_in_Pa / PASCAL_PER_MB, o3l=o3l)

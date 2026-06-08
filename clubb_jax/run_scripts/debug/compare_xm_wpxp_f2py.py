@@ -10,8 +10,8 @@ DEFINITIVE localiser for the rico grid_type=2 divergence. Workflow:
 
 RESULT (Iter148): with l_implemented=False the f2py output matches the JAX output to the
 EXACT rico full-run divergence (thlm 2.4e-6, um 2.5e-6, wpthlp 4.9e-8, upwp 3.1e-7, wprtp
-machine-exact). So given identical inputs, advance_xm_wpxp_jax != Fortran advance_xm_wpxp
-on the stretched grid -> the bug is IN advance_xm_wpxp_jax (assembly/solve), not upstream.
+machine-exact). So given identical inputs, advance_xm_wpxp != Fortran advance_xm_wpxp
+on the stretched grid -> the bug is IN advance_xm_wpxp (assembly/solve), not upstream.
 
 Requires: PYTHONPATH including clubb_release/clubb_python_api.
 """

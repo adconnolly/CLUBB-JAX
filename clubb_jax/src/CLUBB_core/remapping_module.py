@@ -8,7 +8,7 @@ linear map R_ij is built from the overlap of source/target pressure cells. The r
 
 Ported here: `calc_mass_over_grid_intervals`, `remapping_matrix`, `matrix_vector_mult`, `remap_vals_to_target`,
 `remap_vals_to_target_same_grid` (the f2py-exposed driver, source grid == target grid == stored grid), AND the
-E3SM Piecewise-Parabolic Method (method 2): `remap_vals_ppm` → `_map1_ppm` → `_ppm2m`/`_steepz`/`_kmppm` (the
+E3SM Piecewise-Parabolic Method (method 2): `remap_vals_ppm` → `map1_ppm` → `ppm2m`/`steepz`/`kmppm` (the
 kord=4 path; the kord≥7 Huynh branch is omitted). The debug-only conservation/monotonicity/consistency checks
 (active only at debug level ≥ 2) do not affect the output and are omitted.
 
@@ -118,7 +118,7 @@ def _pressure_levels(mass_on_cells, p_sfc):
         [jnp.zeros((mass_on_cells.shape[0], 1), dtype=mass_on_cells.dtype), jnp.cumsum(dp, axis=1)], axis=1)
 
 
-def _kmppm(dm, AA, AL, AR, A6, lmt):
+def kmppm(dm, AA, AL, AR, A6, lmt):
     """PPM monotonicity limiter (remapping_module.F90:kmppm), vectorized + elementwise over (ncol, km).
     lmt: 0 standard PPM, 1 Lin full-monotone, 2 positive-definite, 3 no-op. Returns (AL, AR, A6)."""
     if lmt == 3:
@@ -154,7 +154,7 @@ def _kmppm(dm, AA, AL, AR, A6, lmt):
     return ALn, ARn, A6n
 
 
-def _ppm2m(AA, delp, iv, kord):
+def ppm2m(AA, delp, iv, kord):
     """PPM sub-grid reconstruction (remapping_module.F90:ppm2m), top→surface ordering. AA=cell means (ncol,km),
     delp=layer thicknesses (ncol,km). Returns (AL, AR, A6) for f(s)=AL+s[(AR-AL)+A6(1-s)]. Faithful to the
     kord=4 path (the only one map1_ppm uses); the kord>=7 Huynh branch is omitted."""
@@ -187,7 +187,7 @@ def _ppm2m(AA, delp, iv, kord):
     AL = AL.at[:, 2:-1].set(AL_int)
 
     # steepz discontinuity steepening (modifies AL interior)
-    AL = _steepz(AA, AL, df2, dc, DQ, delp, D4)
+    AL = steepz(AA, AL, df2, dc, DQ, delp, D4)
 
     AR = jnp.zeros_like(AA)
     # Top boundary cubic (k=1,2 Fortran → 0,1)
@@ -242,8 +242,8 @@ def _ppm2m(AA, delp, iv, kord):
     if iv == 0:
         lmt_int = min(2, lmt_int)
     # interior uses kmppm(lmt_int) which (for lmt 1/2) recomputes AL/AR/A6 internally.
-    AL0g, AR0g, A60g = _kmppm(dc, AA, AL, AR, A6, 0)
-    ALig, ARig, A6ig = _kmppm(dc, AA, AL, AR, A6, lmt_int)
+    AL0g, AR0g, A60g = kmppm(dc, AA, AL, AR, A6, 0)
+    ALig, ARig, A6ig = kmppm(dc, AA, AL, AR, A6, lmt_int)
     k = jnp.arange(km)
     interior = (k >= 2) & (k <= km - 3)                          # Fortran k=3..km-2
     sel = interior[None, :]
@@ -253,7 +253,7 @@ def _ppm2m(AA, delp, iv, kord):
     return AL, AR, A6
 
 
-def _steepz(AA, AL, df2, dm, dq, dp, d4):
+def steepz(AA, AL, df2, dm, dq, dp, d4):
     """PPM discontinuity steepening (remapping_module.F90:steepz). Modifies AL in k=4..km-2 (Fortran). All
     arrays (ncol, km); dq=DQ (km), d4=D4 (km). Returns the steepened AL."""
     ncol, km = AA.shape
@@ -282,7 +282,7 @@ def _steepz(AA, AL, df2, dm, dq, dp, d4):
     return AL.at[:, 3:-2].set(AL_new)
 
 
-def _map1_ppm(pe1, q1, pe2, iv, kord):
+def map1_ppm(pe1, q1, pe2, iv, kord):
     """E3SM PPM vertical remap (remapping_module.F90:map1_ppm), all arrays TOP→SURFACE (increasing pressure).
     pe1 (ncol, km+1) source edges, q1 (ncol, km) source means, pe2 (ncol, kn+1) target edges. Returns q2
     (ncol, kn). Conservative: integrates the PPM sub-grid parabola of each source cell over each target cell."""
@@ -290,7 +290,7 @@ def _map1_ppm(pe1, q1, pe2, iv, kord):
     km = kmp1 - 1
     kn = pe2.shape[1] - 1
     dp1 = pe1[:, 1:] - pe1[:, :-1]                              # (km)
-    AL, AR, A6 = _ppm2m(q1, dp1, iv, kord)
+    AL, AR, A6 = ppm2m(q1, dp1, iv, kord)
     AA = q1
 
     # k0(k): smallest source cell kk with pe2(k) <= pe1(kk+1). pe1 increasing → searchsorted.
@@ -342,7 +342,7 @@ def remap_vals_ppm(levels_source, levels_target, source_values, iv, kord=4):
     pe1 = ls[:, ::-1]                                           # top→surface (increasing pressure)
     pe2 = lt[:, ::-1]
     q1 = sv[:, ::-1]
-    q2 = _map1_ppm(pe1, q1, pe2, iv, kord)
+    q2 = map1_ppm(pe1, q1, pe2, iv, kord)
     return q2[:, ::-1]                                          # back to surface→top
 
 

@@ -5,13 +5,15 @@ Composes the oracle-validated KK pieces into the per-step call that the Fortran 
 Mirrors `_cloud_drop_sed` in advance_clubb_to_end.py: extract from `state`, run the physics, store the
 tendencies for the next step's forcings.
 
-STAGED ROLLOUT (incremental-replacement / shadow-comparison discipline, see DESIGN.md):
-  - This stage wires the TENDENCY computation (precip_fraction -> compute_kk_microphysics) on LIVE state
-    and STORES the result, validated against the rf02_do/rico oracles. The hydrometeor TRANSPORT
-    (advance_one_hydrometeor + fill_holes, which needs the sed velocities from `prereqs`) and the feedback
-    APPLICATION are gated behind `state['l_kk_micro_apply']` (default False) so the running cases are
-    byte-for-byte unchanged until the transport stage lands. Non-KK cases never reach this code
-    (hydromet_dim==0 / microphys_scheme!='khairoutdinov_kogan').
+TWO-STAGE STRUCTURE (incremental-replacement / shadow-comparison discipline, see DESIGN.md):
+  - The TENDENCY computation (precip_fraction -> compute_kk_microphysics) runs on LIVE state and STORES the
+    result, validated against the rf02_do/rico oracles. The hydrometeor TRANSPORT (advance_one_hydrometeor +
+    fill_holes, which needs the sed velocities from `prereqs`) and the feedback APPLICATION are gated behind
+    `state['l_kk_micro_apply']`. That flag's model default is False, but `clubb_driver` sets it TRUE for every
+    KK case (`l_kk_micro_apply=(microphys_scheme=='khairoutdinov_kogan')`, clubb_driver.py:1069) — so the
+    transport+application stage IS live for the KK cases (rico), which is consequently FP-limited at precip
+    onset and classified BLOCKED in compare_cases (DESIGN.md "rico"). Non-KK cases never reach this code
+    (hydromet_dim==0 / microphys_scheme!='khairoutdinov_kogan'), so they are byte-for-byte unaffected.
 """
 import numpy as np
 import jax
@@ -154,24 +156,25 @@ def advance_kk_microphysics(state: dict):
     if not state.get('l_kk_micro_apply', False):
         return
 
-    # ---- Transport + application stage (Iter157) -----------------------------------------------
+    # ---- Transport + application stage -----------------------------------------------
     # Per the Fortran advance_microphys (advance_microphys_module.F90): each hydrometeor is advanced by
     # the implicit transport solve (eddy diffusion K_hm + nu_hm, mean advection, mean+turbulent
     # sedimentation), seeded by the microphysics source tendency; then fill_holes; rcm_mc/thlm_mc feed
     # the next step's forcings (already wired in advance_clubb_to_end.py:67-68).
-    from clubb_jax.src.Microphys.KK_microphys.kk_microphys_driver import kk_sedimentation, _hydrometp2_zt
-    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import kk_sed_vel_covars
+    from clubb_jax.src.Microphys.KK_microphys_module import KK_sedimentation
+    from clubb_jax.src.CLUBB_core.setup_clubb_pdf_params import hydrometp2_zt
+    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import KK_sed_vel_covars
     from clubb_jax.src.Microphys.advance_microphys_module import calculate_K_hm, advance_one_hydrometeor
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax, zm2zt_jax
-    from clubb_jax.src.CLUBB_core.advance_xp3_module import skx_func_jax
-    from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical_jax
+    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+    from clubb_jax.src.CLUBB_core.Skx_module import Skx_func
+    from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical, fill_holes_hydromet_clip_jax
 
     gr = state['gr']
     clubb_params = jnp.asarray(np.asarray(state['clubb_params'], np.float64))
     w_tol = float(state.get('w_tol', 2.0e-3))
     wp2 = jnp.asarray(np.asarray(state['wp2'], np.float64))            # (ng, nzm)
     wp3_zm = zt2zm_jax(jnp.asarray(np.asarray(state['wp3'], np.float64)), gr)
-    Skw_zm = skx_func_jax(wp2, wp3_zm, w_tol, clubb_params)            # (ng, nzm)
+    Skw_zm = Skx_func(wp2, wp3_zm, w_tol, clubb_params)            # (ng, nzm)
     Kh_zm = jnp.asarray(np.asarray(state['Kh_zm'], np.float64))
     wm_zt = jnp.asarray(np.asarray(state['wm_zt'], np.float64))
     rho_ds_zm = jnp.asarray(np.asarray(state['rho_ds_zm'], np.float64))
@@ -181,8 +184,8 @@ def advance_kk_microphysics(state: dict):
     hm_tol = float(np.asarray(hmm.hydromet_tol).reshape(-1)[iirr])
 
     # Mean sedimentation velocities (zt) from the rain-drop mean volume radius; to momentum (zt2zm).
-    Vrr_zt, VNr_zt = kk_sedimentation(prereqs['mvr'], l_clip_positive_sed=True)
-    sed = kk_sed_vel_covars(
+    Vrr_zt, VNr_zt = KK_sedimentation(prereqs['mvr'], l_clip_positive_sed=True)
+    sed = KK_sed_vel_covars(
         precip_frac_1 * prereqs['mu_rr_1'], precip_frac_2 * prereqs['mu_rr_2'],
         precip_frac_1 * prereqs['mu_Nr_1'], precip_frac_2 * prereqs['mu_Nr_2'], prereqs['mvr'],
         prereqs['mu_rr_1'], prereqs['mu_rr_2'], prereqs['mu_Nr_1'], prereqs['mu_Nr_2'],
@@ -192,7 +195,7 @@ def advance_kk_microphysics(state: dict):
         prereqs['corr_rr_Nr_n'], prereqs['corr_rr_Nr_n'], jnp.asarray(mixt_frac))
 
     def _advance_hm(hm, hm_tndcy, ratio, V_zt, Vi_zt, Ve_zt):
-        hmp2_zm = zt2zm_jax(_hydrometp2_zt(hm, jnp.asarray(precip_frac), ratio), gr)
+        hmp2_zm = zt2zm_jax(hydrometp2_zt(hm, jnp.asarray(precip_frac), ratio), gr)
         K_hm = calculate_K_hm(wp2, Kh_zm, Skw_zm, hm, hmp2_zm, hm_tol, gr)
         out = advance_one_hydrometeor(
             float(dt), hm, hm_tndcy, K_hm, nu_hm, wm_zt,
@@ -203,7 +206,7 @@ def advance_kk_microphysics(state: dict):
         # below tol, diverging rrm at the cloud edge); full zt range begin=1..nzt (0-based 0..nzt-1). With
         # threshold 0 the call is a no-op when there are no negatives (matching the Fortran's `any(<0)` guard).
         dz = np.asarray(gr.dzt, np.float64)
-        out = fill_holes_vertical_jax(out, np.asarray(state['rho_ds_zt'], np.float64), dz,
+        out = fill_holes_vertical(out, np.asarray(state['rho_ds_zt'], np.float64), dz,
                                       0.0, 0, np.asarray(hm).shape[-1] - 1,
                                       int(state['flags'].fill_holes_type))
         return np.asarray(out, np.float64)
@@ -213,27 +216,19 @@ def advance_kk_microphysics(state: dict):
     Nrm_new = _advance_hm(jnp.asarray(Nrm), jnp.asarray(Nrm_mc), Nr_ratio,
                           VNr_zt, sed['VNrpNrp_impc'], sed['VNrpNrp_expc'])
 
-    # ★ Iter307: fill_holes_driver_api ALSO clips hydromet <= hydromet_tol to 0 (fill_holes.F90:2444-2476),
-    # returning the removed mass to vapor + a latent adjustment to thlm; clip_hydromet_conc_mvr then zeros the
-    # number (<rx>=0). The JAX did only the zero_threshold hole-fill, so sub-tol rrm ACCUMULATED → premature
-    # precip onset (the rico seed, Iter306). Apply the tol clip on the post-advance rain.
+    # fill_holes_driver_api ALSO clips hydromet <= hydromet_tol to 0 (fill_holes.F90:2444-2476), returning the
+    # removed mass to vapor + a latent thlm adjustment (number zeroed by clip_hydromet_conc_mvr). The JAX did only
+    # the zero_threshold hole-fill, so sub-tol rrm ACCUMULATED → premature precip onset (the rico seed, Iter306).
+    # Apply the tol clip on the post-advance rain — now via the fill_holes.py mirror (mirror-refactor iter 214).
     _rr_tol = float(np.asarray(hmm.hydromet_tol).reshape(-1)[iirr])
-    _below = rrm_new <= _rr_tol
-    _removed = np.where(_below, rrm_new, 0.0)            # rr mass removed [kg/kg]
-    rrm_new = np.where(_below, 0.0, rrm_new)
-    Nrm_new = np.where(_below, 0.0, Nrm_new)
-    # conserve water/energy (fill_holes.F90:2451-2473): removed rr → vapor (rvm_mc), latent cooling on thlm
-    # (rain is non-frozen). rvm_mc folds into the rt tendency below; thlm_mc feeds thlm_forcing.
-    from clubb_jax.src.CLUBB_core.constants_clubb import Lv as _LVc, Cp as _CPc
-    _exn = np.asarray(state['exner'], np.float64)
-    rvm_mc = np.asarray(rvm_mc, np.float64) + _removed / float(dt)
-    thlm_mc = np.asarray(thlm_mc, np.float64) - (_LVc / _CPc) * _removed / (_exn * float(dt))
+    rrm_new, Nrm_new, rvm_mc, thlm_mc = fill_holes_hydromet_clip_jax(
+        rrm_new, Nrm_new, _rr_tol, rvm_mc, thlm_mc, state['exner'], float(dt))
 
     hydromet = hydromet.copy()
     hydromet[..., iirr] = rrm_new
     hydromet[..., iiNr] = Nrm_new
     state['hydromet'] = hydromet
-    # ★ Iter307: the rt microphysics tendency is rcm_mc + rvm_mc (cloud→rain + rain→vapor), per
+    # the rt microphysics tendency is rcm_mc + rvm_mc (cloud→rain + rain→vapor), per
     # clubb_driver.F90:3337 `rtm_forcing += rcm_mc + rvm_mc` (the Morrison JAX path already does this; the KK
     # path was DROPPING rvm_mc — the rain-evaporation→vapor term, =0 until rain forms ~step 5, which is exactly
     # where rico started diverging). advance_clubb_to_end adds state['rcm_mc'] to rtm_forcing, so fold rvm_mc in.

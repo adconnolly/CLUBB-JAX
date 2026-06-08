@@ -2,7 +2,7 @@
 
 So far: the implicit LHS contributions of the hydrometeor predictive equation that are NEW physics
 (the mean + turbulent sedimentation terms). The turbulent-advection and mean-advection LHS reuse the
-already-bit-faithful `diffusion_zt_lhs` and `term_ma_zt_lhs`; the sedimentation terms are ported here.
+already-bit-faithful `diffusion_zt_lhs_jax` and `term_ma_zt_lhs_jax`; the sedimentation terms are ported here.
 
 `sed_centered_diff_lhs` (oracle advance_microphys_module.F90:2188) is the implicit, centered-difference
 mean-sedimentation operator for the d<hm>/dt equation:
@@ -69,7 +69,7 @@ def term_turb_sed_lhs(Vhmphmp_impc, rho_ds_zm, invrs_rho_ds_zt, invrs_dzt, w_abo
     The semi-implicit turbulent-sed term is - (1/rho_ds) d( rho_ds <V_hm'h_m'> ) / dz with
     <V_hm'h_m'> = Vhmphmp_impc <h_m> + Vhmphmp_expc; the implicit part has the IDENTICAL flux-form
     discretization as the mean-sedimentation term (`sed_centered_diff_lhs`) with the momentum-level
-    implicit covariance `Vhmphmp_impc` (= zt2zm of `kk_sed_vel_covars`' Vrrprrp_impc) playing the
+    implicit covariance `Vhmphmp_impc` (= zt2zm of `KK_sed_vel_covars`' Vrrprrp_impc) playing the
     role of the velocity <V_hm>. Verified branch-by-branch identical to the Fortran. So this delegates
     to `sed_centered_diff_lhs`; the explicit part (Vhmphmp_expc) goes to the RHS.
 
@@ -111,7 +111,7 @@ def calculate_K_hm(wp2, Kh_zm, Skw_zm, hydromet, hydrometp2, hydromet_tol, gr,
 
 def _turb_adv_lhs(K_hm, nu, rho_ds_zm, invrs_rho_ds_zt, gr):
     """Crank-Nicholson turbulent-advection LHS = (1/2) eddy diffusion, with the explicit k=0 lower-BC
-    re-set (oracle :2096; byte-identical to diffusion_zt_lhs's own bottom row). Shared by
+    re-set (oracle :2096; byte-identical to diffusion_zt_lhs_jax's own bottom row). Shared by
     microphys_lhs (the implicit half) and microphys_rhs (the explicit half). (3, ..., nzt)."""
     from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs_jax
     nu_arr = jnp.broadcast_to(jnp.asarray(nu, dtype=jnp.float64),
@@ -131,8 +131,8 @@ def microphys_lhs(dt, K_hm, nu, wm_zt, V_hm, Vhmphmp_impc,
     Oracle microphys_lhs (advance_microphys_module.F90:1564).
 
       lhs = 1/dt [main]
-            + (1/2) diffusion_zt_lhs(K_hm, nu)   [Crank-Nicholson turbulent advection]
-            + term_ma_zt_lhs(wm_zt)              [mean advection]
+            + (1/2) diffusion_zt_lhs_jax(K_hm, nu)   [Crank-Nicholson turbulent advection]
+            + term_ma_zt_lhs_jax(wm_zt)              [mean advection]
             + sed_centered_diff_lhs(V_hm)        [mean sedimentation, if l_sed]
             + term_turb_sed_lhs(Vhmphmp_impc)    [turbulent sedimentation, if l_sed]
 
@@ -143,7 +143,7 @@ def microphys_lhs(dt, K_hm, nu, wm_zt, V_hm, Vhmphmp_impc,
     Inputs: K_hm, V_hm, Vhmphmp_impc, rho_ds_zm, w_above on MOMENTUM levels (..., nzm); wm_zt,
     invrs_rho_ds_zt on THERMO levels; nu the background diffusivity (..., or scalar broadcast);
     `gr` carries invrs_dzt/invrs_dzm. Returns (super, main, sub), each (..., nzt)."""
-    from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import term_ma_zt_lhs_jax
+    from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax
 
     lhs_ta = _turb_adv_lhs(K_hm, nu, rho_ds_zm, invrs_rho_ds_zt, gr)
     lhs_ma = term_ma_zt_lhs_jax(wm_zt, gr)     # (3, ..., nzt) [super, main, sub]
@@ -179,7 +179,7 @@ def term_turb_sed_rhs(Vhmphmp_expc, rho_ds_zm, invrs_rho_ds_zt, invrs_dzt):
              = - invrs_rho_ds_zt[k] invrs_dzt[k] (F[k+1] - F[k]),   F[m] = rho_ds_zm[m] Vhmphmp_expc[m],
     a flux-divergence of the KNOWN explicit covariance (no <hm> factor); F is zeroed at the model top
     (momentum level nzm-1) for the no-flux upper boundary. Vhmphmp_expc is on MOMENTUM levels
-    (= zt2zm of kk_sed_vel_covars' Vrrprrp_expc). Returns (..., nzt)."""
+    (= zt2zm of KK_sed_vel_covars' Vrrprrp_expc). Returns (..., nzt)."""
     nzt = jnp.asarray(invrs_rho_ds_zt).shape[-1]
     F = rho_ds_zm * Vhmphmp_expc
     F = F.at[..., nzt].set(0.0)                          # no flux through the model top
@@ -193,7 +193,7 @@ def microphys_rhs(dt, hmm, hmm_tndcy, K_hm, nu, Vhmphmp_expc,
       rhs = hmm/dt + hmm_tndcy [microphysics source]
             - lhs_ta·hmm        [Crank-Nicholson EXPLICIT 1/2-diffusion of the current-step hmm]
             + term_turb_sed_rhs [explicit turbulent sedimentation, if l_sed]
-    where lhs_ta = (1/2) diffusion_zt_lhs(K_hm,nu) (the SAME operator microphys_lhs uses implicitly).
+    where lhs_ta = (1/2) diffusion_zt_lhs_jax(K_hm,nu) (the SAME operator microphys_lhs uses implicitly).
     `hmm_tndcy` is the microphysics tendency (auto+accr+evap etc., from compute_kk_microphysics).
     Returns the RHS vector (..., nzt)."""
     lhs_ta = _turb_adv_lhs(K_hm, nu, rho_ds_zm, invrs_rho_ds_zt, gr)
@@ -201,6 +201,16 @@ def microphys_rhs(dt, hmm, hmm_tndcy, K_hm, nu, Vhmphmp_expc,
     if l_sed:
         rhs = rhs + term_turb_sed_rhs(Vhmphmp_expc, rho_ds_zm, invrs_rho_ds_zt, gr.invrs_dzt)
     return rhs
+
+
+def microphys_solve(lhs, rhs):
+    """Solve the tridiagonal system for one hydrometeor mean field (advance_microphys_module.F90:microphys_solve).
+
+    `lhs` is the (3, ..., nzt) [super, main, sub] band; returns the advanced <hm> (..., nzt). The Fortran's
+    budget `stats_update`/`stats_finalize_budget` and error checks are not reproduced — the JAX path computes no
+    microphys budget stats — mirroring the other extracted JAX solve routines (mfl_xm_solve, xp2_xpyp_solve)."""
+    from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve_jax
+    return tridiag_lu_solve_jax(lhs, rhs)
 
 
 def advance_one_hydrometeor(dt, hmm, hmm_tndcy, K_hm, nu, wm_zt,
@@ -212,11 +222,10 @@ def advance_one_hydrometeor(dt, hmm, hmm_tndcy, K_hm, nu, wm_zt,
 
     hmm is the current mean; hmm_tndcy the microphysics source (from compute_kk_microphysics). The sed
     velocities V_hm (mean) and Vhmphmp_impc/_expc (turbulent covariance impc/expc) are on momentum
-    levels (zt2zm of kk_sedimentation / kk_sed_vel_covars). Hole-filling is applied separately."""
-    from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import tridiag_lu_solve_jax
+    levels (zt2zm of KK_sedimentation / KK_sed_vel_covars). Hole-filling is applied separately."""
     sup, main, sub = microphys_lhs(dt, K_hm, nu, wm_zt, V_hm, Vhmphmp_impc,
                                    rho_ds_zm, invrs_rho_ds_zt, gr, w_above, l_sed)
     rhs = microphys_rhs(dt, hmm, hmm_tndcy, K_hm, nu, Vhmphmp_expc,
                         rho_ds_zm, invrs_rho_ds_zt, gr, l_sed)
     lhs = jnp.stack([sup, main, sub], axis=0)            # (3, ngrdcol, nzt) [super, main, sub]
-    return tridiag_lu_solve_jax(lhs, rhs)
+    return microphys_solve(lhs, rhs)

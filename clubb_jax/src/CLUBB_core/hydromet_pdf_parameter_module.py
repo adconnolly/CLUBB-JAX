@@ -7,7 +7,7 @@ Ported as frozen dataclasses holding jnp arrays (differentiable-compatible, zero
 `init_hydromet_pdf_params` / `init_precip_fracs` / `zero_precip_fracs` mirroring the Fortran initializers.
 Validated in `tests/test_hydromet_pdf_parameter.py` (shapes, dims metadata, all-zero, round-trip).
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import jax.numpy as jnp
 

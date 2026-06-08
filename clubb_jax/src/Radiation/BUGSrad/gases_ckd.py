@@ -66,32 +66,32 @@ def qkio3(coefk, tt, pkd, ip1, ip2):
 
 
 def qoph2o(fkg, dp, rmix):
-    """H2O transmission optical depth (qoph2o.F)."""
+    """H2O transmission optical depth (gases_ckd.F90:qoph2o)."""
     return jnp.asarray(fkg) * jnp.asarray(rmix) * jnp.asarray(dp) * MOLAR_VOLUME / MW_H2O * 10.0 / GRAVITY
 
 
 def qopo3i(fkg, dp, o3mix):
-    """O3 IR-band transmission (qopo3i.F)."""
+    """O3 IR-band transmission (gases_ckd.F90:qopo3i)."""
     return jnp.asarray(fkg) * jnp.asarray(o3mix) * jnp.asarray(dp) * MOLAR_VOLUME / MW_O3 * 10.0 / GRAVITY
 
 
 def qopo3s(fk, dp, o3mix):
-    """O3 non-gray (SW) transmission with scalar k `fk` (qopo3s.F)."""
+    """O3 non-gray (SW) transmission with scalar k `fk` (gases_ckd.F90:qopo3s)."""
     return jnp.asarray(o3mix) * jnp.asarray(dp) * fk * MOLAR_VOLUME / MW_O3 * 10.0 / GRAVITY
 
 
 def qophc(fkg, dp):
-    """H2O/CO2 band-overlap transmission (qophc.F): tg = fkg·dp."""
+    """H2O/CO2 band-overlap transmission (gases_ckd.F90:qophc): tg = fkg·dp."""
     return jnp.asarray(fkg) * jnp.asarray(dp)
 
 
 def qopch4(fkg, dp):
-    """CH4 transmission (qopch4.F), ch4_conc = 1.6e-6 ppv (hardcoded in the Fortran)."""
+    """CH4 transmission (gases_ckd.F90:qopch4), ch4_conc = 1.6e-6 ppv (hardcoded in the Fortran)."""
     return jnp.asarray(fkg) * jnp.asarray(dp) * MOLAR_VOLUME * 10.0 / GRAVITY * _CH4_CONC / MW_DRY_AIR
 
 
 def qopn2o(fkg, dp):
-    """N2O transmission (qopn2o.F), n2o_conc = 0.28e-6 ppv (hardcoded in the Fortran)."""
+    """N2O transmission (gases_ckd.F90:qopn2o), n2o_conc = 0.28e-6 ppv (hardcoded in the Fortran)."""
     return jnp.asarray(fkg) * jnp.asarray(dp) * MOLAR_VOLUME * 10.0 / GRAVITY * _N2O_CONC / MW_DRY_AIR
 
 
@@ -102,9 +102,9 @@ _SOLAR = {1: 619.618, 2: 484.295, 3: 149.845, 4: 48.7302, 5: 31.6576, 6: 5.79927
 def gases(ib, ig, dp, tt, rmix, o3mix, umco2, umch4, umn2o, pkd, ip1, ip2, pp):
     """Correlated-k gas transmission optical depth `tg` (ncol, nlm) + weight `hk` (scalar) for
     spectral band `ib` (1-based, 1..18) and k-interval `ig` (0-based). Dispatch over gases_ckd.F90's
-    18 cases using the ported helpers + the parsed `gases_ckd_tables`. `pkd/ip1/ip2` are the
+    18 cases using the ported helpers + the parsed `gases_ckd_data` tables. `pkd/ip1/ip2` are the
     pressure-weighting from `pscale` (the band driver computes them with STANPS/STANPIR)."""
-    from clubb_jax.src.Radiation.BUGSrad.gases_ckd_tables import tables
+    from clubb_jax.src.Radiation.BUGSrad.gases_ckd_data import tables
     T = tables()
 
     def k3(name):     # qk on a 3D table's ig-slice

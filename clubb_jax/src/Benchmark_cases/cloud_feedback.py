@@ -14,7 +14,8 @@ diverges in the JAX driver — but this surface scheme is a faithful, tested por
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.constants_clubb import p0, kappa
-from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
+from clubb_jax.src.Benchmark_cases.sfc_flux import compute_wpthlp_sfc, compute_wprtp_sfc
 
 _C_H_20 = 0.001094     # RICO 3-D heat drag coefficient at 20 m
 _C_Q_20 = 0.001133     # RICO 3-D moisture drag coefficient at 20 m
@@ -43,8 +44,8 @@ def cloud_feedback_sfclyr(thlm_sfc, rtm_sfc, lowest_level, ubar, p_sfc, T_sfc, s
     scale = log_ratio ** 2
     Ch = _C_H_20 * scale
     Cq = _C_Q_20 * scale
-    rsat = sat_mixrat_liq_jax(p_sfc, T_sfc, saturation_formula)
-    wpthlp_sfc = -Ch * ubar * (thlm_sfc - T_sfc / exner_sfc)
-    wprtp_sfc = -Cq * ubar * (rtm_sfc - rsat)
+    rsat = sat_mixrat_liq(p_sfc, T_sfc, saturation_formula)
+    wpthlp_sfc = compute_wpthlp_sfc(Ch, ubar, thlm_sfc, T_sfc, exner_sfc)
+    wprtp_sfc = compute_wprtp_sfc(Cq, ubar, rtm_sfc, rsat)
     ustar = jnp.broadcast_to(_USTAR, jnp.shape(p_sfc))
     return wpthlp_sfc, wprtp_sfc, ustar
