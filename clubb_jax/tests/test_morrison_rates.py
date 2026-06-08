@@ -17,6 +17,15 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import (
     kk_warm_rain_rates, rain_slope, cloud_slope, rain_evap_rate,
     ice_slope, snow_slope, graupel_slope, ice_deposition,
@@ -25,7 +34,7 @@ from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import (
     rain_immersion_freezing, sublimation_number_rates,
     cloud_contact_immersion_freezing, rain_self_collection,
     conserve_qc, conserve_qi, conserve_qr, conserve_qni,
-    saturation_adjustment_pcc, polysvp_jax, _M_EP2, _LV, _CP,
+    saturation_adjustment_pcc, polysvp, _M_EP2, _LV, _CP,
     to_in_cloud, tendency_to_grid_mean, neg_fix_number, _M_CF_THRESH,
     rain_fall_speed, cloud_ice_collect_droplets, rain_ice_collision_snow, rain_accrete_snow)
 
@@ -120,9 +129,9 @@ def test_number_rates_vs_oracle():
 
 def test_slopes_transcription_and_bounds():
     """Distribution slopes (rain LAMR/N0RR, cloud PGAM/LAMC) == a pure-Python Fortran replica, and
-    obey the physical clip bounds. Uses the validated gamma_jax for the cloud slope."""
+    obey the physical clip bounds. Uses the validated gamma for the cloud slope."""
     from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import (
-        _GAMMA_PI, _KK_RHOW, _M_LAMMINR, _M_LAMMAXR, _M_CONS26, gamma_jax)
+        _GAMMA_PI, _KK_RHOW, _M_LAMMINR, _M_LAMMAXR, _M_CONS26, gamma)
     rng_qr = np.array([1e-3, 5e-5, 1e-7, 1e-9])
     rng_nr = np.array([5e4, 1e4, 1e3, 1e2])
     lamr, n0rr = rain_slope(jnp.asarray(rng_qr), jnp.asarray(rng_nr))
@@ -138,8 +147,8 @@ def test_slopes_transcription_and_bounds():
     pgam, lamc = np.asarray(pgam), np.asarray(lamc)
     pg = 0.0005714 * (ncc / 1e6 * rho) + 0.2714
     pg = np.clip(1.0 / pg ** 2 - 1.0, 2.0, 10.0)
-    lc = (_M_CONS26 * ncc * np.array([float(gamma_jax(jnp.array(p + 4.0))) for p in pg])
-          / (qc * np.array([float(gamma_jax(jnp.array(p + 1.0))) for p in pg]))) ** (1.0 / 3.0)
+    lc = (_M_CONS26 * ncc * np.array([float(gamma(jnp.array(p + 4.0))) for p in pg])
+          / (qc * np.array([float(gamma(jnp.array(p + 1.0))) for p in pg]))) ** (1.0 / 3.0)
     lc = np.clip(lc, (pg + 1) / 60e-6, (pg + 1) / 1e-6)
     assert np.max(np.abs(pgam - pg)) < 1e-12, "PGAM transcription"
     assert np.max(np.abs(lamc - lc) / lc) < 1e-13, "LAMC transcription"
@@ -169,14 +178,14 @@ def test_pre_transcription():
     """PRE == a pure-Python replica of the full EPSR ventilation + thermo formula (oracle-free, exact)."""
     from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import (
         _GAMMA_PI, _M_EP2, _M_AR, _M_BR, _M_RHOSU, _M_F1R, _M_F2R, _M_QSMALL,
-        _CP, _LV, _RV, polysvp_jax, rain_slope, gamma_jax)
+        _CP, _LV, _RV, polysvp, rain_slope, gamma)
     qr = np.array([5e-4, 1e-4]); nr = np.array([5e4, 1e4]); qv = np.array([3e-3, 5e-3])
     T = np.array([285.0, 290.0]); pres = np.array([8e4, 9e4]); rho = np.array([1.0, 1.05])
     pre = np.asarray(rain_evap_rate(jnp.asarray(qr), jnp.asarray(nr), jnp.asarray(qv),
                                     jnp.asarray(T), jnp.asarray(pres), jnp.asarray(rho)))
     # replica
-    cons9 = float(gamma_jax(jnp.array(2.5 + _M_BR / 2.0))); cons34 = 2.5 + _M_BR / 2.0
-    evs = np.minimum(0.99 * pres, np.array([float(polysvp_jax(jnp.array(t), 0)) for t in T]))
+    cons9 = float(gamma(jnp.array(2.5 + _M_BR / 2.0))); cons34 = 2.5 + _M_BR / 2.0
+    evs = np.minimum(0.99 * pres, np.array([float(polysvp(jnp.array(t), 0)) for t in T]))
     qvs = _M_EP2 * evs / (pres - evs)
     mu = 1.496e-6 * T ** 1.5 / (T + 120.0)
     arn = (_M_RHOSU / rho) ** 0.54 * _M_AR
@@ -378,7 +387,7 @@ def test_conservation_limiters():
 
 
 def _qsat(T, pres):
-    es = float(polysvp_jax(jnp.array(T), 0))
+    es = float(polysvp(jnp.array(T), 0))
     return _M_EP2 * es / (pres - es)
 
 
@@ -529,7 +538,7 @@ def test_morrison_interface_on_nov11():
     if not os.path.exists(_ORACLE):
         print("  Morrison interface on nov11: SKIPPED (no oracle)"); return
     import netCDF4 as nc
-    from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import morrison_microphys_driver
+    from clubb_jax.src.Microphys.morrison_microphys_module import morrison_microphys_driver
     ds = nc.Dataset(_ORACLE)
     A = lambda n: np.asarray(ds.variables[n][:])
     rrm_all = A("rrm").reshape(A("rrm").shape[0], A("rrm").shape[1])
@@ -638,15 +647,15 @@ def test_minor_collection_rates_vs_oracle():
         assert np.median(rel) < 0.10, f"{name} median rel {np.median(rel):.2e}"
     # PRACS: pure-Python Fortran-formula replica == JAX (transcription exact), on the oracle slopes
     from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import (
-        rain_slope, snow_slope, gamma_jax, _M_RHOSU, _M_AR, _M_AS, _M_BR, _M_BS, _M_ECR, _M_RHOSN)
+        rain_slope, snow_slope, gamma, _M_RHOSU, _M_AR, _M_AS, _M_BR, _M_BS, _M_ECR, _M_RHOSN)
     import math
     lamr, n0rr = (np.asarray(x) for x in rain_slope(qr, nr))
     lams, n0s = (np.asarray(x) for x in snow_slope(qs, ns))
     on = (qr >= 1e-8) & (qs >= 1e-8)
     lr = np.where(lamr > 0, lamr, 1.0); ls = np.where(lams > 0, lams, 1.0)
     dcorr = (_M_RHOSU / rho) ** 0.54
-    cons3 = float(gamma_jax(jnp.array(4.0 + _M_BS))) / 6.0
-    cons4 = float(gamma_jax(jnp.array(4.0 + _M_BR))) / 6.0
+    cons3 = float(gamma(jnp.array(4.0 + _M_BS))) / 6.0
+    cons4 = float(gamma(jnp.array(4.0 + _M_BR))) / 6.0
     cons31 = math.pi ** 2 * _M_ECR * _M_RHOSN
     ums = np.minimum(dcorr * _M_AS * cons3 / ls ** _M_BS, 1.2 * dcorr)
     umr = np.minimum(dcorr * _M_AR * cons4 / lr ** _M_BR, 9.1 * dcorr)

@@ -7,6 +7,13 @@ Effects of rain evaporation on the second moments (l_morr_xp2_mc). Oracle:
   2. precip_frac_double_delta top-down fill correctness.
   3. Physical sign invariants (rtp2_mc, thlp2_mc >= 0; wpthlp_mc <= 0).
   4. A finite jax.grad.
+
+NB (iter 445): the direct f2py oracle `f2py_update_xp2_mc` is deliberately NOT used and the NumPy transcription is
+the gold standard here, for two structural reasons (verified, not assumed): (a) the wrapper reads the PDF component
+means/variances from a module-global `stored_pdf_params` (derived_type_storage) rather than taking them as args — so
+the JAX's actual pdf_params can't be fed to it without a separate derived-type setter; and (b) like
+`f2py_precip_fraction`, it FPE-traps under this build's `-ffpe-trap`. This routine is therefore validated by the
+transcription here + the case-level KK rico oracle (test_kk_rico_oracle), not a direct f2py bit-shadow.
 """
 import os
 import sys
@@ -21,7 +28,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.update_xp2_mc import update_xp2_mc, _precip_frac_double_delta
+from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import update_xp2_mc
+from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_frac_double_delta_jax
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
 from clubb_jax.src.CLUBB_core.constants_clubb import cloud_frac_min, Cp, Lv
 from clubb_jax.src.derived_types.grid_class import setup_grid
@@ -90,7 +98,7 @@ def test_transcription_and_interp():
     rtp2_zt, thlp2_zt, wprtp_zt, wpthlp_zt, rtpthlp_zt, pf = _ref_zt(
         dt, cloud_frac, rcm, rvm, thlm, wm, exner, rrm_evap, p)
     # precip-frac fill matches.
-    assert np.max(np.abs(np.asarray(_precip_frac_double_delta(cloud_frac)) - pf)) < 1e-14, "precip_frac fill"
+    assert np.max(np.abs(np.asarray(precip_frac_double_delta_jax(cloud_frac)) - pf)) < 1e-14, "precip_frac fill"
     # The full outputs equal zt2zm of the literal zt tendencies.
     worst = 0.0
     for g, ref_zt in zip(got, (rtp2_zt, thlp2_zt, wprtp_zt, wpthlp_zt, rtpthlp_zt)):

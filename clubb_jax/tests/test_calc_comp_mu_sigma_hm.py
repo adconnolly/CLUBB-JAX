@@ -18,6 +18,15 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.CLUBB_core.setup_clubb_pdf_params import (
     calc_comp_mu_sigma_hm, compute_mean_stdev, norm_transform_mean_stdev,
     IIPDF_CHI, IIPDF_ETA, IIPDF_W, IIPDF_NCN)

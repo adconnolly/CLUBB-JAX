@@ -38,7 +38,7 @@ except ImportError:
 
 from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zt2zm_jax
 from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs_jax, diffusion_zm_lhs_jax
-from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import tridiag_lu_solve_jax
+from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve_jax
 
 ORACLE_EXE = os.path.join(
     os.path.dirname(__file__), '..', 'fortran_oracle', 'build_exe', 'oracle_driver.exe'

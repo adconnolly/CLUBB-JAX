@@ -28,6 +28,15 @@ jax.config.update("jax_enable_x64", True)
 
 from scipy.special import pbdv  # independent special-function oracle
 
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.Microphys.KK_microphys.parabolic_cylinder import (
     dv_parabolic_cylinder,
 )
@@ -44,7 +53,6 @@ from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_means import (
     KK_accr_upscaled_mean,
     KK_evap_upscaled_mean,
     KK_mvr_upscaled_mean,
-    kk_auto_coef,
     KK_AUTO_RC_EXP,
     KK_AUTO_NC_EXP,
     KK_ACCR_RC_EXP,
@@ -55,6 +63,7 @@ from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_means import (
     KK_MVR_RR_EXP,
     KK_MVR_NR_EXP,
 )
+from clubb_jax.src.Microphys.KK_microphys_module import kk_auto_coef
 
 ALPHA = KK_AUTO_RC_EXP    # 2.47
 BETA = KK_AUTO_NC_EXP     # -1.79

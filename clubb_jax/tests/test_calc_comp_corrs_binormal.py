@@ -97,6 +97,27 @@ def test_bound():
     print(f"  smooth_corr_quotient bound: |corr| <= 0.99 for a huge covariance ({q:.4f})  PASS")
 
 
+def test_smooth_corr_quotient_f2py():
+    """smooth_corr_quotient (pdf_utilities — the smoothly |corr|<=max_mag clamped numerator/denominator) was only
+    checked by the bound property above; validate it directly against the f2py oracle on general num/denom. SKIPs
+    if clubb_f2py is unbuilt. (iter 420)"""
+    try:
+        import clubb_f2py
+    except Exception as e:
+        print(f"  f2py smooth_corr_quotient oracle: SKIP ({type(e).__name__})")
+        return
+    rng = np.random.default_rng(4)
+    worst = 0.0
+    for _ in range(40):
+        ng, nz = 2, 8
+        num = rng.uniform(-1e3, 1e3, (ng, nz)); den = rng.uniform(1e-4, 1e2, (ng, nz)); thr = 1e-10
+        j = np.asarray(smooth_corr_quotient(jnp.asarray(num), jnp.asarray(den), thr))
+        f = np.asarray(clubb_f2py.f2py_smooth_corr_quotient(num, den, thr))
+        worst = max(worst, float(np.max(np.abs(j - f))))
+    assert worst < 1e-12, f"smooth_corr_quotient f2py mismatch {worst:.2e}"
+    print(f"  f2py smooth_corr_quotient (40 cases, incl. clamped): bit-match, worst {worst:.2e}  PASS")
+
+
 def test_differentiable():
     f = _fields(7)
     def loss(xpyp):
@@ -111,7 +132,7 @@ def test_differentiable():
 
 def main():
     print("test_calc_comp_corrs_binormal:")
-    for t in (test_f2py_oracle, test_round_trip, test_bound, test_differentiable):
+    for t in (test_f2py_oracle, test_round_trip, test_bound, test_smooth_corr_quotient_f2py, test_differentiable):
         t()
     print("All calc_comp_corrs_binormal checks PASSED")
 

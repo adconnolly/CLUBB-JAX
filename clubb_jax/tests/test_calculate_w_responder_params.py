@@ -22,7 +22,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.new_pdf import calculate_w_params, calculate_responder_params
+from clubb_jax.src.CLUBB_core.new_hybrid_pdf import calculate_w_params, calculate_responder_params
 
 NG, NZ = 2, 8
 

@@ -23,7 +23,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.new_tsdadg_pdf import (
-    calc_L_x_Skx_fnc, calc_setter_parameters, calc_responder_parameters, tsdadg_pdf_driver)
+    calc_L_x_Skx_fnc, calc_setter_parameters, calc_respnder_parameters, tsdadg_pdf_driver)
 
 NG, NZ = 2, 6
 
@@ -130,7 +130,7 @@ def test_responder():
         xm = rng.uniform(-2, 2); xp2 = rng.uniform(0.1, 2.0); Skx = rng.uniform(-2, 2)
         sgn = float(np.sign(rng.uniform(-1, 1)) or 1.0); mf = rng.uniform(0.3, 0.7); L1 = rng.uniform(0.1, 0.5)
         mu1, mu2, s1, s2, c1, c2 = (float(np.asarray(x)) for x in
-                                    calc_responder_parameters(xm, xp2, Skx, sgn, mf, L1))
+                                    calc_respnder_parameters(xm, xp2, Skx, sgn, mf, L1))
         worst_mean = max(worst_mean, abs(mf * mu1 + (1 - mf) * mu2 - xm))
         # Reproduce coef1 with the literal formula using the same mu1n/mu2n (independent transcription).
         t = Skx * sgn / np.sqrt(4 + Skx ** 2)
@@ -143,7 +143,7 @@ def test_responder():
     assert worst_mean < 1e-9, f"mean reconstruction {worst_mean:.2e}"
     assert worst_coef < 1e-12, f"coef transcription {worst_coef:.2e}"
     def loss(s):
-        outs = calc_responder_parameters(0.5, 1.0, s, 1.0, 0.4, 0.3)
+        outs = calc_respnder_parameters(0.5, 1.0, s, 1.0, 0.4, 0.3)
         return sum(jnp.sum(jnp.asarray(o) ** 2) for o in outs)
     g = float(jax.grad(loss)(1.2))
     assert np.isfinite(g), "non-finite grad"

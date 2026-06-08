@@ -9,8 +9,17 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)  # CLUBB-JAX runs in float64
 import jax.numpy as jnp
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import (
-    polysvp_jax, derf1_jax, gamma_jax)
+    polysvp, derf1, gamma)
 
 try:
     from scipy.special import erf as _scipy_erf, gamma as _scipy_gamma
@@ -39,8 +48,8 @@ def _goff_gratch_ice(T):
 
 def test_polysvp_triple_point():
     """At T=273.16 (dt=0) POLYSVP returns exactly a0·100 — the Flatau intercept."""
-    assert abs(float(polysvp_jax(jnp.array(273.16), 0)) - 611.239921) < 1e-4, "liquid intercept"
-    assert abs(float(polysvp_jax(jnp.array(273.16), 1)) - 611.147274) < 1e-4, "ice intercept"
+    assert abs(float(polysvp(jnp.array(273.16), 0)) - 611.239921) < 1e-4, "liquid intercept"
+    assert abs(float(polysvp(jnp.array(273.16), 1)) - 611.147274) < 1e-4, "ice intercept"
     print("  POLYSVP triple-point intercepts: liquid 611.24 / ice 611.15 Pa  PASS")
 
 
@@ -64,7 +73,7 @@ def test_polysvp_transcription_exact():
     worst = 0.0
     for itype in (0, 1):
         for T in np.linspace(180.0, 320.0, 80):
-            j = float(polysvp_jax(jnp.array(T), itype))
+            j = float(polysvp(jnp.array(T), itype))
             f = _polysvp_fortran_replica(float(T), itype)
             worst = max(worst, abs(j - f) / (abs(f) + 1e-30))
     assert worst < 1e-13, f"POLYSVP transcription rel {worst:.2e}"
@@ -75,11 +84,11 @@ def test_polysvp_physical_plausibility():
     """POLYSVP (Flatau) tracks the Goff-Gratch reference within the formulas' mutual agreement
     (~1% at the cold extremes, <0.3% near 0 C) — a gross coefficient error would show as ≫1%."""
     Tl = np.linspace(248.16, 313.16, 40)  # -25 to +40 C: Flatau & GG agree tightly
-    rel = np.abs(np.array([float(polysvp_jax(jnp.array(t), 0)) for t in Tl])
+    rel = np.abs(np.array([float(polysvp(jnp.array(t), 0)) for t in Tl])
                  - _goff_gratch_liquid(Tl)) / _goff_gratch_liquid(Tl)
     assert rel.max() < 4e-3, f"liquid plausibility rel {rel.max():.2e}"
     Ti = np.linspace(243.16, 273.16, 30)  # -30 to 0 C
-    reli = np.abs(np.array([float(polysvp_jax(jnp.array(t), 1)) for t in Ti])
+    reli = np.abs(np.array([float(polysvp(jnp.array(t), 1)) for t in Ti])
                   - _goff_gratch_ice(Ti)) / _goff_gratch_ice(Ti)
     assert reli.max() < 5e-3, f"ice plausibility rel {reli.max():.2e}"
     print(f"  POLYSVP physical plausibility vs Goff-Gratch: liquid<{rel.max():.1e} ice<{reli.max():.1e}  PASS")
@@ -88,12 +97,12 @@ def test_polysvp_physical_plausibility():
 def test_polysvp_floor_and_monotonic():
     """The dt=max(-80,...) floor caps T below 193.16 K; SVP is monotonic increasing in T."""
     # Floor: T=150 and T=193.16 (both dt clipped to -80) give the same value
-    v_cold = float(polysvp_jax(jnp.array(150.0), 0))
-    v_floor = float(polysvp_jax(jnp.array(193.16), 0))
+    v_cold = float(polysvp(jnp.array(150.0), 0))
+    v_floor = float(polysvp(jnp.array(193.16), 0))
     assert abs(v_cold - v_floor) < 1e-10, "dt floor not applied at extreme cold"
     # Monotonic over the valid range
     T = np.linspace(193.16, 313.16, 60)
-    es = np.array([float(polysvp_jax(jnp.array(t), 0)) for t in T])
+    es = np.array([float(polysvp(jnp.array(t), 0)) for t in T])
     assert np.all(np.diff(es) > 0), "POLYSVP not monotonic increasing"
     print("  POLYSVP dt-floor + monotonicity  PASS")
 
@@ -107,7 +116,7 @@ def test_derf1_vs_scipy():
         print("  DERF1 vs scipy: SKIPPED (no scipy)"); return
     x = np.concatenate([np.linspace(-7.0, 7.0, 600),
                         np.array([0.0, 2.2, 2.2 - 1e-9, 6.9, 6.9 - 1e-9, -2.2, -6.9, 1.0, -1.0])])
-    j = np.array(derf1_jax(jnp.asarray(x)))
+    j = np.array(derf1(jnp.asarray(x)))
     s = _scipy_erf(x)
     err = np.abs(j - s)
     assert err.max() < 1e-12, f"DERF1 vs scipy max abs err {err.max():.2e}"
@@ -116,13 +125,13 @@ def test_derf1_vs_scipy():
 
 def test_derf1_identities():
     """erf(0)=0, erf is odd, erf(±large)=±1, monotonic increasing."""
-    assert abs(float(derf1_jax(jnp.array(0.0)))) < 1e-15, "erf(0)≠0"
+    assert abs(float(derf1(jnp.array(0.0)))) < 1e-15, "erf(0)≠0"
     xs = jnp.array([0.3, 1.7, 3.5, 5.0])
-    odd = np.abs(np.array(derf1_jax(xs)) + np.array(derf1_jax(-xs)))
+    odd = np.abs(np.array(derf1(xs)) + np.array(derf1(-xs)))
     assert odd.max() < 1e-14, "erf not odd"
-    assert abs(float(derf1_jax(jnp.array(8.0))) - 1.0) < 1e-15, "erf(8)≠1"
-    assert abs(float(derf1_jax(jnp.array(-8.0))) + 1.0) < 1e-15, "erf(-8)≠-1"
-    g = np.array(derf1_jax(jnp.linspace(-6.0, 6.0, 200)))
+    assert abs(float(derf1(jnp.array(8.0))) - 1.0) < 1e-15, "erf(8)≠1"
+    assert abs(float(derf1(jnp.array(-8.0))) + 1.0) < 1e-15, "erf(-8)≠-1"
+    g = np.array(derf1(jnp.linspace(-6.0, 6.0, 200)))
     assert np.all(np.diff(g) >= -1e-15), "erf not monotonic"
     print("  DERF1 identities (zero/odd/saturation/monotonic)  PASS")
 
@@ -135,7 +144,7 @@ def test_gamma_vs_scipy_positive():
         print("  GAMMA vs scipy: SKIPPED (no scipy)"); return
     x = np.concatenate([np.linspace(0.05, 15.0, 500),
                         np.array([1.0, 2.0, 11.999, 12.0, 12.001, 0.999, 1.001])])
-    j = np.array(gamma_jax(jnp.asarray(x)))
+    j = np.array(gamma(jnp.asarray(x)))
     s = _scipy_gamma(x)
     rel = np.abs(j - s) / np.abs(s)
     assert rel.max() < 1e-12, f"GAMMA vs scipy max rel {rel.max():.2e}"
@@ -145,13 +154,13 @@ def test_gamma_vs_scipy_positive():
 def test_gamma_known_and_reflection():
     """Exact known values + the negative-argument reflection branch (−π/sin(πr))."""
     sqrtpi = np.sqrt(np.pi)
-    assert abs(float(gamma_jax(jnp.array(1.0))) - 1.0) < 1e-14, "Γ(1)=1"
-    assert abs(float(gamma_jax(jnp.array(5.0))) - 24.0) < 1e-12, "Γ(5)=24"
-    assert abs(float(gamma_jax(jnp.array(0.5))) - sqrtpi) < 1e-13, "Γ(0.5)=√π"
+    assert abs(float(gamma(jnp.array(1.0))) - 1.0) < 1e-14, "Γ(1)=1"
+    assert abs(float(gamma(jnp.array(5.0))) - 24.0) < 1e-12, "Γ(5)=24"
+    assert abs(float(gamma(jnp.array(0.5))) - sqrtpi) < 1e-13, "Γ(0.5)=√π"
     # Reflection: Γ(-0.5) = -2√π, Γ(-1.5) = 4√π/3
     if _HAVE_SCIPY:
         for v in (-0.5, -1.5, -2.5, -0.3, -3.7):
-            assert abs(float(gamma_jax(jnp.array(v))) - _scipy_gamma(v)) / abs(_scipy_gamma(v)) < 1e-11, \
+            assert abs(float(gamma(jnp.array(v))) - _scipy_gamma(v)) / abs(_scipy_gamma(v)) < 1e-11, \
                 f"reflection Γ({v})"
     print("  GAMMA known values + negative-arg reflection  PASS")
 
@@ -160,8 +169,8 @@ def test_gamma_poles_and_overflow():
     """Poles at non-positive integers and overflow beyond XBIG return XINF=3.4e38 (Fortran behavior)."""
     XINF = 3.4e38
     for v in (0.0, -1.0, -2.0, -5.0):
-        assert float(gamma_jax(jnp.array(v))) == XINF, f"pole Γ({v}) not XINF"
-    assert float(gamma_jax(jnp.array(40.0))) == XINF, "overflow not XINF (y>XBIG)"
+        assert float(gamma(jnp.array(v))) == XINF, f"pole Γ({v}) not XINF"
+    assert float(gamma(jnp.array(40.0))) == XINF, "overflow not XINF (y>XBIG)"
     print("  GAMMA poles + overflow → XINF  PASS")
 
 

@@ -10,7 +10,7 @@ It is NOT blocked: `clubb_f2py.f2py_advance_xm_wpxp.__doc__` gives the exact `.s
 signature, and the routine is callable DIRECTLY (after pushing the UDTs via the
 `set_fortran_*` converters). This test proves that, and is the template for the
 definitive rico stretched-grid **input-matched comparison**: capture rico's matched
-step-1 `advance_xm_wpxp_jax` inputs (eager) and feed them here, then diff the Fortran
+step-1 `advance_xm_wpxp` inputs (eager) and feed them here, then diff the Fortran
 vs JAX outputs to localise the grid_type=2 divergence (see DESIGN "rico diagnosis").
 
 Requires the clubb_python_api build on PYTHONPATH:

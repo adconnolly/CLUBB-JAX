@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_compute_sigma_sqd_w.py — validate the JAX compute_sigma_sqd_w_jax port (sigma_sqd_w_module.F90).
+"""test_compute_sigma_sqd_w.py — validate the JAX compute_sigma_sqd_w port (sigma_sqd_w_module.F90).
 
 sigma_sqd_w = gamma_Skw_fnc · (1 − min(max_x corr_wx², 1)), then smoothed zm→zt→zm. Ported and used per
 timestep in the gated driver but lacking a dedicated f2py test. Oracles:
@@ -24,7 +24,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.sigma_sqd_w_module import compute_sigma_sqd_w_jax
+from clubb_jax.src.CLUBB_core.sigma_sqd_w_module import compute_sigma_sqd_w
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
@@ -66,7 +66,7 @@ def test_f2py_oracle():
     for l_pred in (False, True):
         ref = np.asarray(clubb_f2py.f2py_compute_sigma_sqd_w(
             nzt, *[np.asfortranarray(f[k]) for k in order], l_pred))
-        got = np.asarray(compute_sigma_sqd_w_jax(*[f[k] for k in order], l_pred, jgr))
+        got = np.asarray(compute_sigma_sqd_w(*[f[k] for k in order], l_pred, jgr))
         worst = max(worst, np.max(np.abs(got - ref)))
     assert worst < 1e-11, f"compute_sigma_sqd_w f2py mismatch {worst:.2e}"
     print(f"  f2py compute_sigma_sqd_w: bit-match (l_predict on/off), worst {worst:.2e}  PASS")
@@ -77,7 +77,7 @@ def test_bounds():
     nzm = jgr.zm.shape[1]
     f = _fields(nzm, 7)
     order = ('gamma_Skw_fnc', 'wp2', 'thlp2', 'rtp2', 'up2', 'vp2', 'wpthlp', 'wprtp', 'upwp', 'vpwp')
-    s = np.asarray(compute_sigma_sqd_w_jax(*[f[k] for k in order], True, jgr))
+    s = np.asarray(compute_sigma_sqd_w(*[f[k] for k in order], True, jgr))
     # The factor (1 - min(max_corr,1)) is in [0,1]; gamma>0; smoothing has positive weights -> 0 <= s <= max(gamma).
     assert np.all(s >= -1e-12), "sigma_sqd_w must be >= 0"
     assert np.all(s <= np.max(f['gamma_Skw_fnc']) + 1e-9), "sigma_sqd_w must be <= gamma"
@@ -94,12 +94,12 @@ def test_differentiable():
         order = ('gamma_Skw_fnc', 'wp2', 'thlp2', 'rtp2', 'up2', 'vp2', 'wpthlp', 'wprtp', 'upwp', 'vpwp')
         def loss(wpthlp):
             ff = dict(f); ff['wpthlp'] = wpthlp
-            return jnp.sum(compute_sigma_sqd_w_jax(*[ff[k] for k in order], True, jgr) ** 2)
+            return jnp.sum(compute_sigma_sqd_w(*[ff[k] for k in order], True, jgr) ** 2)
         g = np.asarray(jax.grad(loss)(jnp.asarray(f['wpthlp'])))
-        assert np.isfinite(g).all(), "non-finite grad through compute_sigma_sqd_w_jax"
+        assert np.isfinite(g).all(), "non-finite grad through compute_sigma_sqd_w"
     finally:
         _NG = saved
-    print(f"  jax.grad through compute_sigma_sqd_w_jax: finite ({g.size} entries)  PASS")
+    print(f"  jax.grad through compute_sigma_sqd_w: finite ({g.size} entries)  PASS")
 
 
 def main():

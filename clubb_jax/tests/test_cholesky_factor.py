@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_cholesky_factor.py — validate the JAX matrix_operations.cholesky_factor port.
+"""test_cholesky_factor.py — validate the JAX matrix_operations.Cholesky_factor port.
 
 Oracles:
   1. f2py bit-shadow: clubb_f2py.f2py_cholesky_factor on the same matrices — a_scaling, a_cholesky (lower
@@ -26,7 +26,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.matrix_operations import cholesky_factor
+from clubb_jax.src.CLUBB_core.matrix_operations import Cholesky_factor
 
 
 def _corr_matrix(n, seed):
@@ -42,7 +42,7 @@ def _corr_matrix(n, seed):
 def test_reconstruction():
     for n, seed in ((4, 1), (6, 2), (5, 3)):
         a = _corr_matrix(n, seed)
-        a_scaling, L, l_scaled = cholesky_factor(a)
+        a_scaling, L, l_scaled = Cholesky_factor(a)
         L = np.asarray(L)
         # Unit-diagonal correlation matrix -> no equilibration.
         assert not bool(l_scaled), "correlation matrix should not be scaled"
@@ -59,13 +59,13 @@ def test_f2py_oracle():
     try:
         import clubb_f2py
     except Exception as e:
-        print(f"  f2py cholesky_factor oracle: SKIP ({type(e).__name__})")
+        print(f"  f2py Cholesky_factor oracle: SKIP ({type(e).__name__})")
         return
     worst = 0.0
     for n, seed in ((4, 11), (6, 22), (5, 33), (7, 44)):
         a = _corr_matrix(n, seed)
         f_scaling, f_chol, f_lscaled = clubb_f2py.f2py_cholesky_factor(a.copy())
-        j_scaling, j_chol, j_lscaled = cholesky_factor(a)
+        j_scaling, j_chol, j_lscaled = Cholesky_factor(a)
         j_chol = np.asarray(j_chol); j_scaling = np.asarray(j_scaling)
         # Compare the lower triangle (incl. diagonal) + scaling + l_scaled.
         il = np.tril_indices(n)
@@ -75,7 +75,7 @@ def test_f2py_oracle():
         assert rel < 1e-11, f"cholesky lower mismatch n={n}: {rel:.2e}"
         assert rel_s < 1e-12, f"scaling mismatch n={n}: {rel_s:.2e}"
         assert bool(j_lscaled) == bool(f_lscaled), f"l_scaled mismatch n={n}"
-    print(f"  f2py cholesky_factor: bit-match (lower+scaling+l_scaled) over 4 sizes, worst {worst:.2e}  PASS")
+    print(f"  f2py Cholesky_factor: bit-match (lower+scaling+l_scaled) over 4 sizes, worst {worst:.2e}  PASS")
 
 
 def test_non_pd_fallback():
@@ -86,7 +86,7 @@ def test_non_pd_fallback():
                   [0.99, 0.99, 1.0]])
     # Make it indefinite.
     a[0, 2] = a[2, 0] = -0.99
-    _, L, _ = cholesky_factor(a)
+    _, L, _ = Cholesky_factor(a)
     L = np.asarray(L)
     assert np.isfinite(L).all(), "tau fallback did not produce a finite factor"
     print("  tau-on-diagonal fallback: finite factor for a non-PD input  PASS")
@@ -95,18 +95,18 @@ def test_non_pd_fallback():
 def test_differentiable():
     a = jnp.asarray(_corr_matrix(5, 7))
     def loss(x):
-        _, L, _ = cholesky_factor(x)
+        _, L, _ = Cholesky_factor(x)
         return jnp.sum(jnp.tril(L) ** 2)
     g = np.asarray(jax.grad(loss)(a))
-    assert np.isfinite(g).all(), "non-finite grad through cholesky_factor"
-    print(f"  jax.grad through cholesky_factor: finite ({g.size} entries)  PASS")
+    assert np.isfinite(g).all(), "non-finite grad through Cholesky_factor"
+    print(f"  jax.grad through Cholesky_factor: finite ({g.size} entries)  PASS")
 
 
 def main():
     print("test_cholesky_factor:")
     for t in (test_reconstruction, test_f2py_oracle, test_non_pd_fallback, test_differentiable):
         t()
-    print("All cholesky_factor checks PASSED")
+    print("All Cholesky_factor checks PASSED")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, "../.."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 import numpy as np
 import jax
@@ -126,9 +129,29 @@ def test_differentiable():
     print(f"  jax.grad(hydrometeor_mixed_moments) wrt sigma_w_1: finite (||g||={float(jnp.linalg.norm(g)):.3e})  PASS")
 
 
+def test_compute_mean_binormal_f2py():
+    """The literal-loop oracle above CALLS compute_mean_binormal (pdf_utilities.F90) for rtm/thlm/wm, so a bug in
+    it would cancel between driver and oracle. Validate it independently against the f2py Fortran oracle to break
+    that circularity. SKIPs if clubb_f2py is unbuilt. (iter 411)"""
+    try:
+        import clubb_f2py
+    except Exception as e:
+        print(f"  f2py compute_mean_binormal oracle: SKIP ({type(e).__name__})")
+        return
+    rng = np.random.default_rng(2)
+    worst = 0.0
+    for _ in range(200):
+        mu1, mu2, mf = float(rng.uniform(-10, 10)), float(rng.uniform(-10, 10)), float(rng.uniform(0, 1))
+        j = float(compute_mean_binormal(mu1, mu2, mf))
+        f = float(clubb_f2py.f2py_compute_mean_binormal(mu1, mu2, mf))
+        worst = max(worst, abs(j - f))
+    assert worst < 1e-13, f"compute_mean_binormal f2py mismatch {worst:.2e}"
+    print(f"  compute_mean_binormal vs f2py oracle (200 cases): bit-match, worst {worst:.2e}  PASS")
+
+
 def main():
     print("test_hydrometeor_mixed_moments:")
-    for t in (test_driver_vs_literal_loop, test_differentiable):
+    for t in (test_driver_vs_literal_loop, test_differentiable, test_compute_mean_binormal_f2py):
         t()
     print("All hydrometeor_mixed_moments checks PASSED")
 

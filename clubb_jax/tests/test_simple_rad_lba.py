@@ -13,9 +13,9 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.Radiation.simple_rad_lba import (
-    load_lba_rad_table, lba_radhtz, simple_rad_lba, _LBA_DT, _LBA_NTIMES, _LBA_NZRAD)
-from clubb_jax.src.Benchmark_cases.generic_forcings import _zlinterp
+from clubb_jax.src.Radiation.simple_rad_module import (
+    simple_rad_lba_init, lba_radhtz, simple_rad_lba, _LBA_DT, _LBA_NTIMES, _LBA_NZRAD)
+from clubb_jax.src.CLUBB_core.interpolation import zlinterp_fnc
 
 _FORCINGS = os.path.join(_ROOT, "clubb_release", "input", "case_setups", "lba_forcings")
 
@@ -37,17 +37,17 @@ def _ref_radhtz(time, krad):
 
 
 def test_table_load():
-    zrad, krad = load_lba_rad_table(_FORCINGS)
+    zrad, krad = simple_rad_lba_init(_FORCINGS)
     assert zrad.shape == (_LBA_NZRAD,) and krad.shape == (_LBA_NZRAD, _LBA_NTIMES)
     assert zrad[0] == 42.5 and abs(krad[0, 0] - (-0.000016042)) < 1e-15, "first values mismatch"
     assert np.all(np.diff(zrad) > 0), "heights not ascending"
     # Physically reasonable radiative tendencies (mostly cooling, |rate| < ~4 K/day).
     assert np.all(np.abs(krad) < 5e-5) and (krad <= 0).mean() > 0.5, "heating rates out of physical range"
-    print(f"  load_lba_rad_table: zrad{zrad.shape} krad{krad.shape}, zrad[0]={zrad[0]}, krad[0,0]={krad[0,0]:.3e}  PASS")
+    print(f"  simple_rad_lba_init: zrad{zrad.shape} krad{krad.shape}, zrad[0]={zrad[0]}, krad[0,0]={krad[0,0]:.3e}  PASS")
 
 
 def test_time_interp_vs_literal():
-    _, krad = load_lba_rad_table(_FORCINGS)
+    _, krad = simple_rad_lba_init(_FORCINGS)
     worst = 0.0
     for time in (0.0, 300.0, 600.0, 601.0, 900.0, 1500.0, 12345.0, 21000.0, 21600.0, 30000.0):
         got = np.asarray(lba_radhtz(time, krad))
@@ -58,13 +58,13 @@ def test_time_interp_vs_literal():
 
 
 def test_full_radht_vs_literal():
-    zrad, krad = load_lba_rad_table(_FORCINGS)
+    zrad, krad = simple_rad_lba_init(_FORCINGS)
     rng = np.random.default_rng(1)
     zt = np.sort(rng.uniform(0.0, 18000.0, 60))   # thermodynamic grid spanning + beyond the rad table
     worst = 0.0
     for time in (300.0, 1500.0, 12345.0, 25000.0):
         got = simple_rad_lba(time, zrad, krad, zt)
-        ref = _zlinterp(zt, zrad, _ref_radhtz(time, krad))
+        ref = np.asarray(zlinterp_fnc(zt, zrad, _ref_radhtz(time, krad)))
         worst = max(worst, np.max(np.abs(got - ref)))
     # zero-extrapolation above the table top
     rad = simple_rad_lba(1500.0, zrad, krad, zt)
@@ -74,7 +74,7 @@ def test_full_radht_vs_literal():
 
 
 def test_differentiable():
-    _, krad = load_lba_rad_table(_FORCINGS)
+    _, krad = simple_rad_lba_init(_FORCINGS)
     # differentiable w.r.t. the table values (linear interpolation)
     g = jax.grad(lambda k: jnp.sum(lba_radhtz(1500.0, k) ** 2))(jnp.asarray(krad))
     assert np.isfinite(np.asarray(g)).all() and np.any(np.asarray(g) != 0.0), "grad bad"

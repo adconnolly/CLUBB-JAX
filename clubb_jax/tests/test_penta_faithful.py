@@ -23,7 +23,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import penta_lu_solve_jax
+from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve_jax
 
 
 def _fortran_penta_replica(lhs, rhs):

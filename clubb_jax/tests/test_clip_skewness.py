@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_clip_skewness.py — validate the JAX clip_skewness_jax port (clip_explicit.F90:clip_skewness_core).
+"""test_clip_skewness.py — validate the JAX clip_skewness_core port (clip_explicit.F90:clip_skewness_core).
 
 Limits |Skw| = |wp3|/wp2_zt^(3/2) to Skw_max_mag (reduced near the surface), with an absolute |wp3| <= 100 cap.
 Two near-surface treatments: a Peskin smooth-Heaviside ramp (ARM default) and a sharp 100 m AGL threshold.
@@ -25,7 +25,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.clip_explicit import clip_skewness_jax
+from clubb_jax.src.CLUBB_core.clip_explicit import clip_skewness_core
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1500.0
@@ -62,7 +62,7 @@ def test_f2py_oracle():
     for l_smth in (True, False):
         ref = np.asarray(clubb_f2py.f2py_clip_skewness(
             60.0, sfc_elevation, skw_max, np.asfortranarray(wp2_zt), l_smth, np.asfortranarray(wp3.copy())))
-        got = np.asarray(clip_skewness_jax(wp3, wp2_zt, zt, sfc_elevation, skw_max, l_smth))
+        got = np.asarray(clip_skewness_core(wp3, wp2_zt, zt, sfc_elevation, skw_max, l_smth))
         worst = max(worst, np.max(np.abs(got - ref)))
     # The sharp-threshold branch is bit-exact; the ~1e-10 residual is the smooth-Heaviside (Peskin) transition-
     # zone FP-order difference propagated through the wp3 limit, not a transcription error (closed-form faithful).
@@ -77,7 +77,7 @@ def test_skewness_limit():
     rng = np.random.default_rng(6)
     wp2_zt = rng.uniform(0.1, 2.0, (_NG, nzt))
     wp3 = rng.uniform(-8.0, 8.0, (_NG, nzt)) * wp2_zt ** 1.5
-    got = np.asarray(clip_skewness_jax(wp3, wp2_zt, zt, np.zeros(_NG), np.full(_NG, _SKW_MAX), True))
+    got = np.asarray(clip_skewness_core(wp3, wp2_zt, zt, np.zeros(_NG), np.full(_NG, _SKW_MAX), True))
     skw = got / wp2_zt ** 1.5
     # Above the near-surface reduction zone (>200 m AGL) |Skw| must not exceed Skw_max_mag.
     high = zt > 200.0
@@ -91,10 +91,10 @@ def test_differentiable():
     zt = np.asarray(jgr.zt)[:1]
     wp2_zt = np.random.default_rng(1).uniform(0.1, 2.0, (1, nzt))
     def loss(wp3):
-        return jnp.sum(clip_skewness_jax(wp3, wp2_zt, zt, np.zeros(1), np.full(1, _SKW_MAX), True) ** 2)
+        return jnp.sum(clip_skewness_core(wp3, wp2_zt, zt, np.zeros(1), np.full(1, _SKW_MAX), True) ** 2)
     g = np.asarray(jax.grad(loss)(jnp.asarray(np.random.default_rng(2).uniform(-5, 5, (1, nzt)))))
-    assert np.isfinite(g).all(), "non-finite grad through clip_skewness_jax"
-    print(f"  jax.grad through clip_skewness_jax: finite ({g.size} entries)  PASS")
+    assert np.isfinite(g).all(), "non-finite grad through clip_skewness_core"
+    print(f"  jax.grad through clip_skewness_core: finite ({g.size} entries)  PASS")
 
 
 def main():

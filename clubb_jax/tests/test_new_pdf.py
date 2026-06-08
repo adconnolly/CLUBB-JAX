@@ -24,8 +24,10 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.new_pdf import (
-    calc_coef_wp4_implicit, calc_mixture_fraction, calc_coef_wpxp2_implicit, calc_coef_wp2xp_implicit,
-    calculate_coef_wp4_implicit, calculate_mixture_fraction)
+    calc_coef_wp4_implicit, calc_mixture_fraction, calc_coef_wpxp2_implicit)
+# calc_coef_wp2xp_implicit + the calculate_* aliases moved to new_hybrid_pdf.py (mirror-refactor iter 18)
+from clubb_jax.src.CLUBB_core.new_hybrid_pdf import (
+    calc_coef_wp2xp_implicit, calculate_coef_wp4_implicit, calculate_mixture_fraction)
 
 NG, NZ = 2, 6
 

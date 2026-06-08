@@ -34,7 +34,7 @@ try:
 except Exception:
     HAS_FORTRAN = False
 
-from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import penta_lu_solve_jax
+from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve_jax
 
 
 def _dense_penta(s2, s1, d, sb1, sb2):

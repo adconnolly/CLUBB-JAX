@@ -6,6 +6,15 @@ check (the surface/soil temperatures stay finite and relax toward a radiative-tu
 import math
 import numpy as np
 
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.Radiation.soil_vegetation import advance_soil_veg, initialize_soil_veg
 
 _CP, _LV, _RD = 1004.67, 2.5e6, 287.04

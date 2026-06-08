@@ -20,7 +20,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.Benchmark_cases.lba import lba_sfclyr, lba_diurnal_factor, _Z0
-from clubb_jax.src.Benchmark_cases.arm import _diag_ustar
+from clubb_jax.src.Benchmark_cases.diag_ustar_module import _diag_ustar
 from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, grav, sec_per_hr
 
 

@@ -23,7 +23,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.adg1_adg2_3d_luhar_pdf import (
+from clubb_jax.src.CLUBB_core.pdf_closure_module import (
     calc_wp4_pdf, calc_wp2xp_pdf, calc_wpxp2_pdf, calc_wpxpyp_pdf)
 
 NG, NZ = 2, 5

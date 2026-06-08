@@ -22,7 +22,8 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.new_pdf import (
-    calc_coefs_wp2xp_semiimpl, calc_coefs_wpxp2_semiimpl, calc_coefs_wpxpyp_semiimpl)
+    calc_coefs_wp2xp_semiimpl, calc_coefs_wpxpyp_semiimpl)
+from clubb_jax.src.CLUBB_core.new_hybrid_pdf import calc_coefs_wpxp2_semiimpl
 
 NG, NZ = 2, 6
 

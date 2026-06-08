@@ -24,7 +24,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.Input_fields.sounding import read_sounding, convert_pressure_sounding_to_z
-from clubb_jax.src.CLUBB_core.calc_pressure import inverse_hydrostatic, calc_ref_z_linear_thvm
+from clubb_jax.src.Input_fields.hydrostatic_module import inverse_hydrostatic, calc_ref_z_linear_thvm
 from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, p0, kappa, ep2
 
 _CGILS = _ROOT + "/clubb_release/input/case_setups/cgils_s11_sounding.in"

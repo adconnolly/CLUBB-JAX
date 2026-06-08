@@ -21,7 +21,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.Radiation.BUGSrad.cloud_correlate import (
-    bugs_ctot_column, ctot_from_cloudy_layers, bugs_cloudfit_column, _midlayer_heights, MIN_CF, MIN_LC)
+    bugs_ctot, ctot_from_cloudy_layers, bugs_cloudfit, _midlayer_heights, MIN_CF, MIN_LC)
 
 _R_DZ = 29.286
 
@@ -81,7 +81,7 @@ def test_vs_literal_loop():
     for seed in range(40):
         pl2, tl, acld = _profile(seed)
         for l_c in (0.5, 500.0, 5000.0):
-            got = float(bugs_ctot_column(pl2, tl, acld, l_c))
+            got = float(bugs_ctot(pl2, tl, acld, l_c))
             ref = _ref_ctot(pl2, tl, acld, l_c)
             worst = max(worst, abs(got - ref) / (abs(ref) + 1e-30))
     assert worst < 1e-12, f"bugs_ctot vs literal loop rel {worst:.2e}"
@@ -92,10 +92,10 @@ def test_random_limit_bounds_monotonic():
     pl2, tl, acld = _profile(7)
     cl = acld[acld > MIN_CF]
     # Random overlap (l_c < MIN_LC) is the MAXIMUM possible c_tot = 1 - prod(1-cloud) (Fortran's own comment).
-    rnd = float(bugs_ctot_column(pl2, tl, acld, 0.5))
+    rnd = float(bugs_ctot(pl2, tl, acld, 0.5))
     assert abs(rnd - (1.0 - np.prod(1.0 - cl))) < 1e-12, "random-overlap limit"
     # For any l_c, max(cloud) <= c_tot <= random, and c_tot decreases monotonically as l_c grows (more overlap).
-    vals = [float(bugs_ctot_column(pl2, tl, acld, l)) for l in (0.5, 500.0, 2000.0, 5000.0, 1e9)]
+    vals = [float(bugs_ctot(pl2, tl, acld, l)) for l in (0.5, 500.0, 2000.0, 5000.0, 1e9)]
     for v in vals:
         assert cl.max() - 1e-9 <= v <= rnd + 1e-9, f"c_tot {v} out of [max(cloud), random]"
     assert all(vals[i] >= vals[i + 1] - 1e-12 for i in range(len(vals) - 1)), f"not monotone in l_c: {vals}"
@@ -105,11 +105,11 @@ def test_random_limit_bounds_monotonic():
 def test_edge_branches():
     pl2, tl, _ = _profile(3)
     nlm = tl.shape[0]
-    assert float(bugs_ctot_column(pl2, tl, np.zeros(nlm), 1000.0)) == 0.0, "no cloud -> 0"
+    assert float(bugs_ctot(pl2, tl, np.zeros(nlm), 1000.0)) == 0.0, "no cloud -> 0"
     one = np.zeros(nlm); one[5] = 0.6
-    assert abs(float(bugs_ctot_column(pl2, tl, one, 1000.0)) - 0.6) < 1e-12, "one cloud -> its frac"
+    assert abs(float(bugs_ctot(pl2, tl, one, 1000.0)) - 0.6) < 1e-12, "one cloud -> its frac"
     full = np.zeros(nlm); full[3] = 1.0; full[8] = 0.5
-    assert float(bugs_ctot_column(pl2, tl, full, 1000.0)) == 1.0, "max>=1 -> 1"
+    assert float(bugs_ctot(pl2, tl, full, 1000.0)) == 1.0, "max>=1 -> 1"
     print("  bugs_ctot edge branches (Ncloud=0/1, max>=1)  PASS")
 
 
@@ -159,8 +159,8 @@ def test_cloudfit_vs_literal_loop():
     worst = 0.0
     for seed in range(40):
         pl2, tl, acld = _profile(seed)
-        c_tot = float(bugs_ctot_column(pl2, tl, acld, 2000.0))
-        cm, cfx, cfr = bugs_cloudfit_column(acld, c_tot)
+        c_tot = float(bugs_ctot(pl2, tl, acld, 2000.0))
+        cm, cfx, cfr = bugs_cloudfit(acld, c_tot)
         rcm, rcfx, rcfr = _ref_cloudfit(acld, c_tot)
         worst = max(worst, abs(cm - rcm), np.max(np.abs(cfx - rcfx)), np.max(np.abs(cfr - rcfr)))
     assert worst < 1e-12, f"bugs_cloudfit vs literal loop {worst:.2e}"
@@ -170,13 +170,13 @@ def test_cloudfit_vs_literal_loop():
 def test_cloudfit_reconstruction_invariant():
     for seed in range(40):
         pl2, tl, acld = _profile(seed + 100)
-        c_tot = float(bugs_ctot_column(pl2, tl, acld, 2000.0))
-        cm, cfx, cfr = bugs_cloudfit_column(acld, c_tot)
+        c_tot = float(bugs_ctot(pl2, tl, acld, 2000.0))
+        cm, cfx, cfr = bugs_cloudfit(acld, c_tot)
         recon = cm * cfx + (1.0 - cm) * cfr
         assert np.max(np.abs(recon - acld)) < 1e-12, f"reconstruction seed={seed}"
         assert 0.0 <= cm <= acld[acld > MIN_CF].max() + 1e-12, "c_maximal out of [0, max_frac]"
     # clear column -> zeros
-    cm, cfx, cfr = bugs_cloudfit_column(np.zeros(20), 0.0)
+    cm, cfx, cfr = bugs_cloudfit(np.zeros(20), 0.0)
     assert cm == 0.0 and not cfx.any() and not cfr.any(), "clear column"
     print("  bugs_cloudfit: c_maximal*cf_max + (1-c_maximal)*cf_random = acld (40 profiles) + clear column  PASS")
 

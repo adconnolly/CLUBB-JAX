@@ -28,7 +28,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.derived_types.grid_class import setup_grid
-from clubb_jax.src.CLUBB_core.pos_definite_module import pos_definite_adj_jax
+from clubb_jax.src.CLUBB_core.pos_definite_module import pos_definite_adj
 
 _NG, _DZ, _ZTOP, _DT = 2, 40.0, 1200.0, 60.0
 
@@ -50,7 +50,7 @@ def _make_inputs(jgr):
 def test_conservation():
     jgr = setup_grid(ngrdcol=_NG, deltaz=_DZ, zm_init=0.0, zm_top=_ZTOP, grid_type=1)
     field_np1, flux_np1, field_n = _make_inputs(jgr)
-    field_adj, flux_lim, field_pd, flux_pd = pos_definite_adj_jax(jgr, _DT, field_np1, flux_np1, field_n)
+    field_adj, flux_lim, field_pd, flux_pd = pos_definite_adj(jgr, _DT, field_np1, flux_np1, field_n)
     dzt = np.asarray(1.0 / jgr.invrs_dzt)
     col_in = (np.asarray(field_np1) * dzt).sum(axis=1)
     col_out = (np.asarray(field_adj) * dzt).sum(axis=1)
@@ -85,7 +85,7 @@ def test_f2py_oracle():
     field_np1, flux_np1, field_n = _make_inputs(jgr)
     f_field, f_flux, f_field_pd, f_flux_pd = clubb_f2py.f2py_pos_definite_adj(
         _DT, field_np1.copy(), flux_np1.copy(), field_n.copy())
-    j_field, j_flux, j_field_pd, j_flux_pd = pos_definite_adj_jax(jgr, _DT, field_np1, flux_np1, field_n)
+    j_field, j_flux, j_field_pd, j_flux_pd = pos_definite_adj(jgr, _DT, field_np1, flux_np1, field_n)
     worst = 0.0
     for name, jx, fx in (("field_np1", j_field, f_field), ("flux_np1", j_flux, f_flux),
                          ("field_pd", j_field_pd, f_field_pd), ("flux_pd", j_flux_pd, f_flux_pd)):
@@ -102,10 +102,10 @@ def test_differentiable():
     flux = jnp.asarray(np.random.default_rng(1).standard_normal((1, nzm)) * 1e-3)
     field_n = jnp.asarray(np.abs(np.random.default_rng(2).standard_normal((1, nzt))) * 1e-2)
     def loss(field_np1):
-        out, _, _, _ = pos_definite_adj_jax(jgr, _DT, field_np1, flux, field_n)
+        out, _, _, _ = pos_definite_adj(jgr, _DT, field_np1, flux, field_n)
         return jnp.sum(out ** 2)
     g = np.asarray(jax.grad(loss)(field_n))   # field_np1 = field_n (no negatives) baseline
-    assert np.isfinite(g).all(), "non-finite grad through pos_definite_adj_jax"
+    assert np.isfinite(g).all(), "non-finite grad through pos_definite_adj"
     print(f"  jax.grad through pos_definite_adj: finite ({g.size} entries)  PASS")
 
 

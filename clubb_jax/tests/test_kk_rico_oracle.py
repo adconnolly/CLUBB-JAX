@@ -30,10 +30,19 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_means import (
-    KK_auto_upscaled_mean, KK_accr_upscaled_mean, KK_evap_upscaled_mean, kk_auto_coef,
+    KK_auto_upscaled_mean, KK_accr_upscaled_mean, KK_evap_upscaled_mean,
 )
-from clubb_jax.src.Microphys.KK_microphys.KK_utilities import kk_evap_coef
+from clubb_jax.src.Microphys.KK_microphys_module import kk_evap_coef, kk_auto_coef
 from clubb_jax.src.CLUBB_core.pdf_utilities import (
     mean_L2N, stdev_L2N, corr_NL2NN, corr_LL2NN,
 )
@@ -207,7 +216,7 @@ def test_kk_accr_evap_drivers_vs_rico():
     rev = g("rrm_evap")
     # N_r evaporation tendency (same trivariate machinery, exponents 1, -2/3, 5/3)
     from clubb_jax.src.Microphys.KK_microphys.KK_Nrm_tendencies import KK_Nrm_evap_upscaled_mean
-    from clubb_jax.src.Microphys.KK_microphys.KK_utilities import kk_evap_coef
+    from clubb_jax.src.Microphys.KK_microphys_module import kk_evap_coef
     from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N
     L = lambda mu, s2: np.asarray(mean_L2N(np.maximum(mu, 1e-30), s2))
     coef = np.asarray(kk_evap_coef(T_liq, p, 0.86))
@@ -226,7 +235,7 @@ def test_kk_accr_evap_drivers_vs_rico():
 
 
 def test_kk_microphys_adjust_vs_rico():
-    """kk_microphys_adjust (the tendency assembly) reproduces rico's rcm_mc / rrm_mc.
+    """KK_microphys_adjust (the tendency assembly) reproduces rico's rcm_mc / rrm_mc.
 
     Feeds the stored process rates (rrm_auto/accr/evap, Nrm_auto/evap) + state (rcm/rrm/Nrm/exner)
     into the assembly. rcm_mc = -(adjusted auto+accr) is a clean pure-function check (exact,
@@ -240,11 +249,11 @@ def test_kk_microphys_adjust_vs_rico():
         print("  netCDF4 not available — SKIP"); return
     if not os.path.exists(_RICO_STATS):
         print("  rico_fort stats absent — SKIP"); return
-    from clubb_jax.src.Microphys.KK_microphys.kk_microphys_driver import kk_microphys_adjust
+    from clubb_jax.src.Microphys.KK_microphys_module import KK_microphys_adjust
     ds = nc.Dataset(_RICO_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0])
     dt = 300.0   # rico dt_main
-    rrm_mc, Nrm_mc, rvm_mc, rcm_mc, thlm_mc = (np.asarray(x) for x in kk_microphys_adjust(
+    rrm_mc, Nrm_mc, rvm_mc, rcm_mc, thlm_mc = (np.asarray(x) for x in KK_microphys_adjust(
         dt, g("exner"), g("rcm"), g("rrm"), g("Nrm"),
         g("rrm_evap"), g("rrm_auto"), g("rrm_accr"), g("Nrm_evap"), g("Nrm_auto")))
     rcm_s, rrm_s, ev_adj, exner = g("rcm_mc"), g("rrm_mc"), g("rrm_evap_adj"), g("exner")
@@ -256,7 +265,7 @@ def test_kk_microphys_adjust_vs_rico():
     assert np.max(np.abs(rrm_mc[mm] - rrm_s[mm])) < 1e-18, "rrm_mc (no-evap-adj) not exact"
     Lv, Cp = 2.5e6, 1004.67
     assert np.allclose(thlm_mc, (Lv / (Cp * exner)) * rrm_mc), "thlm_mc not self-consistent"
-    print(f"  kk_microphys_adjust vs rico: rcm_mc exact ({mr.sum()} pts), rrm_mc exact at "
+    print(f"  KK_microphys_adjust vs rico: rcm_mc exact ({mr.sum()} pts), rrm_mc exact at "
           f"no-evap-adj pts ({mm.sum()}), thlm_mc self-consistent  PASS")
 
 
@@ -379,9 +388,9 @@ def test_kk_autoconversion_vs_rf02_do():
 
 
 def test_kk_sedimentation_vs_rico():
-    """KK mean sedimentation velocities (kk_sedimentation, KK00 Eq.37) vs the rico oracle. The
+    """KK mean sedimentation velocities (KK_sedimentation, KK00 Eq.37) vs the rico oracle. The
     Fortran stores Vrr/VNr on MOMENTUM levels as zt2zm(hydromet_vel_zt) (microphys_driver.F90:461),
-    so this feeds the Fortran's OWN mean volume radius (mvrr, on zt) into the JAX kk_sedimentation
+    so this feeds the Fortran's OWN mean volume radius (mvrr, on zt) into the JAX KK_sedimentation
     and then the (bit-faithful) zt2zm interpolation, and compares to the Fortran Vrr/VNr. Bit-exact.
     Uses a LONGER rico run (rico_long_fort, 250 steps) so rain has developed -- the canonical
     10-step run has only sub-micron drops, whose (positive) velocities all clip to 0. Generate:
@@ -393,7 +402,7 @@ def test_kk_sedimentation_vs_rico():
     if not os.path.exists(_RICO_LONG_STATS):
         print("  rico_long_fort stats absent — SKIP"); return
     from types import SimpleNamespace
-    from clubb_jax.src.Microphys.KK_microphys.kk_microphys_driver import kk_sedimentation
+    from clubb_jax.src.Microphys.KK_microphys_module import KK_sedimentation
     from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     ds = nc.Dataset(_RICO_LONG_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0])     # (time, nz)
@@ -401,23 +410,23 @@ def test_kk_sedimentation_vs_rico():
     zt, zm = np.asarray(ds["zt"][:]), np.asarray(ds["zm"][:]); ds.close()
     nt = mvr.shape[0]
     gr = SimpleNamespace(zt=jnp.asarray(np.tile(zt, (nt, 1))), zm=jnp.asarray(np.tile(zm, (nt, 1))))
-    Vzt, Nzt = kk_sedimentation(jnp.asarray(mvr))          # zt-level velocities (KK00 Eq.37 + clip)
+    Vzt, Nzt = KK_sedimentation(jnp.asarray(mvr))          # zt-level velocities (KK00 Eq.37 + clip)
     Vrr_j, VNr_j = np.asarray(zt2zm_jax(Vzt, gr)), np.asarray(zt2zm_jax(Nzt, gr))  # -> momentum levels
     mV, mN = Vrr_f < 0, VNr_f < 0                          # non-clipped rain points
     assert mV.sum() > 0, "no rain points to validate sedimentation"
     eV = np.abs(Vrr_j - Vrr_f).max()
     eN = np.abs(VNr_j - VNr_f).max()
     assert eV < 1e-12 and eN < 1e-12, f"sed velocity mismatch: Vrr {eV:.2e}, VNr {eN:.2e}"
-    grad = np.asarray(jax.grad(lambda r: jnp.sum(kk_sedimentation(r)[0]))(jnp.asarray(mvr[-1])))
+    grad = np.asarray(jax.grad(lambda r: jnp.sum(KK_sedimentation(r)[0]))(jnp.asarray(mvr[-1])))
     assert np.all(np.isfinite(grad)), "sed grad not finite"
-    print(f"  kk_sedimentation -> zt2zm vs rico Vrr/VNr: {mV.sum()} rain pts, Vrr |Δ|max {eV:.1e}, "
+    print(f"  KK_sedimentation -> zt2zm vs rico Vrr/VNr: {mV.sum()} rain pts, Vrr |Δ|max {eV:.1e}, "
           f"VNr |Δ|max {eN:.1e}  PASS")
 
 
 def test_kk_sed_vel_covars_vs_rico():
-    """KK sed-velocity covariances (kk_sed_vel_covars) vs the rico oracle: feed the Fortran's OWN
+    """KK sed-velocity covariances (KK_sed_vel_covars) vs the rico oracle: feed the Fortran's OWN
     PDF moments (mu/sigma_rr/Nr + corr_rr_Nr) and the mean volume radius (mvrr) into the JAX
-    kk_sed_vel_covars and compare the <r_r'R_vr'> / <N_r'R_vr'> covariances to the Fortran
+    KK_sed_vel_covars and compare the <r_r'R_vr'> / <N_r'R_vr'> covariances to the Fortran
     rr_KK_mvr_covar_zt / Nr_KK_mvr_covar_zt (both on zt). The overall means are reconstructed
     within-step-consistently (rrm = a*f_p1*mu_rr_1 + (1-a)*f_p2*mu_rr_2) so there is NO timing
     confound; bit-faithful-to-the-gate on the significant points."""
@@ -427,7 +436,7 @@ def test_kk_sed_vel_covars_vs_rico():
         print("  netCDF4 not available — SKIP"); return
     if not os.path.exists(_RICO_STATS):
         print("  rico_fort stats absent — SKIP"); return
-    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import kk_sed_vel_covars
+    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import KK_sed_vel_covars
     from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N, corr_LL2NN
     ds = nc.Dataset(_RICO_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0])
@@ -443,7 +452,7 @@ def test_kk_sed_vel_covars_vs_rico():
     S = lambda x: np.asarray(stdev_L2N(x))
     cc1 = np.asarray(corr_LL2NN(cr1, S(rs1), S(Ns1), rs1, Ns1))
     cc2 = np.asarray(corr_LL2NN(cr2, S(rs2), S(Ns2), rs2, Ns2))
-    out = kk_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr,
+    out = KK_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr,
                             mrr1, mrr2, mNr1, mNr2, L(mrr1, rs1), L(mrr2, rs2),
                             L(mNr1, Ns1), L(mNr2, Ns2), srr1, srr2, sNr1, sNr2,
                             S(rs1), S(rs2), S(Ns1), S(Ns2), cc1, cc2, mf)
@@ -458,9 +467,9 @@ def test_kk_sed_vel_covars_vs_rico():
             L(mrr1, rs1), L(mrr2, rs2), L(mNr1, Ns1), L(mNr2, Ns2), srr1, srr2, sNr1, sNr2,
             S(rs1), S(rs2), S(Ns1), S(Ns2), cc1, cc2, mf)
     gd = jax.grad(lambda r1: jnp.nansum(
-        kk_sed_vel_covars(r1, *base)["rr_KK_mvr_covar"]))(jnp.asarray(pf1 * mrr1))
+        KK_sed_vel_covars(r1, *base)["rr_KK_mvr_covar"]))(jnp.asarray(pf1 * mrr1))
     assert np.all(np.isfinite(np.asarray(gd))), "sed-covar grad not finite"
-    print(f"  kk_sed_vel_covars vs rico rr/Nr_KK_mvr_covar_zt: rr rel max {er:.1e} ({mr.sum()} sig), "
+    print(f"  KK_sed_vel_covars vs rico rr/Nr_KK_mvr_covar_zt: rr rel max {er:.1e} ({mr.sum()} sig), "
           f"Nr rel max {en:.1e}; differentiable  PASS")
 
 
@@ -518,7 +527,7 @@ def test_term_turb_sed_lhs_vs_rico():
     """The turbulent-sedimentation LHS (term_turb_sed_lhs). It has the SAME flux-form discretization
     as the mean-sed operator with Vhmphmp_impc (the implicit sed-velocity covariance, interpolated to
     momentum) replacing the velocity, so this validates the FULL composition
-    kk_sed_vel_covars -> zt2zm -> term_turb_sed_lhs via the rigorous, timing-independent CONSERVATION
+    KK_sed_vel_covars -> zt2zm -> term_turb_sed_lhs via the rigorous, timing-independent CONSERVATION
     CONTRACT (the in-loop `rrm_ts` stat uses stats_finalize_budget bookkeeping + is timing-confounded,
     so the contract is the clean oracle), and confirms term_turb_sed_lhs == sed_centered_diff_lhs."""
     try:
@@ -530,7 +539,7 @@ def test_term_turb_sed_lhs_vs_rico():
     from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import (
         sed_centered_diff_lhs, term_turb_sed_lhs, lhs_budget_term)
-    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import kk_sed_vel_covars
+    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import KK_sed_vel_covars
     from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N, corr_LL2NN
     ds = nc.Dataset(_RICO_LONG_STATS)
@@ -548,7 +557,7 @@ def test_term_turb_sed_lhs_vs_rico():
     L = lambda mu, x: np.asarray(mean_L2N(np.maximum(mu, 1e-30), x)); S = lambda x: np.asarray(stdev_L2N(x))
     cc1 = np.asarray(corr_LL2NN(cr1, S(rs1), S(Ns1), rs1, Ns1))
     cc2 = np.asarray(corr_LL2NN(cr2, S(rs2), S(Ns2), rs2, Ns2))
-    out = kk_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr, mrr1, mrr2, mNr1, mNr2,
+    out = KK_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr, mrr1, mrr2, mNr1, mNr2,
                             L(mrr1, rs1), L(mrr2, rs2), L(mNr1, Ns1), L(mNr2, Ns2), srr1, srr2, sNr1, sNr2,
                             S(rs1), S(rs2), S(Ns1), S(Ns2), cc1, cc2, mf)
     gr = SimpleNamespace(zt=jnp.asarray(np.tile(zt, (nt, 1))), zm=jnp.asarray(np.tile(zm, (nt, 1))))
@@ -568,12 +577,12 @@ def test_term_turb_sed_lhs_vs_rico():
     nz = np.abs(flux) > 1e-30
     cons = np.abs((colsum - flux)[nz] / flux[nz]).max()
     assert cons < 1e-10, f"turb-sed conservation contract violated: {cons:.2e}"
-    print(f"  term_turb_sed_lhs: == sed_centered_diff_lhs, full kk_sed_vel_covars->zt2zm->op "
+    print(f"  term_turb_sed_lhs: == sed_centered_diff_lhs, full KK_sed_vel_covars->zt2zm->op "
           f"conservation contract {cons:.1e} ({int(nz.sum())} pts)  PASS")
 
 
 def test_microphys_mean_adv_vs_rico():
-    """The hydrometeor MEAN-ADVECTION budget (`term_ma_zt_lhs` + `lhs_budget_term`) vs rico `rrm_ma`/
+    """The hydrometeor MEAN-ADVECTION budget (`term_ma_zt_lhs_jax` + `lhs_budget_term`) vs rico `rrm_ma`/
     `Nrm_ma`. Unlike `rrm_ts`/`rrm_ta`, the mean-advection budget is a plain `stats_update(-lhs_ma·hmm)`
     (no explicit+implicit split), so at robust-rrm points (within-step ≈ end-of-step) it matches the
     stored stat to machine precision — confirming the upwind `term_ma_zt_lhs_jax` (l_upwind_xm_ma=.true.
@@ -585,7 +594,7 @@ def test_microphys_mean_adv_vs_rico():
     if not os.path.exists(_RICO_LONG_STATS):
         print("  rico_long_fort stats absent — SKIP"); return
     from types import SimpleNamespace
-    from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import term_ma_zt_lhs_jax
+    from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax
     from clubb_jax.src.Microphys.advance_microphys_module import lhs_budget_term
     ds = nc.Dataset(_RICO_LONG_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0])
@@ -604,7 +613,7 @@ def test_microphys_mean_adv_vs_rico():
         rel = np.abs((out - ref)[sig] / ref[sig]).max()
         assert rel < 1e-10, f"{nm} mismatch: {rel:.2e}"
         worst = max(worst, rel)
-    print(f"  mean-adv budget (term_ma_zt_lhs) vs rico rrm_ma/Nrm_ma: robust-pt rel max {worst:.1e}  PASS")
+    print(f"  mean-adv budget (term_ma_zt_lhs_jax) vs rico rrm_ma/Nrm_ma: robust-pt rel max {worst:.1e}  PASS")
 
 
 def test_microphys_lhs_assembly():
@@ -616,7 +625,7 @@ def test_microphys_lhs_assembly():
     from clubb_jax.src.Microphys.advance_microphys_module import (
         microphys_lhs, sed_centered_diff_lhs, term_turb_sed_lhs, lhs_budget_term)
     from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs_jax
-    from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import term_ma_zt_lhs_jax
+    from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax
     nzt = 30; nzm = nzt + 1; dt = 300.0; nu = 1.5
     zm = np.linspace(0.0, 4000.0, nzm); zt = 0.5 * (zm[1:] + zm[:-1])
     idzt = 1.0 / (zm[1:nzm] - zm[:nzm - 1])
@@ -657,7 +666,7 @@ def test_microphys_rhs_turb_sed_vs_rico():
     `-term_turb_sed_lhs·hmm`) reproduces the rico `rrm_ts` budget stat — confirming `term_turb_sed_rhs`
     AND that `rrm_ts` = explicit + implicit (microphys_rhs stores the explicit via stats_begin_budget,
     microphys_solve adds the implicit via stats_finalize_budget). Validated by feeding the Fortran's own
-    moments → kk_sed_vel_covars → zt2zm → the operators. Median-clean (the relmax tail is the marginal-rrm
+    moments → KK_sed_vel_covars → zt2zm → the operators. Median-clean (the relmax tail is the marginal-rrm
     within-step/end-of-step timing confound)."""
     try:
         import netCDF4 as nc
@@ -668,7 +677,7 @@ def test_microphys_rhs_turb_sed_vs_rico():
     from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import (
         term_turb_sed_lhs, term_turb_sed_rhs, lhs_budget_term)
-    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import kk_sed_vel_covars
+    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import KK_sed_vel_covars
     from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N, corr_LL2NN
     ds = nc.Dataset(_RICO_LONG_STATS)
@@ -684,7 +693,7 @@ def test_microphys_rhs_turb_sed_vs_rico():
     L = lambda mu, x: np.asarray(mean_L2N(np.maximum(mu, 1e-30), x)); S = lambda x: np.asarray(stdev_L2N(x))
     cc1 = np.asarray(corr_LL2NN(cr1, S(rs1), S(Ns1), rs1, Ns1))
     cc2 = np.asarray(corr_LL2NN(cr2, S(rs2), S(Ns2), rs2, Ns2))
-    out = kk_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr, mrr1, mrr2, mNr1, mNr2,
+    out = KK_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr, mrr1, mrr2, mNr1, mNr2,
                             L(mrr1, rs1), L(mrr2, rs2), L(mNr1, Ns1), L(mNr2, Ns2), srr1, srr2, sNr1, sNr2,
                             S(rs1), S(rs2), S(Ns1), S(Ns2), cc1, cc2, mf)
     gr = SimpleNamespace(zt=jnp.asarray(np.tile(zt, (nt, 1))), zm=jnp.asarray(np.tile(zm, (nt, 1))))
@@ -823,7 +832,7 @@ def test_kk_covar_driver_vs_rico():
         print("  rico_fort stats absent — SKIP"); return
     from types import SimpleNamespace
     from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_covariances import KK_upscaled_covar_driver
-    from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_means import kk_auto_coef
+    from clubb_jax.src.Microphys.KK_microphys_module import kk_auto_coef
     from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     ds = nc.Dataset(_RICO_STATS)
     gz = lambda n: np.asarray(ds[n][:, :, 0])              # (time, zt) — zt-level stats

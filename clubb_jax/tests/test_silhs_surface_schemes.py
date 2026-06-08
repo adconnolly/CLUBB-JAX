@@ -23,7 +23,7 @@ from clubb_jax.src.Benchmark_cases.mpace_b import mpace_b_sfclyr
 from clubb_jax.src.Benchmark_cases.arm_97 import arm_97_sfclyr, _Z0 as _ARM97_Z0
 from clubb_jax.src.Benchmark_cases.twp_ice import twp_ice_sfclyr
 from clubb_jax.src.Benchmark_cases.cloud_feedback import cloud_feedback_sfclyr
-from clubb_jax.src.Benchmark_cases.arm import _diag_ustar
+from clubb_jax.src.Benchmark_cases.diag_ustar_module import _diag_ustar
 from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, grav
 
 _SAT = 3

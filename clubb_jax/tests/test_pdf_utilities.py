@@ -6,13 +6,23 @@ mean_L2N and stdev_L2N are verified BIT-TO-BIT against the Fortran f2py API
 Monte-Carlo sampling of correlated (log)normal variables — an independent statistical
 oracle for the defining relations (Garvey 2000, Eqs. B-1 and C-3).
 
-Run: PYTHONPATH=...:clubb_release:clubb_release/clubb_python_api python clubb_jax/tests/test_pdf_utilities.py
+Run: python clubb_jax/tests/test_pdf_utilities.py  (self-bootstraps sys.path; the f2py checks SKIP if unbuilt).
 """
+import os
+import sys
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
+
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 from clubb_jax.src.CLUBB_core.pdf_utilities import (
     mean_L2N, stdev_L2N, corr_NL2NN, corr_LL2NN, MAX_MAG_CORRELATION,

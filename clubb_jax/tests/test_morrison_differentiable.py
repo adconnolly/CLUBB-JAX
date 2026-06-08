@@ -9,8 +9,17 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.Microphys.Morrison_microphys.module_mp_graupel import (
-    polysvp_jax, gamma_jax, derf1_jax, kk_warm_rain_rates, rain_slope,
+    polysvp, gamma, derf1, kk_warm_rain_rates, rain_slope,
     rain_evap_rate, snow_collection_rates, ice_autoconv_to_snow)
 
 
@@ -21,9 +30,9 @@ def _fd(f, x, eps=1e-7):
 def test_special_functions_differentiable():
     """grad through POLYSVP / GAMMA / DERF1 is finite + FD-correct (the branches are jnp.where, the
     integer-reduction loop is masked — all grad-able)."""
-    for name, f, x0 in (("polysvp", lambda t: polysvp_jax(t, 0), 273.0),
-                        ("gamma", lambda x: gamma_jax(x), 4.3),
-                        ("derf1", lambda x: derf1_jax(x), 0.7)):
+    for name, f, x0 in (("polysvp", lambda t: polysvp(t, 0), 273.0),
+                        ("gamma", lambda x: gamma(x), 4.3),
+                        ("derf1", lambda x: derf1(x), 0.7)):
         g = float(jax.grad(lambda v: f(v))(jnp.array(x0)))
         fd = _fd(lambda v: float(f(jnp.array(v))), x0)
         rel = abs(g - fd) / (abs(fd) + 1e-30)

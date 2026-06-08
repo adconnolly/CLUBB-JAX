@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_rcm_sat_adj.py — validate the JAX rcm_sat_adj_jax port (saturation.F90:rcm_sat_adj).
+"""test_rcm_sat_adj.py — validate the JAX rcm_sat_adj port (saturation.F90:rcm_sat_adj).
 
 rcm_sat_adj iteratively (bisection) finds theta s.t. theta - (Lv/(Cp exner))·max(rtm - rsat(theta·exner),0) =
 thlm, then returns rcm = max(rtm - rsat,0). The JAX port replicates the Fortran's exact "freeze theta once the
@@ -26,7 +26,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.saturation import (
-    rcm_sat_adj_jax, sat_mixrat_liq_jax, SATURATION_FLATAU, SATURATION_BOLTON)
+    rcm_sat_adj, sat_mixrat_liq, SATURATION_FLATAU, SATURATION_BOLTON)
 
 _Cp, _Lv = 1004.67, 2.5e6
 
@@ -54,7 +54,7 @@ def test_f2py_oracle():
     for formula in (SATURATION_FLATAU, SATURATION_BOLTON):
         for thlm, rtm, p, exner in _cases():
             ref = float(clubb_f2py.f2py_rcm_sat_adj(thlm, rtm, p, exner, formula))
-            got = float(rcm_sat_adj_jax(thlm, rtm, p, exner, formula))
+            got = float(rcm_sat_adj(thlm, rtm, p, exner, formula))
             worst = max(worst, abs(got - ref))
             if ref > 1e-8:
                 n_sat += 1
@@ -66,10 +66,10 @@ def test_f2py_oracle():
 def test_self_consistency():
     # For a saturated point, rcm and the implied theta should satisfy the fixed point within ~tolerance.
     thlm, rtm, p, exner, formula = 285.0, 0.02, 95000.0, 0.95, SATURATION_FLATAU
-    rcm = float(rcm_sat_adj_jax(thlm, rtm, p, exner, formula))
+    rcm = float(rcm_sat_adj(thlm, rtm, p, exner, formula))
     assert rcm > 0.0, "expected a saturated point"
     theta = thlm + (_Lv / (_Cp * exner)) * rcm
-    rsat = float(sat_mixrat_liq_jax(p, theta * exner, formula))
+    rsat = float(sat_mixrat_liq(p, theta * exner, formula))
     rcm_check = max(rtm - rsat, 0.0)
     assert abs(rcm - rcm_check) < 1e-5, f"fixed point not satisfied: {abs(rcm-rcm_check):.2e}"
     print(f"  self-consistency: saturated rcm satisfies the adjustment fixed point (rcm={rcm:.2e})  PASS")
@@ -77,10 +77,10 @@ def test_self_consistency():
 
 def test_differentiable():
     def loss(rtm):
-        return rcm_sat_adj_jax(285.0, rtm, 95000.0, 0.95, SATURATION_FLATAU) ** 2
+        return rcm_sat_adj(285.0, rtm, 95000.0, 0.95, SATURATION_FLATAU) ** 2
     g = float(jax.grad(loss)(0.02))
-    assert np.isfinite(g), "non-finite grad through rcm_sat_adj_jax"
-    print(f"  jax.grad through rcm_sat_adj_jax: finite (d/drtm = {g:.3e})  PASS")
+    assert np.isfinite(g), "non-finite grad through rcm_sat_adj"
+    print(f"  jax.grad through rcm_sat_adj: finite (d/drtm = {g:.3e})  PASS")
 
 
 def main():

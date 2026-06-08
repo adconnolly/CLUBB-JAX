@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_spurious_source.py — validate the JAX _calculate_spurious_source port (advance_clubb_core_module).
+"""test_spurious_source.py — validate the JAX calculate_spurious_source port (advance_clubb_core_module).
 
 spurious_source = (integral_after - integral_before)/dt + flux_top - flux_sfc - integral_forcing — the
 conservation-error budget diagnostic. Ported but lacking a dedicated f2py test. Oracles:
@@ -24,7 +24,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.advance_clubb_core_module import _calculate_spurious_source
+from clubb_jax.src.CLUBB_core.numerical_check import calculate_spurious_source
 
 
 def test_f2py_oracle():
@@ -39,7 +39,7 @@ def test_f2py_oracle():
     for _ in range(200):
         ia, ib, ft, fs, ifc = rng.uniform(-10, 10, 5)
         ref = float(clubb_f2py.f2py_calculate_spurious_source(ia, ib, ft, fs, ifc, dt))
-        got = float(_calculate_spurious_source(ia, ib, ft, fs, ifc, dt))
+        got = float(calculate_spurious_source(ia, ib, ft, fs, ifc, dt))
         worst = max(worst, abs(got - ref))
     assert worst < 1e-12, f"spurious_source f2py mismatch {worst:.2e}"
     print(f"  f2py calculate_spurious_source: bit-match over 200 configs, worst {worst:.2e}  PASS")
@@ -50,10 +50,10 @@ def test_conservation_identity():
     ib, ft, fs, ifc = 5.0, 0.3, 0.1, 0.02
     # Construct integral_after so the budget closes exactly -> spurious source = 0.
     ia = ib + dt * (ifc - ft + fs)
-    s = float(_calculate_spurious_source(ia, ib, ft, fs, ifc, dt))
+    s = float(calculate_spurious_source(ia, ib, ft, fs, ifc, dt))
     assert abs(s) < 1e-12, f"closed budget should give zero spurious source, got {s}"
     # A perturbation of integral_after by eps -> spurious source = eps/dt.
-    s2 = float(_calculate_spurious_source(ia + 0.5, ib, ft, fs, ifc, dt))
+    s2 = float(calculate_spurious_source(ia + 0.5, ib, ft, fs, ifc, dt))
     assert abs(s2 - 0.5 / dt) < 1e-12, "spurious source sensitivity to integral_after"
     print("  conservation identity: closed budget -> 0; d/d(integral_after) = 1/dt  PASS")
 
@@ -61,10 +61,10 @@ def test_conservation_identity():
 def test_differentiable():
     def loss(args):
         ia, ib, ft, fs, ifc = args
-        return _calculate_spurious_source(ia, ib, ft, fs, ifc, 60.0) ** 2
+        return calculate_spurious_source(ia, ib, ft, fs, ifc, 60.0) ** 2
     g = np.asarray(jax.grad(loss)(jnp.array([3.0, 2.0, 0.1, 0.05, 0.01])))
-    assert np.isfinite(g).all(), "non-finite grad through _calculate_spurious_source"
-    print(f"  jax.grad through _calculate_spurious_source: finite ({g.size} entries)  PASS")
+    assert np.isfinite(g).all(), "non-finite grad through calculate_spurious_source"
+    print(f"  jax.grad through calculate_spurious_source: finite ({g.size} entries)  PASS")
 
 
 def main():

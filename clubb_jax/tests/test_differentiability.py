@@ -22,10 +22,19 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax, sat_mixrat_ice_jax
-from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import tridiag_lu_solve_jax
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq, sat_mixrat_ice
+from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve_jax
 from clubb_jax.src.derived_types.grid_class import setup_grid
-from clubb_jax.src.CLUBB_core.advance_helper_module import calc_brunt_vaisala_freq_sqd_jax
+from clubb_jax.src.CLUBB_core.advance_helper_module import calc_brunt_vaisala_freq_sqd
 
 _SQRT2 = jnp.sqrt(2.0)
 
@@ -48,8 +57,8 @@ def _fd_check(fn, x, idx, eps=1e-6):
 def test_saturation_differentiable():
     """sat_mixrat_liq / sat_mixrat_ice are differentiable w.r.t. T, and correct."""
     T = jnp.linspace(240.0, 300.0, 40)
-    for name, fn in (("liq", lambda T: sat_mixrat_liq_jax(jnp.full_like(T, 9e4), T, 3)),
-                     ("ice", lambda T: sat_mixrat_ice_jax(jnp.full_like(T, 9e4), T))):
+    for name, fn in (("liq", lambda T: sat_mixrat_liq(jnp.full_like(T, 9e4), T, 3)),
+                     ("ice", lambda T: sat_mixrat_ice(jnp.full_like(T, 9e4), T))):
         _, finite, nonzero = _grad_finite(fn, T)
         assert finite and nonzero, f"sat_mixrat_{name} gradient not finite/nonzero"
         ad, fd = _fd_check(fn, T, 20)
@@ -87,7 +96,7 @@ def test_solver_differentiable():
 def test_penta_solver_differentiable():
     """The penta-diagonal LU solver (jitted Iter290, lax.scan sweeps) is differentiable w.r.t. rhs.
     Guards that wrapping the solver in jax.jit (the OOM/recompile fix) preserved autodiff."""
-    from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import penta_lu_solve_jax
+    from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve_jax
     ndim = 20
     d = jnp.full((1, ndim), 4.0); s1 = jnp.full((1, ndim), 1.0); s2 = jnp.full((1, ndim), 0.5)
     sb1 = jnp.full((1, ndim), 1.0); sb2 = jnp.full((1, ndim), 0.5)
@@ -104,14 +113,14 @@ def test_penta_solver_differentiable():
 
 
 def test_fill_holes_differentiable():
-    """fill_holes_vertical_jax (jitted Iter291; sliding-window fori_loop + global-fallback lax.cond)
+    """fill_holes_vertical (jitted Iter291; sliding-window fori_loop + global-fallback lax.cond)
     is reverse-mode differentiable w.r.t. the field. The mass-conserving redistribution must keep the
     gradient flowing (the hole-fill is the only clip in several prognostic update paths)."""
-    from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical_jax
+    from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical
     nzt = 20
     field = jnp.array([[0.5] * 8 + [-0.3] + [0.6] * 11])   # one hole at index 8
     rho = jnp.full((1, nzt), 1.0); dz = jnp.full((1, nzt), 50.0)
-    ff = lambda x: fill_holes_vertical_jax(x, rho, dz, 0.0, 0, nzt - 1, 2)  # type 2 = sliding+global
+    ff = lambda x: fill_holes_vertical(x, rho, dz, 0.0, 0, nzt - 1, 2)  # type 2 = sliding+global
     g, finite, nonzero = _grad_finite(ff, field)
     assert finite and nonzero, "fill_holes gradient not finite/nonzero"
     # FD check at a smooth interior level away from the hole + window edges
@@ -140,7 +149,7 @@ def test_composability():
     demonstrating the modules compose into a differentiable pipeline."""
     rt = 0.012                           # fixed total water
     def chi_of(T):
-        rsat = sat_mixrat_liq_jax(jnp.full_like(T, 9.0e4), T, 3)
+        rsat = sat_mixrat_liq(jnp.full_like(T, 9.0e4), T, 3)
         return (rt - rsat) / 1.0e-3      # crude chi (scaled excess)
     def pipeline(T):
         return jnp.sum(0.5 * (1.0 + jax.scipy.special.erf(chi_of(T) / _SQRT2)))
@@ -171,7 +180,7 @@ def test_brunt_vaisala_differentiable():
         thvm = thlm                       # crude (no moisture loading) — fine for grad test
         isf = jnp.zeros((1, nzt))
         bve = jnp.full((1,), 5.0)
-        out = calc_brunt_vaisala_freq_sqd_jax(
+        out = calc_brunt_vaisala_freq_sqd(
             thlm, exner, rtm, rcm, p, thvm, isf, bve, 300.0, False, False, False, gr)
         return out[0]                     # brunt_vaisala_freq_sqd
     thlm = jnp.asarray(300.0 + 0.003 * jnp.arange(nzt))[None]
@@ -269,7 +278,7 @@ def test_adg1_w_closure_differentiable():
     from wp2/Skw/sigma_sqd_w) — the FOUNDATION of CLUBB's subgrid cloud/buoyancy scheme — is
     differentiable w.r.t. the skewness and finite-difference-correct. Confirms the core PDF physics
     is reverse-mode grad-able (no while_loop/numpy, unlike mixing_length)."""
-    from clubb_jax.src.CLUBB_core.adg1_adg2_3d_luhar_pdf import ADG1_w_closure_jax
+    from clubb_jax.src.CLUBB_core.adg1_adg2_3d_luhar_pdf import ADG1_w_closure
     n = 30
     wm = jnp.zeros((1, n))
     wp2 = jnp.full((1, n), 0.4)
@@ -277,7 +286,7 @@ def test_adg1_w_closure_differentiable():
     sigma_sqd_w = jnp.full((1, n), 0.4)
 
     def mf_of_skw(Skw):
-        out = ADG1_w_closure_jax(wm, wp2, Skw, sigma_sqd_w, sqrt_wp2, 0.99)
+        out = ADG1_w_closure(wm, wp2, Skw, sigma_sqd_w, sqrt_wp2, 0.99)
         return jnp.sum(out[6])                       # mixt_frac
     Skw0 = jnp.linspace(-1.5, 1.5, n)[None]          # spans the symmetric & skewed regimes
     g = jax.grad(mf_of_skw)(Skw0)
@@ -298,7 +307,7 @@ def test_adg1_full_pdf_driver_differentiable():
     closure, the most composed core-physics pipeline; grad of the rt PDF component variance
     (varnce_rt_1) w.r.t. the rt variance flows through the mixture-fraction (Skw) width factor + the
     responder normalized-variance factor alpha_rt (which itself is a nonlinear function of rtp2)."""
-    from clubb_jax.src.CLUBB_core.adg1_adg2_3d_luhar_pdf import ADG1_pdf_driver_jax
+    from clubb_jax.src.CLUBB_core.adg1_adg2_3d_luhar_pdf import ADG1_pdf_driver
     n = 25
     wm = jnp.zeros((1, n)); rtm = jnp.full((1, n), 0.012); thlm = jnp.full((1, n), 300.0)
     um = jnp.full((1, n), 5.0); vm = jnp.full((1, n), 2.0)
@@ -310,7 +319,7 @@ def test_adg1_full_pdf_driver_differentiable():
     sqrt_wp2 = jnp.sqrt(wp2); sigma_sqd_w = jnp.full((1, n), 0.4)
 
     def vrt1_sum(rtp2):
-        out = ADG1_pdf_driver_jax(wm, rtm, thlm, um, vm, wp2, rtp2, thlp2, up2, vp2,
+        out = ADG1_pdf_driver(wm, rtm, thlm, um, vm, wp2, rtp2, thlp2, up2, vp2,
                                   Skw, wprtp, wpthlp, upwp, vpwp, sqrt_wp2, sigma_sqd_w,
                                   jnp.full((1,), 2.0), 0.99)
         return jnp.sum(out['varnce_rt_1'])
@@ -335,7 +344,7 @@ def test_mixing_length_forward_differentiable():
     :367,:553) converted to bounded `lax.scan`-with-done-mask — a bit-exact transform (the body already
     freezes via jnp.where once `done`), deferred as it risks all 15 faithful cases without unlocking the
     full-timestep grad (the orchestration's ~570 numpy round-trips + the numpy flux limiter remain)."""
-    from clubb_jax.src.CLUBB_core.mixing_length import compute_mixing_length_jax
+    from clubb_jax.src.CLUBB_core.mixing_length import compute_mixing_length
     gr = setup_grid(ngrdcol=1, deltaz=100.0, zm_init=0.0, zm_top=3000.0, grid_type=1)
     nzt = gr.zt.shape[1]
     rtm = jnp.full((1, nzt), 0.008)
@@ -345,7 +354,7 @@ def test_mixing_length_forward_differentiable():
     def lscale_sum(thlm):
         thvm = thlm * (1.0 + 0.61 * rtm)
         em = jnp.full((1, gr.zm.shape[1]), 0.5)        # em is on momentum (zm) levels
-        Lscale, _up, _dn = compute_mixing_length_jax(
+        Lscale, _up, _dn = compute_mixing_length(
             thvm, thlm, rtm, em, jnp.full((1,), 1.0e5), p, exner, thvm,
             jnp.full((1,), 1.0e-3), 20.0, 3, False, gr)
         return jnp.sum(Lscale)
@@ -365,7 +374,7 @@ def test_mixing_length_reverse_differentiable():
     by a bit-exact bounded `lax.scan` (`_bounded_while`), so the Golaz mixing length is now REVERSE-mode
     differentiable — `jax.grad` previously RAISED on the dynamic-trip-count while_loop. grad w.r.t. the
     mean thlm profile is finite, nonzero, and finite-difference-correct (directional derivative)."""
-    from clubb_jax.src.CLUBB_core.mixing_length import compute_mixing_length_jax
+    from clubb_jax.src.CLUBB_core.mixing_length import compute_mixing_length
     gr = setup_grid(ngrdcol=1, deltaz=100.0, zm_init=0.0, zm_top=3000.0, grid_type=1)
     nzt = gr.zt.shape[1]
     rtm = jnp.full((1, nzt), 0.008)
@@ -375,7 +384,7 @@ def test_mixing_length_reverse_differentiable():
     def lscale_sum(thlm):
         thvm = thlm * (1.0 + 0.61 * rtm)
         em = jnp.full((1, gr.zm.shape[1]), 0.5)
-        Lscale, _u, _d = compute_mixing_length_jax(
+        Lscale, _u, _d = compute_mixing_length(
             thvm, thlm, rtm, em, jnp.full((1,), 1.0e5), p, exner, thvm,
             jnp.full((1,), 1.0e-3), 20.0, 3, False, gr)
         return jnp.sum(Lscale)

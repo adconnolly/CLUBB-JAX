@@ -35,7 +35,7 @@ def _repo_paths():
 def test_faithful_cases_run_without_clubb_python():
     """Multiple faithful cases (different grids) init + step 3× IN ONE PROCESS with clubb_python blocked
     → finite prognostics. Proves both (a) the JAX driver is standalone (no Fortran import), and (b) it is
-    REENTRANT — init_clubb_case resets the cross-timestep core state (`_prev_adg1_j25`, Iter281), so case 2
+    REENTRANT — init_clubb_case resets the cross-timestep core state (`_prev_adg1`, Iter281), so case 2
     doesn't inherit case 1's grid shape (which previously caused a broadcast error)."""
     sys.meta_path.insert(0, _ClubbPythonBlocker())
     # also evict any already-imported clubb_python so the block is real

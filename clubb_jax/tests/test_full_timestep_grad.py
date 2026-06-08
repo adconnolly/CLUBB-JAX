@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""test_full_timestep_grad.py — B4 probe/validator (REFACTOR B4 stage 1, iter15).
+"""test_full_timestep_grad.py — fast fixture-based whole-timestep differentiability validator.
 
 Captures the real 135-kwarg input of `advance_clubb_core` for one arm step (via the env-gated
 CLUBB_CAPTURE_KWARGS hook) and:
   1. confirms the forward call runs (88 returns, finite) — a real gate;
-  2. reports the full-timestep `jax.grad` status. TODAY this is BLOCKED by the orchestration's NumPy
-     writebacks (`TracerArrayConversionError` from `np.asarray()` on a tracer) — the B4 target. When the
-     pure-functional core lands, this flips to asserting grad is finite + finite-difference-correct.
+  2. asserts the full-timestep `jax.grad` is finite AND finite-difference-correct for several prognostic
+     inputs (the differentiable pure-functional core is in place, so this is a real grad gate).
 
-This is the fixture-based validator the staged B4 conversion is built against (no slow case run per check).
+A fast proxy for the production whole-driver differentiability gate (`run_scripts/compare_grad.py`): it grads
+one captured timestep instead of running a full case, so it catches a broken grad path in seconds.
 """
 import os
 import sys
@@ -71,8 +71,8 @@ def test_forward_runs():
 
 
 def test_grad_status():
-    """Report the full-timestep jax.grad status. PASS today documents the B4 blocker; flips to a real
-    grad gate (finite + FD-correct) once the pure-functional core (B4) lands."""
+    """Whole-timestep jax.grad gate: asserts grad is finite + finite-difference-correct for several
+    prognostic inputs (the differentiable pure-functional core is in place)."""
     from clubb_jax.src.CLUBB_core.advance_clubb_core_module import advance_clubb_core
     kw = _load()
     if kw is None:
@@ -81,7 +81,7 @@ def test_grad_status():
 
     # Target the differentiable PROGNOSTIC path: bypass the debug check + stats (debug_level=0,
     # l_sample=False) — these diagnostics are not part of the prognostic update and break tracing
-    # separately (REFACTOR B4: grad path = prognostic update, diagnostics are side computations).
+    # separately (the grad path is the prognostic update; diagnostics are side computations).
     kw = dict(kw); kw["debug_level"] = 0; kw["l_sample"] = False
 
     # advance_clubb_core return order: um(0) vm(1) up3(2) vp3(3) thlm(4) rtm(5) ...
@@ -105,14 +105,12 @@ def test_grad_status():
         assert finite and nonzero and rel < 1e-3, f"d{out_idx}/d{in_key}: ad={ad:.3e} fd={fd:.3e} rel={rel:.2e}"
         return rel
 
-    try:
-        rels = {f"d{ok_out}/d{ik}": grad_ok(ik, ok_out) for ik, ok_out in cases}
-        worst = max(rels.values())
-        print(f"  full timestep jax.grad: WORKS, finite + FD-correct for {len(cases)} prognostics "
-              f"(worst rel {worst:.1e}; {', '.join(f'{k}={v:.0e}' for k,v in rels.items())}) — B4 COMPLETE  PASS")
-    except jax.errors.TracerArrayConversionError:
-        print("  full timestep jax.grad: BLOCKED by NumPy writebacks (TracerArrayConversionError) "
-              "— B4 not yet done (expected; this is the B4 target)  PASS(documented)")
+    # Real gate: grad_ok() asserts finite + FD-correct, so a broken grad path (incl. a re-introduced
+    # TracerArrayConversionError from a NumPy writeback on a tracer) FAILS here rather than being excused.
+    rels = {f"d{ok_out}/d{ik}": grad_ok(ik, ok_out) for ik, ok_out in cases}
+    worst = max(rels.values())
+    print(f"  full timestep jax.grad: finite + FD-correct for {len(cases)} prognostics "
+          f"(worst rel {worst:.1e}; {', '.join(f'{k}={v:.0e}' for k,v in rels.items())})  PASS")
     return True
 
 
@@ -120,5 +118,5 @@ if __name__ == "__main__":
     ok = True
     ok &= test_forward_runs()
     ok &= test_grad_status()
-    print("\nAll full-timestep-grad probe checks PASSED" if ok else "\nFAILED")
+    print("\nAll full-timestep-grad checks PASSED" if ok else "\nFAILED")
     sys.exit(0 if ok else 1)

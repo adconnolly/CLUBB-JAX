@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from clubb_jax.src.Benchmark_cases.cloud_feedback import (
     cloud_feedback_sfclyr, _C_H_20, _C_Q_20, _Z0, _STD_FLUX_ALT, _USTAR)
 from clubb_jax.src.CLUBB_core.constants_clubb import p0, kappa
-from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
 
 _SAT = 3   # SATURATION_FLATAU
 
@@ -31,7 +31,7 @@ def _ref(thlm, rtm, zlow, ubar, psfc, Tsfc):
     exner = (psfc / p0) ** kappa
     scale = (math.log(_STD_FLUX_ALT / _Z0) / math.log(zlow / _Z0)) ** 2
     Ch, Cq = _C_H_20 * scale, _C_Q_20 * scale
-    rsat = float(sat_mixrat_liq_jax(psfc, Tsfc, _SAT))
+    rsat = float(sat_mixrat_liq(psfc, Tsfc, _SAT))
     wpthlp = -Ch * ubar * (thlm - Tsfc / exner)
     wprtp = -Cq * ubar * (rtm - rsat)
     return wpthlp, wprtp
@@ -64,7 +64,7 @@ def test_physical_invariants():
     # Neutral (thlm == T_sfc/exner) -> zero heat flux; rtm == rsat -> zero moisture flux.
     Tn, pn, zn, un = 298.0, 1.0e5, 30.0, 6.0
     thn = Tn / ((pn / p0) ** kappa)
-    rsat = float(sat_mixrat_liq_jax(pn, Tn, _SAT))
+    rsat = float(sat_mixrat_liq(pn, Tn, _SAT))
     wth0, wrt0, _ = cloud_feedback_sfclyr(jnp.asarray([thn]), jnp.asarray([rsat]), jnp.asarray([zn]),
                                           jnp.asarray([un]), jnp.asarray([pn]), jnp.asarray([Tn]), _SAT)
     assert abs(float(wth0[0])) < 1e-12 and abs(float(wrt0[0])) < 1e-12, "neutral/saturated should give zero flux"

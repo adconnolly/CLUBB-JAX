@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""test_validation_checks.py — validate the ported CLUBB check routines (assert_corr_symmetric, sfc_varnce_check).
+"""test_validation_checks.py — validate the ported CLUBB check routines.
 
-These are the last in-scope check routines (corr_varnce_module.F90 / numerical_check.F90). Their f2py wrappers
-set err_code on `stored_err_info` and `return` (no error-stop, and the f2py does NOT expose err_code), so there is
-no observable f2py oracle — validation is by the Fortran source logic (behavioral) plus an f2py no-crash
+Covers the in-scope NaN/validation check routines (corr_varnce_module.F90 / numerical_check.F90). Their f2py
+wrappers set err_code on `stored_err_info` and `return` (no error-stop, and the f2py does NOT expose err_code), so
+there is no observable f2py oracle — validation is by the Fortran source logic (behavioral) plus an f2py no-crash
 cross-check on the valid case.
   assert_corr_symmetric: True iff symmetric within 1e-6 AND unit diagonal within eps (1e-10).
   sfc_varnce_check:       True iff every surface variance/covariance is finite.
+  length_check:           True iff Lscale/Lscale_up/Lscale_down are all finite.
+  pdf_closure_check:      True iff every pdf_closure output AND pdf_params component is finite.
+  rad_check:              True iff every radiation input (incl. rvm=rtm-rcm) is non-negative.
 """
 import os
 import sys
@@ -22,7 +25,10 @@ for p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
 import numpy as np
 
 from clubb_jax.src.CLUBB_core.corr_varnce_module import assert_corr_symmetric
-from clubb_jax.src.CLUBB_core.numerical_check import sfc_varnce_check
+from clubb_jax.src.CLUBB_core.numerical_check import (
+    sfc_varnce_check, length_check, pdf_closure_check, rad_check, invalid_model_arrays,
+)
+from clubb_jax.src.derived_types.pdf_params import init_pdf_params
 
 
 def test_assert_corr_symmetric_behavior():
@@ -73,10 +79,62 @@ def test_sfc_varnce_check_behavior():
     print("  sfc_varnce_check: all-finite PASS / NaN+Inf FAIL (incl. passive scalars)  PASS")
 
 
+def test_length_check_behavior():
+    g = np.ones(8)
+    assert length_check(g, g, g) is True, "all-finite mixing lengths rejected"
+    assert length_check(g, np.array([np.nan] + [1.0] * 7), g) is False, "NaN Lscale_up accepted"
+    assert length_check(g, g, np.array([np.inf] + [1.0] * 7)) is False, "Inf Lscale_down accepted"
+    print("  length_check: all-finite PASS / NaN+Inf FAIL  PASS")
+
+
+def test_pdf_closure_check_behavior():
+    pp = init_pdf_params(10, 1)   # nz=10, ngrdcol=1 → all-zero (finite) pdf_params components
+    closure = dict(wp4=np.zeros(10), wp2rtp=np.zeros(10), rcm=np.zeros(10), crt_1=np.ones(10))
+    assert pdf_closure_check(closure, pp, sclr_dim=0) is True, "all-finite pdf_closure outputs rejected"
+    bad = dict(closure); bad['rcm'] = np.array([np.nan] + [0.0] * 9)
+    assert pdf_closure_check(bad, pp, sclr_dim=0) is False, "NaN closure output accepted"
+    # NaN inside a pdf_params component must also fail
+    pp_bad = pp._replace(w_1=np.array([[np.nan] + [0.0] * 9]))
+    assert pdf_closure_check(closure, pp_bad, sclr_dim=0) is False, "NaN pdf_params%w_1 accepted"
+    # NaN passive-scalar array with sclr_dim>0
+    assert pdf_closure_check(closure, pp, sclr_dim=1,
+                             sclr_fields=dict(sclrpthvp=np.array([np.nan]))) is False, "NaN scalar accepted"
+    print("  pdf_closure_check: all-finite PASS / NaN closure+pdf_params+scalar FAIL  PASS")
+
+
+def test_rad_check_behavior():
+    n = 6
+    ok = dict(thlm=300 * np.ones(n), rcm=np.zeros(n), rtm=1e-3 * np.ones(n), rim=np.zeros(n),
+              cloud_frac=0.5 * np.ones(n), p_in_Pa=1e5 * np.ones(n), exner=np.ones(n), rho_zm=np.ones(n))
+    assert rad_check(**ok) is True, "all-nonnegative radiation inputs rejected"
+    neg = dict(ok); neg['rim'] = np.array([-1e-6] + [0.0] * (n - 1))
+    assert rad_check(**neg) is False, "negative rim accepted"
+    # rvm = rtm - rcm < 0 must also fail (rcm > rtm)
+    rvm_neg = dict(ok); rvm_neg['rcm'] = 2e-3 * np.ones(n)
+    assert rad_check(**rvm_neg) is False, "negative rvm (rcm>rtm) accepted"
+    print("  rad_check: all-nonnegative PASS / negative input+rvm FAIL  PASS")
+
+
+def test_invalid_model_arrays_behavior():
+    n = 8
+    ok = {k: np.ones(n) for k in ('um', 'vm', 'rtm', 'wprtp', 'thlm', 'wpthlp', 'rtp2', 'thlp2',
+                                  'rtpthlp', 'wp2', 'wp3', 'wp2thvp', 'wp2up', 'rtpthvp', 'thlpthvp')}
+    # NOTE inverse polarity: returns True if INVALID (matching the Fortran name + driver `if invalid(...)`).
+    assert invalid_model_arrays(**ok) is False, "all-finite arrays flagged invalid"
+    bad = dict(ok); bad['wp3'] = np.array([np.inf] + [1.0] * (n - 1))
+    assert invalid_model_arrays(**bad) is True, "Inf in wp3 not flagged"
+    hm = np.ones((n, 2)); hm[2, 1] = np.nan
+    assert invalid_model_arrays(**ok, hydromet=hm, hydromet_list=['rrm', 'Nrm']) is True, "NaN hydromet not flagged"
+    assert invalid_model_arrays(**ok, sclrm=np.ones((n, 1)), edsclrm=np.ones((n, 1))) is False
+    print("  invalid_model_arrays: clean->False / Inf wp3 + NaN hydromet->True (inverse polarity)  PASS")
+
+
 def main():
     print("test_validation_checks:")
     for t in (test_assert_corr_symmetric_behavior, test_assert_corr_symmetric_f2py_nocrash,
-              test_sfc_varnce_check_behavior):
+              test_sfc_varnce_check_behavior, test_length_check_behavior,
+              test_pdf_closure_check_behavior, test_rad_check_behavior,
+              test_invalid_model_arrays_behavior):
         t()
     print("All validation-check ports PASSED")
 

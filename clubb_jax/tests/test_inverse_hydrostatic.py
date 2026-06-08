@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_inverse_hydrostatic.py — validate inverse_hydrostatic (pressure-sounding altitudes).
 
-Strongest oracle: the ROUND-TRIP against the existing forward hydrostatic (init_pressure_jax uses the same
+Strongest oracle: the ROUND-TRIP against the existing forward hydrostatic (init_pressure uses the same
 log-mean scheme), so building exner from known heights then inverting must recover those heights exactly. Also:
 a literal NumPy transcription, the constant-thvm analytic closed form, and a finite jax.grad.
 """
@@ -19,7 +19,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.calc_pressure import (
+from clubb_jax.src.Input_fields.hydrostatic_module import (
     calc_ref_z_linear_thvm, inverse_hydrostatic, _CP_OV_G)
 from clubb_jax.src.CLUBB_core.constants_clubb import p0, kappa, Cp, grav
 
@@ -38,7 +38,7 @@ def _ref_calc_ref_z(thvm, exner):
 
 
 def _exner_from_z(z, thvm, exner_sfc):
-    """Forward: build exner at heights z from thvm + surface exner, same log-mean scheme as init_pressure_jax."""
+    """Forward: build exner at heights z from thvm + surface exner, same log-mean scheme as init_pressure."""
     n = len(z)
     exner = np.zeros(n)
     exner[0] = exner_sfc

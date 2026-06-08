@@ -25,7 +25,8 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.remapping_module import (
-    calc_mass_over_grid_intervals, remapping_matrix, matrix_vector_mult, remap_vals_to_target_same_grid)
+    calc_mass_over_grid_intervals, remapping_matrix, matrix_vector_mult, remap_vals_to_target_same_grid,
+    remap_vals_to_target, _pressure_levels)
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _DZ, _ZTOP = 2, 50.0, 1500.0
@@ -116,10 +117,50 @@ def test_matvec_and_grad():
     print(f"  matrix_vector_mult==einsum + finite jax.grad through calc_mass ({g.size} entries)  PASS")
 
 
+def test_remap_vals_to_target_two_grids():
+    """`remap_vals_to_target` (remapping_module.F90:remap_vals_to_target_helper, Ullrich-linear) is the GENERAL
+    two-grid conservative remap — distinct source/target grids. The existing tests only cover its building blocks
+    and the same-grid (identity) f2py driver, so the two-grid composition was unpinned. Validate the two defining
+    properties: (1) mass conservation — when both grids span the same domain, the pressure-thickness-weighted
+    integral is preserved exactly: sum(target·dp_tgt) == sum(source·dp_src); (2) identity — a target grid equal
+    to the source grid returns source_values unchanged (the remap matrix is the identity). (iter 526)"""
+    ng = _NG
+    H = 1000.0
+    # Source (10 cells) and target (7 cells) grids spanning the SAME [0, H] domain (required for exact conservation).
+    src = np.tile(np.linspace(0.0, H, 11), (ng, 1))
+    tgt = np.tile(np.array([0.0, 120.0, 300.0, 470.0, 640.0, 800.0, 930.0, H]), (ng, 1))
+    rho_vals, rho_levels = _rho_spline(ng, H)
+    p_sfc = np.full(ng, 1.0e5)
+    rng = np.random.default_rng(526)
+    source_values = rng.uniform(1.0, 5.0, (ng, src.shape[1] - 1))      # arbitrary field on source cells
+
+    target_values = np.asarray(remap_vals_to_target(src, tgt, rho_vals, rho_levels, source_values, p_sfc))
+    # Reconstruct the same internal pressure pipeline to form dp on each grid.
+    p_src = np.asarray(_pressure_levels(calc_mass_over_grid_intervals(rho_vals, rho_levels, src), p_sfc))
+    p_tgt = np.asarray(_pressure_levels(calc_mass_over_grid_intervals(rho_vals, rho_levels, tgt), p_sfc))
+    dp_src = p_src[:, :-1] - p_src[:, 1:]
+    dp_tgt = p_tgt[:, :-1] - p_tgt[:, 1:]
+    mass_src = np.sum(source_values * dp_src, axis=1)
+    mass_tgt = np.sum(target_values * dp_tgt, axis=1)
+    rel = np.max(np.abs(mass_tgt - mass_src) / np.abs(mass_src))
+    assert rel < 1e-10, f"two-grid remap not mass-conserving: rel {rel:.2e}"
+
+    # Identity: target grid == source grid -> output == input.
+    ident = np.asarray(remap_vals_to_target(src, src, rho_vals, rho_levels, source_values, p_sfc))
+    iworst = np.max(np.abs(ident - source_values))
+    assert iworst < 1e-9, f"same-grid remap_vals_to_target not identity: {iworst:.2e}"
+
+    # Finite grad through the full two-grid pipeline.
+    g = np.asarray(jax.grad(lambda v: jnp.sum(
+        remap_vals_to_target(src, tgt, rho_vals, rho_levels, v, p_sfc) ** 2))(jnp.asarray(source_values)))
+    assert np.isfinite(g).all(), "non-finite grad through remap_vals_to_target"
+    print(f"  remap_vals_to_target (two grids): mass-conserving (rel {rel:.1e}) + identity + finite grad  PASS")
+
+
 def main():
     print("test_remapping_module:")
     for t in (test_f2py_oracle, test_remapping_matrix_identity_and_conservation,
-              test_calc_mass_analytic, test_matvec_and_grad):
+              test_calc_mass_analytic, test_matvec_and_grad, test_remap_vals_to_target_two_grids):
         t()
     print("All remapping_module checks PASSED")
 

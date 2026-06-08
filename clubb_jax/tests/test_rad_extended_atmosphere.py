@@ -20,8 +20,8 @@ if _ROOT not in sys.path:
 
 import numpy as np
 
-from clubb_jax.src.Input_fields.sounding import read_sounding, convert_pressure_sounding_to_z
-from clubb_jax.src.Radiation.bugsrad_driver import read_ozone_sounding, build_case_extended_atmosphere
+from clubb_jax.src.Input_fields.sounding import (
+    read_sounding, convert_pressure_sounding_to_z, read_ozone_sounding, convert_snd2extended_atm)
 from clubb_jax.src.CLUBB_core.constants_clubb import p0, kappa
 
 _CASE = _ROOT + "/clubb_release/input/case_setups/cgils_s11"
@@ -38,7 +38,7 @@ def test_real_cgils_extended_atmosphere():
     n = len(snd['z'])
     assert len(o3l) == n, f"ozone levels {len(o3l)} != sounding levels {n}"
 
-    ext = build_case_extended_atmosphere(
+    ext = convert_snd2extended_atm(
         snd['z'], snd['theta'], snd['theta_type'], snd['rt'], snd['p_in_Pa'], _P_SFC, o3l)
     # Structure / convert_snd2extended_atm semantics
     for k in ('alt', 'T_in_K', 'sp_hmdty', 'p_in_mb', 'o3l'):
@@ -64,7 +64,7 @@ def test_theta_branch_exner_conversion():
     z = np.linspace(0, 11000, 12)
     o3l = np.full(12, 5e-8)
     p_sfc = 1.01e5
-    ext = build_case_extended_atmosphere(z, theta, 'thm[K]', rt, p, p_sfc, o3l)
+    ext = convert_snd2extended_atm(z, theta, 'thm[K]', rt, p, p_sfc, o3l)
     exner = (p / p0) ** kappa
     exner[0] = (p_sfc / p0) ** kappa                        # Fortran uses p_sfc for level 1
     assert np.allclose(ext['T_in_K'], theta * exner), "thm[K] branch: T_in_K != θ·exner (or wrong level-1 exner)"

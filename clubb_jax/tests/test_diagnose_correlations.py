@@ -25,7 +25,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.diagnose_correlations_module import (
-    diagnose_correlations, calc_mean, calc_varnce, calc_w_corr)
+    diagnose_correlations, calc_mean, calc_varnce, calc_w_corr, corr_array_assertion_checks)
 
 
 def _corr_matrix(n, seed):
@@ -76,9 +76,19 @@ def test_differentiable():
     print(f"  jax.grad through diagnose_correlations: finite ({g.size} entries)  PASS")
 
 
+def test_corr_array_assertion_checks():
+    c = _corr_matrix(5, 9)                       # valid: symmetric, unit diag, off-diag in (-0.9,0.9)
+    assert corr_array_assertion_checks(c) is True, "valid correlation matrix rejected"
+    bad = c.copy(); bad[0, 1] = bad[1, 0] = 1.5  # off-diagonal out of [-0.99, 0.99]
+    assert corr_array_assertion_checks(bad) is False, "out-of-range off-diagonal accepted"
+    nd = c.copy(); nd[2, 2] = 0.9                # diagonal != 1
+    assert corr_array_assertion_checks(nd) is False, "non-unit-diagonal accepted"
+    print("  corr_array_assertion_checks: valid PASS / out-of-range + non-unit-diag FAIL  PASS")
+
+
 def main():
     print("test_diagnose_correlations:")
-    for t in (test_helpers, test_f2py_oracle, test_differentiable):
+    for t in (test_helpers, test_f2py_oracle, test_differentiable, test_corr_array_assertion_checks):
         t()
     print("All diagnose_correlations checks PASSED")
 

@@ -30,7 +30,12 @@ except ImportError:
 
 from clubb_jax.src.CLUBB_core.diffusion import (
     diffusion_zt_lhs_jax, diffusion_zm_lhs_jax,
-    term_dp1_lhs_jax, xp2_xpyp_lhs_jax,
+)
+# term_dp1_lhs / xp2_xpyp_lhs live in their Fortran home advance_xp2_xpyp_module.py
+# (advance_xp2_xpyp_module.F90), not diffusion.F90 — mirror-refactor iter 228 removed the
+# dead duplicates from diffusion.py.
+from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import (
+    term_dp1_lhs, xp2_xpyp_lhs,
 )
 
 
@@ -344,7 +349,7 @@ def test_term_dp1_lhs_shape():
     nzm, ngrdcol = 6, 2
     Cn = jnp.ones((ngrdcol, nzm))
     invrs_tau = jnp.ones((ngrdcol, nzm))
-    lhs = term_dp1_lhs_jax(Cn, invrs_tau)
+    lhs = term_dp1_lhs(Cn, invrs_tau)
     assert lhs.shape == (ngrdcol, nzm), f"Expected ({ngrdcol},{nzm}), got {lhs.shape}"
     print(f"  shape = {lhs.shape}  PASS")
 
@@ -358,7 +363,7 @@ def test_term_dp1_lhs_boundary_zeros():
     rng = np.random.default_rng(42)
     Cn = jnp.array(rng.uniform(0.1, 2.0, (ngrdcol, nzm)))
     invrs_tau = jnp.array(rng.uniform(0.01, 1.0, (ngrdcol, nzm)))
-    lhs = np.asarray(term_dp1_lhs_jax(Cn, invrs_tau))
+    lhs = np.asarray(term_dp1_lhs(Cn, invrs_tau))
     assert np.all(lhs[:, 0] == 0.0), f"Lower boundary not zero: {lhs[:, 0]}"
     assert np.all(lhs[:, -1] == 0.0), f"Upper boundary not zero: {lhs[:, -1]}"
     print(f"  lower={lhs[:, 0]}, upper={lhs[:, -1]}  PASS")
@@ -372,7 +377,7 @@ def test_term_dp1_lhs_interior_values():
     nzm, ngrdcol = 5, 1
     Cn = jnp.array([[0.5, 0.7, 0.9, 1.1, 1.3]])
     invrs_tau = jnp.array([[0.1, 0.2, 0.3, 0.4, 0.5]])
-    lhs = np.asarray(term_dp1_lhs_jax(Cn, invrs_tau))
+    lhs = np.asarray(term_dp1_lhs(Cn, invrs_tau))
     # Boundaries must be zero
     assert lhs[0, 0] == 0.0 and lhs[0, -1] == 0.0
     # Interior: lhs[k] = Cn[k] * invrs_tau[k] for k=1..nzm-2
@@ -392,7 +397,7 @@ def test_term_dp1_lhs_multi_col():
     rng = np.random.default_rng(99)
     Cn_np = rng.uniform(0.1, 3.0, (ngrdcol, nzm))
     tau_np = rng.uniform(0.01, 2.0, (ngrdcol, nzm))
-    lhs = np.asarray(term_dp1_lhs_jax(jnp.array(Cn_np), jnp.array(tau_np)))
+    lhs = np.asarray(term_dp1_lhs(jnp.array(Cn_np), jnp.array(tau_np)))
     ref = Cn_np * tau_np
     ref[:, 0] = 0.0;  ref[:, -1] = 0.0
     err = np.max(np.abs(lhs - ref))
@@ -422,7 +427,7 @@ def test_xp2_xpyp_lhs_shape():
     ma = jnp.array(_make_random_3band(ngrdcol, nzm, 2))
     diff = jnp.array(_make_random_3band(ngrdcol, nzm, 3))
     dp1 = jnp.zeros((ngrdcol, nzm))
-    lhs = xp2_xpyp_lhs_jax(ta, ma, diff, dp1, dt=60.0)
+    lhs = xp2_xpyp_lhs(ta, ma, diff, dp1, dt=60.0)
     assert lhs.shape == (3, ngrdcol, nzm), f"Expected (3,{ngrdcol},{nzm}), got {lhs.shape}"
     print(f"  shape = {lhs.shape}  PASS")
 
@@ -438,7 +443,7 @@ def test_xp2_xpyp_lhs_boundary_conditions():
     ma = jnp.array(rng.uniform(-1.0, 1.0, (3, ngrdcol, nzm)))
     diff = jnp.array(rng.uniform(-1.0, 1.0, (3, ngrdcol, nzm)))
     dp1 = jnp.array(rng.uniform(0.0, 1.0, (ngrdcol, nzm)))
-    lhs = np.asarray(xp2_xpyp_lhs_jax(ta, ma, diff, dp1, dt=30.0))
+    lhs = np.asarray(xp2_xpyp_lhs(ta, ma, diff, dp1, dt=30.0))
     for bnd in [0, -1]:
         assert np.all(lhs[0, :, bnd] == 0.0), f"super at bnd={bnd}: {lhs[0,:,bnd]}"
         assert np.all(lhs[1, :, bnd] == 1.0), f"main at bnd={bnd}: {lhs[1,:,bnd]}"
@@ -461,7 +466,7 @@ def test_xp2_xpyp_lhs_interior_formula():
     dp1_np  = np.abs(rng.uniform(0.0, 0.5, (ngrdcol, nzm)))
     dp1_np[:, 0] = 0.0;  dp1_np[:, -1] = 0.0
 
-    lhs_jax = np.asarray(xp2_xpyp_lhs_jax(
+    lhs_jax = np.asarray(xp2_xpyp_lhs(
         jnp.array(ta_np), jnp.array(ma_np), jnp.array(diff_np),
         jnp.array(dp1_np), dt=dt, gamma=gamma,
     ))
@@ -479,6 +484,63 @@ def test_xp2_xpyp_lhs_interior_formula():
     )
     print(f"  interior max_err = {err:.3e}  PASS" if err < 1e-14 else f"  FAIL err={err}")
     assert err < 1e-14
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# f2py Fortran-oracle bit-shadow (general stretched grid + varying K)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_f2py_oracle():
+    """Validate diffusion_zt_lhs / diffusion_zm_lhs against the f2py Fortran oracle on a STRETCHED grid with
+    varying K_zm/K_zt (beyond the uniform-grid constant-coefficient analytic check above). The Fortran takes both
+    k_zm and k_zt; the JAX uses only K_zm (the k_zt term is the l_upwind_Kh_dp_term branch, off by default) — passing
+    random K_zt and matching confirms the default path ignores it. SKIPs if clubb_f2py / clubb_python is unbuilt.
+    """
+    for p in (os.path.join(os.path.dirname(__file__), '..', '..', 'clubb_release'),
+              os.path.join(os.path.dirname(__file__), '..', '..', 'clubb_release', 'clubb_python_api')):
+        ap = os.path.abspath(p)
+        if ap not in sys.path:
+            sys.path.append(ap)
+    try:
+        import clubb_f2py
+        from clubb_python import clubb_api
+        from clubb_python.derived_types.err_info import ErrInfo
+    except Exception as e:
+        print(f"  f2py diffusion oracle: SKIP ({type(e).__name__})")
+        return
+    from clubb_jax.src.derived_types.grid_class import setup_grid
+    from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs_jax, diffusion_zm_lhs_jax
+
+    NG, DZ, ZTOP = 2, 40.0, 1200.0
+    jgr = setup_grid(ngrdcol=NG, deltaz=DZ, zm_init=0.0, zm_top=ZTOP, grid_type=1)  # stretched grid
+    ng, nzm = jgr.zm.shape
+    nzt = nzm - 1
+    clubb_api.init_err_info(ng)
+    cf = clubb_api.get_default_config_flags(); clubb_api.init_config_flags(cf)
+    clubb_api.setup_grid(nzmax=nzm, ngrdcol=ng, sfc_elevation=np.zeros(ng),
+                         l_implemented=False, l_ascending_grid=True, grid_type=2,
+                         deltaz=np.full(ng, DZ), zm_init=np.zeros(ng), zm_top=np.full(ng, float(jgr.zm[0, -1])),
+                         momentum_heights=np.asfortranarray(np.asarray(jgr.zm)),
+                         thermodynamic_heights=np.asfortranarray(np.asarray(jgr.zt)),
+                         err_info=ErrInfo(ngrdcol=ng))
+    rng = np.random.default_rng(7)
+    K_zm = rng.uniform(0.1, 5.0, (ng, nzm)); K_zt = rng.uniform(0.1, 5.0, (ng, nzt))
+    nu = rng.uniform(0.5, 2.0, (ng,))
+    rho_zm = rng.uniform(0.8, 1.2, (ng, nzm)); rho_zt = rng.uniform(0.8, 1.2, (ng, nzt))
+    irho_zt = 1.0 / rho_zt; irho_zm = 1.0 / rho_zm
+
+    ref_zt = np.asarray(clubb_f2py.f2py_diffusion_zt_lhs(
+        np.asfortranarray(K_zm), np.asfortranarray(K_zt), nu, np.asfortranarray(irho_zt), np.asfortranarray(rho_zm)))
+    got_zt = np.asarray(diffusion_zt_lhs_jax(jnp.asarray(K_zm), jnp.asarray(nu), jnp.asarray(irho_zt), jnp.asarray(rho_zm), jgr))
+    worst_zt = float(np.max(np.abs(ref_zt - got_zt)))
+    assert worst_zt < 1e-12, f"diffusion_zt_lhs f2py mismatch {worst_zt:.2e}"
+
+    ref_zm = np.asarray(clubb_f2py.f2py_diffusion_zm_lhs(
+        np.asfortranarray(K_zt), np.asfortranarray(K_zm), nu, np.asfortranarray(irho_zm), np.asfortranarray(rho_zt)))
+    got_zm = np.asarray(diffusion_zm_lhs_jax(jnp.asarray(K_zt), jnp.asarray(nu), jnp.asarray(irho_zm), jnp.asarray(rho_zt), jgr))
+    worst_zm = float(np.max(np.abs(ref_zm - got_zm)))
+    assert worst_zm < 1e-12, f"diffusion_zm_lhs f2py mismatch {worst_zm:.2e}"
+    print(f"  f2py diffusion zt/zm LHS: bit-match on stretched grid + varying K, worst {max(worst_zt, worst_zm):.2e}  PASS")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -512,6 +574,7 @@ if __name__ == '__main__':
         test_xp2_xpyp_lhs_shape,
         test_xp2_xpyp_lhs_boundary_conditions,
         test_xp2_xpyp_lhs_interior_formula,
+        test_f2py_oracle,
     ]
 
     passed = 0

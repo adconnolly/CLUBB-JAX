@@ -10,13 +10,23 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.Radiation.BUGSrad.bugsrad_planck import planck, _B, _MBIR
 from clubb_jax.src.Radiation.BUGSrad.newexp import newexp
 from clubb_jax.src.Radiation.BUGSrad.rayle import rayle
 from clubb_jax.src.Radiation.BUGSrad.gascon import gascon, parm_ckd24, _CK24, _H2OBND, _IFLB
 from clubb_jax.src.Radiation.BUGSrad.bugsrad_physconst import GRAVITY, R_D, R_STAR, MW_H2O, F_VIRT
 from clubb_jax.src.Radiation.BUGSrad.cloudg import cloudg, _PI as _CLOUDG_PI
-from clubb_jax.src.Radiation.BUGSrad.comscp import comscp1, comscp2
+from clubb_jax.src.Radiation.BUGSrad.comscp1 import comscp1
+from clubb_jax.src.Radiation.BUGSrad.comscp2 import comscp2
 from clubb_jax.src.Radiation.BUGSrad.two_rt_lw import two_rt_lw
 from clubb_jax.src.Radiation.BUGSrad.two_rt_sw import two_rt_sw
 from clubb_jax.src.Radiation.BUGSrad.gases_ckd import (pscale, qk, qkio3, qoph2o, qopo3s, qophc,
@@ -349,10 +359,10 @@ def test_two_rt_sw_vs_fortran_replica():
     print(f"  two_rt_sw (delta-Eddington 2-stream + direct beam + adding): vs replica rel {worst:.1e}  PASS")
 
 
-def test_gases_ckd_tables_parser():
+def test_gases_ckd_data_parser():
     """The gases_ckd_data.h parser builds the correlated-k tables with correct shapes, fully filled
     (no missing T-coefficient slices), and the right spot-checked values."""
-    from clubb_jax.src.Radiation.BUGSrad.gases_ckd_tables import tables, KG, NUMPS, NUMPIR, NUMTS, NUMTIR
+    from clubb_jax.src.Radiation.BUGSrad.gases_ckd_data import tables, KG, NUMPS, NUMPIR, NUMTS, NUMTIR
     t = tables()
     # 1D weights hk1..hk18 (length KG[band]) + fk1o3 (KG[0])
     for b in range(18):
@@ -379,7 +389,7 @@ def test_gases_ckd_tables_parser():
 def test_gases_dispatch_vs_fortran_replica():
     """The `gases` 18-band dispatch (table indexing + overlap formulas + hk weights) vs a NumPy replica."""
     from clubb_jax.src.Radiation.BUGSrad.gases_ckd import gases, pscale
-    from clubb_jax.src.Radiation.BUGSrad.gases_ckd_tables import tables, KG, STANPS, STANPIR
+    from clubb_jax.src.Radiation.BUGSrad.gases_ckd_data import tables, KG, STANPS, STANPIR
     from clubb_jax.src.Radiation.BUGSrad.bugsrad_physconst import MOLAR_VOLUME as MV, GRAVITY as G, \
         MW_H2O as MWh, MW_O3 as MWo, MW_DRY_AIR as MWd
     T = tables()
@@ -587,10 +597,11 @@ def test_bugsrad_driver():
     sane bounds for a gabls3-like grid (model top 5 km, radiation_top 30 km), and compute_bugsrad_radiation
     produces a strictly-increasing radiation-grid pressure, finite CLUBB-grid heating, and zero SW at night."""
     import numpy as np
+    from clubb_jax.src.Input_fields.sounding import load_extended_std_atm
     from clubb_jax.src.Radiation.bugsrad_driver import (
-        load_std_atmosphere, determine_extended_atmos_bounds, build_rad_grid_setup,
+        determine_extended_atmos_bounds, build_rad_grid_setup,
         compute_bugsrad_radiation)
-    ext = load_std_atmosphere()
+    ext = load_extended_std_atm()
     assert ext['alt'].shape == (50,) and ext['alt'][0] == 1000.0 and ext['alt'][-1] == 50000.0
     nzm, dz, ncol = 51, 100.0, 2
     zm = np.arange(nzm) * dz                                  # 0..5000 m
@@ -624,11 +635,11 @@ def test_bugsrad_driver():
 
 
 def test_bugsrad_radiation_dispatch():
-    """End-to-end wiring: advance_radiation(rad_scheme='bugsrad') builds the grid setup, maps a gabls3-like
+    """End-to-end wiring: advance_clubb_radiation(rad_scheme='bugsrad') builds the grid setup, maps a gabls3-like
     CLUBB state through bugs_rad, and writes a finite K/s heating rate into state['radht'] (shape (1,nzt))."""
     import numpy as np
     from clubb_jax.src.derived_types.grid_class import setup_grid
-    from clubb_jax.src.Radiation.radiation import advance_radiation
+    from clubb_jax.src.Radiation.radiation_module import advance_clubb_radiation
     gr = setup_grid(ngrdcol=1, deltaz=100.0, zm_init=0.0, zm_top=5000.0)
     nzt, nzm = gr.nzt, gr.nzm
     zt = np.asarray(gr.zt)[0]
@@ -646,14 +657,14 @@ def test_bugsrad_radiation_dispatch():
                  rad_scheme="bugsrad", p_in_Pa=p_zt, exner=exner, thlm=thlm, rtm=rtm, rcm=rcm,
                  cloud_frac=cloud_frac, ice_supersat_frac=np.zeros((1, nzt)), rho_zm=rho_zm,
                  radht=np.zeros((1, nzt)))
-    advance_radiation(state, time_current=43200.0)                  # local noon-ish
+    advance_clubb_radiation(state, time_current=43200.0)                  # local noon-ish
     assert state['radht'].shape == (1, nzt), "radht wrong shape"
     assert np.all(np.isfinite(state['radht'])), "non-finite radht from bugsrad dispatch"
     assert '_bugsrad_setup' in state, "rad-grid setup not cached"
     assert np.any(state['radht_SW'] != 0.0), "daytime SW heating should be nonzero"
-    advance_radiation(state, time_current=43500.0)                  # second call reuses cached setup
+    advance_clubb_radiation(state, time_current=43500.0)                  # second call reuses cached setup
     assert np.all(np.isfinite(state['radht']))
-    print(f"  bugsrad dispatch (advance_radiation end-to-end): radht finite {state['radht'].shape}, "
+    print(f"  bugsrad dispatch (advance_clubb_radiation end-to-end): radht finite {state['radht'].shape}, "
           f"setup cached, day SW≠0  PASS")
 
 
@@ -692,7 +703,7 @@ if __name__ == "__main__":
     tests = [
         test_planck_vs_fortran_replica, test_newexp_vs_fortran_replica, test_rayle_vs_fortran_replica,
         test_gascon_vs_fortran_replica, test_cloudg_vs_fortran_replica, test_comscp_vs_fortran_replica,
-        test_two_rt_lw_vs_fortran_replica, test_two_rt_sw_vs_fortran_replica, test_gases_ckd_tables_parser,
+        test_two_rt_lw_vs_fortran_replica, test_two_rt_sw_vs_fortran_replica, test_gases_ckd_data_parser,
         test_gases_ckd_helpers_vs_fortran_replica, test_gases_dispatch_vs_fortran_replica,
         test_bugs_lwr, test_bugs_swr, test_bugs_rad, test_bugsrad_driver, test_bugsrad_radiation_dispatch,
         test_bugs_rad_differentiable,

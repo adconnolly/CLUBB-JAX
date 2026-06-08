@@ -5,7 +5,7 @@ calc_corr_norm_and_cholesky_factor (setup_clubb_pdf_params.F90:1070) adjusts the
 below-cloud correlation matrices (ADG zeroing, Ncn in-cloud override, eta–hm product estimate), Cholesky-
 factorizes each once, then assigns per grid column/level by rc. Oracle:
   1. Reconstruction: at every (i,k) the assigned Cholesky factor L satisfies L Lᵀ == the assigned corr array
-     (cholesky_factor itself is bit-validated vs f2py in test_cholesky_factor).
+     (Cholesky_factor itself is bit-validated vs f2py in test_cholesky_factor).
   2. Structure: corr arrays symmetric + unit diagonal; Cholesky lower-triangular.
   3. The matrix adjustments + rc-selection vs a literal NumPy reference.
   4. A finite jax.grad.

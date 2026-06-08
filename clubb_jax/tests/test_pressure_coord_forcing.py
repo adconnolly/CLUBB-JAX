@@ -16,7 +16,7 @@ if _ROOT not in sys.path:
 
 import numpy as np
 
-from clubb_jax.src.Benchmark_cases.generic_forcings import _parse_forcings_file
+from clubb_jax.src.Benchmark_cases.time_dependent_input import _parse_forcings_file
 
 
 def _write(tmp, header, blocks):
@@ -104,7 +104,7 @@ def test_T_f_and_um_ref_exposed():
 def test_apply_T_f_conversion():
     """The apply step must convert an absolute-T forcing to a thlm forcing: thlm_forcing = T_f/exner
     (time_dependent_input.F90:671). This is the only forcing branch no gated case exercises."""
-    from clubb_jax.src.Benchmark_cases.generic_forcings import _apply_time_dependent_forcings
+    from clubb_jax.src.Benchmark_cases.time_dependent_input import apply_time_dependent_forcings
     nzt = 8
     # T_f profile, two times (constant in time here for a clean check).
     T_f = np.tile(np.linspace(-2e-4, -1e-4, nzt)[:, None], (1, 2))   # (nzt, ntimes)
@@ -114,7 +114,7 @@ def test_apply_T_f_conversion():
     fd.update({'times': np.array([0.0, 3600.0]), 'T_f': T_f, 'omega_mb_hr': False})
     state = {'ngrdcol': 1, '_forcings_data': fd,
              'thlm_forcing': np.zeros((1, nzt)), 'rtm_forcing': np.zeros((1, nzt)), 'exner': exner}
-    _apply_time_dependent_forcings(state, 1800.0)
+    apply_time_dependent_forcings(state, 1800.0)
     expect = T_f[:, 0][None, :] / exner
     expect[:, -1] = 0.0   # Fortran zeroes the top
     assert np.max(np.abs(state['thlm_forcing'] - expect)) < 1e-15, "T_f -> thlm_forcing = T_f/exner failed"

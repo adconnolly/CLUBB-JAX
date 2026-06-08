@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_clip_covar.py — validate the JAX clip_covar_jax port (clip_explicit.F90:clip_covar).
+"""test_clip_covar.py — validate the JAX clip_covar port (clip_explicit.F90:clip_covar).
 
 Clips a covariance x'y' to ±max_mag_corr·sqrt(x'^2·y'^2) on interior momentum levels (boundaries untouched), so
 |corr(x,y)| <= max_mag_corr. Ported (advance_xm_wpxp_module.py) but lacking a dedicated f2py test. Oracles:
@@ -24,7 +24,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import clip_covar_jax
+from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import clip_covar
+from clubb_jax.src.CLUBB_core.clip_explicit import clip_covars_denom
 
 NG, NZM = 2, 9
 CLIP_RTPTHLP, CLIP_WPRTP = 3, 8
@@ -51,7 +52,7 @@ def test_f2py_oracle():
         xp2, yp2, xpyp = _inputs(11 + solve_type)
         f_xpyp, f_chnge = clubb_f2py.f2py_clip_covar(
             solve_type, np.asfortranarray(xp2), np.asfortranarray(yp2), np.asfortranarray(xpyp.copy()))
-        g_xpyp = np.asarray(clip_covar_jax(xpyp, xp2, yp2, MAX_MAG))
+        g_xpyp = np.asarray(clip_covar(xpyp, xp2, yp2, MAX_MAG))
         # JAX returns the clipped covariance; reconstruct the change with zero boundaries (Fortran convention).
         g_chnge = g_xpyp - xpyp
         g_chnge[:, 0] = 0.0; g_chnge[:, -1] = 0.0
@@ -61,9 +62,44 @@ def test_f2py_oracle():
     print(f"  f2py clip_covar: bit-match (xpyp + change, non-flux/flux), worst {worst:.2e}  PASS")
 
 
+def test_clip_covars_denom_f2py():
+    """clip_covars_denom (clip_explicit.F90) — the post-wp2/wp3-solve Cauchy-Schwarz clip driver that calls
+    clip_covar on wprtp(/wp2,rtp2), wpthlp(/wp2,thlp2) and (l_tke_aniso) upwp(/wp2,up2)+vpwp(/wp2,vp2), else
+    upwp/vpwp against wp2. Validate the 4 clipped covars vs f2py_clip_covars_denom for BOTH l_tke_aniso branches.
+    The JAX hardcodes sclr_dim=0 + l_linearize_pbl_winds=False, so drive the f2py with sclr_dim=1 (dummy zero
+    sclrp2/wpsclrp — its scalar clip cannot perturb the 4 momentum/thermo covars) and zero pert winds, comparing
+    only the 4 returned fields. SKIPs if clubb_f2py is unbuilt. (iter 434)"""
+    try:
+        import clubb_f2py
+    except Exception as e:
+        print(f"  f2py clip_covars_denom oracle: SKIP ({type(e).__name__})")
+        return
+    rng = np.random.default_rng(3)
+    worst = 0.0
+    for aniso in (True, False):
+        for _ in range(15):
+            wp2 = rng.uniform(0.0, 1.0, (NG, NZM)); rtp2 = rng.uniform(0.0, 1e-6, (NG, NZM))
+            thlp2 = rng.uniform(0.0, 1.0, (NG, NZM)); up2 = rng.uniform(0.0, 1.0, (NG, NZM)); vp2 = rng.uniform(0.0, 1.0, (NG, NZM))
+            # large covars to force clipping past the ±0.99 correlation bound
+            wprtp = rng.uniform(-1, 1, (NG, NZM)) * 1e-3; wpthlp = rng.uniform(-2, 2, (NG, NZM))
+            upwp = rng.uniform(-2, 2, (NG, NZM)); vpwp = rng.uniform(-2, 2, (NG, NZM))
+            j = clip_covars_denom(jnp.asarray(wprtp), jnp.asarray(wpthlp), jnp.asarray(upwp), jnp.asarray(vpwp),
+                                  jnp.asarray(wp2), jnp.asarray(rtp2), jnp.asarray(thlp2), jnp.asarray(up2),
+                                  jnp.asarray(vp2), l_tke_aniso=aniso)
+            sclrp2 = np.zeros((NG, NZM, 1)); wpsclrp = np.zeros((NG, NZM, 1)); z = np.zeros((NG, NZM))
+            f = clubb_f2py.f2py_clip_covars_denom(1, 60.0, rtp2, thlp2, up2, vp2, wp2, sclrp2, int(aniso), 0, 1,
+                                                  0, 0, 0, 0, wprtp.copy(), wpthlp.copy(), upwp.copy(), vpwp.copy(),
+                                                  wpsclrp, z.copy(), z.copy())
+            for k in range(4):   # returned (wprtp, wpthlp, upwp, vpwp) are at f[4..7]
+                worst = max(worst, float(np.max(np.abs(np.asarray(j[k]) - np.asarray(f[4 + k])))))
+    assert worst < 1e-12, f"clip_covars_denom f2py mismatch {worst:.2e}"
+    print(f"  f2py clip_covars_denom (4 clipped covars, both l_tke_aniso branches, 30 cases): "
+          f"bit-match, worst {worst:.2e}  PASS")
+
+
 def test_realizability():
     xp2, yp2, xpyp = _inputs(5)
-    g = np.asarray(clip_covar_jax(xpyp, xp2, yp2, MAX_MAG))
+    g = np.asarray(clip_covar(xpyp, xp2, yp2, MAX_MAG))
     corr = g / np.sqrt(xp2 * yp2)
     # Interior levels must satisfy |corr| <= max_mag_corr (boundaries are left as-is).
     assert np.all(np.abs(corr[:, 1:-1]) <= MAX_MAG + 1e-12), "interior correlation exceeds max_mag_corr"
@@ -75,15 +111,15 @@ def test_realizability():
 def test_differentiable():
     xp2, yp2, xpyp = _inputs(7)
     def loss(v):
-        return jnp.sum(clip_covar_jax(v, xp2, yp2, MAX_MAG) ** 2)
+        return jnp.sum(clip_covar(v, xp2, yp2, MAX_MAG) ** 2)
     g = np.asarray(jax.grad(loss)(jnp.asarray(xpyp)))
-    assert np.isfinite(g).all(), "non-finite grad through clip_covar_jax"
-    print(f"  jax.grad through clip_covar_jax: finite ({g.size} entries)  PASS")
+    assert np.isfinite(g).all(), "non-finite grad through clip_covar"
+    print(f"  jax.grad through clip_covar: finite ({g.size} entries)  PASS")
 
 
 def main():
     print("test_clip_covar:")
-    for t in (test_f2py_oracle, test_realizability, test_differentiable):
+    for t in (test_f2py_oracle, test_clip_covars_denom_f2py, test_realizability, test_differentiable):
         t()
     print("All clip_covar checks PASSED")
 

@@ -17,7 +17,11 @@ import os
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 try:
     import jax
@@ -27,7 +31,7 @@ try:
 except ImportError:
     HAS_JAX = False
 
-from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import tridiag_lu_solve_jax
+from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve_jax
 
 
 def _make_lhs_from_bands(sup_np, mid_np, sub_np):
@@ -202,6 +206,35 @@ def test_solver_residual():
     assert max_res < 1e-12, f"residual too large: {max_res}"
 
 
+def test_solver_f2py_oracle():
+    """f2py bit-shadow vs the Fortran oracle. tridiag_lu_solve_jax is a faithful port of
+    `tridiag_lu_solve_single_rhs_multiple_lhs` (tridiag_lu_solver.F90) — this is THE workhorse solver every
+    prognostic advance routes through, so bit-matching the SPECIFIC Fortran LU (not merely numpy.linalg.solve,
+    which only confirms the system is solved) is what underpins the whole bit-faithful case suite. SKIPs if
+    clubb_f2py is unbuilt. (iter 441)"""
+    if not HAS_JAX:
+        print("  SKIP (no jax)"); return
+    try:
+        import clubb_f2py
+    except Exception as e:
+        print(f"  f2py tridiag_lu_solve oracle: SKIP ({type(e).__name__})")
+        return
+    rng = np.random.default_rng(0)
+    worst = 0.0
+    for _ in range(20):
+        ng, nd = 2, 15
+        lhs = np.zeros((3, ng, nd))
+        lhs[0] = rng.uniform(-0.3, 0.3, (ng, nd))   # superdiagonal
+        lhs[1] = rng.uniform(2.0, 4.0, (ng, nd))    # main (diagonally dominant → stable LU)
+        lhs[2] = rng.uniform(-0.3, 0.3, (ng, nd))   # subdiagonal
+        rhs = rng.uniform(-1.0, 1.0, (ng, nd))
+        j = np.asarray(tridiag_lu_solve_jax(jnp.asarray(lhs), jnp.asarray(rhs)))
+        f = np.asarray(clubb_f2py.f2py_tridiag_lu_solve_single_rhs_multiple_lhs(lhs, rhs))
+        worst = max(worst, float(np.max(np.abs(j - f) / np.maximum(np.abs(f), 1e-30))))
+    assert worst < 1e-12, f"tridiag_lu_solve f2py mismatch {worst:.2e}"
+    print(f"  f2py tridiag_lu_solve_single_rhs_multiple_lhs: bit-match, worst rel {worst:.2e}  PASS")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -220,6 +253,7 @@ if __name__ == '__main__':
         test_solver_vs_numpy_single_col,
         test_solver_vs_numpy_multi_col,
         test_solver_residual,
+        test_solver_f2py_oracle,
     ]
 
     passed = failed = 0

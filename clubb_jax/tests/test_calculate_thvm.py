@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_calculate_thvm.py — validate the JAX calculate_thvm_jax port (calc_pressure.F90:calculate_thvm).
+"""test_calculate_thvm.py — validate the JAX calculate_thvm port (calc_pressure.F90:calculate_thvm).
 
 thvm = thlm + ep1·thv_ds_zt·rtm + (Lv/(Cp·exner) − ep2·thv_ds_zt)·rcm — mean virtual potential temperature.
 This routine is ported and used in the gated driver but had no dedicated f2py test. Oracles:
@@ -23,7 +23,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.T_in_K_module import calculate_thvm_jax
+from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
 from clubb_jax.src.CLUBB_core.constants_clubb import ep1, ep2, Lv, Cp
 
 NG, NZ = 2, 8
@@ -49,7 +49,7 @@ def test_f2py_oracle():
     for seed in (11, 22, 33):
         thlm, rtm, rcm, exner, thv_ds_zt = _inputs(seed)
         ref = np.asarray(clubb_f2py.f2py_calculate_thvm(thlm, rtm, rcm, exner, thv_ds_zt))
-        got = np.asarray(calculate_thvm_jax(thlm, rtm, rcm, exner, thv_ds_zt))
+        got = np.asarray(calculate_thvm(thlm, rtm, rcm, exner, thv_ds_zt))
         worst = max(worst, np.max(np.abs(got - ref)))
     assert worst < 1e-11, f"calculate_thvm f2py mismatch {worst:.2e}"
     print(f"  f2py calculate_thvm: bit-match over 3 seeds, worst {worst:.2e}  PASS")
@@ -57,11 +57,11 @@ def test_f2py_oracle():
 
 def test_closed_form():
     thlm, rtm, rcm, exner, thv_ds_zt = _inputs(5)
-    got = np.asarray(calculate_thvm_jax(thlm, rtm, rcm, exner, thv_ds_zt))
+    got = np.asarray(calculate_thvm(thlm, rtm, rcm, exner, thv_ds_zt))
     ref = thlm + ep1 * thv_ds_zt * rtm + (Lv / (Cp * exner) - ep2 * thv_ds_zt) * rcm
     assert np.max(np.abs(got - ref)) < 1e-12, "closed-form mismatch"
     # rcm = 0 -> thvm = thlm + ep1*thv_ds_zt*rtm.
-    g0 = np.asarray(calculate_thvm_jax(thlm, rtm, np.zeros_like(rcm), exner, thv_ds_zt))
+    g0 = np.asarray(calculate_thvm(thlm, rtm, np.zeros_like(rcm), exner, thv_ds_zt))
     assert np.max(np.abs(g0 - (thlm + ep1 * thv_ds_zt * rtm))) < 1e-12, "rcm=0 limit"
     print("  closed-form identity + rcm=0 limit  PASS")
 
@@ -69,10 +69,10 @@ def test_closed_form():
 def test_differentiable():
     thlm, rtm, rcm, exner, thv_ds_zt = _inputs(7)
     def loss(rcm_v):
-        return jnp.sum(calculate_thvm_jax(thlm, rtm, rcm_v, exner, thv_ds_zt) ** 2)
+        return jnp.sum(calculate_thvm(thlm, rtm, rcm_v, exner, thv_ds_zt) ** 2)
     g = np.asarray(jax.grad(loss)(jnp.asarray(rcm)))
-    assert np.isfinite(g).all(), "non-finite grad through calculate_thvm_jax"
-    print(f"  jax.grad through calculate_thvm_jax: finite ({g.size} entries)  PASS")
+    assert np.isfinite(g).all(), "non-finite grad through calculate_thvm"
+    print(f"  jax.grad through calculate_thvm: finite ({g.size} entries)  PASS")
 
 
 def main():

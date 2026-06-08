@@ -2,7 +2,7 @@
 """test_ice_dfsn.py — validate the JAX ice_dfsn port (cloud-water depletion by diffusional growth of ice).
 
 Oracles:
-  1. `thlm2T_in_K_jax` is bit-validated vs the f2py oracle `f2py_thlm2t_in_k_1d` (SKIPs if unbuilt).
+  1. `thlm2T_in_K` is bit-validated vs the f2py oracle `f2py_thlm2t_in_k_1d` (SKIPs if unbuilt).
   2. `ice_dfsn` is validated vs a LITERAL NumPy transcription of the Fortran top-to-bottom mass-integration
      loop (the algorithm is sequential, so a direct Python loop is a faithful, independent reference) — rel ~1e-14.
   3. Branch coverage: tendencies are 0 outside in-cloud/below-freezing; the over-depletion cap is exercised.
@@ -26,8 +26,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.T_in_K_module import thlm2T_in_K_jax
-from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq_jax
+from clubb_jax.src.CLUBB_core.T_in_K_module import thlm2T_in_K
+from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
 from clubb_jax.src.CLUBB_core.constants_clubb import (
     Cp, Lv, ep, Rv, Lf, Ls, T_freeze_K, cm_per_m)
 from clubb_jax.src.Microphys.ice_dfsn_module import ice_dfsn
@@ -65,7 +65,7 @@ def _numpy_ice_dfsn(gr, dt, thlm, rcm, exner, p, rho):
     inv_dzm = np.asarray(gr.invrs_dzm[0])
     for k in range(nzt - 1, -1, -1):   # 0-based for Fortran k=nzt..1
         if rcm[k] >= _RCM_THR and T[k] < T_freeze_K:
-            r_s = float(sat_mixrat_liq_jax(p[k], T[k], _SAT_FORMULA))
+            r_s = float(sat_mixrat_liq(p[k], T[k], _SAT_FORMULA))
             e_s = (r_s * p[k]) / (ep + r_s)
             e_i = e_s / np.exp((Lf / (Rv * T_freeze_K)) * (T_freeze_K / T[k] - 1.0))
             S_i = e_s / e_i
@@ -95,7 +95,7 @@ def test_thlm2T_in_K_vs_f2py():
     thlm = 290.0 + rng.standard_normal(30) * 5
     exner = 0.9 + rng.standard_normal(30) * 0.02
     rcm = np.abs(rng.standard_normal(30)) * 1e-4
-    got = np.asarray(thlm2T_in_K_jax(jnp.asarray(thlm), jnp.asarray(exner), jnp.asarray(rcm)))
+    got = np.asarray(thlm2T_in_K(jnp.asarray(thlm), jnp.asarray(exner), jnp.asarray(rcm)))
     try:
         import clubb_f2py
     except Exception:
@@ -122,7 +122,7 @@ def test_ice_dfsn_vs_numpy():
 
 def test_branches_and_coupling():
     gr, thlm, rcm, exner, p, rho = _make_grid_and_profile()
-    T = np.asarray(thlm2T_in_K_jax(jnp.asarray(thlm), jnp.asarray(exner), jnp.asarray(rcm)))
+    T = np.asarray(thlm2T_in_K(jnp.asarray(thlm), jnp.asarray(exner), jnp.asarray(rcm)))
     g_rcm, g_thl = ice_dfsn(gr, 60.0, thlm, rcm, exner, p, rho, _SAT_FORMULA)
     g_rcm = np.asarray(g_rcm)
     outside = ~((rcm >= _RCM_THR) & (T < T_freeze_K))

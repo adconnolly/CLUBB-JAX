@@ -117,6 +117,22 @@ def test_f2py_oracle():
     assert resid < 1e-11, f"cubic residual {resid:.2e}"
     print(f"  f2py cubic_solve: sorted-real bit-match {err:.2e} (incl. negative-R), residual {resid:.2e}  PASS")
 
+    # quadratic_solve vs f2py_quadratic_solve — was only checked vs np.roots (a re-implementation); the f2py
+    # oracle is the independent Fortran truth, incl. the complex-root branch. The JAX entry assumes a/=0, so keep
+    # |a| away from 0 (a=0 is the Fortran's separate linear fallback). (iter 412)
+    rng = np.random.default_rng(11)
+    qworst = 0.0
+    for _ in range(50):
+        n = 8
+        aa = rng.uniform(-3.0, 3.0, n); aa = np.where(np.abs(aa) < 0.3, 1.0, aa)
+        bb = rng.uniform(-5.0, 5.0, n); cc = rng.uniform(-5.0, 5.0, n)   # mix of real & complex roots
+        jr = np.asarray(quadratic_solve(jnp.asarray(aa), jnp.asarray(bb), jnp.asarray(cc)))   # complex (n,2)
+        qre, qim = clubb_f2py.f2py_quadratic_solve(aa, bb, cc)
+        qworst = max(qworst, float(np.max(np.abs(jr.real - np.asarray(qre)))),
+                     float(np.max(np.abs(jr.imag - np.asarray(qim)))))
+    assert qworst < 1e-12, f"f2py quadratic_solve mismatch {qworst:.2e}"
+    print(f"  f2py quadratic_solve: bit-match over 50 cases (real + complex roots), worst {qworst:.2e}  PASS")
+
 
 def main():
     print("test_calc_roots:")

@@ -8,11 +8,25 @@ confirms the rate-relevant correlations equal the values validated against the r
 """
 import numpy as np
 
+import os
+import sys
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 from clubb_jax.src.CLUBB_core.corr_varnce_module import (
-    set_corr_arrays_to_default, kk_prescribed_correlations, KK_PDF_TO_DEF,
+    set_corr_arrays_to_default, kk_prescribed_correlations, def_corr_idx, get_corr_var_index, HmMetadata,
     CORR_ARRAY_N_CLOUD_DEF, CORR_ARRAY_N_BELOW_DEF,
     II_CHI, II_ETA, II_W, II_NCN, II_RR, II_NR,
     init_pdf_hydromet_arrays, kk_hm_metadata)
+
+# KK PDF layout [chi, eta, w, Ncn, rr, Nr] -> default-table columns, derived via def_corr_idx
+# (mirrors the Fortran set_corr_arrays_to_default <- def_corr_idx chain).
+_KK_LAYOUT = HmMetadata(hydromet_dim=2, iiPDF_rr=II_RR, iiPDF_Nr=II_NR)
+KK_PDF_TO_DEF = tuple(def_corr_idx(i, _KK_LAYOUT) for i in range(6))
 
 # The 6×6 prescribed lower-triangular arrays, hand-extracted from the Fortran default tables.
 # Row index = pdf var j, col index = pdf var i; entry [j,i] (j>i) = corr(j,i).
@@ -64,6 +78,30 @@ def test_kk_prescribed_correlations():
     print("  kk_prescribed_correlations: chi_rr=0.788, chi_Nr=0.675, rr_Nr=0.821, chi_Ncn=0.09  PASS")
 
 
+def test_def_corr_idx():
+    """def_corr_idx maps each PDF variable to its default-table column; -1 for no match."""
+    md = HmMetadata(hydromet_dim=2, iiPDF_rr=II_RR, iiPDF_Nr=II_NR)
+    assert tuple(def_corr_idx(i, md) for i in range(6)) == (II_CHI, II_ETA, II_W, II_NCN, II_RR, II_NR)
+    assert def_corr_idx(II_RR, md) == II_RR and def_corr_idx(II_NR, md) == II_NR
+    assert def_corr_idx(99, md) == -1     # no PDF variable at that index
+    # A metadata without rain hydrometeors (warm 4-var PDF) maps only chi/eta/w/Ncn.
+    md4 = HmMetadata(hydromet_dim=0)
+    assert tuple(def_corr_idx(i, md4) for i in range(4)) == (II_CHI, II_ETA, II_W, II_NCN)
+    assert def_corr_idx(II_RR, md4) == -1   # rr absent (iiPDF_rr defaults to -1)
+    print("  def_corr_idx: KK layout -> (chi,eta,w,Ncn,rr,Nr) cols; absent vars -> -1  PASS")
+
+
+def test_get_corr_var_index():
+    """get_corr_var_index maps a PDF-variable NAME to its iiPDF index; -1 for unknown/absent."""
+    md = HmMetadata(hydromet_dim=2, iiPDF_rr=II_RR, iiPDF_Nr=II_NR)
+    assert get_corr_var_index("chi", md) == II_CHI and get_corr_var_index("eta", md) == II_ETA
+    assert get_corr_var_index("w", md) == II_W and get_corr_var_index("Ncn", md) == II_NCN
+    assert get_corr_var_index("rr", md) == II_RR and get_corr_var_index("Nr", md) == II_NR
+    assert get_corr_var_index("ri", md) == -1     # frozen species absent in the warm KK PDF
+    assert get_corr_var_index("bogus", md) == -1  # unknown name
+    print("  get_corr_var_index: name -> iiPDF index (chi..Nr); absent/unknown -> -1  PASS")
+
+
 def test_kk_hm_metadata():
     """init_pdf_hydromet_arrays produces rico's KK hydrometeor config: rr at array index 0,
     Nr at 1; names rrm/Nrm; rr a mixing ratio (Nr a number conc); neither frozen; the rico
@@ -94,5 +132,7 @@ if __name__ == "__main__":
     test_default_table_storage()
     test_set_corr_arrays_to_default()
     test_kk_prescribed_correlations()
+    test_def_corr_idx()
+    test_get_corr_var_index()
     test_kk_hm_metadata()
     print("All corr_varnce_module tests PASSED.")
