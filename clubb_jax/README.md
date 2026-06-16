@@ -37,11 +37,13 @@ same relative path.
   pure-JAX driver needs to run a case.
 - **A sibling `clubb_release/` checkout** (`CLUBB-JAX/clubb_release/`). The run scripts read
   case namelists, soundings, and tunable parameters from `clubb_release/input/`.
-- **Compiled Fortran artifacts in `clubb_release/`** — `bin/clubb_standalone` and
-  `clubb_python_api/*.so` — are needed to (a) generate/compare against the Fortran oracle and
+- **Compiled Fortran artifacts in `clubb_release/`** —
+  `install/latest/clubb_standalone` and `clubb_python_api/*.so` — are needed to
+  (a) generate/compare against the Fortran oracle and
   (b) for the launcher's environment setup. They are build outputs, not in git; build them
-  from the repo root with:
+  from the `clubb_release` root with:
   ```bash
+  cd clubb_release
   ./compile.py [-debug] -python
   ```
   Note: the compiled API is the *oracle* for comparison — the JAX physics does not call it
@@ -58,7 +60,8 @@ python clubb_jax/run_scripts/run_scm.py arm -jax -max_iters 30
 
 `-jax` writes stats to **`clubb_jax/output/<case>_stats.nc`** (the Fortran oracle lives
 separately in `clubb_release/output/`, so a JAX run never clobbers it). Drop `-jax` to run
-the compiled Fortran instead (`-legacy`).
+the compiled Fortran instead. By default the run script uses
+`clubb_release/install/latest/clubb_standalone`; pass `-exe <path>` to use a specific build.
 
 You can also invoke the driver module directly on an already-aggregated namelist:
 

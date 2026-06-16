@@ -11,7 +11,7 @@ jax.config.update("jax_enable_x64", True)
 
 
 # grad-safe sqrt(max(x,0)) — the canonical tracer-toolkit helper.
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt as _ssqrt
+from clubb_jax.src.CLUBB_core.pdf_utilities import _safe_sqrt as _ssqrt
 
 
 def _scbrt(x):

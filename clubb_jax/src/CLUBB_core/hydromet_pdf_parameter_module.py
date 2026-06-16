@@ -9,11 +9,35 @@ Validated in `tests/test_hydromet_pdf_parameter.py` (shapes, dims metadata, all-
 """
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 
 MAX_HYDROMET_DIM = 8   # hydromet_pdf_parameter_module.F90:27
 
 
+_HYDROMET_PDF_PARAMETER_FIELDS = (
+    "hm_1",
+    "hm_2",
+    "mu_hm_1",
+    "mu_hm_2",
+    "sigma_hm_1",
+    "sigma_hm_2",
+    "corr_w_hm_1",
+    "corr_w_hm_2",
+    "corr_chi_hm_1",
+    "corr_chi_hm_2",
+    "corr_eta_hm_1",
+    "corr_eta_hm_2",
+    "corr_hmx_hmy_1",
+    "corr_hmx_hmy_2",
+    "mu_Ncn_1",
+    "mu_Ncn_2",
+    "sigma_Ncn_1",
+    "sigma_Ncn_2",
+)
+
+
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class HydrometPdfParameter:
     """Means/variances/correlations of the hydrometeor PDF (hydromet_pdf_parameter type)."""
@@ -36,7 +60,16 @@ class HydrometPdfParameter:
     sigma_Ncn_1: float
     sigma_Ncn_2: float
 
+    def tree_flatten(self):
+        return tuple(getattr(self, name) for name in _HYDROMET_PDF_PARAMETER_FIELDS), None
 
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        del aux_data
+        return cls(**dict(zip(_HYDROMET_PDF_PARAMETER_FIELDS, children)))
+
+
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class PrecipitationFractions:
     """Precipitation-fraction fields, shape (ngrdcol, nzt) (precipitation_fractions type)."""
@@ -45,6 +78,23 @@ class PrecipitationFractions:
     precip_frac: jnp.ndarray
     precip_frac_1: jnp.ndarray
     precip_frac_2: jnp.ndarray
+
+    def tree_flatten(self):
+        children = (self.precip_frac, self.precip_frac_1, self.precip_frac_2)
+        aux_data = (self.ngrdcol, self.nzt)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        ngrdcol, nzt = aux_data
+        precip_frac, precip_frac_1, precip_frac_2 = children
+        return cls(
+            ngrdcol=ngrdcol,
+            nzt=nzt,
+            precip_frac=precip_frac,
+            precip_frac_1=precip_frac_1,
+            precip_frac_2=precip_frac_2,
+        )
 
 
 def init_hydromet_pdf_params():

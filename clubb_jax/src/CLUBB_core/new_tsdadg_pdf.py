@@ -28,11 +28,11 @@ def calc_L_x_Skx_fnc(Skx, sgn_wpxp, small_l_x_1, small_l_x_2):
     return big_L_x_1, big_L_x_2
 
 
-from clubb_jax.src.CLUBB_core.constants_clubb import eps as _EPS  # noqa: E402
+from clubb_jax.src.CLUBB_core.clubb_constants import eps as _EPS  # noqa: E402
 
 
 # grad-safe sqrt(max(x,0)) — the canonical tracer-toolkit helper.
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt as _ssqrt
+from clubb_jax.src.CLUBB_core.pdf_utilities import _safe_sqrt as _ssqrt
 
 
 def calc_setter_parameters(xm, xp2, Skx, sgn_wpxp, big_L_x_1, big_L_x_2):

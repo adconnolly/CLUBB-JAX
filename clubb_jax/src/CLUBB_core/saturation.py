@@ -1,26 +1,20 @@
-"""JAX implementations of saturation.F90 routines."""
+"""JAX implementations of selected routines from `saturation.F90`."""
 
-import jax
+from __future__ import annotations
+
 import jax.numpy as jnp
 
-# Physical constants — mirror the Fortran saturation.F90 `use constants_clubb` (Cp/Lv/T_freeze_K/ep) instead of
-# re-defining them here (values bit-identical, verified iter 600)
-from clubb_jax.src.CLUBB_core.constants_clubb import (
-    Cp as _Cp, Lv as _Lv, T_freeze_K as _T_FREEZE_K, ep as _EP,
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    T_freeze_K,
+    ep,
+    saturation_bolton,
+    saturation_flatau,
+    saturation_gfdl,
+    saturation_lookup,
 )
 
-# Saturation formula integer codes — model_flags.F90 enum parameters; import from their Fortran-home model_flags.py
-from clubb_jax.src.CLUBB_core.model_flags import (
-    saturation_bolton as SATURATION_BOLTON, saturation_flatau as SATURATION_FLATAU,
-)
-
-# Flatau polynomial minimum temperature [C]
-_FLATAU_MIN_T_C = -85.0
-
-# Flatau ice polynomial coefficients (Table 4, Flatau et al. 1992, pp.1511)
-# multiplied by 100 as in Fortran saturation.F90
 _FLATAU_ICE_MIN_T_C = -90.0
-_FLATAU_ICE_A = [
+_FLATAU_ICE_A = (
     100.0 * 6.09868993,
     100.0 * 0.499320233,
     100.0 * 0.184672631e-1,
@@ -30,169 +24,123 @@ _FLATAU_ICE_A = [
     100.0 * 0.307839583e-9,
     100.0 * 0.105785160e-11,
     100.0 * 0.161444444e-14,
-]
+)
 
 
 def sat_vapor_press_liq_flatau(T_in_K):
-    """Flatau et al. 1992 8th-order polynomial SVP over liquid water.
+    """Flatau et al. polynomial approximation for liquid saturation pressure.
 
-    Valid range: -85 to ~50 deg_C.
-    Returns esat [Pa].
+    This mirrors the factored polynomial in `sat_mixrat_liq_k` for the
+    `saturation_flatau` case.  The temperature is clipped at -85 C, matching
+    the valid range limiter in the Fortran routine.
     """
-    T_in_C = jnp.clip(T_in_K - _T_FREEZE_K, a_min=_FLATAU_MIN_T_C)
-    T_sqd = T_in_C ** 2
-    esat = (
+    T_in_C = jnp.maximum(T_in_K - T_freeze_K, -85.0)
+    T_in_C_sqd = T_in_C ** 2
+    return (
         -3.21582393e-14
         * (T_in_C - 646.5835252598777)
         * (T_in_C + 90.72381630364440)
-        * (T_sqd + 111.0976961559954 * T_in_C + 6459.629194243118)
-        * (T_sqd + 152.3131930092453 * T_in_C + 6499.774954705265)
-        * (T_sqd + 174.4279584934021 * T_in_C + 7721.679732114084)
+        * (T_in_C_sqd + 111.0976961559954 * T_in_C + 6459.629194243118)
+        * (T_in_C_sqd + 152.3131930092453 * T_in_C + 6499.774954705265)
+        * (T_in_C_sqd + 174.4279584934021 * T_in_C + 7721.679732114084)
     )
-    return esat
 
 
 def sat_vapor_press_liq_bolton(T_in_K):
-    """Bolton 1980 SVP over liquid water. Returns esat [Pa]."""
-    return 611.2 * jnp.exp(17.67 * (T_in_K - _T_FREEZE_K) / (T_in_K - 29.65))
+    """Bolton 1980 approximation for liquid saturation pressure."""
+    return 611.2 * jnp.exp(17.67 * (T_in_K - T_freeze_K) / (T_in_K - 29.65))
+
+
+def sat_vapor_press_liq_gfdl(T_in_K):
+    """GFDL/Goff-Gratch approximation for liquid saturation pressure."""
+    T_in_K_clipped = jnp.maximum(173.15, T_in_K)
+    return (
+        10.0 ** (
+            -7.90298 * (373.16 / T_in_K_clipped - 1.0)
+            + 5.02808 * jnp.log10(373.16 / T_in_K_clipped)
+            - 1.3816e-7
+            * (10.0 ** (11.344 * (1.0 - T_in_K_clipped / 373.16)) - 1.0)
+            + 8.1328e-3
+            * (10.0 ** (-3.49149 * (373.16 / T_in_K_clipped - 1.0)) - 1.0)
+            + jnp.log10(1013.246)
+        )
+        * 100.0
+    )
 
 
 def sat_vapor_press_liq(T_in_K, saturation_formula: int):
-    """SVP over liquid water — dispatcher (saturation.F90:sat_vapor_press_liq).
+    """Liquid saturation vapor pressure selected by `saturation_formula`.
 
-    Mirrors the Fortran select-case that picks one of the SVP approximations by
-    `saturation_formula`. The gfdl/lookup cases are gated-off not-targets in this
-    port; the flatau and bolton branches are mirrored.
-
-    Args:
-        T_in_K:             Temperature [K], any shape.
-        saturation_formula: SATURATION_FLATAU=3 or SATURATION_BOLTON=1.
-
-    Returns:
-        esat: saturation vapor pressure over water [Pa], same shape as T_in_K.
+    The Flatau, Bolton, and GFDL branches mirror `saturation.F90`.
+    `saturation_lookup` depends on the Fortran lookup table and is left
+    explicit here rather than silently using a different formula.
     """
-    if saturation_formula == SATURATION_FLATAU:
+    T_in_K = jnp.asarray(T_in_K, dtype=jnp.float64)
+    if saturation_formula == saturation_flatau:
         return sat_vapor_press_liq_flatau(T_in_K)
-    elif saturation_formula == SATURATION_BOLTON:
+    if saturation_formula == saturation_bolton:
         return sat_vapor_press_liq_bolton(T_in_K)
-    else:
-        raise ValueError(f"Unsupported saturation_formula={saturation_formula}")
+    if saturation_formula == saturation_gfdl:
+        return sat_vapor_press_liq_gfdl(T_in_K)
+    if saturation_formula == saturation_lookup:
+        raise ValueError("saturation_lookup is not ported to JAX yet.")
+    raise ValueError(f"Unsupported saturation_formula={saturation_formula}")
 
 
 def sat_mixrat_liq(p_in_Pa, T_in_K, saturation_formula: int):
-    """Saturation mixing ratio over liquid water (saturation.F90:sat_mixrat_liq_api).
+    """Saturation mixing ratio over liquid water.
 
-    Uses I_sat_sphum = .false. (mixing ratio, not specific humidity).
+    Mirrors `sat_mixrat_liq_api` with `I_sat_sphum = .false.`:
 
-    rsat = ep * esat / (p_in_Pa - esat)   when p_in_Pa - esat >= 1.0
-         = ep                              otherwise (esat ≈ pressure)
+      rs = ep * esat / (p - esat)
 
-    Args:
-        p_in_Pa:            Pressure [Pa], any shape.
-        T_in_K:             Temperature [K], same shape.
-        saturation_formula: SATURATION_FLATAU=3 or SATURATION_BOLTON=1.
-
-    Returns:
-        rsat: saturation mixing ratio [kg/kg], same shape as inputs.
+    If `p - esat < 1`, the Fortran routine returns `ep`.
     """
+    p_in_Pa = jnp.asarray(p_in_Pa, dtype=jnp.float64)
+    T_in_K = jnp.asarray(T_in_K, dtype=jnp.float64)
     esat = sat_vapor_press_liq(T_in_K, saturation_formula)
 
-    # Protect against p - esat < 1 (esat ≥ pressure — near pure vapor)
-    safe = (p_in_Pa - esat) >= 1.0
-    # safe-division (iter 514): clamp the denominator BEFORE dividing so the unconditional quotient is finite even
-    # where it is masked out — otherwise a near-zero/negative (p−esat) gives an inf/nan VALUE whose reverse-mode VJP
-    # poisons the gradient (nan·0 = nan) at that level, even though the forward `where` discards it. Forward-identical:
-    # where safe, denom_safe == p−esat (unchanged); where not, the `where` still picks _EP.
-    denom_safe = jnp.where(safe, p_in_Pa - esat, 1.0)
-    rsat = jnp.where(safe, _EP * esat / denom_safe, _EP)
-    return rsat
+    denom = p_in_Pa - esat
+    safe = denom >= 1.0
+    denom_safe = jnp.where(safe, denom, 1.0)
+    return jnp.where(safe, ep * esat / denom_safe, ep)
 
 
 def sat_mixrat_ice(p_in_Pa, T_in_K):
-    """Saturation mixing ratio over ice via Flatau polynomial (saturation_formula=3).
-
-    Matches Fortran saturation.F90:sat_mixrat_ice_2D with saturation_flatau.
-
-    Args:
-        p_in_Pa: Pressure [Pa], any shape.
-        T_in_K:  Temperature [K], same shape.
-
-    Returns:
-        rsat_ice: saturation mixing ratio over ice [kg/kg].
-    """
-    T_in_C = jnp.clip(T_in_K - _T_FREEZE_K, a_min=_FLATAU_ICE_MIN_T_C)
+    """Saturation mixing ratio over ice using the Flatau polynomial."""
+    p_in_Pa = jnp.asarray(p_in_Pa, dtype=jnp.float64)
+    T_in_K = jnp.asarray(T_in_K, dtype=jnp.float64)
+    T_in_C = jnp.maximum(T_in_K - T_freeze_K, _FLATAU_ICE_MIN_T_C)
     a = _FLATAU_ICE_A
-    esat_ice = (a[0] + T_in_C * (a[1] + T_in_C * (a[2] + T_in_C * (
-                a[3] + T_in_C * (a[4] + T_in_C * (a[5] + T_in_C * (
-                a[6] + T_in_C * (a[7] + T_in_C * a[8]))))))))
-    safe = (p_in_Pa - esat_ice) >= 1.0
-    denom_safe = jnp.where(safe, p_in_Pa - esat_ice, 1.0)   # safe-division (iter 514): see sat_mixrat_liq
-    return jnp.where(safe, _EP * esat_ice / denom_safe, _EP)
-
-
-def rcm_sat_adj(thlm, rtm, p_in_Pa, exner, saturation_formula: int):
-    """Bisection saturation adjustment for cloud water (saturation.F90:rcm_sat_adj).
-
-    Finds theta satisfying:
-      theta - (Lv/(Cp*exner)) * max(rtm - rsat(p, theta*exner), 0) = thlm
-    then returns rcm = max(rtm - rsat(p, theta*exner), 0).
-
-    Works for any array shape. Uses 100 bisection iterations (enough for 0.001 K
-    tolerance from an initial bracket of ~20 K).
-
-    Args:
-        thlm:               liquid potential temperature [K]
-        rtm:                total water mixing ratio [kg/kg]
-        p_in_Pa:            pressure [Pa]
-        exner:              Exner function [-]
-        saturation_formula: SATURATION_FLATAU=3 or SATURATION_BOLTON=1
-
-    Returns:
-        rcm: cloud water mixing ratio [kg/kg], same shape as inputs.
-    """
-    _tol = 0.001  # Fortran tolerance [K]
-    _Lv_Cp_exner = _Lv / (_Cp * exner)
-
-    def _answer(theta):
-        T = theta * exner
-        rsat = sat_mixrat_liq(p_in_Pa, T, saturation_formula)
-        rc = jnp.maximum(rtm - rsat, 0.0)
-        return theta - _Lv_Cp_exner * rc
-
-    # --- First iteration (Fortran special case: always sets too_high = theta + 20) ---
-    theta0 = thlm
-    answer0 = _answer(theta0)
-    diff0 = answer0 - thlm
-
-    too_low0 = jnp.where(diff0 < -_tol, theta0, jnp.zeros_like(thlm))
-    # Fortran: if iteration==1 then too_high = theta + 20 (overrides any too_high update)
-    too_high0 = theta0 + 20.0
-    # But also apply normal update if answer > thlm+tol
-    too_high0 = jnp.where(diff0 > _tol, theta0, too_high0)
-
-    converged0 = jnp.abs(diff0) <= _tol
-    theta1 = jnp.where(converged0, theta0, (too_low0 + too_high0) / 2.0)
-
-    # --- Subsequent bisection steps ---
-    def _bisect_step(carry, _):
-        theta, too_low, too_high, converged = carry
-        answer = _answer(theta)
-        diff = answer - thlm
-
-        new_too_high = jnp.where(diff > _tol, theta, too_high)
-        new_too_low  = jnp.where(diff < -_tol, theta, too_low)
-        new_conv = converged | (jnp.abs(diff) <= _tol)
-        new_theta_next = (new_too_low + new_too_high) / 2.0
-
-        # Freeze converged elements
-        new_theta    = jnp.where(new_conv, theta, new_theta_next)
-        new_too_low  = jnp.where(converged, too_low,  new_too_low)
-        new_too_high = jnp.where(converged, too_high, new_too_high)
-        return (new_theta, new_too_low, new_too_high, new_conv), None
-
-    state0 = (theta1, too_low0, too_high0, converged0)
-    (theta_final, _, _, _), _ = jax.lax.scan(_bisect_step, state0, None, length=100)
-
-    T_final = theta_final * exner
-    rsat_final = sat_mixrat_liq(p_in_Pa, T_final, saturation_formula)
-    return jnp.maximum(rtm - rsat_final, 0.0)
+    esat_ice = (
+        a[0]
+        + T_in_C
+        * (
+            a[1]
+            + T_in_C
+            * (
+                a[2]
+                + T_in_C
+                * (
+                    a[3]
+                    + T_in_C
+                    * (
+                        a[4]
+                        + T_in_C
+                        * (
+                            a[5]
+                            + T_in_C
+                            * (
+                                a[6]
+                                + T_in_C * (a[7] + T_in_C * a[8])
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+    denom = p_in_Pa - esat_ice
+    safe = denom >= 1.0
+    denom_safe = jnp.where(safe, denom, 1.0)
+    return jnp.where(safe, ep * esat_ice / denom_safe, ep)

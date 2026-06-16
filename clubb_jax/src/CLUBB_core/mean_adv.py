@@ -1,198 +1,302 @@
-"""JAX port of mean_adv.F90 — mean-advection LHS operators.
+"""JAX port of `src/CLUBB_core/mean_adv.F90`.
 
-Mirrors clubb_release/src/CLUBB_core/mean_adv.F90:
-  term_ma_zt_lhs   — tridiagonal mean-advection LHS for a zt-level variable.
-                     As in the single Fortran subroutine, the `l_upwind_xm_ma`
-                     flag selects the centered scheme (False) or the upwind
-                     scheme (True, default) via an internal runtime branch.
-  term_ma_zm_lhs   — tridiagonal mean-advection LHS for a zm-level variable
+Module mean_adv computes the mean advection terms for all of the time-tendency
+(prognostic) equations in the CLUBB parameterization.  All of the mean
+advection terms are solved for completely implicitly, and therefore become part
+of the left-hand side of their respective equations.
 
-Output layout lhs[3, ngrdcol, nz]:
-  lhs[0] = superdiagonal  (coefficient of var[k+1])
-  lhs[1] = main diagonal  (coefficient of var[k])
-  lhs[2] = subdiagonal    (coefficient of var[k-1])
+Function term_ma_zt_lhs handles the mean advection terms for the variables
+located at thermodynamic grid levels.  These variables are: rtm, thlm, wp3,
+all hydrometeor species, and sclrm.
 
-Array layout: (ngrdcol, nz), ascending grid (index 0 = lowest level, grid_dir=+1).
-Pure-jnp → differentiable.
+Function term_ma_zm_lhs handles the mean advection terms for the variables
+located at momentum grid levels.  The variables are: wprtp, wpthlp, wp2, rtp2,
+thlp2, rtpthlp, up2, vp2, wpsclrp, sclrprtp, sclrpthlp, and sclrp2.
 """
 
 from __future__ import annotations
 
+from functools import partial
+
+import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from jax import jit
 
 
-# ---------------------------------------------------------------------------
-# term_ma_zt_lhs  (zt-level variable) — centered + upwind branches via l_upwind_xm_ma
-# ---------------------------------------------------------------------------
+@partial(
+    jax.jit,
+    static_argnames=("nzm", "nzt", "ngrdcol", "l_upwind_xm_ma"),
+)
+def term_ma_zt_lhs(
+    nzm: int,
+    nzt: int,
+    ngrdcol: int,
+    wm_zt,
+    weights_zt2zm,
+    invrs_dzt,
+    invrs_dzm,
+    l_upwind_xm_ma: bool,
+    grid_dir: float,
+):
+    """Mean advection of var_zt: implicit portion of the code.
 
-def term_ma_zt_lhs_jax(
-    wm_zt: jnp.ndarray,
-    gr,
-    l_upwind_xm_ma: bool = True,
-) -> jnp.ndarray:
-    """Mean-advection LHS for a zt-level variable.
+    The variable "var_zt" stands for a variable that is located at
+    thermodynamic grid levels.
 
-    Faithful port of the single mean_adv.F90:term_ma_zt_lhs subroutine for an
-    ascending grid (grid_dir=+1). As in the Fortran, the `l_upwind_xm_ma` flag
-    selects the scheme at runtime via an internal branch:
+    The d(var_zt)/dt equation contains a mean advection term:
 
-    Centered scheme (l_upwind_xm_ma=False), interior k=1..nzt-2 (Fortran k=2..nzt-1):
-      super[k] = wm_zt[k] * invrs_dzt[k] * weights_zt2zm[k+1, 0]
-      main[k]  = wm_zt[k] * invrs_dzt[k] * (weights_zt2zm[k+1, 1] - weights_zt2zm[k, 0])
-      sub[k]   = -wm_zt[k] * invrs_dzt[k] * weights_zt2zm[k, 1]
+      - w * d(var_zt)/dz.
 
-    Upwind scheme (l_upwind_xm_ma=True):
-      wm_zt >= 0 (upward wind):   super = 0,  main = +wm_zt*invrs_dzm[k],  sub = -wm_zt*invrs_dzm[k]
-      wm_zt < 0  (downward wind): super = +wm_zt*invrs_dzm[k+1],  main = -wm_zt*invrs_dzm[k+1],  sub = 0
+    This term is solved for completely implicitly, such that:
 
-    Output shape: (3, ngrdcol, nzt).
-      out[0] = superdiagonal (coeff of xm[k+1])
-      out[1] = main diagonal (coeff of xm[k])
-      out[2] = subdiagonal   (coeff of xm[k-1])
+      - w * d( var_zt(t+1) )/dz.
 
-    Args:
-        wm_zt:          (ngrdcol, nzt)
-        gr:             grid object with invrs_dzm (ngrdcol, nzm), invrs_dzt, weights_zt2zm
-        l_upwind_xm_ma: True → upwind branch (default), False → centered branch
+    Note: When the term is brought over to the left-hand side, the sign is
+    reversed and the leading "-" in front of the term is changed to a "+".
+
+    The timestep index (t+1) means that the value of var_zt being used is from
+    the next timestep, which is being advanced to in solving the d(var_zt)/dt
+    equation.
+
+    This term is discretized as follows:
+
+    The values of var_zt are found on the thermodynamic levels, as are the
+    values of wm_zt (mean vertical velocity on thermodynamic levels).  The
+    variable var_zt is interpolated to the intermediate momentum levels.  The
+    derivative of the interpolated values is taken over the central
+    thermodynamic level.  The derivative is multiplied by wm_zt at the central
+    thermodynamic level to get the desired result.
+
+      -----var_zt---------------------------------------------- t(k+1)
+
+      =================var_zt(interp)========================== m(k+1)
+
+      -----var_zt---------------------d(var_zt)/dz-----wm_zt--- t(k)
+
+      =================var_zt(interp)========================== m(k)
+
+      -----var_zt---------------------------------------------- t(k-1)
+
+    The vertical indices t(k+1), m(k+1), t(k), m(k), and t(k-1) correspond
+    with altitudes zt(k+1), zm(k+1), zt(k), zm(k), and zt(k-1), respectively.
+    The letter "t" is used for thermodynamic levels and the letter "m" is used
+    for momentum levels.
+
+      invrs_dzt(k) = 1 / ( zm(k) - zm(k-1) )
+
+    Special discretization for upper and lower boundary levels:
+
+    Zero derivative method: the derivative d(var_zt)/dz is set to 0 over the
+    model top and the model bottom.
+
+    This method corresponds with the "zero-flux" boundary condition option for
+    eddy diffusion, where d(var_zt)/dz is set to 0 across the upper boundary.
+
+    In order to discretize the upper boundary condition, consider a new level
+    outside the model (thermodynamic level gr%nzt+1) just above the upper
+    boundary level (thermodynamic level gr%nzt).  The value of var_zt at the
+    level just outside the model is defined to be the same as the value of
+    var_zt at thermodynamic level gr%nzt.  Therefore, the value of
+    d(var_zt)/dz between the level just outside the model and the uppermost
+    thermodynamic level is 0, staying consistent with the zero-flux boundary
+    condition option for the eddy diffusion portion of the code.  Therefore,
+    the value of var_zt at momentum level gr%nzm, which is the upper boundary
+    of the model, would be the same as the value of var_zt at the uppermost
+    thermodynamic level.
+
+    The values of var_zt are found on the thermodynamic levels, as are the
+    values of wm_zt (mean vertical velocity on the thermodynamic levels).  The
+    variable var_zt is interpolated to momentum level gr%nzm-1, based on the
+    values of var_zt at thermodynamic levels gr%nzt and gr%nzt-1.  The value
+    of var_zt at momentum level gr%nzm is set equal to the value of var_zt at
+    thermodynamic level gr%nzt, as described above.  The derivative of the set
+    and interpolated values, d(var_zt)/dz, is taken over the central
+    thermodynamic level.  The derivative is multiplied by wm_zt at the central
+    thermodynamic level to get the desired result.
+
+    For the following diagram, k = gr%nzm, which is the uppermost level of the
+    model:
+
+      --[var_zt(k+1) = var_zt(k)]----(level outside model)----- t(k+1)
+
+      ==[var_zt(top) = var_zt(k)]===[d(var_zt)/dz|_(top) = 0]== m(k+1) Boundary
+
+      -----var_zt(k)------------------d(var_zt)/dz-----wm_zt--- t(k)
+
+      =================var_zt(interp)========================== m(k)
+
+      -----var_zt(k-1)----------------------------------------- t(k-1)
+
+    where (top) stands for the grid index of momentum level k = gr%nzm, which
+    is the upper boundary of the model.
+
+    An analogous discretization occurs at the lower boundary.
+
+    JAX adaptation: the Fortran out-argument `lhs_ma` is returned as an array
+    with diagonal order [superdiagonal, main diagonal, subdiagonal].  Fortran
+    1-based grid indices are represented by 0-based Python slices.
     """
-    ngrdcol, nzt = wm_zt.shape
-
+    # Use centered differencing.
     if not l_upwind_xm_ma:
-        # ===== Centered-differencing branch (Fortran `.not. l_upwind_xm_ma` block) =====
-        invrs_dzt = gr.invrs_dzt       # (ngrdcol, nzt)
-        w = gr.weights_zt2zm           # (ngrdcol, nzm, 2); index 0=t_above, 1=t_below
+        # Most of the interior model; normal conditions.
+        fac = wm_zt[:, 1:-1] * invrs_dzt[:, 1:-1]
 
-        # Interior k=1..nzt-2 (Python)
-        fac = wm_zt[:, 1:-1] * invrs_dzt[:, 1:-1]      # (ngrdcol, nzt-2)
-        super_int = fac * w[:, 2:-1, 0]                  # w[k_py+1, t_above]
-        main_int  = fac * (w[:, 2:-1, 1] - w[:, 1:-2, 0])
-        sub_int   = -fac * w[:, 1:-2, 1]
+        # Thermodynamic superdiagonal: [ x var_zt(k+1,<t+1>) ]
+        super_int = fac * weights_zt2zm[:, 2:-1, 0]
 
-        # Lower boundary k=0
-        fac0 = wm_zt[:, 0] * invrs_dzt[:, 0]            # (ngrdcol,)
-        sup_bot = fac0 * w[:, 1, 0]
-        mid_bot = -fac0 * (1.0 - w[:, 1, 1])
-        sub_bot = jnp.zeros((ngrdcol,), dtype=wm_zt.dtype)
+        # Thermodynamic main diagonal: [ x var_zt(k,<t+1>) ]
+        main_int = fac * (
+            weights_zt2zm[:, 2:-1, 1]
+            - weights_zt2zm[:, 1:-2, 0]
+        )
 
-        # Upper boundary k=nzt-1
-        fac_top = wm_zt[:, -1] * invrs_dzt[:, -1]       # (ngrdcol,)
-        sup_top = jnp.zeros((ngrdcol,), dtype=wm_zt.dtype)
-        mid_top = fac_top * (1.0 - w[:, -2, 0])
-        sub_top = -fac_top * w[:, -2, 1]
+        # Thermodynamic subdiagonal: [ x var_zt(k-1,<t+1>) ]
+        sub_int = -fac * weights_zt2zm[:, 1:-2, 1]
 
-        sup = jnp.concatenate([sup_bot[:, None], super_int, sup_top[:, None]], axis=1)
-        mid = jnp.concatenate([mid_bot[:, None], main_int,  mid_top[:, None]], axis=1)
-        sub = jnp.concatenate([sub_bot[:, None], sub_int,   sub_top[:, None]], axis=1)
+        # Upper Boundary for an Ascending Grid or Lower Boundary for a
+        # Descending Grid.  This is the zero-derivative boundary method.
+        fac_top = wm_zt[:, -1:] * invrs_dzt[:, -1:]
+        super_top = jnp.zeros((ngrdcol, 1), dtype=jnp.float64)
+        main_top = fac_top * (1.0 - weights_zt2zm[:, nzm - 2:nzm - 1, 0])
+        sub_top = -fac_top * weights_zt2zm[:, nzm - 2:nzm - 1, 1]
 
-        return jnp.stack([sup, mid, sub], axis=0)   # (3, ngrdcol, nzt)
+        # Lower Boundary for an Ascending Grid or Upper Boundary for a
+        # Descending Grid.  This is the zero-derivative boundary method.
+        fac_bot = wm_zt[:, :1] * invrs_dzt[:, :1]
+        super_bot = fac_bot * weights_zt2zm[:, 1:2, 0]
+        main_bot = -fac_bot * (1.0 - weights_zt2zm[:, 1:2, 1])
+        sub_bot = jnp.zeros((ngrdcol, 1), dtype=jnp.float64)
 
-    # ===== Upwind-differencing branch (Fortran `else` block) =====
-    nzm = nzt + 1
-    invrs_dzm = gr.invrs_dzm   # (ngrdcol, nzm)
+        superdiag = jnp.concatenate([super_bot, super_int, super_top], axis=1)
+        maindiag = jnp.concatenate([main_bot, main_int, main_top], axis=1)
+        subdiag = jnp.concatenate([sub_bot, sub_int, sub_top], axis=1)
+        return jnp.stack([superdiag, maindiag, subdiag], axis=0)
 
-    # ---- Interior k=1..nzt-2 (Fortran k=2..nzt-1) ----
-    wm_int = wm_zt[:, 1:-1]                  # (ngrdcol, nzt-2)
-    idzm_k  = invrs_dzm[:, 1:-2]             # invrs_dzm[k]   for k=1..nzt-2 (Python zm)
-    idzm_kp1 = invrs_dzm[:, 2:-1]            # invrs_dzm[k+1] for k=1..nzt-2
+    # l_upwind_xm_ma == true; use "upwind" differencing.
 
-    mask = wm_int >= 0.0                     # True → upward wind
+    # Most of the interior model; normal conditions.
+    wm_int = wm_zt[:, 1:-1]
+    grid_wm_int = grid_dir * wm_int
+    invrs_dzm_k = invrs_dzm[:, 1:-2]
+    invrs_dzm_kp1 = invrs_dzm[:, 2:-1]
 
-    sup_int = jnp.where(mask, 0.0,            wm_int * idzm_kp1)
-    mid_int = jnp.where(mask,  wm_int * idzm_k, -wm_int * idzm_kp1)
-    sub_int = jnp.where(mask, -wm_int * idzm_k, 0.0)
+    # grid_dir * wm_zt >= 0: mean wind is upward for an ascending grid
+    # or downward for a descending grid.  Otherwise the stencil is reversed.
+    super_int = jnp.where(grid_wm_int >= 0.0, 0.0, wm_int * invrs_dzm_kp1)
+    main_int = jnp.where(
+        grid_wm_int >= 0.0,
+        wm_int * invrs_dzm_k,
+        -wm_int * invrs_dzm_kp1,
+    )
+    sub_int = jnp.where(grid_wm_int >= 0.0, -wm_int * invrs_dzm_k, 0.0)
 
-    # ---- Upper boundary k=nzt-1 (Fortran k=nzt) ----
-    wm_top = wm_zt[:, -1]                    # (ngrdcol,)
-    idzm_top = invrs_dzm[:, nzm-2]           # invrs_dzm[nzm-2] (Fortran invrs_dzm(nzm-1))
-    mask_top = wm_top >= 0.0
+    # Upper Boundary for an Ascending Grid or Lower Boundary for a Descending Grid.
+    wm_top = wm_zt[:, -1:]
+    grid_wm_top = grid_dir * wm_top
+    invrs_dzm_top = invrs_dzm[:, nzm - 2:nzm - 1]
+    super_top = jnp.zeros((ngrdcol, 1), dtype=jnp.float64)
+    main_top = jnp.where(grid_wm_top >= 0.0, wm_top * invrs_dzm_top, 0.0)
+    sub_top = jnp.where(grid_wm_top >= 0.0, -wm_top * invrs_dzm_top, 0.0)
 
-    sup_top = jnp.zeros((ngrdcol,))
-    mid_top = jnp.where(mask_top,  wm_top * idzm_top, 0.0)
-    sub_top = jnp.where(mask_top, -wm_top * idzm_top, 0.0)
+    # Lower Boundary for an Ascending Grid or Upper Boundary for a Descending Grid.
+    wm_bot = wm_zt[:, :1]
+    grid_wm_bot = grid_dir * wm_bot
+    invrs_dzm_bot = invrs_dzm[:, 1:2]
+    super_bot = jnp.where(grid_wm_bot >= 0.0, 0.0, wm_bot * invrs_dzm_bot)
+    main_bot = jnp.where(grid_wm_bot >= 0.0, 0.0, -wm_bot * invrs_dzm_bot)
+    sub_bot = jnp.zeros((ngrdcol, 1), dtype=jnp.float64)
 
-    # ---- Lower boundary k=0 (Fortran k=1) ----
-    wm_bot = wm_zt[:, 0]                     # (ngrdcol,)
-    idzm_2 = invrs_dzm[:, 1]                 # invrs_dzm[1] (Fortran invrs_dzm(2))
-    mask_bot = wm_bot >= 0.0
-
-    sup_bot = jnp.where(mask_bot, 0.0,  wm_bot * idzm_2)
-    mid_bot = jnp.where(mask_bot, 0.0, -wm_bot * idzm_2)
-    sub_bot = jnp.zeros((ngrdcol,))
-
-    # ---- Assemble (ngrdcol, nzt) ----
-    sup = jnp.concatenate([sup_bot[:, None], sup_int, sup_top[:, None]], axis=1)
-    mid = jnp.concatenate([mid_bot[:, None], mid_int, mid_top[:, None]], axis=1)
-    sub = jnp.concatenate([sub_bot[:, None], sub_int, sub_top[:, None]], axis=1)
-
-    return jnp.stack([sup, mid, sub], axis=0)   # (3, ngrdcol, nzt)
+    superdiag = jnp.concatenate([super_bot, super_int, super_top], axis=1)
+    maindiag = jnp.concatenate([main_bot, main_int, main_top], axis=1)
+    subdiag = jnp.concatenate([sub_bot, sub_int, sub_top], axis=1)
+    return jnp.stack([superdiag, maindiag, subdiag], axis=0)
 
 
-# ---------------------------------------------------------------------------
-# term_ma_zm_lhs  (zm-level variable)
-# ---------------------------------------------------------------------------
+@partial(jax.jit, static_argnames=("nzm", "nzt", "ngrdcol"))
+def term_ma_zm_lhs(
+    nzm: int,
+    nzt: int,
+    ngrdcol: int,
+    wm_zm,
+    invrs_dzm,
+    weights_zm2zt,
+):
+    """Mean advection of var_zm: implicit portion of the code.
 
-def term_ma_zm_lhs_jax(
-    wm_zm: jnp.ndarray,
-    gr,
-) -> jnp.ndarray:
-    """Tridiagonal LHS for implicit mean advection of a zm-level variable.
+    The variable "var_zm" stands for a variable that is located at momentum
+    grid levels.
 
-    Faithful port of Fortran term_ma_zm_lhs (mean_adv.F90).
+    The d(var_zm)/dt equation contains a mean advection term:
 
-    Discretizes w * d(var_zm)/dz implicitly at zm levels.  Boundary rows
-    (k=0 and k=nzm-1) are set to zero (fixed-value BCs applied by caller).
+      - w * d(var_zm)/dz.
 
-    Fortran index conventions (1-based → 0-based Python):
-      k=1       → k=0   (lower boundary, zero)
-      k=2..nzm-1→ k=1..nzm-2 (interior)
-      k=nzm     → k=nzm-1   (upper boundary, zero)
+    This term is solved for completely implicitly, such that:
 
-    Args:
-        wm_zm:  Mean vertical velocity on momentum levels (ngrdcol, nzm).
-        gr:     Grid object with:
-                  .invrs_dzm  (ngrdcol, nzm): 1 / (zt[k] - zt[k-1])
-                  .weights_zm2zt (ngrdcol, nzt=nzm-1, 2):
-                    [:,k,0] = M_ABOVE weight for zm[k] contributing to zt[k]
-                    [:,k,1] = M_BELOW weight for zm[k+1] contributing to zt[k]
+      - w * d( var_zm(t+1) )/dz.
 
-    Returns:
-        lhs: shape (3, ngrdcol, nzm).
+    Note: When the term is brought over to the left-hand side, the sign is
+    reversed and the leading "-" in front of the term is changed to a "+".
+
+    The timestep index (t+1) means that the value of var_zm being used is from
+    the next timestep, which is being advanced to in solving the d(var_zm)/dt
+    equation.
+
+    This term is discretized as follows:
+
+    The values of var_zm are found on the momentum levels, as are the values of
+    wm_zm (mean vertical velocity on momentum levels).  The variable var_zm is
+    interpolated to the intermediate thermodynamic levels.  The derivative of
+    the interpolated values is taken over the central momentum level.  The
+    derivative is multiplied by wm_zm at the central momentum level to get the
+    desired result.
+
+      =====var_zm============================================== m(k+1)
+
+      -----------------var_zm(interp)-------------------------- t(k)
+
+      =====var_zm=====================d(var_zm)/dz=====wm_zm=== m(k)
+
+      -----------------var_zm(interp)-------------------------- t(k-1)
+
+      =====var_zm============================================== m(k-1)
+
+    The vertical indices m(k+1), t(k), m(k), t(k-1), and m(k-1) correspond
+    with altitudes zm(k+1), zt(k), zm(k), zt(k-1), and zm(k-1), respectively.
+    The letter "t" is used for thermodynamic levels and the letter "m" is used
+    for momentum levels.
+
+      invrs_dzm(k) = 1 / ( zt(k) - zt(k-1) )
+
+    JAX adaptation: the Fortran out-argument `lhs_ma` is returned as an array
+    with diagonal order [superdiagonal, main diagonal, subdiagonal].  Fortran
+    1-based grid indices are represented by 0-based Python slices.
     """
-    invrs_dzm = gr.invrs_dzm            # (ngrdcol, nzm)
-    w2zt = gr.weights_zm2zt             # (ngrdcol, nzt=nzm-1, 2)
+    # Set lower boundary array to 0.
+    # Most of the interior model; normal conditions.
+    fac = wm_zm[:, 1:-1] * invrs_dzm[:, 1:-1]
 
-    ngrdcol = wm_zm.shape[0]
+    # Momentum superdiagonal: [ x var_zm(k+1,<t+1>) ]
+    super_int = fac * weights_zm2zt[:, 1:, 0]
 
-    # Interior k_p=1..nzm-2 (Fortran k=2..nzm-1)
-    fac = wm_zm[:, 1:-1] * invrs_dzm[:, 1:-1]  # (ngrdcol, nzm-2)
+    # Momentum main diagonal: [ x var_zm(k,<t+1>) ]
+    main_int = fac * (
+        weights_zm2zt[:, 1:, 1]
+        - weights_zm2zt[:, :-1, 0]
+    )
 
-    # For momentum level k_p, the zt level "above" is zt[k_p] and "below" is zt[k_p-1].
-    # weights_zm2zt[:, k_p, 0] = M_ABOVE: weight for zm[k_p] at zt[k_p]
-    # weights_zm2zt[:, k_p, 1] = M_BELOW: weight for zm[k_p+1] at zt[k_p]
-    # Fortran lhs_ma(kp1_mdiag) uses weights_zm2zt[i, k, m_above]   → w2zt[:, 1:, 0]
-    # Fortran lhs_ma(km1_mdiag) uses weights_zm2zt[i, k-1, m_below] → w2zt[:, :-1, 1]
-    super_int = fac * w2zt[:, 1:, 0]
-    main_int  = fac * (w2zt[:, 1:, 1] - w2zt[:, :-1, 0])
-    sub_int   = -fac * w2zt[:, :-1, 1]
+    # Momentum subdiagonal: [ x var_zm(k-1,<t+1>) ]
+    sub_int = -fac * weights_zm2zt[:, :-1, 1]
 
-    zeros_bnd = jnp.zeros((ngrdcol, 1), dtype=wm_zm.dtype)
-
+    # Set upper boundary array to 0.
+    zeros_bnd = jnp.zeros((ngrdcol, 1), dtype=jnp.float64)
     superdiag = jnp.concatenate([zeros_bnd, super_int, zeros_bnd], axis=1)
-    maindiag  = jnp.concatenate([zeros_bnd, main_int,  zeros_bnd], axis=1)
-    subdiag   = jnp.concatenate([zeros_bnd, sub_int,   zeros_bnd], axis=1)
-
-    return jnp.stack([superdiag, maindiag, subdiag], axis=0)   # (3, ngrdcol, nzm)
-
-
-# JIT-compiled production versions
-term_ma_zt_lhs = jit(term_ma_zt_lhs_jax)
-term_ma_zm_lhs = jit(term_ma_zm_lhs_jax)
+    maindiag = jnp.concatenate([zeros_bnd, main_int, zeros_bnd], axis=1)
+    subdiag = jnp.concatenate([zeros_bnd, sub_int, zeros_bnd], axis=1)
+    return jnp.stack([superdiag, maindiag, subdiag], axis=0)
 
 
 __all__ = [
-    "term_ma_zt_lhs_jax",
-    "term_ma_zm_lhs_jax",
     "term_ma_zt_lhs",
     "term_ma_zm_lhs",
 ]

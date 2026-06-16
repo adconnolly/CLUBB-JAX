@@ -27,18 +27,20 @@ See tests/test_pdf_utilities.py. All functions are jnp and differentiable.
 import jax
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
-
 jax.config.update("jax_enable_x64", True)
 
 # constants_clubb.F90 (pdf_utilities.F90 `use constants_clubb`)
-from clubb_jax.src.CLUBB_core.constants_clubb import (
+from clubb_jax.src.CLUBB_core.clubb_constants import (
     max_mag_correlation as MAX_MAG_CORRELATION,
     chi_tol as _CHI_TOL, eta_tol as _ETA_TOL, rt_tol as _RT_TOL, thl_tol as _THL_TOL,
 )
 _TINY = jnp.finfo(jnp.float64).tiny  # Fortran tiny(mu_x) for double precision
 _MIN_MAX_SMTH_MAG = 1.0e-9           # constants_clubb.F90 min_max_smth_mag
 _EPS = 1.0e-10                       # constants_clubb.F90 eps = max(1e-10, epsilon)
+
+
+def _safe_sqrt(value):
+    return jnp.sqrt(jnp.maximum(value, 0.0))
 
 
 def mean_L2N(mu_x, sigma2_on_mu2):

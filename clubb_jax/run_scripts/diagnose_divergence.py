@@ -20,8 +20,7 @@ distinction is exactly what separated real bugs (the two Iter307 KK fixes; the I
 sed axis bug) from genuine FP limits.
 
 Prereq: run `compare_runs.py --case CASE --max-iters N` first to generate the per-step
-stats (Fortran under clubb_release/output/{case}_compare_fort/, JAX under
-clubb_jax/output/{case}_compare_jax/). This tool only reads them.
+stats. This tool reads the same transient comparison output directories.
 
 Usage:
     python run_scripts/diagnose_divergence.py CASE [--var upwp] [--all] [--jump-ratio 1e3]
@@ -37,14 +36,14 @@ import sys
 
 import numpy as np
 
-from compare_runs import CLUBB_ROOT, JAX_ROOT, PROGNOSTIC, REL_TOL, ABS_TOL
+from compare_runs import PROGNOSTIC, REL_TOL, ABS_TOL, compare_output_dirs
 
 
 def _stats(case: str):
-    # Mirrors compare_runs.py's output convention: Fortran stats under
-    # clubb_release/output/, JAX stats under clubb_jax/output/.
-    fp = os.path.join(CLUBB_ROOT, f"output/{case}_compare_fort/{case}_stats.nc")
-    jp = os.path.join(JAX_ROOT, "clubb_jax", f"output/{case}_compare_jax/{case}_stats.nc")
+    # Mirrors compare_runs.py's output convention.
+    fort_dir, jax_dir = compare_output_dirs(case)
+    fp = os.path.join(fort_dir, f"{case}_stats.nc")
+    jp = os.path.join(jax_dir, f"{case}_stats.nc")
     for p in (fp, jp):
         if not os.path.isfile(p):
             sys.exit(f"missing {p} — run compare_runs.py --case {case} first")

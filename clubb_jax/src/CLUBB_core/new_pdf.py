@@ -58,7 +58,7 @@ def calc_mixture_fraction(Skx, F_x, zeta_x, sgn_wpxp):
 
 # grad-safe sqrt(max(x,0)) — the canonical tracer-toolkit helper (re-exported under _ssqrt
 # so new_hybrid_pdf can keep `from new_pdf import _ssqrt`, mirroring the Fortran shared helper).
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt as _ssqrt
+from clubb_jax.src.CLUBB_core.pdf_utilities import _safe_sqrt as _ssqrt
 
 
 def calc_coef_wpxp2_implicit(wp2, xp2, wpxp, sgn_wpxp, mixt_frac, F_w, F_x,

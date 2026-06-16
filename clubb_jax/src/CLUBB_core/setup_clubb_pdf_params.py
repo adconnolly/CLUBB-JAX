@@ -27,11 +27,38 @@ chi, eta, w, Ncn, <hydrometeors in hydromet-array order>, matching the iiPDF ind
 import jax
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.constants_clubb import max_mag_correlation, w_tol, rc_tol
+from clubb_jax.src.CLUBB_core.advance_helper_module import calc_xpwp
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    cloud_frac_min,
+    max_mag_correlation,
+    Ncn_tol,
+    rc_tol,
+    w_tol,
+    zero_threshold,
+)
+from clubb_jax.src.CLUBB_core.clip_explicit import clip_covar, clip_wphydrometp
+from clubb_jax.src.CLUBB_core.corr_varnce_module import assert_corr_symmetric
+from clubb_jax.src.CLUBB_core.error_code import clubb_at_least_debug_level
+from clubb_jax.src.CLUBB_core.grid_class import zm2zt, zt2zm
+from clubb_jax.src.CLUBB_core.hydromet_pdf_parameter_module import (
+    HydrometPdfParameter,
+    MAX_HYDROMET_DIM,
+    PrecipitationFractions,
+)
+from clubb_jax.src.CLUBB_core.index_mapping import hydromet2pdf_idx, pdf2hydromet_idx
+from clubb_jax.src.CLUBB_core.Nc_Ncn_eqns import Nc_in_cloud_to_Ncnm
+from clubb_jax.src.CLUBB_core.parameter_indices import ic_K_hm, iomicron, izeta_vrnce_rat
 from clubb_jax.src.CLUBB_core.pdf_utilities import (
-    mean_L2N, stdev_L2N, corr_NN2NL, corr_NN2LL, compute_variance_binormal)
+    _safe_sqrt,
+    compute_mean_binormal,
+    compute_variance_binormal,
+    corr_NN2NL,
+    corr_NN2LL,
+    mean_L2N,
+    stdev_L2N,
+)
 from clubb_jax.src.CLUBB_core.matrix_operations import Cholesky_factor
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
+from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction
 
 jax.config.update("jax_enable_x64", True)
 
@@ -43,6 +70,574 @@ IIPDF_ETA = 1
 IIPDF_W = 2
 IIPDF_NCN = 3
 # Precipitating hydrometeors follow Ncn in hydromet-array order (rr, Nr for KK).
+
+
+def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
+                             hydromet_dim,
+                             Nc_in_cloud, cloud_frac, Kh_zm,
+                             ice_supersat_frac, hydromet, wphydrometp,
+                             corr_array_n_cloud, corr_array_n_below,
+                             hm_metadata,
+                             pdf_params,
+                             clubb_params,
+                             iiPDF_type,
+                             l_use_precip_frac,
+                             l_diagnose_correlations,
+                             l_calc_w_corr,
+                             l_const_Nc_in_cloud,
+                             l_fix_w_chi_eta_correlations,
+                             err_info,
+                             precip_fracs,
+                             hydromet_pdf_params,
+                             stats):
+    """Set up hydrometeor PDF parameters.
+
+    Fortran out arguments are returned in the same order after ``err_info``:
+    ``hydrometp2, mu_x_1_n, mu_x_2_n, sigma_x_1_n, sigma_x_2_n,
+    corr_array_1_n, corr_array_2_n, corr_cholesky_mtx_1,
+    corr_cholesky_mtx_2, precip_fracs, hydromet_pdf_params, stats``.
+    """
+    del precip_fracs
+
+    Nc_in_cloud = jnp.asarray(Nc_in_cloud, dtype=jnp.float64)
+    cloud_frac = jnp.asarray(cloud_frac, dtype=jnp.float64)
+    Kh_zm = jnp.asarray(Kh_zm, dtype=jnp.float64)
+    ice_supersat_frac = jnp.asarray(ice_supersat_frac, dtype=jnp.float64)
+    hydromet = jnp.asarray(hydromet, dtype=jnp.float64)
+    wphydrometp = jnp.asarray(wphydrometp, dtype=jnp.float64)
+    corr_array_n_cloud = jnp.asarray(corr_array_n_cloud, dtype=jnp.float64)
+    corr_array_n_below = jnp.asarray(corr_array_n_below, dtype=jnp.float64)
+    clubb_params = jnp.asarray(clubb_params, dtype=jnp.float64)
+
+    # Assertion check
+    # Check that all hydrometeors are positive otherwise exit the program.
+    if clubb_at_least_debug_level(0):
+        negative_hydromet = jnp.any(hydromet < zero_threshold, axis=(1, 2))
+        err_info = err_info.set_fatal(mask=negative_hydromet)
+        # JAX adaptation: Fortran returns immediately after setting a fatal
+        # code. A jitted path cannot branch on that host boolean, so the fatal
+        # code is carried functionally and handled by the caller after the JAX
+        # region.
+
+    # Setup some of the PDF parameters
+    sigma_w_1 = jnp.sqrt(pdf_params.varnce_w_1)
+    sigma_w_2 = jnp.sqrt(pdf_params.varnce_w_2)
+
+    # Compute rcm_pdf for use within SILHS
+    rcm_pdf = compute_mean_binormal(
+        pdf_params.rc_1,
+        pdf_params.rc_2,
+        pdf_params.mixt_frac,
+    )
+
+    # Calculate precipitation fraction.
+    if l_use_precip_frac:
+        (
+            err_info,
+            precip_frac,
+            precip_frac_1,
+            precip_frac_2,
+            precip_frac_tol,
+            stats,
+        ) = precip_fraction(
+            gr,
+            nzt,
+            ngrdcol,
+            hydromet_dim,
+            hydromet,
+            cloud_frac,
+            pdf_params.cloud_frac_1,
+            hm_metadata.l_mix_rat_hm,
+            hm_metadata.l_frozen_hm,
+            hm_metadata.hydromet_tol,
+            pdf_params.cloud_frac_2,
+            ice_supersat_frac,
+            pdf_params.ice_supersat_frac_1,
+            pdf_params.ice_supersat_frac_2,
+            pdf_params.mixt_frac,
+            clubb_params,
+            err_info,
+            stats,
+        )
+        # JAX adaptation: preserve the fatal code from precip_fraction, but do
+        # not return early inside the traced region.
+    else:
+        precip_frac = jnp.ones((ngrdcol, nzt), dtype=jnp.float64)
+        precip_frac_1 = jnp.ones((ngrdcol, nzt), dtype=jnp.float64)
+        precip_frac_2 = jnp.ones((ngrdcol, nzt), dtype=jnp.float64)
+        precip_frac_tol = jnp.full((ngrdcol,), cloud_frac_min, dtype=jnp.float64)
+
+    precip_fracs = PrecipitationFractions(
+        ngrdcol=ngrdcol,
+        nzt=nzt,
+        precip_frac=precip_frac,
+        precip_frac_1=precip_frac_1,
+        precip_frac_2=precip_frac_2,
+    )
+
+    # Calculate <N_cn> from Nc_in_cloud, whether Nc_in_cloud is predicted or
+    # based on a prescribed value, and whether the value is constant or varying
+    # over the grid level.
+    if not l_const_Nc_in_cloud:
+        const_Ncnp2_on_Ncnm2 = jnp.full_like(
+            Nc_in_cloud,
+            hm_metadata.Ncnp2_on_Ncnm2,
+        )
+        stdev_const_Ncnp2_on_Ncnm2 = stdev_L2N(const_Ncnp2_on_Ncnm2)
+    else:
+        const_Ncnp2_on_Ncnm2 = jnp.zeros_like(Nc_in_cloud)
+        stdev_const_Ncnp2_on_Ncnm2 = jnp.zeros_like(Nc_in_cloud)
+
+    const_corr_chi_Ncn_n_cloud = jnp.full_like(
+        Nc_in_cloud,
+        corr_array_n_cloud[hm_metadata.iiPDF_Ncn, hm_metadata.iiPDF_chi],
+    )
+    const_corr_chi_Ncn = corr_NN2NL(
+        const_corr_chi_Ncn_n_cloud,
+        stdev_const_Ncnp2_on_Ncnm2,
+        const_Ncnp2_on_Ncnm2,
+    )
+
+    Ncnm = Nc_in_cloud_to_Ncnm(
+        pdf_params.chi_1,
+        pdf_params.chi_2,
+        pdf_params.stdev_chi_1,
+        pdf_params.stdev_chi_2,
+        pdf_params.mixt_frac,
+        Nc_in_cloud,
+        pdf_params.cloud_frac_1,
+        pdf_params.cloud_frac_2,
+        const_Ncnp2_on_Ncnm2,
+        const_corr_chi_Ncn,
+    )
+
+    # Calculate the overall variance of a precipitating hydrometeor (hm),
+    # <hm'^2>.
+    hydromet_tol = jnp.asarray(hm_metadata.hydromet_tol, dtype=jnp.float64)
+    hmp2_ip_on_hmm2_ip = jnp.asarray(
+        hm_metadata.hmp2_ip_on_hmm2_ip,
+        dtype=jnp.float64,
+    )
+    precip_frac_safe = jnp.where(precip_frac > 0.0, precip_frac, 1.0)
+    hydrometp2_zt = jnp.where(
+        hydromet >= hydromet_tol[None, None, :],
+        (
+            (hmp2_ip_on_hmm2_ip[None, None, :] + 1.0)
+            / precip_frac_safe[:, :, None]
+            - 1.0
+        )
+        * hydromet ** 2,
+        0.0,
+    )
+
+    # Interpolate the overall variance of a hydrometeor, <hm'^2>, to its home
+    # on momentum grid levels.
+    hydrometp2 = jnp.stack(
+        [
+            zt2zm(
+                nzm,
+                nzt,
+                ngrdcol,
+                gr,
+                hydrometp2_zt[:, :, j],
+                zero_threshold,
+            ).at[:, gr.k_ub_zm].set(0.0)
+            for j in range(hydromet_dim)
+        ],
+        axis=-1,
+    )
+
+    wphydrometp_zt = jnp.zeros((ngrdcol, nzt, hydromet_dim), dtype=jnp.float64)
+    wpNcnp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+
+    # Calculate correlations involving w and Ncn by first calculating the
+    # overall covariance of w and Ncn using the down-gradient approximation.
+    if l_calc_w_corr:
+        wm_zt = compute_mean_binormal(
+            pdf_params.w_1,
+            pdf_params.w_2,
+            pdf_params.mixt_frac,
+        )
+        wp2_zt = compute_variance_binormal(
+            wm_zt,
+            pdf_params.w_1,
+            pdf_params.w_2,
+            sigma_w_1,
+            sigma_w_2,
+            pdf_params.mixt_frac,
+        )
+
+        wphydrometp_zt = jnp.stack(
+            [
+                zm2zt(nzm, nzt, ngrdcol, gr, wphydrometp[:, :, j])
+                for j in range(hydromet_dim)
+            ],
+            axis=-1,
+        )
+        wphydrometp_zt = jnp.where(
+            hydromet < hydromet_tol[None, None, :],
+            0.0,
+            wphydrometp_zt,
+        )
+
+        clipped_wphydrometp_zt = []
+        for j in range(hydromet_dim):
+            wphydrometp_zt_j, _wphydrometp_chnge_j = clip_covar(
+                nzt,
+                ngrdcol,
+                clip_wphydrometp,
+                wp2_zt,
+                hydrometp2_zt[:, :, j],
+                wphydrometp_zt[:, :, j],
+            )
+            clipped_wphydrometp_zt.append(wphydrometp_zt_j)
+        wphydrometp_zt = jnp.stack(clipped_wphydrometp_zt, axis=-1)
+
+        if clubb_params.ndim == 1:
+            Kh_zm_c_K_hm = -clubb_params[ic_K_hm] * Kh_zm
+        else:
+            Kh_zm_c_K_hm = -clubb_params[:, ic_K_hm][:, None] * Kh_zm
+
+        wpNcnp_zm = calc_xpwp(nzm, nzt, ngrdcol, gr, Kh_zm_c_K_hm, Ncnm)
+
+        # Boundary conditions; We are assuming zero flux.
+        wpNcnp_zm = wpNcnp_zm.at[:, 0].set(0.0)
+        wpNcnp_zm = wpNcnp_zm.at[:, nzm - 1].set(0.0)
+
+        # Interpolate the covariances to thermodynamic grid levels.
+        wpNcnp_zt = zm2zt(nzm, nzt, ngrdcol, gr, wpNcnp_zm)
+        wpNcnp_zt = jnp.where(Ncnm <= Ncn_tol, 0.0, wpNcnp_zt)
+    else:
+        wm_zt = compute_mean_binormal(
+            pdf_params.w_1,
+            pdf_params.w_2,
+            pdf_params.mixt_frac,
+        )
+
+    # Unpack CLUBB parameters.
+    if clubb_params.ndim == 1:
+        omicron = clubb_params[iomicron]
+        zeta_vrnce_rat = clubb_params[izeta_vrnce_rat]
+    else:
+        omicron = clubb_params[:, iomicron][:, None]
+        zeta_vrnce_rat = clubb_params[:, izeta_vrnce_rat][:, None]
+
+    hydromets = [
+        (
+            hydromet[:, :, j],
+            hydrometp2_zt[:, :, j],
+            hmp2_ip_on_hmm2_ip[j],
+            hydromet_tol[j],
+        )
+        for j in range(hydromet_dim)
+    ]
+
+    # Calculate the means and standard deviations involving PDF variables
+    # -- w, chi, eta, N_cn, and any precipitating hydrometeors (hm in-precip)
+    # -- for each PDF component.
+    (
+        mu_x_1,
+        mu_x_2,
+        sigma_x_1,
+        sigma_x_2,
+        hm_1,
+        hm_2,
+        sigma2_on_mu2_ip_1,
+        sigma2_on_mu2_ip_2,
+    ) = compute_mean_stdev(
+        pdf_params.chi_1,
+        pdf_params.chi_2,
+        pdf_params.stdev_chi_1,
+        pdf_params.stdev_chi_2,
+        pdf_params.stdev_eta_1,
+        pdf_params.stdev_eta_2,
+        Ncnm,
+        hm_metadata.Ncnp2_on_Ncnm2,
+        l_const_Nc_in_cloud,
+        hydromets,
+        pdf_params.thl_1,
+        pdf_params.thl_2,
+        pdf_params.mixt_frac,
+        precip_frac,
+        precip_frac_1,
+        precip_frac_2,
+        precip_frac_tol,
+        omicron,
+        zeta_vrnce_rat,
+        pdf_params.w_1,
+        pdf_params.w_2,
+        sigma_w_1,
+        sigma_w_2,
+    )
+
+    # Transform the component means and standard deviations involving
+    # precipitating hydrometeors (hm in-precip) and N_cn -- ln hm and
+    # ln N_cn -- to normal space for each PDF component.
+    mu_x_1_n, mu_x_2_n, sigma_x_1_n, sigma_x_2_n = norm_transform_mean_stdev(
+        mu_x_1,
+        mu_x_2,
+        sigma_x_1,
+        sigma_x_2,
+        sigma2_on_mu2_ip_1,
+        sigma2_on_mu2_ip_2,
+        Ncnm,
+        hm_1,
+        hm_2,
+        hydromet_tol,
+        l_const_Nc_in_cloud,
+    )
+
+    # Calculate the normal space correlations.
+    if l_diagnose_correlations:
+        from clubb_jax.src.CLUBB_core.diagnose_correlations_module import (
+            calc_cholesky_corr_mtx_approx,
+            diagnose_correlations,
+        )
+
+        corr_cloud = diagnose_correlations(
+            pdf_dim,
+            hm_metadata.iiPDF_w,
+            corr_array_n_cloud,
+            l_calc_w_corr,
+        )
+        corr_below = diagnose_correlations(
+            pdf_dim,
+            hm_metadata.iiPDF_w,
+            corr_array_n_below,
+            l_calc_w_corr,
+        )
+        corr_array_1_n = jnp.where(
+            (rcm_pdf > rc_tol)[:, :, None, None],
+            corr_cloud,
+            corr_below,
+        )
+        corr_array_2_n = corr_array_1_n
+
+        def _diag_cholesky(corr_array_n):
+            corr_cholesky_mtx, corr_array_n = calc_cholesky_corr_mtx_approx(
+                pdf_dim,
+                hm_metadata.iiPDF_w,
+                corr_array_n,
+            )
+            return corr_cholesky_mtx, corr_array_n
+
+        corr_cholesky_mtx_1, corr_array_1_n = jax.vmap(
+            jax.vmap(_diag_cholesky, in_axes=0),
+            in_axes=0,
+        )(corr_array_1_n)
+        corr_cholesky_mtx_2, corr_array_2_n = jax.vmap(
+            jax.vmap(_diag_cholesky, in_axes=0),
+            in_axes=0,
+        )(corr_array_2_n)
+    else:
+        if l_fix_w_chi_eta_correlations and not l_calc_w_corr:
+            # When the flags are set this way, the correlation matrices do not
+            # vary with any vertical values, and instead are determined entirely
+            # by prescribed values.
+            (
+                corr_array_1_n,
+                corr_array_2_n,
+                corr_cholesky_mtx_1,
+                corr_cholesky_mtx_2,
+            ) = calc_corr_norm_and_cholesky_factor(
+                corr_array_n_cloud,
+                corr_array_n_below,
+                pdf_params.rc_1,
+                pdf_params.rc_2,
+                iiPDF_type,
+                hm_metadata.iiPDF_chi,
+                hm_metadata.iiPDF_eta,
+                hm_metadata.iiPDF_w,
+                hm_metadata.iiPDF_Ncn,
+                True,
+            )
+        else:
+            pdf2hydromet = tuple(
+                pdf2hydromet_idx(j, hm_metadata) for j in range(pdf_dim)
+            )
+            pdf_params_corr = {
+                "corr_chi_eta_1": pdf_params.corr_chi_eta_1,
+                "corr_chi_eta_2": pdf_params.corr_chi_eta_2,
+                "corr_w_chi_1": pdf_params.corr_w_chi_1,
+                "corr_w_chi_2": pdf_params.corr_w_chi_2,
+            }
+            (
+                corr_array_1_n,
+                corr_array_2_n,
+            ) = comp_corr_norm(
+                mu_x_1,
+                mu_x_2,
+                sigma_x_1,
+                sigma_x_2,
+                sigma_x_1_n,
+                sigma_x_2_n,
+                wm_zt,
+                pdf_params.rc_1,
+                pdf_params.rc_2,
+                pdf_params.mixt_frac,
+                precip_frac_1,
+                precip_frac_2,
+                wpNcnp_zt,
+                wphydrometp_zt,
+                corr_array_n_cloud,
+                corr_array_n_below,
+                hm_metadata.iiPDF_chi,
+                hm_metadata.iiPDF_eta,
+                hm_metadata.iiPDF_w,
+                hm_metadata.iiPDF_Ncn,
+                pdf2hydromet,
+                hydromet_tol,
+                Ncn_tol,
+                iiPDF_type,
+                l_calc_w_corr,
+                l_fix_w_chi_eta_correlations,
+                pdf_params_corr,
+            )
+
+            def _cholesky(corr_array_n):
+                _corr_array_scaling, corr_cholesky_mtx, _l_corr_array_scaling = (
+                    Cholesky_factor(corr_array_n)
+                )
+                return jnp.tril(corr_cholesky_mtx)
+
+            corr_cholesky_mtx_1 = jax.vmap(
+                jax.vmap(_cholesky, in_axes=0),
+                in_axes=0,
+            )(corr_array_1_n)
+            corr_cholesky_mtx_2 = jax.vmap(
+                jax.vmap(_cholesky, in_axes=0),
+                in_axes=0,
+            )(corr_array_2_n)
+
+    # hydromet_pdf_params is optional, so if it is not present we simply skip
+    # the steps to compute it.
+    if hydromet_pdf_params is not None:
+        corr_array_1, corr_array_2 = denorm_transform_corr(
+            sigma_x_1_n,
+            sigma_x_2_n,
+            sigma2_on_mu2_ip_1,
+            sigma2_on_mu2_ip_2,
+            corr_array_1_n,
+            corr_array_2_n,
+            hm_metadata.iiPDF_chi,
+            hm_metadata.iiPDF_eta,
+            hm_metadata.iiPDF_w,
+            hm_metadata.iiPDF_Ncn,
+        )
+        hydromet_pdf_params = pack_hydromet_pdf_params(
+            nzt,
+            ngrdcol,
+            hydromet_dim,
+            hm_metadata,
+            hm_1,
+            hm_2,
+            pdf_dim,
+            mu_x_1,
+            mu_x_2,
+            sigma_x_1,
+            sigma_x_2,
+            corr_array_1,
+            corr_array_2,
+            hydromet_pdf_params,
+        )
+    else:
+        corr_array_1 = None
+        corr_array_2 = None
+
+    if stats.l_sample:
+        for j in range(hydromet_dim):
+            hm_type = hm_metadata.hydromet_list[j]
+            var_name = f"{hm_type[:2].strip()}p2_zt"
+            stats = stats.update(var_name, hydrometp2_zt[:, :, j])
+
+        if corr_array_1 is not None and corr_array_2 is not None:
+            stats = pdf_param_hm_stats(
+                nzt,
+                ngrdcol,
+                pdf_dim,
+                hydromet_dim,
+                hm_metadata,
+                hm_1,
+                hm_2,
+                mu_x_1,
+                mu_x_2,
+                sigma_x_1,
+                sigma_x_2,
+                corr_array_1,
+                corr_array_2,
+                stats,
+            )
+
+        stats = pdf_param_ln_hm_stats(
+            nzt,
+            ngrdcol,
+            pdf_dim,
+            hm_metadata,
+            mu_x_1_n,
+            mu_x_2_n,
+            sigma_x_1_n,
+            sigma_x_2_n,
+            corr_array_1_n,
+            corr_array_2_n,
+            stats,
+        )
+
+        if stats.var_on_stats_list("rtp2_from_chi"):
+            rtp2_zt_from_chi = compute_rtp2_from_chi(
+                pdf_params.stdev_chi_1,
+                pdf_params.stdev_chi_2,
+                pdf_params.stdev_eta_1,
+                pdf_params.stdev_eta_2,
+                pdf_params.rt_1,
+                pdf_params.rt_2,
+                pdf_params.crt_1,
+                pdf_params.crt_2,
+                pdf_params.mixt_frac,
+                corr_array_1_n[:, :, hm_metadata.iiPDF_chi, hm_metadata.iiPDF_eta],
+                corr_array_2_n[:, :, hm_metadata.iiPDF_chi, hm_metadata.iiPDF_eta],
+            )
+            rtp2_zm_from_chi = zt2zm(
+                nzm,
+                nzt,
+                ngrdcol,
+                gr,
+                rtp2_zt_from_chi,
+                zero_threshold,
+            )
+            stats = stats.update("rtp2_from_chi", rtp2_zm_from_chi)
+
+        stats = stats.update("precip_frac", precip_frac)
+        stats = stats.update("precip_frac_1", precip_frac_1)
+        stats = stats.update("precip_frac_2", precip_frac_2)
+        stats = stats.update("Ncnm", Ncnm)
+
+    if clubb_at_least_debug_level(2):
+        corr_array_1_host = jax.device_get(corr_array_1_n)
+        corr_array_2_host = jax.device_get(corr_array_2_n)
+        bad_corr = []
+        for i in range(ngrdcol):
+            bad_col = False
+            for k in range(nzt):
+                bad_col = bad_col or not assert_corr_symmetric(corr_array_1_host[i, k])
+                bad_col = bad_col or not assert_corr_symmetric(corr_array_2_host[i, k])
+            bad_corr.append(bad_col)
+        err_info = err_info.set_fatal(mask=jnp.asarray(bad_corr, dtype=bool))
+
+    return (
+        err_info,
+        hydrometp2,
+        mu_x_1_n,
+        mu_x_2_n,
+        sigma_x_1_n,
+        sigma_x_2_n,
+        corr_array_1_n,
+        corr_array_2_n,
+        corr_cholesky_mtx_1,
+        corr_cholesky_mtx_2,
+        precip_fracs,
+        hydromet_pdf_params,
+        stats,
+    )
 
 
 def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
@@ -82,10 +677,11 @@ def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
     # zeta sign depends on mu_thl_1 vs mu_thl_2 (so the cloudier comp has the larger mean).
     thl_le = mu_thl_1 <= mu_thl_2
     zeta_flip = (1.0 / (1.0 + zeta_vrnce_rat_in)) - 1.0
-    if zeta_vrnce_rat_in >= 0.0:
-        zeta = jnp.where(thl_le, zeta_vrnce_rat_in, zeta_flip)
-    else:
-        zeta = jnp.where(thl_le, zeta_flip, zeta_vrnce_rat_in)
+    zeta = jnp.where(
+        zeta_vrnce_rat_in >= 0.0,
+        jnp.where(thl_le, zeta_vrnce_rat_in, zeta_flip),
+        jnp.where(thl_le, zeta_flip, zeta_vrnce_rat_in),
+    )
 
     # Guard the Rmax denominator: at no-precip points fp1=fp2=0 -> 0/0 = nan (forward and grad),
     # which poisons even though the both-precip branch is unselected there.
@@ -367,7 +963,7 @@ def component_corr_eta_hm_n_ip(corr_chi_eta_1, corr_chi_hm_n_1, corr_chi_eta_2, 
 
 # iiPDF_type enumeration (model_flags.F90:31-37) — imported from its Fortran-home model_flags.py (the PDF types
 # whose ADG standards fix corr(w,x)=0).
-from clubb_jax.src.CLUBB_core.model_flags import (
+from clubb_jax.src.CLUBB_core.clubb_constants import (
     iiPDF_ADG1 as IIPDF_TYPE_ADG1, iiPDF_ADG2 as IIPDF_TYPE_ADG2, iiPDF_new_hybrid as IIPDF_TYPE_NEW_HYBRID,
 )
 
@@ -659,6 +1255,421 @@ def calc_corr_norm_and_cholesky_factor(corr_array_n_cloud, corr_array_n_below, r
     corr_1, chol_1 = _select(rc_1)
     corr_2, chol_2 = _select(rc_2)
     return corr_1, corr_2, chol_1, chol_2
+
+
+def pdf_param_hm_stats(nzt, ngrdcol, pdf_dim, hydromet_dim, hm_metadata,
+                       hm_1, hm_2,
+                       mu_x_1, mu_x_2,
+                       sigma_x_1, sigma_x_2,
+                       corr_array_1, corr_array_2,
+                       stats):
+    """Record statistics for standard PDF parameters involving hydrometeors."""
+    del nzt, ngrdcol
+
+    if not stats.l_sample:
+        return stats
+
+    iiPDF_chi = hm_metadata.iiPDF_chi
+    iiPDF_eta = hm_metadata.iiPDF_eta
+    iiPDF_w = hm_metadata.iiPDF_w
+    iiPDF_Ncn = hm_metadata.iiPDF_Ncn
+
+    for ivar in range(hydromet_dim):
+        hm_type = hm_metadata.hydromet_list[ivar]
+
+        # Mean of the precipitating hydrometeor in PDF component 1.
+        var_name = f"{hm_type[:2].strip()}_1"
+        stats = stats.update(var_name, hm_1[:, :, ivar])
+
+        # Mean of the precipitating hydrometeor in PDF component 2.
+        var_name = f"{hm_type[:2].strip()}_2"
+        stats = stats.update(var_name, hm_2[:, :, ivar])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Mean of the precipitating hydrometeor (in-precip) in PDF component 1.
+        var_name = f"mu_{hm_type[:2].strip()}_1"
+        stats = stats.update(var_name, mu_x_1[:, :, ivar])
+
+        # Mean of the precipitating hydrometeor (in-precip) in PDF component 2.
+        var_name = f"mu_{hm_type[:2].strip()}_2"
+        stats = stats.update(var_name, mu_x_2[:, :, ivar])
+
+    # Mean of cloud nuclei concentration in PDF component 1.
+    stats = stats.update("mu_Ncn_1", mu_x_1[:, :, iiPDF_Ncn])
+    # Mean of cloud nuclei concentration in PDF component 2.
+    stats = stats.update("mu_Ncn_2", mu_x_2[:, :, iiPDF_Ncn])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Standard deviation of the precipitating hydrometeor (in-precip) in PDF component 1.
+        var_name = f"sigma_{hm_type[:2].strip()}_1"
+        stats = stats.update(var_name, sigma_x_1[:, :, ivar])
+
+        # Standard deviation of the precipitating hydrometeor (in-precip) in PDF component 2.
+        var_name = f"sigma_{hm_type[:2].strip()}_2"
+        stats = stats.update(var_name, sigma_x_2[:, :, ivar])
+
+    # Standard deviation of cloud nuclei concentration in PDF component 1.
+    stats = stats.update("sigma_Ncn_1", sigma_x_1[:, :, iiPDF_Ncn])
+    # Standard deviation of cloud nuclei concentration in PDF component 2.
+    stats = stats.update("sigma_Ncn_2", sigma_x_2[:, :, iiPDF_Ncn])
+
+    # Correlations of w and chi/eta found in the correlation arrays.
+    stats = stats.update("corr_w_chi_1_ca", corr_array_1[:, :, iiPDF_w, iiPDF_chi])
+    stats = stats.update("corr_w_chi_2_ca", corr_array_2[:, :, iiPDF_w, iiPDF_chi])
+    stats = stats.update("corr_w_eta_1_ca", corr_array_1[:, :, iiPDF_w, iiPDF_eta])
+    stats = stats.update("corr_w_eta_2_ca", corr_array_2[:, :, iiPDF_w, iiPDF_eta])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of w and the precipitating hydrometeor in PDF component 1.
+        var_name = f"corr_w_{hm_type[:2].strip()}_1"
+        stats = stats.update(var_name, corr_array_1[:, :, ivar, iiPDF_w])
+
+        # Correlation (in-precip) of w and the precipitating hydrometeor in PDF component 2.
+        var_name = f"corr_w_{hm_type[:2].strip()}_2"
+        stats = stats.update(var_name, corr_array_2[:, :, ivar, iiPDF_w])
+
+    # Correlation of w and N_cn in PDF component 1.
+    stats = stats.update("corr_w_Ncn_1", corr_array_1[:, :, iiPDF_Ncn, iiPDF_w])
+    # Correlation of w and N_cn in PDF component 2.
+    stats = stats.update("corr_w_Ncn_2", corr_array_2[:, :, iiPDF_Ncn, iiPDF_w])
+
+    # Correlation of chi and eta in each PDF component found in the correlation arrays.
+    stats = stats.update("corr_chi_eta_1_ca", corr_array_1[:, :, iiPDF_eta, iiPDF_chi])
+    stats = stats.update("corr_chi_eta_2_ca", corr_array_2[:, :, iiPDF_eta, iiPDF_chi])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of chi (old s) and the precipitating hydrometeor in PDF component 1.
+        var_name = f"corr_chi_{hm_type[:2].strip()}_1"
+        stats = stats.update(var_name, corr_array_1[:, :, ivar, iiPDF_chi])
+
+        # Correlation (in-precip) of chi (old s) and the precipitating hydrometeor in PDF component 2.
+        var_name = f"corr_chi_{hm_type[:2].strip()}_2"
+        stats = stats.update(var_name, corr_array_2[:, :, ivar, iiPDF_chi])
+
+    # Correlation of chi (old s) and N_cn in PDF component 1.
+    stats = stats.update("corr_chi_Ncn_1", corr_array_1[:, :, iiPDF_Ncn, iiPDF_chi])
+    # Correlation of chi (old s) and N_cn in PDF component 2.
+    stats = stats.update("corr_chi_Ncn_2", corr_array_2[:, :, iiPDF_Ncn, iiPDF_chi])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of eta (old t) and the precipitating hydrometeor in PDF component 1.
+        var_name = f"corr_eta_{hm_type[:2].strip()}_1"
+        stats = stats.update(var_name, corr_array_1[:, :, ivar, iiPDF_eta])
+
+        # Correlation (in-precip) of eta (old t) and the precipitating hydrometeor in PDF component 2.
+        var_name = f"corr_eta_{hm_type[:2].strip()}_2"
+        stats = stats.update(var_name, corr_array_2[:, :, ivar, iiPDF_eta])
+
+    # Correlation of eta (old t) and N_cn in PDF component 1.
+    stats = stats.update("corr_eta_Ncn_1", corr_array_1[:, :, iiPDF_Ncn, iiPDF_eta])
+    # Correlation of eta (old t) and N_cn in PDF component 2.
+    stats = stats.update("corr_eta_Ncn_2", corr_array_2[:, :, iiPDF_Ncn, iiPDF_eta])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of N_cn and the precipitating hydrometeor in PDF component 1.
+        var_name = f"corr_Ncn_{hm_type[:2].strip()}_1"
+        stats = stats.update(var_name, corr_array_1[:, :, ivar, iiPDF_Ncn])
+
+        # Correlation (in-precip) of N_cn and the precipitating hydrometeor in PDF component 2.
+        var_name = f"corr_Ncn_{hm_type[:2].strip()}_2"
+        stats = stats.update(var_name, corr_array_2[:, :, ivar, iiPDF_Ncn])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx_ivar = pdf2hydromet_idx(ivar, hm_metadata)
+        hmx_type = hm_metadata.hydromet_list[hm_idx_ivar]
+
+        for jvar in range(ivar + 1, pdf_dim):
+            hm_idx_jvar = pdf2hydromet_idx(jvar, hm_metadata)
+            hmy_type = hm_metadata.hydromet_list[hm_idx_jvar]
+
+            # Correlation (in-precip) of two different hydrometeors in PDF component 1.
+            var_name = f"corr_{hmx_type[:2].strip()}_{hmy_type[:2].strip()}_1"
+            stats = stats.update(var_name, corr_array_1[:, :, jvar, ivar])
+
+            # Correlation (in-precip) of two different hydrometeors in PDF component 2.
+            var_name = f"corr_{hmx_type[:2].strip()}_{hmy_type[:2].strip()}_2"
+            stats = stats.update(var_name, corr_array_2[:, :, jvar, ivar])
+
+    return stats
+
+
+def pdf_param_ln_hm_stats(nzt, ngrdcol, pdf_dim, hm_metadata,
+                          mu_x_1_n, mu_x_2_n,
+                          sigma_x_1_n, sigma_x_2_n,
+                          corr_array_1_n,
+                          corr_array_2_n,
+                          stats):
+    """Record statistics for normal space PDF parameters involving hydrometeors."""
+    del nzt, ngrdcol
+
+    if not stats.l_sample:
+        return stats
+
+    iiPDF_chi = hm_metadata.iiPDF_chi
+    iiPDF_eta = hm_metadata.iiPDF_eta
+    iiPDF_w = hm_metadata.iiPDF_w
+    iiPDF_Ncn = hm_metadata.iiPDF_Ncn
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        var_name = f"mu_{hm_type[:2].strip()}_1_n"
+        if stats.var_on_stats_list(var_name):
+            stats = stats.update(var_name, mu_x_1_n[:, :, ivar])
+
+        var_name = f"mu_{hm_type[:2].strip()}_2_n"
+        if stats.var_on_stats_list(var_name):
+            stats = stats.update(var_name, mu_x_2_n[:, :, ivar])
+
+    if stats.var_on_stats_list("mu_Ncn_1_n"):
+        stats = stats.update("mu_Ncn_1_n", mu_x_1_n[:, :, iiPDF_Ncn])
+
+    if stats.var_on_stats_list("mu_Ncn_2_n"):
+        stats = stats.update("mu_Ncn_2_n", mu_x_2_n[:, :, iiPDF_Ncn])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        var_name = f"sigma_{hm_type[:2].strip()}_1_n"
+        stats = stats.update(var_name, sigma_x_1_n[:, :, ivar])
+
+        var_name = f"sigma_{hm_type[:2].strip()}_2_n"
+        stats = stats.update(var_name, sigma_x_2_n[:, :, ivar])
+
+    stats = stats.update("sigma_Ncn_1_n", sigma_x_1_n[:, :, iiPDF_Ncn])
+    stats = stats.update("sigma_Ncn_2_n", sigma_x_2_n[:, :, iiPDF_Ncn])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of w and ln hm in PDF component 1.
+        var_name = f"corr_w_{hm_type[:2].strip()}_1_n"
+        stats = stats.update(var_name, corr_array_1_n[:, :, ivar, iiPDF_w])
+
+        # Correlation (in-precip) of w and ln hm in PDF component 2.
+        var_name = f"corr_w_{hm_type[:2].strip()}_2_n"
+        stats = stats.update(var_name, corr_array_2_n[:, :, ivar, iiPDF_w])
+
+    # Correlation of w and ln N_cn in PDF component 1.
+    stats = stats.update("corr_w_Ncn_1_n", corr_array_1_n[:, :, iiPDF_Ncn, iiPDF_w])
+    # Correlation of w and ln N_cn in PDF component 2.
+    stats = stats.update("corr_w_Ncn_2_n", corr_array_2_n[:, :, iiPDF_Ncn, iiPDF_w])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of chi (old s) and ln hm in PDF component 1.
+        var_name = f"corr_chi_{hm_type[:2].strip()}_1_n"
+        stats = stats.update(var_name, corr_array_1_n[:, :, ivar, iiPDF_chi])
+
+        # Correlation (in-precip) of chi (old s) and ln hm in PDF component 2.
+        var_name = f"corr_chi_{hm_type[:2].strip()}_2_n"
+        stats = stats.update(var_name, corr_array_2_n[:, :, ivar, iiPDF_chi])
+
+    # Correlation of chi (old s) and ln N_cn in PDF component 1.
+    stats = stats.update("corr_chi_Ncn_1_n", corr_array_1_n[:, :, iiPDF_Ncn, iiPDF_chi])
+    # Correlation of chi (old s) and ln N_cn in PDF component 2.
+    stats = stats.update("corr_chi_Ncn_2_n", corr_array_2_n[:, :, iiPDF_Ncn, iiPDF_chi])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of eta (old t) and ln hm in PDF component 1.
+        var_name = f"corr_eta_{hm_type[:2].strip()}_1_n"
+        stats = stats.update(var_name, corr_array_1_n[:, :, ivar, iiPDF_eta])
+
+        # Correlation (in-precip) of eta (old t) and ln hm in PDF component 2.
+        var_name = f"corr_eta_{hm_type[:2].strip()}_2_n"
+        stats = stats.update(var_name, corr_array_2_n[:, :, ivar, iiPDF_eta])
+
+    # Correlation of eta (old t) and ln N_cn in PDF component 1.
+    stats = stats.update("corr_eta_Ncn_1_n", corr_array_1_n[:, :, iiPDF_Ncn, iiPDF_eta])
+    # Correlation of eta (old t) and ln N_cn in PDF component 2.
+    stats = stats.update("corr_eta_Ncn_2_n", corr_array_2_n[:, :, iiPDF_Ncn, iiPDF_eta])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx = pdf2hydromet_idx(ivar, hm_metadata)
+        hm_type = hm_metadata.hydromet_list[hm_idx]
+
+        # Correlation (in-precip) of ln N_cn and ln hm in PDF component 1.
+        var_name = f"corr_Ncn_{hm_type[:2].strip()}_1_n"
+        stats = stats.update(var_name, corr_array_1_n[:, :, ivar, iiPDF_Ncn])
+
+        # Correlation (in-precip) of ln N_cn and ln hm in PDF component 2.
+        var_name = f"corr_Ncn_{hm_type[:2].strip()}_2_n"
+        stats = stats.update(var_name, corr_array_2_n[:, :, ivar, iiPDF_Ncn])
+
+    for ivar in range(iiPDF_Ncn + 1, pdf_dim):
+        hm_idx_ivar = pdf2hydromet_idx(ivar, hm_metadata)
+        hmx_type = hm_metadata.hydromet_list[hm_idx_ivar]
+
+        for jvar in range(ivar + 1, pdf_dim):
+            hm_idx_jvar = pdf2hydromet_idx(jvar, hm_metadata)
+            hmy_type = hm_metadata.hydromet_list[hm_idx_jvar]
+
+            # Correlation (in-precip) of ln hmx and ln hmy in PDF component 1.
+            var_name = f"corr_{hmx_type[:2].strip()}_{hmy_type[:2].strip()}_1_n"
+            stats = stats.update(var_name, corr_array_1_n[:, :, jvar, ivar])
+
+            # Correlation (in-precip) of ln hmx and ln hmy in PDF component 2.
+            var_name = f"corr_{hmx_type[:2].strip()}_{hmy_type[:2].strip()}_2_n"
+            stats = stats.update(var_name, corr_array_2_n[:, :, jvar, ivar])
+
+    return stats
+
+
+def pack_hydromet_pdf_params(nzt, ngrdcol,
+                             hydromet_dim, hm_metadata,
+                             hm_1, hm_2, pdf_dim, mu_x_1,
+                             mu_x_2, sigma_x_1, sigma_x_2,
+                             corr_array_1, corr_array_2,
+                             hydromet_pdf_params):
+    """Pack hydrometeor PDF parameters.
+
+    JAX/Python adaptation: Fortran packs an ``(ngrdcol,nzt)`` array of derived
+    types; the JAX object stores those per-cell fields as leading array
+    dimensions on each field of one ``HydrometPdfParameter`` pytree.
+    """
+    del nzt, ngrdcol, pdf_dim, hydromet_pdf_params
+
+    iiPDF_chi = hm_metadata.iiPDF_chi
+    iiPDF_eta = hm_metadata.iiPDF_eta
+    iiPDF_w = hm_metadata.iiPDF_w
+    iiPDF_Ncn = hm_metadata.iiPDF_Ncn
+
+    base_shape = hm_1.shape[:2]
+    hm_shape = base_shape + (MAX_HYDROMET_DIM,)
+    corr_shape = base_shape + (MAX_HYDROMET_DIM, MAX_HYDROMET_DIM)
+
+    hm_1_out = jnp.zeros(hm_shape, dtype=jnp.float64)
+    hm_2_out = jnp.zeros(hm_shape, dtype=jnp.float64)
+    mu_hm_1 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    mu_hm_2 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    sigma_hm_1 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    sigma_hm_2 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    corr_w_hm_1 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    corr_w_hm_2 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    corr_chi_hm_1 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    corr_chi_hm_2 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    corr_eta_hm_1 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    corr_eta_hm_2 = jnp.zeros(hm_shape, dtype=jnp.float64)
+    corr_hmx_hmy_1 = jnp.zeros(corr_shape, dtype=jnp.float64)
+    corr_hmx_hmy_2 = jnp.zeros(corr_shape, dtype=jnp.float64)
+
+    # Pack remaining means and standard deviations into hydromet_pdf_params.
+    for ivar in range(hydromet_dim):
+        pdf_idx = hydromet2pdf_idx(ivar, hm_metadata)
+
+        # Mean of a hydrometeor (overall) in the 1st PDF component.
+        hm_1_out = hm_1_out.at[:, :, ivar].set(hm_1[:, :, ivar])
+        # Mean of a hydrometeor (overall) in the 2nd PDF component.
+        hm_2_out = hm_2_out.at[:, :, ivar].set(hm_2[:, :, ivar])
+
+        # Mean of a hydrometeor (in-precip) in the 1st PDF component.
+        mu_hm_1 = mu_hm_1.at[:, :, ivar].set(mu_x_1[:, :, pdf_idx])
+        # Mean of a hydrometeor (in-precip) in the 2nd PDF component.
+        mu_hm_2 = mu_hm_2.at[:, :, ivar].set(mu_x_2[:, :, pdf_idx])
+
+        # Standard deviation of a hydrometeor (in-precip) in the 1st PDF component.
+        sigma_hm_1 = sigma_hm_1.at[:, :, ivar].set(sigma_x_1[:, :, pdf_idx])
+        # Standard deviation of a hydrometeor (in-precip) in the 2nd PDF component.
+        sigma_hm_2 = sigma_hm_2.at[:, :, ivar].set(sigma_x_2[:, :, pdf_idx])
+
+        # Correlation (in-precip) of w and a hydrometeor in the 1st PDF component.
+        corr_w_hm_1 = corr_w_hm_1.at[:, :, ivar].set(corr_array_1[:, :, pdf_idx, iiPDF_w])
+
+        # Correlation (in-precip) of w and a hydrometeor in the 2nd PDF component.
+        corr_w_hm_2 = corr_w_hm_2.at[:, :, ivar].set(corr_array_2[:, :, pdf_idx, iiPDF_w])
+
+        # Correlation (in-precip) of chi and a hydrometeor in the 1st PDF component.
+        corr_chi_hm_1 = corr_chi_hm_1.at[:, :, ivar].set(corr_array_1[:, :, pdf_idx, iiPDF_chi])
+
+        # Correlation (in-precip) of chi and a hydrometeor in the 2nd PDF component.
+        corr_chi_hm_2 = corr_chi_hm_2.at[:, :, ivar].set(corr_array_2[:, :, pdf_idx, iiPDF_chi])
+
+        # Correlation (in-precip) of eta and a hydrometeor in the 1st PDF component.
+        corr_eta_hm_1 = corr_eta_hm_1.at[:, :, ivar].set(corr_array_1[:, :, pdf_idx, iiPDF_eta])
+
+        # Correlation (in-precip) of eta and a hydrometeor in the 2nd PDF component.
+        corr_eta_hm_2 = corr_eta_hm_2.at[:, :, ivar].set(corr_array_2[:, :, pdf_idx, iiPDF_eta])
+
+        # Correlation (in-precip) of two hydrometeors, hmx and hmy, in the 1st PDF component.
+        corr_hmx_hmy_1 = corr_hmx_hmy_1.at[:, :, ivar, ivar].set(1.0)
+
+        for jvar in range(ivar + 1, hydromet_dim):
+            jpdf_idx = hydromet2pdf_idx(jvar, hm_metadata)
+            corr_hmx_hmy_1 = corr_hmx_hmy_1.at[:, :, jvar, ivar].set(
+                corr_array_1[:, :, jpdf_idx, pdf_idx]
+            )
+            corr_hmx_hmy_1 = corr_hmx_hmy_1.at[:, :, ivar, jvar].set(
+                corr_hmx_hmy_1[:, :, jvar, ivar]
+            )
+
+        # Correlation (in-precip) of two hydrometeors, hmx and hmy, in the 2nd PDF component.
+        corr_hmx_hmy_2 = corr_hmx_hmy_2.at[:, :, ivar, ivar].set(1.0)
+
+        for jvar in range(ivar + 1, hydromet_dim):
+            jpdf_idx = hydromet2pdf_idx(jvar, hm_metadata)
+            corr_hmx_hmy_2 = corr_hmx_hmy_2.at[:, :, jvar, ivar].set(
+                corr_array_2[:, :, jpdf_idx, pdf_idx]
+            )
+            corr_hmx_hmy_2 = corr_hmx_hmy_2.at[:, :, ivar, jvar].set(
+                corr_hmx_hmy_2[:, :, jvar, ivar]
+            )
+
+    # Mean of Ncn (overall) in the 1st PDF component.
+    mu_Ncn_1 = mu_x_1[:, :, iiPDF_Ncn]
+    # Mean of Ncn (overall) in the 2nd PDF component.
+    mu_Ncn_2 = mu_x_2[:, :, iiPDF_Ncn]
+
+    # Standard deviation of Ncn (overall) in the 1st PDF component.
+    sigma_Ncn_1 = sigma_x_1[:, :, iiPDF_Ncn]
+    # Standard deviation of Ncn (overall) in the 2nd PDF component.
+    sigma_Ncn_2 = sigma_x_2[:, :, iiPDF_Ncn]
+
+    return HydrometPdfParameter(
+        hm_1=hm_1_out,
+        hm_2=hm_2_out,
+        mu_hm_1=mu_hm_1,
+        mu_hm_2=mu_hm_2,
+        sigma_hm_1=sigma_hm_1,
+        sigma_hm_2=sigma_hm_2,
+        corr_w_hm_1=corr_w_hm_1,
+        corr_w_hm_2=corr_w_hm_2,
+        corr_chi_hm_1=corr_chi_hm_1,
+        corr_chi_hm_2=corr_chi_hm_2,
+        corr_eta_hm_1=corr_eta_hm_1,
+        corr_eta_hm_2=corr_eta_hm_2,
+        corr_hmx_hmy_1=corr_hmx_hmy_1,
+        corr_hmx_hmy_2=corr_hmx_hmy_2,
+        mu_Ncn_1=mu_Ncn_1,
+        mu_Ncn_2=mu_Ncn_2,
+        sigma_Ncn_1=sigma_Ncn_1,
+        sigma_Ncn_2=sigma_Ncn_2,
+    )
 
 
 def compute_rtp2_from_chi(sigma_chi_1, sigma_chi_2, sigma_eta_1, sigma_eta_2,

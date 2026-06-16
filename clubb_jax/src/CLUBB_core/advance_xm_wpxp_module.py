@@ -1,1361 +1,2088 @@
-"""JAX implementations of advance_xm_wpxp sub-functions.
+"""JAX-side entry point for ``src/CLUBB_core/advance_xm_wpxp_module.F90``.
 
-Faithful ports of CLUBB_core/advance_xm_wpxp_module.F90. The mean-advection
-LHS operators (term_ma_zt_lhs_jax/term_ma_zm_lhs_jax) live in mean_adv.py, mirroring
-the Fortran `use mean_adv`; they are imported back in here.
-
-Functions implemented:
-  xm_term_ta_lhs       -- turbulent advection LHS for xm (zt-level)
-  wpxp_term_tp_lhs     -- turbulent production LHS for w'x' (zm-level)
-  wpxp_terms_ac_pr2_lhs -- accumulation + pressure-2 LHS for w'x' (zm-level)
-  wpxp_term_pr1_lhs    -- pressure-1 LHS for w'x' (zm-level)
-  wpxp_terms_bp_pr3_rhs -- buoyancy-production + pressure-3 RHS for w'x' (zm-level)
-  xm_wpxp_lhs          -- full interleaved pentadiagonal LHS assembly
-  xm_wpxp_rhs          -- full interleaved RHS assembly
-  solve_xm_wpxp_with_single_lhs -- per-field solve: returns (wpxp_new, xm_new)
-  advance_xm_wpxp      -- whole-driver: advances rt/thl + um/vm, returns state dict
-  clip_covar            -- covariance clipping post-solve
-  apply_sponge_field_jax    -- sponge-layer damping of a mean field (advance_xm_wpxp tail block)
-
-All functions operate in float64.
+Description:
+  Contains the CLUBB advance_xm_wpxp_module scheme. Advance the mean and flux
+  terms by one timestep.
 
 References:
-  src/CLUBB_core/advance_xm_wpxp_module.F90
+  https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:wpxp_eqns
+
+  Eqn. 16 & 17 on p. 3546 of
+  ``A PDF-Based Model for Boundary Layer Clouds. Part I:
+    Method and Model Description'' Golaz, et al. (2002)
+    JAS, Vol. 59, pp. 3540--3551.
+
+Adaptation notes:
+- This JAX entry point preserves the Fortran argument and return contract while
+  using JAX-side stats, limiter, positive-definite, skewness, and matrix-solver
+  helpers inside the jitted region.
+- Sponge damping blocks are unsupported here because clubb_case_initalization
+  rejects sponge-enabled Python/JAX driver cases before this routine is called.
+- error_prints_xm_wpxp is intentionally reduced until full JAX diagnostic state
+  is available.
+- _solve_one_xm_wpxp preserves the repeated solve structure of the Fortran
+  multiple-LHS path while avoiding a larger target-only abstraction.
 """
 
-from __future__ import annotations
+from functools import partial
 
-import numpy as np
+import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray, _xp, _iset
-from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zt2zm_jax, zm2zt2zm, zt2zm2zt, ddzt
-from clubb_jax.src.CLUBB_core.diffusion import diffusion_zm_lhs_jax
-from clubb_jax.src.CLUBB_core.turbulent_adv_pdf import xpyp_term_ta_pdf_lhs_jax
-from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax, term_ma_zm_lhs_jax
-from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve
-# clip_covar lives in its Fortran home clip_explicit.F90 (the Fortran `use clip_explicit`)
-from clubb_jax.src.CLUBB_core.clip_explicit import clip_covar, clip_rcm
-# fill_holes_vertical (fill_holes.F90) + the monotonic flux limiter (mono_flux_limiter.F90) —
-# called by xm_wpxp_clipping_and_stats per the Fortran `use` chain
+from clubb_jax.src.CLUBB_core.Skx_module import Skx_func
+from clubb_jax.src.CLUBB_core.advance_helper_module import calc_wp3_on_wp2
+from clubb_jax.src.CLUBB_core.clip_explicit import clip_covar
+from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs, diffusion_zm_lhs
+from clubb_jax.src.CLUBB_core.error_code import clubb_at_least_debug_level
 from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical
+from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs, term_ma_zm_lhs
+from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import band_solve
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.CLUBB_core.mono_flux_limiter import (
-    monotonic_turbulent_flux_limit, MFL_UM, MFL_VM, MFL_RTM, MFL_THLM,
-    calc_turb_adv_range, mean_vert_vel_up_down,
+    calc_turb_adv_range,
+    monotonic_turbulent_flux_limit,
 )
-from clubb_jax.src.CLUBB_core.constants_clubb import eps as _EPS
-from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import (
-    apply_lhs_band2_zt2zm_interior_jax, apply_lhs_band3_interior_jax,
+from clubb_jax.src.CLUBB_core.pos_definite_module import pos_definite_adj
+from clubb_jax.src.CLUBB_core.turbulent_adv_pdf import (
+    xpyp_term_ta_pdf_lhs,
+    xpyp_term_ta_pdf_lhs_godunov,
+    xpyp_term_ta_pdf_rhs,
 )
-from clubb_jax.src.CLUBB_core.constants_clubb import (
-    rt_tol, thl_tol, rt_tol as _RT_TOL, thl_tol as _THL_TOL,
-    rt_tol_mfl as _RT_TOL_MFL, thl_tol_mfl as _THL_TOL_MFL,
-    w_tol as _W_TOL, w_tol_sqd as _W_TOL_SQD,
-    ep1, grav, iC6rt, iC6thl, iC_uu_shr, ibeta, ic_K6, zero_threshold,
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    clip_upwp,
+    clip_vpwp,
+    clip_wprtp,
+    clip_wpsclrp,
+    clip_wpthlp,
+    eps,
+    ep1,
     gamma_over_implicit_ts,
+    grav,
+    ic_K6,
+    iC6rt,
+    iC6rt_Lscale0,
+    iC6rtb,
+    iC6rtc,
+    iC6thl,
+    iC6thl_Lscale0,
+    iC6thlb,
+    iC6thlc,
+    iC7,
+    iC7_Lscale0,
+    iC7b,
+    iC7c,
+    iC_uu_shr,
+    ialtitude_threshold,
+    iiPDF_ADG1,
+    iiPDF_new,
+    iiPDF_new_hybrid,
+    iwpxp_L_thresh,
+    l_clip_turb_adv,
+    l_explicit_turbulent_adv_wpxp,
+    l_force_descending_solves,
+    l_pos_def,
+    one,
+    one_half,
+    penta_bicgstab,
+    rt_tol,
+    rt_tol_mfl,
+    thl_tol,
+    thl_tol_mfl,
+    upwp_cl_max,
+    vpwp_cl_max,
+    w_tol,
+    w_tol_sqd,
+    wprtp_cl_max,
+    wpthlp_cl_max,
+    zero,
+    zero_threshold,
 )
-# sponge_damp_xm lives in its Fortran home sponge_layer_damping.F90 (the Fortran `use sponge_layer_damping`)
-from clubb_jax.src.CLUBB_core.sponge_layer_damping import sponge_damp_xm
+from clubb_jax.src.CLUBB_core.grid_class import (
+    ddzt,
+    zm2zt,
+    zm2zt2zm,
+    zt2zm,
+    zt2zm2zt,
+)
+from clubb_jax.src.derived_types import (
+    ErrInfo,
+    Grid,
+    NuVertResDep,
+    implicit_coefs_terms,
+)
 
-# gamma_over_implicit_ts = 3/2 (constants_clubb.F90); advance_xm_wpxp_module.F90:1255 `use constants_clubb`
-_gamma = gamma_over_implicit_ts
+nsub = 2
+nsup = 2
+xm_wpxp_thlm = 1
+xm_wpxp_rtm = 2
+xm_wpxp_scalar = 3
+xm_wpxp_um = 4
+xm_wpxp_vm = 5
 
-
-def apply_sponge_field_jax(key, xm, xm_ref, gr, dt_advance, sponge_cfg):
-    """Apply sponge-layer damping to a mean field toward its reference profile.
-
-    Faithful to the sponge block at the end of advance_xm_wpxp
-    (advance_xm_wpxp_module.F90:1053-1123). A no-op unless `sponge_cfg` contains
-    `key` (i.e. that field's l_sponge_damping is set). tau/depth are precomputed
-    once at init (sponge_layer_damping.initialize_tau_sponge_damp). The reference
-    profile xm_ref is the initial sounding profile (clubb_driver.F90:5298-5316).
-    """
-    if not sponge_cfg or key not in sponge_cfg:
-        return xm
-    prof = sponge_cfg[key]
-    tau, depth = prof['tau'], prof['depth']
-    zt_a = _asarray(gr.zt, dtype=np.float64)
-    zm_a = _asarray(gr.zm, dtype=np.float64)
-    ref_a = _asarray(xm_ref, dtype=np.float64)
-    dt = float(dt_advance)
-    # Vectorized + tracer-transparent (REFACTOR B5): sponge_damp_xm is now pure broadcast arithmetic
-    # (tau (nz,) broadcasts over the (ngrdcol, nz) field), so this is bit-identical to the per-column loop
-    # while keeping the prognostic xm on the autodiff graph (the old `np.array(xm)`+in-place loop severed it).
-    return sponge_damp_xm(_asarray(xm, dtype=np.float64), ref_a, zt_a, zm_a[:, -1:], tau, depth, dt)
+ndiags2 = 2
+ndiags3 = 3
+ndiags5 = 5
 
 
-# ---------------------------------------------------------------------------
-# xm_term_ta_lhs
-# ---------------------------------------------------------------------------
+@partial(
+    jax.jit,
+    static_argnames=(
+        "nzm",
+        "nzt",
+        "ngrdcol",
+        "sclr_dim",
+        "iipdf_type",
+        "penta_solve_method",
+        "tridiag_solve_method",
+        "fill_holes_type",
+        "l_predict_upwp_vpwp",
+        "l_ho_nontrad_coriolis",
+        "l_ho_trad_coriolis",
+        "l_diffuse_rtm_and_thlm",
+        "l_stability_correct_kh_n2_zm",
+        "l_godunov_upwind_wpxp_ta",
+        "l_upwind_xm_ma",
+        "l_uv_nudge",
+        "l_tke_aniso",
+        "l_diag_lscale_from_tau",
+        "l_use_c7_richardson",
+        "l_lmm_stepping",
+        "l_enable_relaxed_clipping",
+        "l_linearize_pbl_winds",
+        "l_mono_flux_lim_thlm",
+        "l_mono_flux_lim_rtm",
+        "l_mono_flux_lim_um",
+        "l_mono_flux_lim_vm",
+        "l_mono_flux_lim_spikefix",
+        "wprtp_cl_num",
+        "wpthlp_cl_num",
+        "upwp_cl_num",
+        "vpwp_cl_num",
+        "l_implemented",
+    ),
+)
+def advance_xm_wpxp(
+    nzm: int, nzt: int, ngrdcol: int, sclr_dim: int, sclr_tol, gr: Grid, dt: float,
+    sigma_sqd_w, wm_zm, wm_zt, wp2, lscale_zm,
+    wp3, kh_zt, kh_zm,
+    stability_correction,
+    invrs_tau_c6_zm, tau_max_zm, wp2rtp, rtpthvp,
+    rtm_forcing, wprtp_forcing, rtm_ref, wp2thlp,
+    thlpthvp, thlm_forcing, wpthlp_forcing, thlm_ref,
+    rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt, thv_ds_zm, rtp2, thlp2,
+    w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm, mixt_frac_zm,
+    l_implemented: bool, em, wp2sclrp, sclrpthvp, sclrm_forcing, sclrp2, cx_fnc_richardson,
+    pdf_implicit_coefs_terms: implicit_coefs_terms,
+    um_forcing, vm_forcing, ug, vg, wpthvp,
+    fcor, fcor_y, um_ref, vm_ref, up2, vp2, uprcp, vprcp, rc_coef_zm,
+    clubb_params, nu_vert_res_dep: NuVertResDep, ts_nudge: float,
+    iipdf_type: int, penta_solve_method: int, tridiag_solve_method: int, fill_holes_type: int,
+    l_predict_upwp_vpwp: bool, l_ho_nontrad_coriolis: bool, l_ho_trad_coriolis: bool,
+    l_diffuse_rtm_and_thlm: bool, l_stability_correct_kh_n2_zm: bool,
+    l_godunov_upwind_wpxp_ta: bool, l_upwind_xm_ma: bool, l_uv_nudge: bool,
+    l_tke_aniso: bool, l_diag_lscale_from_tau: bool, l_use_c7_richardson: bool,
+    l_lmm_stepping: bool, l_enable_relaxed_clipping: bool, l_linearize_pbl_winds: bool,
+    l_mono_flux_lim_thlm: bool, l_mono_flux_lim_rtm: bool, l_mono_flux_lim_um: bool,
+    l_mono_flux_lim_vm: bool, l_mono_flux_lim_spikefix: bool,
+    wprtp_cl_num: int, wpthlp_cl_num: int, upwp_cl_num: int, vpwp_cl_num: int,
+    stats: JaxStats,
+    rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, um, upwp, vm, vpwp,
+    um_pert, vm_pert, upwp_pert, vpwp_pert,
+    err_info: ErrInfo,
+):
+    """Advance mean fields and turbulent fluxes one model timestep."""
+    l_iter = True
+    l_sample = stats.l_sample
+    l_perturbed_wind = l_predict_upwp_vpwp and l_linearize_pbl_winds
 
-def xm_term_ta_lhs(
-    invrs_rho_ds_zt: jnp.ndarray,
-    rho_ds_zm: jnp.ndarray,
-    gr,
-) -> jnp.ndarray:
-    """Turbulent advection LHS for xm (thermodynamic levels).
+    wp3_zm = zt2zm(nzm, nzt, ngrdcol, gr, wp3)
+    Skw_zm = Skx_func(nzm, ngrdcol, wp2, wp3_zm, w_tol, clubb_params)
+    wp3_on_wp2, wp3_on_wp2_zt = calc_wp3_on_wp2(
+        nzm, nzt, ngrdcol, gr, wp2, wp3,
+    )
 
-    Faithful port of advance_xm_wpxp_module.F90:xm_term_ta_lhs.
+    if clubb_at_least_debug_level(0):
+        if l_mono_flux_lim_rtm and not l_mono_flux_lim_spikefix:
+            err_info = err_info.set_fatal()
+            return (
+                wprtp_cl_num, wpthlp_cl_num, upwp_cl_num, vpwp_cl_num,
+                rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, um, upwp, vm, vpwp,
+                um_pert, vm_pert, upwp_pert, vpwp_pert, err_info, stats,
+            )
 
-    Computes: (1/rho_ds_zt) * d(rho_ds_zm * w'x') / dz, solved implicitly.
+    l_scalar_calc = sclr_dim > 0
+    if iipdf_type == iiPDF_new and not l_explicit_turbulent_adv_wpxp:
+        nrhs = 1
+    else:
+        nrhs = 2 + sclr_dim
+        if l_predict_upwp_vpwp:
+            nrhs += 2
+            if l_perturbed_wind:
+                nrhs += 2
 
-    Output shape: (2, ngrdcol, nzt).
-      out[0, :, k] = coeff of wpxp[k+1]   (momentum superdiagonal)
-      out[1, :, k] = coeff of wpxp[k]     (momentum subdiagonal)
+    rtm_old = rtm
+    thlm_old = thlm
+    wprtp_old = wprtp
+    wpthlp_old = wpthlp
+    sclrm_old = sclrm
+    wpsclrp_old = wpsclrp
+    um_old = um
+    vm_old = vm
+    upwp_old = upwp
+    vpwp_old = vpwp
 
-    Args:
-        invrs_rho_ds_zt: (ngrdcol, nzt)
-        rho_ds_zm:       (ngrdcol, nzm)
-        gr:              grid object
-    """
-    invrs_dzt = gr.invrs_dzt   # (ngrdcol, nzt)
-    # super: coeff of wpxp(k+1) = rho_ds_zm[k+1]
-    sup = invrs_rho_ds_zt * invrs_dzt * rho_ds_zm[:, 1:]   # (ngrdcol, nzt)
-    # sub:  coeff of wpxp(k)   = rho_ds_zm[k]
-    sub = -invrs_rho_ds_zt * invrs_dzt * rho_ds_zm[:, :-1]  # (ngrdcol, nzt)
-    return jnp.stack([sup, sub], axis=0)   # (2, ngrdcol, nzt)
+    if not l_diag_lscale_from_tau:
+        C6rt = clubb_params[:, iC6rt]
+        C6rtb = clubb_params[:, iC6rtb]
+        C6rtc = clubb_params[:, iC6rtc]
+        C6rtc_safe = jnp.where(jnp.abs(C6rtc) > zero, C6rtc, one)
+        C6rt_varying = jnp.abs(C6rt - C6rtb) > jnp.abs(C6rt + C6rtb) * eps / 2.0
+        C6rt_computed = (
+            C6rtb[:, None]
+            + (C6rt - C6rtb)[:, None]
+            * jnp.exp(-one_half * (jnp.asarray(Skw_zm) / C6rtc_safe[:, None]) ** 2)
+        )
+        C6rt_Skw_fnc = jnp.where(C6rt_varying[:, None], C6rt_computed, C6rtb[:, None])
 
+        C6thl = clubb_params[:, iC6thl]
+        C6thlb = clubb_params[:, iC6thlb]
+        C6thlc = clubb_params[:, iC6thlc]
+        C6thlc_safe = jnp.where(jnp.abs(C6thlc) > zero, C6thlc, one)
+        C6thl_varying = jnp.abs(C6thl - C6thlb) > jnp.abs(C6thl + C6thlb) * eps / 2.0
+        C6thl_computed = (
+            C6thlb[:, None]
+            + (C6thl - C6thlb)[:, None]
+            * jnp.exp(-one_half * (jnp.asarray(Skw_zm) / C6thlc_safe[:, None]) ** 2)
+        )
+        C6thl_Skw_fnc = jnp.where(C6thl_varying[:, None], C6thl_computed, C6thlb[:, None])
+        C6rt_Skw_fnc = damp_coefficient(
+            nzm, ngrdcol, gr, clubb_params[:, iC6rt], C6rt_Skw_fnc,
+            clubb_params[:, iC6rt_Lscale0],
+            clubb_params[:, ialtitude_threshold],
+            clubb_params[:, iwpxp_L_thresh], lscale_zm,
+        )
+        C6thl_Skw_fnc = damp_coefficient(
+            nzm, ngrdcol, gr, clubb_params[:, iC6thl], C6thl_Skw_fnc,
+            clubb_params[:, iC6thl_Lscale0],
+            clubb_params[:, ialtitude_threshold],
+            clubb_params[:, iwpxp_L_thresh], lscale_zm,
+        )
+    else:
+        C6rt_Skw_fnc = jnp.broadcast_to(clubb_params[:, iC6rt, None], (ngrdcol, nzm)).copy()
+        C6thl_Skw_fnc = jnp.broadcast_to(clubb_params[:, iC6thl, None], (ngrdcol, nzm)).copy()
 
-# ---------------------------------------------------------------------------
-# wpxp_term_tp_lhs
-# ---------------------------------------------------------------------------
+    if l_use_c7_richardson:
+        C7_Skw_fnc = jnp.asarray(cx_fnc_richardson, dtype=jnp.float64)
+    else:
+        C7 = clubb_params[:, iC7]
+        C7b = clubb_params[:, iC7b]
+        C7c = clubb_params[:, iC7c]
+        C7c_safe = jnp.where(jnp.abs(C7c) > zero, C7c, one)
+        C7_varying = jnp.abs(C7 - C7b) > jnp.abs(C7 + C7b) * eps / 2.0
+        C7_computed = (
+            C7b[:, None]
+            + (C7 - C7b)[:, None]
+            * jnp.exp(-one_half * (jnp.asarray(Skw_zm) / C7c_safe[:, None]) ** 2)
+        )
+        C7_Skw_fnc = jnp.where(C7_varying[:, None], C7_computed, C7b[:, None])
+        C7_Skw_fnc = damp_coefficient(
+            nzm, ngrdcol, gr, clubb_params[:, iC7], C7_Skw_fnc,
+            clubb_params[:, iC7_Lscale0],
+            clubb_params[:, ialtitude_threshold],
+            clubb_params[:, iwpxp_L_thresh], lscale_zm,
+        )
 
-def wpxp_term_tp_lhs(
-    wp2: jnp.ndarray,
-    gr,
-) -> jnp.ndarray:
-    """Turbulent production LHS for w'x' (momentum levels).
+    if l_sample:
+        stats = stats.update("C7_Skw_fnc", C7_Skw_fnc)
+        stats = stats.update("C6rt_Skw_fnc", C6rt_Skw_fnc)
+        stats = stats.update("C6thl_Skw_fnc", C6thl_Skw_fnc)
 
-    Faithful port of advance_xm_wpxp_module.F90:wpxp_term_tp_lhs.
+    if clubb_at_least_debug_level(0):
+        c7_bad = jnp.any(
+            (jnp.asarray(C7_Skw_fnc) > one) | (jnp.asarray(C7_Skw_fnc) < zero),
+            axis=1,
+        )
+        err_info = err_info.set_fatal(mask=c7_bad)
 
-    Output shape: (2, ngrdcol, nzm).
-      out[0, :, k] = coeff of xm[k]     (zt level k, thermodynamic superdiagonal)
-      out[1, :, k] = coeff of xm[k-1]   (zt level k-1, thermodynamic subdiagonal)
-    Boundaries k=0 and k=nzm-1 are zero.
+    Kw6 = clubb_params[:, ic_K6, None] * kh_zt
+    low_lev_effect, high_lev_effect, stats = calc_turb_adv_range(
+        nzm, nzt, ngrdcol, gr, dt,
+        w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm, mixt_frac_zm,
+        stats,
+    )
 
-    Args:
-        wp2: (ngrdcol, nzm)
-        gr:  grid object
-    """
-    nzm = wp2.shape[1]
-    invrs_dzm = gr.invrs_dzm   # (ngrdcol, nzm)
+    lhs_pr1_wprtp, lhs_pr1_wpthlp, lhs_pr1_wpsclrp = wpxp_term_pr1_lhs(
+        nzm, ngrdcol, gr, C6rt_Skw_fnc, C6thl_Skw_fnc, C7_Skw_fnc,
+        invrs_tau_c6_zm, l_scalar_calc,
+    )
 
-    interior = wp2[:, 1:-1] * invrs_dzm[:, 1:-1]   # (ngrdcol, nzm-2)
-    zeros_col = jnp.zeros((wp2.shape[0], 1))
+    C6_term = C6rt_Skw_fnc * invrs_tau_c6_zm
+    if l_sample:
+        stats = stats.update("C6_term", C6_term)
 
-    sup_interior = interior     # coeff of xm[k]   = +wp2[k]*invrs_dzm[k]
-    sub_interior = -interior    # coeff of xm[k-1] = -wp2[k]*invrs_dzm[k]
+    (
+        lhs_ta_wprtp, lhs_ta_wpthlp, lhs_ta_wpup,
+        lhs_ta_wpvp, lhs_ta_wpsclrp,
+        rhs_ta_wprtp, rhs_ta_wpthlp, rhs_ta_wpup,
+        rhs_ta_wpvp, rhs_ta_wpsclrp, stats,
+    ) = calc_xm_wpxp_ta_terms(
+        nzm, nzt, ngrdcol, sclr_dim, gr, wp2rtp,
+        wp2thlp, wp2sclrp,
+        rho_ds_zt, invrs_rho_ds_zm, rho_ds_zm,
+        sigma_sqd_w, wp3_on_wp2_zt,
+        pdf_implicit_coefs_terms,
+        iipdf_type,
+        l_explicit_turbulent_adv_wpxp, l_predict_upwp_vpwp,
+        l_scalar_calc,
+        l_godunov_upwind_wpxp_ta,
+        stats,
+    )
 
-    # Pad boundaries with zeros
-    sup = jnp.concatenate([zeros_col, sup_interior, zeros_col], axis=1)  # (ngrdcol, nzm)
-    sub = jnp.concatenate([zeros_col, sub_interior, zeros_col], axis=1)
-    return jnp.stack([sup, sub], axis=0)   # (2, ngrdcol, nzm)
+    (
+        lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm,
+        lhs_tp, lhs_ta_xm, lhs_ac_pr2,
+    ) = calc_xm_wpxp_lhs_terms(
+        nzm, nzt, ngrdcol, gr, wm_zm, wm_zt, wp2,
+        kh_zm, stability_correction, Kw6, C7_Skw_fnc,
+        invrs_rho_ds_zt, invrs_rho_ds_zm, rho_ds_zt,
+        rho_ds_zm, l_implemented, nu_vert_res_dep,
+        l_diffuse_rtm_and_thlm,
+        l_stability_correct_kh_n2_zm,
+        l_upwind_xm_ma,
+    )
 
+    if iipdf_type == iiPDF_new and not l_explicit_turbulent_adv_wpxp:
+        (
+            wprtp_cl_num, wpthlp_cl_num,
+            rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, err_info, stats,
+        ) = solve_xm_wpxp_with_multiple_lhs(
+            nzm, nzt, ngrdcol, sclr_dim, sclr_tol, gr, dt,
+            l_iter, nrhs, wm_zt, wp2,
+            rtpthvp, rtm_forcing, wprtp_forcing, thlpthvp,
+            thlm_forcing, wpthlp_forcing, rho_ds_zm,
+            rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+            thv_ds_zm, rtp2, thlp2, l_implemented,
+            sclrpthvp, sclrm_forcing, sclrp2,
+            low_lev_effect, high_lev_effect, C7_Skw_fnc,
+            lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm,
+            lhs_ta_wprtp, lhs_ta_wpthlp, lhs_ta_wpsclrp,
+            rhs_ta_wprtp, rhs_ta_wpthlp, rhs_ta_wpsclrp,
+            lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1_wprtp,
+            lhs_pr1_wpthlp, lhs_pr1_wpsclrp,
+            penta_solve_method,
+            tridiag_solve_method,
+            fill_holes_type,
+            l_diffuse_rtm_and_thlm,
+            l_upwind_xm_ma,
+            l_tke_aniso,
+            l_enable_relaxed_clipping,
+            l_mono_flux_lim_thlm,
+            l_mono_flux_lim_rtm,
+            l_mono_flux_lim_um,
+            l_mono_flux_lim_vm,
+            l_mono_flux_lim_spikefix,
+            int(wprtp_cl_num), int(wpthlp_cl_num),
+            stats,
+            rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, err_info,
+        )
+    else:
+        (
+            wprtp_cl_num, wpthlp_cl_num, upwp_cl_num, vpwp_cl_num,
+            rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, um, upwp, vm, vpwp,
+            um_pert, vm_pert, upwp_pert, vpwp_pert, err_info, stats,
+        ) = solve_xm_wpxp_with_single_lhs(
+            nzm, nzt, ngrdcol, sclr_dim, sclr_tol, gr, dt,
+            l_iter, nrhs,
+            wm_zt, wp2, invrs_tau_c6_zm, tau_max_zm,
+            rtpthvp, rtm_forcing, wprtp_forcing, thlpthvp,
+            thlm_forcing, wpthlp_forcing, rho_ds_zm,
+            rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+            thv_ds_zm, rtp2, thlp2, l_implemented,
+            sclrpthvp, sclrm_forcing, sclrp2, um_forcing,
+            vm_forcing, ug, vg, uprcp, vprcp, rc_coef_zm, fcor,
+            fcor_y, up2, vp2,
+            low_lev_effect, high_lev_effect,
+            C6rt_Skw_fnc, C6thl_Skw_fnc, C7_Skw_fnc,
+            lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm,
+            lhs_ta_wprtp,
+            rhs_ta_wprtp, rhs_ta_wpthlp, rhs_ta_wpup,
+            rhs_ta_wpvp, rhs_ta_wpsclrp,
+            lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1_wprtp,
+            lhs_pr1_wpthlp, lhs_pr1_wpsclrp,
+            clubb_params[:, iC_uu_shr],
+            penta_solve_method,
+            tridiag_solve_method,
+            fill_holes_type,
+            l_predict_upwp_vpwp,
+            l_ho_nontrad_coriolis,
+            l_ho_trad_coriolis,
+            l_diffuse_rtm_and_thlm,
+            l_upwind_xm_ma,
+            l_tke_aniso,
+            l_enable_relaxed_clipping,
+            l_perturbed_wind,
+            l_mono_flux_lim_thlm,
+            l_mono_flux_lim_rtm,
+            l_mono_flux_lim_um,
+            l_mono_flux_lim_vm,
+            l_mono_flux_lim_spikefix,
+            int(wprtp_cl_num), int(wpthlp_cl_num), int(upwp_cl_num), int(vpwp_cl_num),
+            stats,
+            rtm, wprtp, thlm, wpthlp,
+            sclrm, wpsclrp, um, upwp, vm, vpwp,
+            um_pert, vm_pert, upwp_pert, vpwp_pert, err_info,
+        )
 
-# ---------------------------------------------------------------------------
-# wpxp_terms_ac_pr2_lhs
-# ---------------------------------------------------------------------------
+    if l_lmm_stepping:
+        thlm = one_half * (thlm_old + thlm)
+        rtm = one_half * (rtm_old + rtm)
+        wpthlp = one_half * (wpthlp_old + wpthlp)
+        wprtp = one_half * (wprtp_old + wprtp)
 
-def wpxp_terms_ac_pr2_lhs(
-    C7_Skw_fnc: jnp.ndarray,
-    wm_zt: jnp.ndarray,
-    gr,
-) -> jnp.ndarray:
-    """Accumulation + pressure-2 LHS for w'x' (momentum levels).
+        for sclr in range(sclr_dim):
+            sclrm = sclrm.at[:, :, sclr].set(
+                one_half * (sclrm_old[:, :, sclr] + sclrm[:, :, sclr])
+            )
+            wpsclrp = wpsclrp.at[:, :, sclr].set(
+                one_half * (wpsclrp_old[:, :, sclr] + wpsclrp[:, :, sclr])
+            )
 
-    Faithful port of advance_xm_wpxp_module.F90:wpxp_terms_ac_pr2_lhs.
+        if l_predict_upwp_vpwp:
+            um = one_half * (um_old + um)
+            vm = one_half * (vm_old + vm)
+            upwp = one_half * (upwp_old + upwp)
+            vpwp = one_half * (vpwp_old + vpwp)
 
-    Computes: (1 - C7) * wpxp * d(wm_zt)/dz  at each zm level.
+    # Fortran applies rtm/thlm/uv sponge damping here. The Python/JAX driver
+    # rejects sponge-enabled cases in clubb_case_initalization, so these blocks
+    # remain unsupported until sponge-layer state is owned by the JAX path.
 
-    Output shape: (ngrdcol, nzm).  Boundaries are zero.
+    if l_predict_upwp_vpwp:
+        if l_uv_nudge:
+            if l_sample:
+                stats = stats.begin_budget("um_ndg", um / dt)
+                stats = stats.begin_budget("vm_ndg", vm / dt)
+            um = um - ((um - um_ref) * (dt / ts_nudge))
+            vm = vm - ((vm - vm_ref) * (dt / ts_nudge))
+            if l_sample:
+                stats = stats.finalize_budget("um_ndg", um / dt)
+                stats = stats.finalize_budget("vm_ndg", vm / dt)
 
-    Args:
-        C7_Skw_fnc: (ngrdcol, nzm)
-        wm_zt:      (ngrdcol, nzt)
-        gr:         grid object
-    """
-    nzm = C7_Skw_fnc.shape[1]
-    invrs_dzm = gr.invrs_dzm   # (ngrdcol, nzm)
+        if l_sample:
+            stats = stats.update("um_ref", um_ref)
+            stats = stats.update("vm_ref", vm_ref)
 
-    # Interior k=1..nzm-2 (Python 0-based).
-    # At zm level k_py (k_py=1..nzm-2): d(wm_zt)/dz = (wm_zt[k_py] - wm_zt[k_py-1]) * invrs_dzm[k_py]
-    # Fortran: (wm_zt(k) - wm_zt(k-1)) where k is Fortran 1-based zm index.
-    # Python: wm_zt[:, k_py] - wm_zt[:, k_py-1] for k_py=1..nzm-2.
-    # Vectorized: wm_zt[:, 1:nzm-1] - wm_zt[:, 0:nzm-2]
-    #           = wm_zt[:, 1:-1] - wm_zt[:, :-2]  (since nzm-1 = nzt)
-    # But wm_zt has shape (ngrdcol, nzt) where nzt = nzm-1, so nzm-1 <= nzt means this
-    # equals wm_zt[:, 1:] - wm_zt[:, :-1] when nzm-1 = nzt exactly (always true).
-    # wm_zt[:, 1:] - wm_zt[:, :-1] has shape (ngrdcol, nzt-1) = (ngrdcol, nzm-2). ✓
-    d_wm = wm_zt[:, 1:] - wm_zt[:, :-1]   # (ngrdcol, nzm-2)
+    return (
+        wprtp_cl_num, wpthlp_cl_num, upwp_cl_num, vpwp_cl_num,
+        rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, um, upwp, vm, vpwp,
+        um_pert, vm_pert, upwp_pert, vpwp_pert, err_info, stats,
+    )
 
-    interior = (1.0 - C7_Skw_fnc[:, 1:-1]) * invrs_dzm[:, 1:-1] * d_wm
-    zeros_col = jnp.zeros((C7_Skw_fnc.shape[0], 1))
-    return jnp.concatenate([zeros_col, interior, zeros_col], axis=1)  # (ngrdcol, nzm)
-
-
-# ---------------------------------------------------------------------------
-# wpxp_term_pr1_lhs
-# ---------------------------------------------------------------------------
-
-def wpxp_term_pr1_lhs(
-    C6_Skw_fnc: jnp.ndarray,
-    invrs_tau_C6_zm: jnp.ndarray,
-) -> jnp.ndarray:
-    """Pressure-1 LHS for w'x' (momentum levels).
-
-    Faithful port of advance_xm_wpxp_module.F90:wpxp_term_pr1_lhs.
-
-    Computes: C6 * (1/tau_m) * wpxp at each zm level.
-
-    Output shape: (ngrdcol, nzm).  Boundaries (k=0, k=nzm-1) are zero.
-
-    Args:
-        C6_Skw_fnc:     (ngrdcol, nzm)
-        invrs_tau_C6_zm:(ngrdcol, nzm)
-    """
-    nzm = C6_Skw_fnc.shape[1]
-    result = C6_Skw_fnc * invrs_tau_C6_zm   # (ngrdcol, nzm)
-    # Zero out boundaries
-    result = result.at[:, 0].set(0.0)
-    result = result.at[:, -1].set(0.0)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# wpxp_terms_bp_pr3_rhs
-# ---------------------------------------------------------------------------
-
-def wpxp_terms_bp_pr3_rhs(
-    C7_Skw_fnc: jnp.ndarray,
-    thv_ds_zm: jnp.ndarray,
-    xpthvp: jnp.ndarray,
-    grav: float = grav,   # constants_clubb.grav (mirrors the Fortran `use constants_clubb, only: grav`)
-) -> jnp.ndarray:
-    """Buoyancy-production + pressure-3 RHS for w'x' (momentum levels).
-
-    Faithful port of advance_xm_wpxp_module.F90:wpxp_terms_bp_pr3_rhs.
-
-    Computes: (1 - C7) * (g/thv_ds) * x'thv'.
-
-    Output shape: (ngrdcol, nzm).  Boundaries are zero.
-
-    Args:
-        C7_Skw_fnc: (ngrdcol, nzm)
-        thv_ds_zm:  (ngrdcol, nzm)
-        xpthvp:     (ngrdcol, nzm)  -- r't' or thl'thv' or similar
-    """
-    result = (grav / thv_ds_zm) * (1.0 - C7_Skw_fnc) * xpthvp
-    result = result.at[:, 0].set(0.0)
-    result = result.at[:, -1].set(0.0)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# xm_wpxp_lhs
-# ---------------------------------------------------------------------------
 
 def xm_wpxp_lhs(
-    lhs_diff_zm: jnp.ndarray,
-    lhs_ma_zm: jnp.ndarray,
-    lhs_ma_zt: jnp.ndarray,
-    lhs_ta_wpxp: jnp.ndarray,
-    lhs_ta_xm: jnp.ndarray,
-    lhs_tp: jnp.ndarray,
-    lhs_ac_pr2: jnp.ndarray,
-    lhs_pr1: jnp.ndarray,
-    dt: float,
-) -> jnp.ndarray:
-    """Assemble the interleaved pentadiagonal LHS for the xm/w'x' system.
+    nzm, nzt, ngrdcol, l_iter, dt,
+    l_implemented, lhs_diff_zm, lhs_diff_zt,
+    lhs_ma_zm, lhs_ma_zt, lhs_ta_wpxp, lhs_ta_xm,
+    lhs_tp, lhs_pr1, lhs_ac_pr2,
+    l_diffuse_rtm_and_thlm,
+):
+    """Compute LHS band diagonal matrix for xm and w'x'."""
+    invrs_dt = one / dt
+    lhs = jnp.zeros((nsup + nsub + 1, ngrdcol, 2 * nzm - 1), dtype=jnp.float64)
 
-    Faithful port of advance_xm_wpxp_module.F90:xm_wpxp_lhs.
-    Handles: l_implemented=False (standalone), l_diffuse_rtm_and_thlm=False,
-    l_iter=True (always), ascending grid.
+    # Lower (upper) boundary for w'x' on ascending (descending) grid.
+    lhs = lhs.at[2, :, 0].set(one)
 
-    Interleaving scheme (Python 0-based, nzm zm-levels, nzt=nzm-1 zt-levels):
-      j=0, 2, ..., 2*(nzm-1)  →  wpxp at zm levels 0..nzm-1
-      j=1, 3, ..., 2*nzm-3    →  xm at zt levels 0..nzt-1
-    Total size = 2*nzm-1.
+    # Combine xm and w'x' terms into LHS
+    k_xm = slice(1, 2 * nzt + 1, 2)
+    lhs = lhs.at[1, :, k_xm].set(jnp.asarray(lhs_ta_xm[0, :, :]))
+    lhs = lhs.at[2, :, k_xm].set(invrs_dt)
+    lhs = lhs.at[3, :, k_xm].set(jnp.asarray(lhs_ta_xm[1, :, :]))
 
-    Output shape: (5, ngrdcol, 2*nzm-1).
-      out[0] = super2, out[1] = super1, out[2] = diag, out[3] = sub1, out[4] = sub2
-
-    Args:
-        lhs_diff_zm:  (3, ngrdcol, nzm)
-        lhs_ma_zm:    (3, ngrdcol, nzm)
-        lhs_ma_zt:    (3, ngrdcol, nzt)  -- for l_implemented=False
-        lhs_ta_wpxp:  (3, ngrdcol, nzm)  -- gamma-weighted implicitly
-        lhs_ta_xm:    (2, ngrdcol, nzt)
-        lhs_tp:       (2, ngrdcol, nzm)
-        lhs_ac_pr2:   (ngrdcol, nzm)
-        lhs_pr1:      (ngrdcol, nzm)
-        dt:           scalar timestep
-    """
-    ngrdcol = lhs_diff_zm.shape[1]
-    nzm = lhs_diff_zm.shape[2]
-    nzt = nzm - 1
-    ndim = 2 * nzm - 1
-    invrs_dt = 1.0 / dt
-    gamma = _gamma
-
-    lhs = jnp.zeros((5, ngrdcol, ndim))
-
-    # ------------------------------------------------------------------ #
-    # xm rows: j = 2*k_zt + 1, k_zt = 0..nzt-1                          #
-    # Python lhs penta band: [super2, super1, diag, sub1, sub2]           #
-    # super2 (j+2=next xm): coeff of xm[k+1] = lhs_ma_zt[0]             #
-    # super1 (j+1=next wpxp): coeff of wpxp[k+1] = lhs_ta_xm[0]         #
-    # diag   (j=this xm): invrs_dt + lhs_ma_zt[1]                        #
-    # sub1   (j-1=this wpxp): coeff of wpxp[k] = lhs_ta_xm[1]           #
-    # sub2   (j-2=prev xm): coeff of xm[k-1] = lhs_ma_zt[2]             #
-    # ------------------------------------------------------------------ #
-    # j=1,3,...,2*nzt-1 are all xm rows (slice 1::2 of lhs)
-    lhs = lhs.at[0, :, 1::2].set(lhs_ma_zt[0])   # super2: xm[k+1]
-    lhs = lhs.at[1, :, 1::2].set(lhs_ta_xm[0])   # super1: wpxp[k+1]
-    lhs = lhs.at[2, :, 1::2].set(invrs_dt + lhs_ma_zt[1])  # diag
-    lhs = lhs.at[3, :, 1::2].set(lhs_ta_xm[1])   # sub1: wpxp[k]
-    lhs = lhs.at[4, :, 1::2].set(lhs_ma_zt[2])   # sub2: xm[k-1]
-
-    # ------------------------------------------------------------------ #
-    # wpxp rows: j = 2*k_zm, k_zm = 0..nzm-1                            #
-    # Interior (k_zm=1..nzm-2):                                          #
-    # super2 (j+2=next wpxp): lhs_ma_zm[0]+lhs_diff_zm[0]+gamma*ta[0]   #
-    # super1 (j+1=this xm ): lhs_tp[0]   (coeff of xm[k_zm])            #
-    # diag   (this wpxp):    lhs_ma_zm[1]+lhs_diff_zm[1]+lhs_ac+gamma*(ta[1]+pr1)+invrs_dt
-    # sub1   (j-1=prev xm ): lhs_tp[1]   (coeff of xm[k_zm-1])          #
-    # sub2   (j-2=prev wpxp): lhs_ma_zm[2]+lhs_diff_zm[2]+gamma*ta[2]   #
-    # ------------------------------------------------------------------ #
-    # Interior: k_zm=1..nzm-2, j=2..2*(nzm-2), step 2
-    interior_sup2 = (lhs_ma_zm[0, :, 1:-1] + lhs_diff_zm[0, :, 1:-1]
-                     + gamma * lhs_ta_wpxp[0, :, 1:-1])
-    interior_sup1 = lhs_tp[0, :, 1:-1]
-    interior_diag = (lhs_ma_zm[1, :, 1:-1] + lhs_diff_zm[1, :, 1:-1]
-                     + lhs_ac_pr2[:, 1:-1]
-                     + gamma * (lhs_ta_wpxp[1, :, 1:-1] + lhs_pr1[:, 1:-1])
-                     + invrs_dt)
-    interior_sub1 = lhs_tp[1, :, 1:-1]
-    interior_sub2 = (lhs_ma_zm[2, :, 1:-1] + lhs_diff_zm[2, :, 1:-1]
-                     + gamma * lhs_ta_wpxp[2, :, 1:-1])
-
-    lhs = lhs.at[0, :, 2:2*nzm-2:2].set(interior_sup2)
-    lhs = lhs.at[1, :, 2:2*nzm-2:2].set(interior_sup1)
-    lhs = lhs.at[2, :, 2:2*nzm-2:2].set(interior_diag)
-    lhs = lhs.at[3, :, 2:2*nzm-2:2].set(interior_sub1)
-    lhs = lhs.at[4, :, 2:2*nzm-2:2].set(interior_sub2)
-
-    # ------------------------------------------------------------------ #
-    # Lower boundary wpxp BC: j=0 → diag=1, others=0                    #
-    # ------------------------------------------------------------------ #
-    lhs = lhs.at[0, :, 0].set(0.0)
-    lhs = lhs.at[1, :, 0].set(0.0)
-    lhs = lhs.at[2, :, 0].set(1.0)
-    lhs = lhs.at[3, :, 0].set(0.0)
-    lhs = lhs.at[4, :, 0].set(0.0)
-
-    # ------------------------------------------------------------------ #
-    # Upper boundary wpxp BC: j=2*(nzm-1) → diag=1, others=0            #
-    # ------------------------------------------------------------------ #
-    lhs = lhs.at[0, :, -1].set(0.0)
-    lhs = lhs.at[1, :, -1].set(0.0)
-    lhs = lhs.at[2, :, -1].set(1.0)
-    lhs = lhs.at[3, :, -1].set(0.0)
-    lhs = lhs.at[4, :, -1].set(0.0)
-
-    return lhs   # (5, ngrdcol, 2*nzm-1)
-
-
-# ---------------------------------------------------------------------------
-# xm_wpxp_rhs
-# ---------------------------------------------------------------------------
-
-def xm_wpxp_rhs(
-    wpxp: jnp.ndarray,
-    xm: jnp.ndarray,
-    wpxp_forcing: jnp.ndarray,
-    xm_forcing: jnp.ndarray,
-    rhs_bp_pr3: jnp.ndarray,
-    rhs_ta: jnp.ndarray,
-    lhs_ta_wpxp: jnp.ndarray,
-    lhs_pr1: jnp.ndarray,
-    dt: float,
-    k_lb_zm: int,
-) -> jnp.ndarray:
-    """Assemble the interleaved RHS for the xm/w'x' system.
-
-    Faithful port of advance_xm_wpxp_module.F90:xm_wpxp_rhs.
-    l_iter=True always (adds wpxp*invrs_dt to RHS), ascending grid.
-
-    Output shape: (ngrdcol, 2*nzm-1).
-
-    Args:
-        wpxp:         (ngrdcol, nzm)
-        xm:           (ngrdcol, nzt)
-        wpxp_forcing: (ngrdcol, nzm)
-        xm_forcing:   (ngrdcol, nzt)
-        rhs_bp_pr3:   (ngrdcol, nzm)
-        rhs_ta:       (ngrdcol, nzm)  -- 0 for ADG1
-        lhs_ta_wpxp:  (3, ngrdcol, nzm)
-        lhs_pr1:      (ngrdcol, nzm)
-        dt:           scalar
-        k_lb_zm:      lower boundary zm index (0 for ascending grid)
-    """
-    ngrdcol, nzm = wpxp.shape
-    nzt = nzm - 1
-    ndim = 2 * nzm - 1
-    invrs_dt = 1.0 / dt
-    gamma = _gamma
-
-    rhs = jnp.zeros((ngrdcol, ndim))
-
-    # ---- Lower boundary wpxp BC: j=0 = wpxp at lower boundary ----
-    rhs = rhs.at[:, 0].set(wpxp[:, k_lb_zm])
-
-    # ---- xm rows: j=2k+1 for k=0..nzt-1 ----
-    rhs = rhs.at[:, 1::2].set(xm * invrs_dt + xm_forcing)
-
-    # ---- Interior wpxp rows: j=2k for k=1..nzm-2 ----
-    # Ascending grid: grid_dir_indx=1
-    # lhs_ta_wpxp[0] = coeff of wpxp[k+1], [1] = coeff of wpxp[k], [2] = coeff of wpxp[k-1]
-    wpxp_kp1 = wpxp[:, 2:]      # k+1, shape (ngrdcol, nzm-2)
-    wpxp_k   = wpxp[:, 1:-1]    # k,   shape (ngrdcol, nzm-2)
-    wpxp_km1 = wpxp[:, :-2]     # k-1, shape (ngrdcol, nzm-2)
-
-    ta = lhs_ta_wpxp[:, :, 1:-1]   # (3, ngrdcol, nzm-2)
-    pr1 = lhs_pr1[:, 1:-1]          # (ngrdcol, nzm-2)
-
-    rhs_int = (
-        rhs_bp_pr3[:, 1:-1]
-        + wpxp_forcing[:, 1:-1]
-        + rhs_ta[:, 1:-1]
-        + (1.0 - gamma) * (
-            -ta[0] * wpxp_kp1
-            - ta[1] * wpxp_k
-            - ta[2] * wpxp_km1
-            - pr1 * wpxp_k
-        )
-        + wpxp_k * invrs_dt     # l_iter = True always
+    k_wpxp = slice(2, 2 * nzm - 2, 2)
+    lhs = lhs.at[0, :, k_wpxp].set(
+        jnp.asarray(lhs_ma_zm[0, :, 1:nzm - 1])
+        + jnp.asarray(lhs_diff_zm[0, :, 1:nzm - 1])
+        + gamma_over_implicit_ts * jnp.asarray(lhs_ta_wpxp[0, :, 1:nzm - 1])
     )
-    rhs = rhs.at[:, 2:-1:2].set(rhs_int)
-
-    # ---- Upper boundary wpxp BC: j=ndim-1=2*(nzm-1) ----
-    rhs = rhs.at[:, -1].set(0.0)
-
-    return rhs   # (ngrdcol, 2*nzm-1)
-
-
-# ---------------------------------------------------------------------------
-# xm_wpxp_solve
-# ---------------------------------------------------------------------------
-
-def xm_wpxp_solve(lhs, rhs):
-    """Pentadiagonal solve of the coupled xm/wpxp system, then de-interleave the solution —
-    the JAX analog of advance_xm_wpxp_module.F90:xm_wpxp_solve. The solution vector packs the two
-    prognostics on alternating slots; returns ``(wpxp_new, xm_new)`` (wpxp on even slots, xm on odd)."""
-    soln = penta_lu_solve(lhs, rhs)   # (ngrdcol, 2*nzm-1)
-    return soln[:, 0::2], soln[:, 1::2]
-
-
-# ---------------------------------------------------------------------------
-# advance_xm_wpxp
-# ---------------------------------------------------------------------------
-
-def solve_xm_wpxp_with_single_lhs(
-    wpxp: jnp.ndarray,
-    xm: jnp.ndarray,
-    wpxp_forcing: jnp.ndarray,
-    xm_forcing: jnp.ndarray,
-    C6_Skw_fnc: jnp.ndarray,
-    C7_Skw_fnc: jnp.ndarray,
-    invrs_tau_C6_zm: jnp.ndarray,
-    lhs_ta_wpxp: jnp.ndarray,
-    lhs_diff_zm: jnp.ndarray,
-    lhs_ma_zm: jnp.ndarray,
-    lhs_ma_zt: jnp.ndarray,
-    lhs_ta_xm: jnp.ndarray,
-    lhs_tp: jnp.ndarray,
-    lhs_ac_pr2: jnp.ndarray,
-    thv_ds_zm: jnp.ndarray,
-    xpthvp: jnp.ndarray,
-    wm_zt: jnp.ndarray,
-    dt: float,
-    gr,
-    wp2: jnp.ndarray | None = None,
-    xp2_relaxed: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Full JAX solve for one xm/w'x' variable pair.
-
-    Returns (wpxp_new, xm_new), each (ngrdcol, nzm) and (ngrdcol, nzt).
-
-    Faithful port of solve_xm_wpxp_with_single_lhs for ADG1, ascending grid,
-    l_not_diffuse, l_not_implemented cases.
-
-    If wp2 and xp2_relaxed are provided, covariance clipping is applied after
-    the solve (matching xm_wpxp_clipping_and_stats in clip_explicit.F90).
-
-    Args:
-        wpxp:            (ngrdcol, nzm)  current value
-        xm:              (ngrdcol, nzt)  current value
-        wpxp_forcing:    (ngrdcol, nzm)
-        xm_forcing:      (ngrdcol, nzt)
-        C6_Skw_fnc:      (ngrdcol, nzm)  C6rt or C6thl
-        C7_Skw_fnc:      (ngrdcol, nzm)
-        invrs_tau_C6_zm: (ngrdcol, nzm)
-        lhs_ta_wpxp:     (3, ngrdcol, nzm)  variable-specific TA LHS
-        lhs_diff_zm:     (3, ngrdcol, nzm)  shared diffusion LHS
-        lhs_ma_zm:       (3, ngrdcol, nzm)  shared MA LHS (zm)
-        lhs_ma_zt:       (3, ngrdcol, nzt)  shared MA LHS (zt)
-        lhs_ta_xm:       (2, ngrdcol, nzt)  shared TA-xm LHS
-        lhs_tp:          (2, ngrdcol, nzm)  shared TP LHS
-        lhs_ac_pr2:      (ngrdcol, nzm)     shared AC+PR2 LHS
-        thv_ds_zm:       (ngrdcol, nzm)
-        xpthvp:          (ngrdcol, nzm)  rt'thv' or thl'thv'
-        wm_zt:           (ngrdcol, nzt)
-        dt:              scalar
-        gr:              grid object
-        wp2:             (ngrdcol, nzm) optional; if given, clip wpxp after solve
-        xp2_relaxed:     (ngrdcol, nzm) optional; xp2 (possibly floored) for clipping
-    """
-    k_lb_zm = gr.k_lb_zm
-
-    # Pressure-1 LHS (variable-specific)
-    lhs_pr1 = wpxp_term_pr1_lhs(C6_Skw_fnc, invrs_tau_C6_zm)
-
-    # Buoyancy-production + pressure-3 RHS
-    rhs_bp_pr3 = wpxp_terms_bp_pr3_rhs(C7_Skw_fnc, thv_ds_zm, xpthvp)
-
-    # rhs_ta = 0 for ADG1
-    rhs_ta = jnp.zeros_like(wpxp)
-
-    # Assemble LHS and RHS
-    lhs = xm_wpxp_lhs(
-        lhs_diff_zm, lhs_ma_zm, lhs_ma_zt,
-        lhs_ta_wpxp, lhs_ta_xm, lhs_tp,
-        lhs_ac_pr2, lhs_pr1, dt,
+    lhs = lhs.at[1, :, k_wpxp].set(jnp.asarray(lhs_tp[0, :, 1:nzm - 1]))
+    lhs = lhs.at[2, :, k_wpxp].set(
+        jnp.asarray(lhs_ma_zm[1, :, 1:nzm - 1])
+        + jnp.asarray(lhs_diff_zm[1, :, 1:nzm - 1])
+        + jnp.asarray(lhs_ac_pr2[:, 1:nzm - 1])
+        + gamma_over_implicit_ts
+        * (jnp.asarray(lhs_ta_wpxp[1, :, 1:nzm - 1]) + jnp.asarray(lhs_pr1[:, 1:nzm - 1]))
     )
-    rhs = xm_wpxp_rhs(
-        wpxp, xm, wpxp_forcing, xm_forcing,
-        rhs_bp_pr3, rhs_ta, lhs_ta_wpxp, lhs_pr1, dt, k_lb_zm,
+    lhs = lhs.at[3, :, k_wpxp].set(jnp.asarray(lhs_tp[1, :, 1:nzm - 1]))
+    lhs = lhs.at[4, :, k_wpxp].set(
+        jnp.asarray(lhs_ma_zm[2, :, 1:nzm - 1])
+        + jnp.asarray(lhs_diff_zm[2, :, 1:nzm - 1])
+        + gamma_over_implicit_ts * jnp.asarray(lhs_ta_wpxp[2, :, 1:nzm - 1])
     )
 
-    # Solve the pentadiagonal system + de-interleave (xm_wpxp_solve)
-    wpxp_new, xm_new = xm_wpxp_solve(lhs, rhs)   # wpxp (ngrdcol, nzm), xm (ngrdcol, nzt)
+    # Upper (lower) boundary for w'x' on ascending (descending) grid.
+    lhs = lhs.at[2, :, 2 * nzm - 2].set(one)
 
-    # Apply covariance clipping if wp2/xp2 provided
-    if wp2 is not None and xp2_relaxed is not None:
-        wpxp_new = clip_covar(wpxp_new, wp2, xp2_relaxed)
+    # LHS time tendency
+    if l_iter:
+        lhs = lhs.at[2, :, k_wpxp].add(invrs_dt)
 
-    return wpxp_new, xm_new
+    # Calculate diffusion terms for all thermodynamic grid level
+    if l_diffuse_rtm_and_thlm:
+        lhs = lhs.at[0, :, k_xm].add(jnp.asarray(lhs_diff_zt[0, :, :]))
+        lhs = lhs.at[2, :, k_xm].add(jnp.asarray(lhs_diff_zt[1, :, :]))
+        lhs = lhs.at[4, :, k_xm].add(jnp.asarray(lhs_diff_zt[2, :, :]))
 
+    # Calculate mean advection terms for all momentum grid level
+    if not l_implemented:
+        lhs = lhs.at[0, :, k_xm].add(jnp.asarray(lhs_ma_zt[0, :, :]))
+        lhs = lhs.at[2, :, k_xm].add(jnp.asarray(lhs_ma_zt[1, :, :]))
+        lhs = lhs.at[4, :, k_xm].add(jnp.asarray(lhs_ma_zt[2, :, :]))
 
-# ---------------------------------------------------------------------------
-# calc_xm_wpxp_ta_terms
-# ---------------------------------------------------------------------------
+    return lhs
 
-def calc_xm_wpxp_ta_terms(
-    sigma_sqd_w: jnp.ndarray,
-    wp3_on_wp2_zt: jnp.ndarray,
-    rho_ds_zt: jnp.ndarray,
-    invrs_rho_ds_zm: jnp.ndarray,
-    gr,
-) -> jnp.ndarray:
-    """The ADG1 turbulent-advection LHS operator for w'x' — the JAX analog of the Fortran
-    `calc_xm_wpxp_ta_terms` (advance_xm_wpxp_module.F90:1996), which the Fortran computes as a
-    SEPARATE call (its out-arg `lhs_ta_wprtp`) and passes into the xm/wpxp LHS assembly.
-
-    For ADG1 the implicit turbulent-advection coefficient is
-        coef_wp2rtp = a1_coef_zt * wp3_on_wp2_zt,   a1_coef = 1/(1 - sigma_sqd_w) regridded zm->zt,
-    and lhs_ta_wprtp = xpyp_term_ta_pdf_lhs(coef_wp2rtp). The SAME operator serves wpthlp and (when
-    predicted) wpup/wpvp — the moment pairs share one ADG1 TA LHS.
-
-    sigma_sqd_w: (ngrdcol, nzm); wp3_on_wp2_zt: (ngrdcol, nzt); rho_ds_zt: (ngrdcol, nzt);
-    invrs_rho_ds_zm: (ngrdcol, nzm). Returns lhs_ta_wprtp: (3, ngrdcol, nzm)."""
-    a1_coef = 1.0 / (1.0 - sigma_sqd_w)                         # (ngrdcol, nzm)
-    a1_coef_zt = zm2zt_jax(a1_coef, gr)                          # (ngrdcol, nzt)
-    coef_wp2rtp = a1_coef_zt * wp3_on_wp2_zt                     # (ngrdcol, nzt)
-    return xpyp_term_ta_pdf_lhs_jax(coef_wp2rtp, rho_ds_zt, invrs_rho_ds_zm, gr)
-
-
-# ---------------------------------------------------------------------------
-# calc_xm_wpxp_lhs_terms
-# ---------------------------------------------------------------------------
 
 def calc_xm_wpxp_lhs_terms(
-    wm_zm: jnp.ndarray,
-    wm_zt: jnp.ndarray,
-    wp2: jnp.ndarray,
-    Kw6: jnp.ndarray,
-    nu6: float,
-    C7_Skw_fnc: jnp.ndarray,
-    invrs_rho_ds_zm: jnp.ndarray,
-    rho_ds_zt: jnp.ndarray,
-    rho_ds_zm: jnp.ndarray,
-    invrs_rho_ds_zt: jnp.ndarray,
-    gr,
-) -> dict:
-    """Compute the shared LHS terms for the xm/w'x' system — the JAX analog of
-    advance_xm_wpxp_module.F90:calc_xm_wpxp_lhs_terms (the Fortran out-args lhs_diff_zm/lhs_ma_zt/
-    lhs_ma_zm/lhs_tp/lhs_ta_xm/lhs_ac_pr2), computed once and shared across the moment pairs. As in the
-    Fortran, the ADG1 turbulent-advection operator `lhs_ta_wprtp` is computed SEPARATELY by
-    `calc_xm_wpxp_ta_terms` (a sibling call) and is NOT produced here.
+    nzm, nzt, ngrdcol, gr, wm_zm, wm_zt, wp2,
+    Kh_zm, stability_correction, Kw6, C7_Skw_fnc,
+    invrs_rho_ds_zt, invrs_rho_ds_zm, rho_ds_zt,
+    rho_ds_zm, l_implemented, nu_vert_res_dep,
+    l_diffuse_rtm_and_thlm,
+    l_stability_correct_Kh_N2_zm,
+    l_upwind_xm_ma,
+):
+    """Calculate various xm and w'x' terms reused by multiple LHS matrices."""
+    constant_nu = 0.1
+    Kw6_zm = jnp.maximum(
+        zt2zm(nzm, nzt, ngrdcol, gr, Kw6),
+        zero_threshold,
+    )
 
-    Returns a dict with keys: lhs_diff_zm, lhs_ma_zm, lhs_ma_zt, lhs_ta_xm, lhs_tp, lhs_ac_pr2.
+    # Calculate turbulent advection terms of xm for all grid levels
+    lhs_ta_xm = xm_term_ta_lhs(
+        nzm, nzt, ngrdcol, gr,
+        rho_ds_zm, invrs_rho_ds_zt,
+    )
 
-    Args:
-        wm_zm:           (ngrdcol, nzm)
-        wm_zt:           (ngrdcol, nzt)
-        wp2:             (ngrdcol, nzm)
-        Kw6:             (ngrdcol, nzt)  = c_K6 * Kh_zt
-        nu6:             scalar (background diffusivity for w'x')
-        C7_Skw_fnc:      (ngrdcol, nzm)
-        invrs_rho_ds_zm: (ngrdcol, nzm)
-        rho_ds_zt:       (ngrdcol, nzt)
-        rho_ds_zm:       (ngrdcol, nzm)
-        invrs_rho_ds_zt: (ngrdcol, nzt)
-        gr:              grid object
-    """
-    # Diffusion LHS for w'x' (zm-level variable)
-    nu6_arr = jnp.broadcast_to(jnp.array(nu6), (invrs_rho_ds_zm.shape[0],))
-    lhs_diff_zm = diffusion_zm_lhs_jax(Kw6, nu6_arr, invrs_rho_ds_zm, rho_ds_zt, gr)
+    # Calculate turbulent production terms of w'x' for all grid level
+    lhs_tp = wpxp_term_tp_lhs(nzm, ngrdcol, gr, wp2)
 
-    # Mean advection LHS for w'x' (zm-level)
-    lhs_ma_zm = term_ma_zm_lhs_jax(wm_zm, gr)
+    # Calculate accumulation of w'x' and w'x' pressure term 2 of w'x' for all grid level
+    # https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:wpxp_pr
+    lhs_ac_pr2 = wpxp_terms_ac_pr2_lhs(
+        nzm, nzt, ngrdcol, gr, C7_Skw_fnc,
+        wm_zt, gr.invrs_dzm,
+    )
 
-    # Mean advection LHS for xm (zt-level, upwind)
-    lhs_ma_zt = term_ma_zt_lhs_jax(wm_zt, gr)
+    # Calculate diffusion terms for all momentum grid level
+    lhs_diff_zm = diffusion_zm_lhs(
+        nzm, nzt, ngrdcol, gr, Kw6, Kw6_zm, nu_vert_res_dep.nu6,
+        invrs_rho_ds_zm, rho_ds_zt,
+    )
 
-    # Turbulent advection LHS for xm
-    lhs_ta_xm = xm_term_ta_lhs(invrs_rho_ds_zt, rho_ds_zm, gr)
+    # Calculate mean advection terms for all momentum grid level
+    lhs_ma_zm = term_ma_zm_lhs(
+        nzm, nzt, ngrdcol, wm_zm,
+        gr.invrs_dzm, gr.weights_zm2zt,
+    )
 
-    # Turbulent production LHS for w'x'
-    lhs_tp = wpxp_term_tp_lhs(wp2, gr)
+    lhs_diff_zt = jnp.zeros((ndiags3, ngrdcol, nzt), dtype=jnp.float64)
+    lhs_ma_zt = jnp.zeros((ndiags3, ngrdcol, nzt), dtype=jnp.float64)
 
-    # Accumulation + pressure-2 LHS for w'x'
-    lhs_ac_pr2 = wpxp_terms_ac_pr2_lhs(C7_Skw_fnc, wm_zt, gr)
+    # Calculate diffusion terms for all thermodynamic grid level
+    if l_diffuse_rtm_and_thlm:
+        if l_stability_correct_Kh_N2_zm:
+            Kh_N2_zm = jnp.asarray(Kh_zm) / jnp.asarray(stability_correction)
+        else:
+            Kh_N2_zm = jnp.asarray(Kh_zm)
 
-    return dict(
-        lhs_diff_zm=lhs_diff_zm,
-        lhs_ma_zm=lhs_ma_zm,
-        lhs_ma_zt=lhs_ma_zt,
-        lhs_ta_xm=lhs_ta_xm,
-        lhs_tp=lhs_tp,
-        lhs_ac_pr2=lhs_ac_pr2,
+        K_zm = Kh_N2_zm + constant_nu
+        K_zt = jnp.maximum(
+            zm2zt(nzm, nzt, ngrdcol, gr, K_zm),
+            zero_threshold,
+        )
+        zeros_array = jnp.zeros(ngrdcol, dtype=jnp.float64)
+
+        lhs_diff_zt = diffusion_zt_lhs(
+            nzm, nzt, ngrdcol, gr, K_zm, K_zt, zeros_array,
+            invrs_rho_ds_zt, rho_ds_zm,
+        )
+
+    # Calculate mean advection terms for all thermodynamic grid level
+    if not l_implemented:
+        lhs_ma_zt = term_ma_zt_lhs(
+            nzm, nzt, ngrdcol, wm_zt, gr.weights_zt2zm,
+            gr.invrs_dzt, gr.invrs_dzm,
+            l_upwind_xm_ma, gr.grid_dir,
+        )
+
+    return lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm, lhs_tp, lhs_ta_xm, lhs_ac_pr2
+
+
+def xm_wpxp_rhs(
+    nzm, nzt, ngrdcol, gr, solve_type, l_iter, dt,
+    xm, wpxp, xm_forcing, wpxp_forcing, C7_Skw_fnc,
+    xpthvp, rhs_ta, thv_ds_zm,
+    lhs_pr1, lhs_ta_wpxp,
+    stats,
+):
+    """Compute RHS vector for xm and w'x'."""
+    l_sample = stats.l_sample
+    xm = jnp.asarray(xm, dtype=jnp.float64)
+    wpxp = jnp.asarray(wpxp, dtype=jnp.float64)
+    xm_forcing = jnp.asarray(xm_forcing, dtype=jnp.float64)
+    wpxp_forcing = jnp.asarray(wpxp_forcing, dtype=jnp.float64)
+    rhs_ta = jnp.asarray(rhs_ta, dtype=jnp.float64)
+    lhs_pr1 = jnp.asarray(lhs_pr1, dtype=jnp.float64)
+    lhs_ta_wpxp = jnp.asarray(lhs_ta_wpxp, dtype=jnp.float64)
+
+    invrs_dt = one / dt
+    rhs_bp_pr3 = wpxp_terms_bp_pr3_rhs(
+        nzm, ngrdcol, gr, C7_Skw_fnc, thv_ds_zm, xpthvp,
+    )
+
+    rhs = jnp.zeros((ngrdcol, 2 * nzm - 1), dtype=jnp.float64)
+
+    # Index of the momentum boundary levels
+    if gr.grid_dir_indx > 0:
+        # Ascending Grid
+        rhs_lb_idx_zm = 0
+        rhs_ub_idx_zm = 2 * nzm - 2
+    else:
+        # Descending Grid
+        rhs_lb_idx_zm = 2 * nzm - 2
+        rhs_ub_idx_zm = 0
+
+    # Set lower boundary for w'x'
+    rhs = rhs.at[:, rhs_lb_idx_zm].set(wpxp[:, gr.k_lb_zm])
+
+    # RHS time tendency and forcings for xm
+    rhs = rhs.at[:, 1:2 * nzt + 1:2].set(
+        xm * invrs_dt + xm_forcing
+    )
+
+    k_int = slice(1, nzm - 1)
+    k_wpxp = slice(2, 2 * nzm - 2, 2)
+    k_plus = slice(1 + gr.grid_dir_indx, nzm - 1 + gr.grid_dir_indx)
+    k_minus = slice(1 - gr.grid_dir_indx, nzm - 1 - gr.grid_dir_indx)
+    rhs_wpxp_int = (
+        rhs_bp_pr3[:, k_int]
+        + wpxp_forcing[:, k_int]
+        + rhs_ta[:, k_int]
+        + (one - gamma_over_implicit_ts)
+        * (
+            -lhs_ta_wpxp[1 - gr.grid_dir_indx, :, k_int] * wpxp[:, k_plus]
+            - lhs_ta_wpxp[1, :, k_int] * wpxp[:, k_int]
+            - lhs_ta_wpxp[1 + gr.grid_dir_indx, :, k_int] * wpxp[:, k_minus]
+            - lhs_pr1[:, k_int] * wpxp[:, k_int]
+        )
+    )
+    if l_iter:
+        rhs_wpxp_int = rhs_wpxp_int + wpxp[:, k_int] * invrs_dt
+    rhs = rhs.at[:, k_wpxp].set(rhs_wpxp_int)
+
+    # Upper boundary for w'x'
+    rhs = rhs.at[:, rhs_ub_idx_zm].set(zero)
+
+    if l_sample:
+        if solve_type == xm_wpxp_rtm:
+            name_xm_f = "rtm_forcing"
+            name_wpxp_bp = "wprtp_bp"
+            name_wpxp_pr3 = "wprtp_pr3"
+            name_wpxp_f = "wprtp_forcing"
+            name_wpxp_ta = "wprtp_ta"
+            name_wpxp_pr1 = "wprtp_pr1"
+        elif solve_type == xm_wpxp_thlm:
+            name_xm_f = "thlm_forcing"
+            name_wpxp_bp = "wpthlp_bp"
+            name_wpxp_pr3 = "wpthlp_pr3"
+            name_wpxp_f = "wpthlp_forcing"
+            name_wpxp_ta = "wpthlp_ta"
+            name_wpxp_pr1 = "wpthlp_pr1"
+        elif solve_type == xm_wpxp_um:
+            name_xm_f = ""
+            name_wpxp_bp = "upwp_bp"
+            name_wpxp_pr3 = "upwp_pr3"
+            name_wpxp_f = ""
+            name_wpxp_ta = "upwp_ta"
+            name_wpxp_pr1 = "upwp_pr1"
+        elif solve_type == xm_wpxp_vm:
+            name_xm_f = ""
+            name_wpxp_bp = "vpwp_bp"
+            name_wpxp_pr3 = "vpwp_pr3"
+            name_wpxp_f = ""
+            name_wpxp_ta = "vpwp_ta"
+            name_wpxp_pr1 = "vpwp_pr1"
+        else:
+            name_xm_f = ""
+            name_wpxp_bp = ""
+            name_wpxp_pr3 = ""
+            name_wpxp_f = ""
+            name_wpxp_ta = ""
+            name_wpxp_pr1 = ""
+
+        C7_Skw_fnc_zeros = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        C7_Skw_fnc_plus_one = jnp.asarray(C7_Skw_fnc) + one
+
+        # Statistics: explicit contributions for wpxp.
+        rhs_bp = wpxp_terms_bp_pr3_rhs(
+            nzm, ngrdcol, gr, C7_Skw_fnc_zeros,
+            thv_ds_zm, xpthvp,
+        )
+        rhs_pr3 = wpxp_terms_bp_pr3_rhs(
+            nzm, ngrdcol, gr, C7_Skw_fnc_plus_one,
+            thv_ds_zm, xpthvp,
+        )
+
+        # Keep the bp/pr3 split consistent with the legacy stats decomposition.
+        # rhs_bp uses C7_Skw_fnc=0 and rhs_pr3 uses C7_Skw_fnc+1.
+        if len(name_wpxp_bp.strip()) > 0:
+            stats = stats.update(name_wpxp_bp, rhs_bp)
+        if len(name_wpxp_pr3.strip()) > 0:
+            stats = stats.update(name_wpxp_pr3, rhs_pr3)
+
+        if len(name_wpxp_f.strip()) > 0:
+            wpxp_forcing_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            wpxp_forcing_stats = wpxp_forcing_stats.at[:, 1:nzm - 1].set(
+                wpxp_forcing[:, 1:nzm - 1]
+            )
+            # w'x' forcing term is completely explicit; call stat_update_var_pt.
+            stats = stats.update(name_wpxp_f, wpxp_forcing_stats)
+
+        if len(name_wpxp_ta.strip()) > 0:
+            # <w'x'> term ta has both implicit and explicit components.
+            stats = stats.begin_budget(name_wpxp_ta, rhs_ta)
+            ta_over = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            ta_over = ta_over.at[:, 1:nzm - 1].set(
+                (one - gamma_over_implicit_ts)
+                * (
+                    -lhs_ta_wpxp[1 - gr.grid_dir_indx, :, k_int] * wpxp[:, k_plus]
+                    - lhs_ta_wpxp[1, :, k_int] * wpxp[:, k_int]
+                    - lhs_ta_wpxp[1 + gr.grid_dir_indx, :, k_int] * wpxp[:, k_minus]
+                )
+            )
+            stats = stats.update_budget(name_wpxp_ta, ta_over)
+
+        if len(name_wpxp_pr1.strip()) > 0:
+            pr1_over = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            pr1_over = pr1_over.at[:, 1:nzm - 1].set(
+                (one - gamma_over_implicit_ts) * lhs_pr1[:, k_int] * wpxp[:, k_int]
+            )
+            stats = stats.begin_budget(name_wpxp_pr1, pr1_over)
+
+        # Statistics: explicit contributions for xm
+        #             (including microphysics/radiation).
+        if len(name_xm_f.strip()) > 0:
+            stats = stats.update(name_xm_f, xm_forcing)
+
+    return rhs, stats
+
+
+def calc_xm_wpxp_ta_terms(
+    nzm, nzt, ngrdcol, sclr_dim, gr, wp2rtp,
+    wp2thlp, wp2sclrp,
+    rho_ds_zt, invrs_rho_ds_zm, rho_ds_zm,
+    sigma_sqd_w, wp3_on_wp2_zt,
+    pdf_implicit_coefs_terms,
+    iiPDF_type,
+    l_explicit_turbulent_adv_wpxp, l_predict_upwp_vpwp,
+    l_scalar_calc,
+    l_godunov_upwind_wpxp_ta,
+    stats,
+):
+    """Calculate the turbulent advection terms for LHS and RHS matrices."""
+    l_sample = stats.l_sample
+    l_dummy_false = False
+
+    coef_wp2rtp_implicit = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    term_wp2rtp_explicit = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    coef_wp2rtp_implicit_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    term_wp2rtp_explicit_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+
+    coef_wp2thlp_implicit = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    term_wp2thlp_explicit = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    coef_wp2thlp_implicit_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    term_wp2thlp_explicit_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+
+    term_wp2sclrp_explicit = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    term_wp2sclrp_explicit_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+
+    sgn_t_vel_wprtp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    sgn_t_vel_wpthlp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    sgn_t_vel_wpsclrp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+
+    lhs_ta_wprtp = jnp.zeros((ndiags3, ngrdcol, nzm), dtype=jnp.float64)
+    lhs_ta_wpthlp = jnp.zeros((ndiags3, ngrdcol, nzm), dtype=jnp.float64)
+    lhs_ta_wpup = jnp.zeros((ndiags3, ngrdcol, nzm), dtype=jnp.float64)
+    lhs_ta_wpvp = jnp.zeros((ndiags3, ngrdcol, nzm), dtype=jnp.float64)
+    lhs_ta_wpsclrp = jnp.zeros((ndiags3, ngrdcol, nzm, max(sclr_dim, 1)), dtype=jnp.float64)
+
+    rhs_ta_wprtp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    rhs_ta_wpthlp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    rhs_ta_wpup = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    rhs_ta_wpvp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    rhs_ta_wpsclrp = jnp.zeros((ngrdcol, nzm, max(sclr_dim, 1)), dtype=jnp.float64)
+
+    # Set up the implicit coefficients and explicit terms for turbulent
+    # advection of <w'rt'>, <w'thl'>, and <w'sclr'>.
+    if l_explicit_turbulent_adv_wpxp:
+
+        # The turbulent advection of <w'x'> is handled explicitly
+        term_wp2rtp_explicit = jnp.asarray(wp2rtp)
+        term_wp2thlp_explicit = jnp.asarray(wp2thlp)
+
+        # Calculate the RHS turbulent advection term for <w'r_t'>
+        rhs_ta_wprtp = xpyp_term_ta_pdf_rhs(
+            nzm, nzt, ngrdcol, gr, term_wp2rtp_explicit,
+            rho_ds_zt, rho_ds_zm,
+            invrs_rho_ds_zm,
+            l_dummy_false,
+            sgn_t_vel_wprtp,
+            term_wp2rtp_explicit_zm,
+        )
+
+        # Calculate the RHS turbulent advection term for <w'thl'>
+        rhs_ta_wpthlp = xpyp_term_ta_pdf_rhs(
+            nzm, nzt, ngrdcol, gr, term_wp2thlp_explicit,
+            rho_ds_zt, rho_ds_zm,
+            invrs_rho_ds_zm,
+            l_dummy_false,
+            sgn_t_vel_wpthlp,
+            term_wp2thlp_explicit_zm,
+        )
+
+        for sclr in range(sclr_dim):
+            term_wp2sclrp_explicit = jnp.asarray(wp2sclrp)[:, :, sclr]
+            rhs_ta_wpsclrp = rhs_ta_wpsclrp.at[:, :, sclr].set(xpyp_term_ta_pdf_rhs(
+                nzm, nzt, ngrdcol, gr, term_wp2sclrp_explicit,
+                rho_ds_zt, rho_ds_zm,
+                invrs_rho_ds_zm,
+                l_dummy_false,
+                sgn_t_vel_wpsclrp,
+                term_wp2sclrp_explicit_zm,
+            ))
+
+    else:
+
+        # The turbulent advection of <w'x'> is handled implicitly or
+        # semi-implicitly.
+        if iiPDF_type == iiPDF_ADG1:
+
+            # The ADG1 PDF is used.
+            a1_coef = one / (one - jnp.asarray(sigma_sqd_w))
+            a1_coef_zt = jnp.maximum(
+                zm2zt(nzm, nzt, ngrdcol, gr, a1_coef),
+                zero_threshold,
+            )
+            coef_wp2rtp_implicit = a1_coef_zt * jnp.asarray(wp3_on_wp2_zt)
+            coef_wp2thlp_implicit = coef_wp2rtp_implicit
+
+            if not l_godunov_upwind_wpxp_ta:
+                # Calculate the LHS turbulent advection term for <w'r_t'>
+                lhs_ta_wprtp = xpyp_term_ta_pdf_lhs(
+                    nzm, nzt, ngrdcol, gr, coef_wp2rtp_implicit,
+                    rho_ds_zt, rho_ds_zm,
+                    invrs_rho_ds_zm,
+                    l_dummy_false,
+                    sgn_t_vel_wprtp,
+                    coef_wp2rtp_implicit_zm,
+                )
+            else:
+                # Godunov-like method for the vertical discretization of ta term
+                coef_wp2rtp_implicit = a1_coef_zt * jnp.asarray(wp3_on_wp2_zt)
+                coef_wp2thlp_implicit = coef_wp2rtp_implicit
+                lhs_ta_wprtp = xpyp_term_ta_pdf_lhs_godunov(
+                    nzm, nzt, ngrdcol, gr,
+                    coef_wp2rtp_implicit,
+                    invrs_rho_ds_zm, rho_ds_zm,
+                )
+
+            # For ADG1, the LHS turbulent advection terms for
+            # <w'r_t'>, <w'thl'>, <w'sclr'> are all equal
+            lhs_ta_wpthlp = jnp.asarray(lhs_ta_wprtp)
+
+            if l_scalar_calc:
+                for sclr in range(sclr_dim):
+                    lhs_ta_wpsclrp = lhs_ta_wpsclrp.at[:, :, :, sclr].set(lhs_ta_wprtp)
+
+            # The <w'r_t'>, <w'thl'>, <w'sclr'> turbulent advection terms are entirely implicit.
+            if l_predict_upwp_vpwp:
+
+                # Predict <u> and <u'w'>, as well as <v> and <v'w'>.
+                # These terms are equal to the <w'r_t'> terms as well in this case
+                lhs_ta_wpup = jnp.asarray(lhs_ta_wprtp)
+                lhs_ta_wpvp = jnp.asarray(lhs_ta_wprtp)
+
+        elif iiPDF_type == iiPDF_new:
+
+            # The new PDF is used.
+            coef_wp2rtp_implicit = jnp.asarray(pdf_implicit_coefs_terms.coef_wp2rtp_implicit)
+            coef_wp2thlp_implicit = jnp.asarray(pdf_implicit_coefs_terms.coef_wp2thlp_implicit)
+            term_wp2rtp_explicit = jnp.asarray(pdf_implicit_coefs_terms.term_wp2rtp_explicit)
+            term_wp2thlp_explicit = jnp.asarray(pdf_implicit_coefs_terms.term_wp2thlp_explicit)
+
+            # Calculate the LHS turbulent advection term for <w'rt'>
+            lhs_ta_wprtp = xpyp_term_ta_pdf_lhs(
+                nzm, nzt, ngrdcol, gr, coef_wp2rtp_implicit,
+                rho_ds_zt, rho_ds_zm,
+                invrs_rho_ds_zm,
+                l_dummy_false,
+                sgn_t_vel_wprtp,
+                coef_wp2rtp_implicit_zm,
+            )
+
+            # Calculate the RHS turbulent advection term for <w'rt'>
+            rhs_ta_wprtp = xpyp_term_ta_pdf_rhs(
+                nzm, nzt, ngrdcol, gr, term_wp2rtp_explicit,
+                rho_ds_zt, rho_ds_zm,
+                invrs_rho_ds_zm,
+                l_dummy_false,
+                sgn_t_vel_wprtp,
+                term_wp2rtp_explicit_zm,
+            )
+
+            # Calculate the LHS turbulent advection term for <w'thl'>
+            lhs_ta_wpthlp = xpyp_term_ta_pdf_lhs(
+                nzm, nzt, ngrdcol, gr, coef_wp2thlp_implicit,
+                rho_ds_zt, rho_ds_zm,
+                invrs_rho_ds_zm,
+                l_dummy_false,
+                sgn_t_vel_wpthlp,
+                coef_wp2thlp_implicit_zm,
+            )
+
+            # Calculate the RHS turbulent advection term for <w'thl'>
+            rhs_ta_wpthlp = xpyp_term_ta_pdf_rhs(
+                nzm, nzt, ngrdcol, gr, term_wp2thlp_explicit,
+                rho_ds_zt, rho_ds_zm,
+                invrs_rho_ds_zm,
+                l_dummy_false,
+                sgn_t_vel_wpthlp,
+                term_wp2thlp_explicit_zm,
+            )
+
+        elif iiPDF_type == iiPDF_new_hybrid:
+
+            # The new hybrid PDF is used.
+            coef_wp2rtp_implicit = jnp.asarray(pdf_implicit_coefs_terms.coef_wp2rtp_implicit)
+            coef_wp2thlp_implicit = coef_wp2rtp_implicit
+
+            # Calculate the LHS turbulent advection term for <w'rt'>
+            lhs_ta_wprtp = xpyp_term_ta_pdf_lhs(
+                nzm, nzt, ngrdcol, gr, coef_wp2rtp_implicit,
+                rho_ds_zt, rho_ds_zm,
+                invrs_rho_ds_zm,
+                l_dummy_false,
+                sgn_t_vel_wprtp,
+                coef_wp2rtp_implicit_zm,
+            )
+
+            # For the new hybrid PDF, the LHS turbulent advection terms for
+            # <w'r_t'>, <w'thl'>, and <w'sclr'> are all the same.
+            lhs_ta_wpthlp = jnp.asarray(lhs_ta_wprtp)
+
+            if l_scalar_calc:
+                for sclr in range(sclr_dim):
+                    lhs_ta_wpsclrp = lhs_ta_wpsclrp.at[:, :, :, sclr].set(lhs_ta_wprtp)
+
+            if l_predict_upwp_vpwp:
+
+                # Predict <u> and <u'w'>, as well as <v> and <v'w'>.
+                # These terms are equal to the <w'r_t'> terms as well in this case
+                lhs_ta_wpup = jnp.asarray(lhs_ta_wprtp)
+                lhs_ta_wpvp = jnp.asarray(lhs_ta_wprtp)
+
+    if l_sample:
+        stats = stats.update("coef_wp2rtp_implicit", coef_wp2rtp_implicit)
+        stats = stats.update("term_wp2rtp_explicit", term_wp2rtp_explicit)
+        stats = stats.update("coef_wp2thlp_implicit", coef_wp2thlp_implicit)
+        stats = stats.update("term_wp2thlp_explicit", term_wp2thlp_explicit)
+
+    return (
+        lhs_ta_wprtp, lhs_ta_wpthlp, lhs_ta_wpup,
+        lhs_ta_wpvp, lhs_ta_wpsclrp,
+        rhs_ta_wprtp, rhs_ta_wpthlp, rhs_ta_wpup,
+        rhs_ta_wpvp, rhs_ta_wpsclrp, stats,
     )
 
 
-
-
-def diagnose_upxp(ypwp, xm, wpxp, ym, C6x_Skw_fnc, tau_C6_zm, C7_Skw_fnc, gr):
-    """advance_xm_wpxp_module.F90:diagnose_upxp (line 6052).
-
-    Diagnose the turbulent horizontal flux of a conserved scalar (upthlp/uprtp/vpthlp/vprtp)
-    — Andre et al. (1978) eqn. 7 / Bougeault et al. (1981) eqn. 4:
-        ypxp[k] = (tau_C6/C6x) * ( -ypwp*d(xm)/dz - (1-C7)*wpxp*d(ym)/dz )   for k=2..nzm-1
-    with the top/bottom boundary levels left at 0. d/dz of xm and ym are formed here (the
-    caller passes the smoothed velocity as `ym`, mirroring the Fortran `um_smth`/`vm_smth` args).
-    Pure-jnp → differentiable.
-    """
-    ypwp = jnp.asarray(ypwp); xm = jnp.asarray(xm); wpxp = jnp.asarray(wpxp); ym = jnp.asarray(ym)
-    C6x = jnp.asarray(C6x_Skw_fnc); tau = jnp.asarray(tau_C6_zm); C7 = jnp.asarray(C7_Skw_fnc)
-    ddzt_xm = ddzt(xm, gr)
-    ddzt_ym = ddzt(ym, gr)
-    interior = (tau[:, 1:-1] / C6x[:, 1:-1]) * (
-        -ypwp[:, 1:-1] * ddzt_xm[:, 1:-1]
-        - (1.0 - C7[:, 1:-1]) * wpxp[:, 1:-1] * ddzt_ym[:, 1:-1]
+def solve_xm_wpxp_with_single_lhs(
+    nzm, nzt, ngrdcol, sclr_dim, sclr_tol, gr, dt,
+    l_iter, nrhs,
+    wm_zt, wp2, invrs_tau_C6_zm, tau_max_zm,
+    rtpthvp, rtm_forcing, wprtp_forcing, thlpthvp,
+    thlm_forcing, wpthlp_forcing, rho_ds_zm,
+    rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+    thv_ds_zm, rtp2, thlp2, l_implemented,
+    sclrpthvp, sclrm_forcing, sclrp2, um_forcing,
+    vm_forcing, ug, vg, uprcp, vprcp, rc_coef_zm, fcor,
+    fcor_y, up2, vp2,
+    low_lev_effect, high_lev_effect,
+    C6rt_Skw_fnc, C6thl_Skw_fnc, C7_Skw_fnc,
+    lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm,
+    lhs_ta_wpxp,
+    rhs_ta_wprtp, rhs_ta_wpthlp, rhs_ta_wpup,
+    rhs_ta_wpvp, rhs_ta_wpsclrp,
+    lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1_wprtp,
+    lhs_pr1_wpthlp, lhs_pr1_wpsclrp,
+    C_uu_shr,
+    penta_solve_method,
+    tridiag_solve_method,
+    fill_holes_type,
+    l_predict_upwp_vpwp,
+    l_ho_nontrad_coriolis,
+    l_ho_trad_coriolis,
+    l_diffuse_rtm_and_thlm,
+    l_upwind_xm_ma,
+    l_tke_aniso,
+    l_enable_relaxed_clipping,
+    l_perturbed_wind,
+    l_mono_flux_lim_thlm,
+    l_mono_flux_lim_rtm,
+    l_mono_flux_lim_um,
+    l_mono_flux_lim_vm,
+    l_mono_flux_lim_spikefix,
+    wprtp_cl_num,
+    wpthlp_cl_num, upwp_cl_num, vpwp_cl_num,
+    stats,
+    rtm, wprtp, thlm, wpthlp,
+    sclrm, wpsclrp, um, upwp, vm, vpwp,
+    um_pert, vm_pert, upwp_pert, vpwp_pert, err_info,
+):
+    """Solve all xm_wpxp fields with one shared LHS matrix."""
+    l_sample = stats.l_sample
+    lhs = xm_wpxp_lhs(
+        nzm, nzt, ngrdcol, l_iter, dt,
+        l_implemented, lhs_diff_zm, lhs_diff_zt,
+        lhs_ma_zm, lhs_ma_zt, lhs_ta_wpxp, lhs_ta_xm,
+        lhs_tp, lhs_pr1_wprtp, lhs_ac_pr2,
+        l_diffuse_rtm_and_thlm,
     )
-    return jnp.zeros_like(ypwp).at[:, 1:-1].set(interior)
+
+    rhs = jnp.zeros((ngrdcol, 2 * nzm - 1, nrhs), dtype=jnp.float64)
+    rhs_field, stats = xm_wpxp_rhs(
+        nzm, nzt, ngrdcol, gr, xm_wpxp_rtm, l_iter, dt,
+        rtm, wprtp, rtm_forcing, wprtp_forcing, C7_Skw_fnc,
+        rtpthvp, rhs_ta_wprtp, thv_ds_zm, lhs_pr1_wprtp,
+        lhs_ta_wpxp, stats,
+    )
+    rhs = rhs.at[:, :, 0].set(rhs_field)
+    rhs_field, stats = xm_wpxp_rhs(
+        nzm, nzt, ngrdcol, gr, xm_wpxp_thlm, l_iter, dt,
+        thlm, wpthlp, thlm_forcing, wpthlp_forcing, C7_Skw_fnc,
+        thlpthvp, rhs_ta_wpthlp, thv_ds_zm, lhs_pr1_wpthlp,
+        lhs_ta_wpxp, stats,
+    )
+    rhs = rhs.at[:, :, 1].set(rhs_field)
+
+    wpsclrp_forcing = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    for sclr in range(sclr_dim):
+        rhs_field, stats = xm_wpxp_rhs(
+            nzm, nzt, ngrdcol, gr, xm_wpxp_scalar, l_iter, dt,
+            sclrm[:, :, sclr], wpsclrp[:, :, sclr], sclrm_forcing[:, :, sclr],
+            wpsclrp_forcing, C7_Skw_fnc,
+            sclrpthvp[:, :, sclr], rhs_ta_wpsclrp[:, :, sclr], thv_ds_zm,
+            lhs_pr1_wpsclrp, lhs_ta_wpxp, stats,
+        )
+        rhs = rhs.at[:, :, 2 + sclr].set(rhs_field)
+
+    um_tndcy = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    vm_tndcy = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+
+    if l_predict_upwp_vpwp:
+        fcor_col = jnp.asarray(fcor)[:, None]
+        fcor_y_col = jnp.asarray(fcor_y)[:, None]
+
+        if not l_implemented:
+            um_tndcy = jnp.asarray(um_forcing) - fcor_col * (jnp.asarray(vg) - jnp.asarray(vm))
+            vm_tndcy = jnp.asarray(vm_forcing) + fcor_col * (jnp.asarray(ug) - jnp.asarray(um))
+
+            if l_sample:
+                stats = stats.update("um_gf", -fcor_col * jnp.asarray(vg))
+                stats = stats.update("vm_gf", fcor_col * jnp.asarray(ug))
+                stats = stats.update("um_cf", fcor_col * jnp.asarray(vm))
+                stats = stats.update("vm_cf", -fcor_col * jnp.asarray(um))
+                stats = stats.update("um_f", um_forcing)
+                stats = stats.update("vm_f", vm_forcing)
+
+        ddzt_um = ddzt(nzm, nzt, ngrdcol, gr, um)
+        ddzt_vm = ddzt(nzm, nzt, ngrdcol, gr, vm)
+
+        C_uu_shr_col = jnp.asarray(C_uu_shr)[:, None]
+        upwp_forcing = C_uu_shr_col * jnp.asarray(wp2) * ddzt_um
+        vpwp_forcing = C_uu_shr_col * jnp.asarray(wp2) * ddzt_vm
+
+        if l_ho_trad_coriolis:
+            upwp_forcing = upwp_forcing + fcor_col * jnp.asarray(vpwp)
+            vpwp_forcing = vpwp_forcing - fcor_col * jnp.asarray(upwp)
+
+        if l_ho_nontrad_coriolis:
+            upwp_forcing = upwp_forcing + fcor_y_col * (jnp.asarray(up2) - jnp.asarray(wp2))
+
+        upwp_forcing_pert = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        vpwp_forcing_pert = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        if l_perturbed_wind:
+            ddzt_um_pert = ddzt(nzm, nzt, ngrdcol, gr, um_pert)
+            ddzt_vm_pert = ddzt(nzm, nzt, ngrdcol, gr, vm_pert)
+            upwp_forcing_pert = C_uu_shr_col * jnp.asarray(wp2) * ddzt_um_pert
+            vpwp_forcing_pert = C_uu_shr_col * jnp.asarray(wp2) * ddzt_vm_pert
+
+        if l_sample:
+            stats = stats.update("upwp_pr4", C_uu_shr_col * jnp.asarray(wp2) * ddzt_um)
+            stats = stats.update("vpwp_pr4", C_uu_shr_col * jnp.asarray(wp2) * ddzt_vm)
+            if l_ho_trad_coriolis:
+                stats = stats.update("upwp_tct", fcor_col * jnp.asarray(vpwp))
+                stats = stats.update("vpwp_tct", -fcor_col * jnp.asarray(upwp))
+            if l_ho_nontrad_coriolis:
+                stats = stats.update("upwp_nct", fcor_y_col * (jnp.asarray(up2) - jnp.asarray(wp2)))
+
+        tau_C6_zm = jnp.minimum(one / jnp.asarray(invrs_tau_C6_zm), jnp.asarray(tau_max_zm))
+        um_smth = zt2zm2zt(nzm, nzt, ngrdcol, gr, um, zt_min=-jnp.inf)
+        vm_smth = zt2zm2zt(nzm, nzt, ngrdcol, gr, vm, zt_min=-jnp.inf)
+
+        upthlp = diagnose_upxp(
+            nzm, nzt, ngrdcol, gr, upwp, thlm, wpthlp, um_smth,
+            C6thl_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+        )
+        uprtp = diagnose_upxp(
+            nzm, nzt, ngrdcol, gr, upwp, rtm, wprtp, um_smth,
+            C6rt_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+        )
+        vpthlp = diagnose_upxp(
+            nzm, nzt, ngrdcol, gr, vpwp, thlm, wpthlp, vm_smth,
+            C6thl_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+        )
+        vprtp = diagnose_upxp(
+            nzm, nzt, ngrdcol, gr, vpwp, rtm, wprtp, vm_smth,
+            C6rt_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+        )
+
+        if l_perturbed_wind:
+            upthlp_pert = diagnose_upxp(
+                nzm, nzt, ngrdcol, gr, upwp_pert, thlm, wpthlp, um_pert,
+                C6thl_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+            )
+            uprtp_pert = diagnose_upxp(
+                nzm, nzt, ngrdcol, gr, upwp_pert, rtm, wprtp, um_pert,
+                C6rt_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+            )
+            vpthlp_pert = diagnose_upxp(
+                nzm, nzt, ngrdcol, gr, vpwp_pert, thlm, wpthlp, vm_pert,
+                C6thl_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+            )
+            vprtp_pert = diagnose_upxp(
+                nzm, nzt, ngrdcol, gr, vpwp_pert, rtm, wprtp, vm_pert,
+                C6rt_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+            )
+        else:
+            upthlp_pert = uprtp_pert = vpthlp_pert = vprtp_pert = None
+
+        upthvp_tmp = upthlp + ep1 * jnp.asarray(thv_ds_zm) * uprtp + jnp.asarray(rc_coef_zm) * jnp.asarray(uprcp)
+        vpthvp_tmp = vpthlp + ep1 * jnp.asarray(thv_ds_zm) * vprtp + jnp.asarray(rc_coef_zm) * jnp.asarray(vprcp)
+        upthvp = zm2zt2zm(nzm, nzt, ngrdcol, gr, upthvp_tmp, zm_min=-jnp.inf)
+        vpthvp = zm2zt2zm(nzm, nzt, ngrdcol, gr, vpthvp_tmp, zm_min=-jnp.inf)
+
+        if l_perturbed_wind:
+            upthvp_pert = (
+                upthlp_pert
+                + ep1 * jnp.asarray(thv_ds_zm) * uprtp_pert
+                + jnp.asarray(rc_coef_zm) * jnp.asarray(uprcp)
+            )
+            vpthvp_pert = (
+                vpthlp_pert
+                + ep1 * jnp.asarray(thv_ds_zm) * vprtp_pert
+                + jnp.asarray(rc_coef_zm) * jnp.asarray(vprcp)
+            )
+
+        if l_sample:
+            stats = stats.update("upthlp", upthlp)
+            stats = stats.update("uprtp", uprtp)
+            stats = stats.update("vpthlp", vpthlp)
+            stats = stats.update("vprtp", vprtp)
+            stats = stats.update("upthvp", upthvp)
+            stats = stats.update("vpthvp", vpthvp)
+
+        rhs_field, stats = xm_wpxp_rhs(
+            nzm, nzt, ngrdcol, gr, xm_wpxp_um, l_iter, dt,
+            um, upwp, um_tndcy, upwp_forcing, C7_Skw_fnc,
+            upthvp, rhs_ta_wpup, thv_ds_zm,
+            lhs_pr1_wprtp, lhs_ta_wpxp, stats,
+        )
+        rhs = rhs.at[:, :, 2 + sclr_dim].set(rhs_field)
+        rhs_field, stats = xm_wpxp_rhs(
+            nzm, nzt, ngrdcol, gr, xm_wpxp_vm, l_iter, dt,
+            vm, vpwp, vm_tndcy, vpwp_forcing, C7_Skw_fnc,
+            vpthvp, rhs_ta_wpvp, thv_ds_zm,
+            lhs_pr1_wprtp, lhs_ta_wpxp, stats,
+        )
+        rhs = rhs.at[:, :, 3 + sclr_dim].set(rhs_field)
+
+        if l_perturbed_wind:
+            rhs_field, stats = xm_wpxp_rhs(
+                nzm, nzt, ngrdcol, gr, xm_wpxp_um, l_iter, dt,
+                um_pert, upwp_pert, um_tndcy, upwp_forcing_pert, C7_Skw_fnc,
+                upthvp_pert, rhs_ta_wpup, thv_ds_zm,
+                lhs_pr1_wprtp, lhs_ta_wpxp, stats,
+            )
+            rhs = rhs.at[:, :, 4 + sclr_dim].set(rhs_field)
+            rhs_field, stats = xm_wpxp_rhs(
+                nzm, nzt, ngrdcol, gr, xm_wpxp_vm, l_iter, dt,
+                vm_pert, vpwp_pert, vm_tndcy, vpwp_forcing_pert, C7_Skw_fnc,
+                vpthvp_pert, rhs_ta_wpvp, thv_ds_zm,
+                lhs_pr1_wprtp, lhs_ta_wpxp, stats,
+            )
+            rhs = rhs.at[:, :, 5 + sclr_dim].set(rhs_field)
+
+    field_pairs = [(rtm, wprtp), (thlm, wpthlp)]
+    for sclr in range(sclr_dim):
+        field_pairs.append((sclrm[:, :, sclr], wpsclrp[:, :, sclr]))
+    if l_predict_upwp_vpwp:
+        field_pairs.extend([(um, upwp), (vm, vpwp)])
+        if l_perturbed_wind:
+            field_pairs.extend([(um_pert, upwp_pert), (vm_pert, vpwp_pert)])
+
+    old_solution = jnp.zeros((ngrdcol, 2 * nzm - 1, nrhs), dtype=jnp.float64)
+    if penta_solve_method == penta_bicgstab:
+        for irhs, (xm_field, wpxp_field) in enumerate(field_pairs):
+            old_solution = old_solution.at[:, 1:2 * (nzm - 1) + 1:2, irhs].set(
+                jnp.asarray(xm_field)
+            )
+            old_solution = old_solution.at[:, 0:2 * nzm - 1:2, irhs].set(
+                jnp.asarray(wpxp_field)
+            )
+
+    use_rcond = bool(
+        l_sample
+        and (
+            stats.var_on_stats_list("thlm_matrix_condt_num")
+            or stats.var_on_stats_list("rtm_matrix_condt_num")
+        )
+    )
+    solution, rcond, err_info = xm_wpxp_solve(
+        nzm, ngrdcol, nrhs, gr, penta_solve_method, l_implemented,
+        old_solution, lhs, rhs, err_info, use_rcond=use_rcond,
+    )
+
+    rtm, wprtp, err_info, wprtp_cl_num, stats = xm_wpxp_clipping_and_stats(
+        nzm, nzt, ngrdcol, gr, xm_wpxp_rtm, dt, wp2, rtp2, wm_zt,
+        rtm_forcing, rho_ds_zm, rho_ds_zt,
+        invrs_rho_ds_zm, invrs_rho_ds_zt,
+        rt_tol ** 2, rt_tol, rcond,
+        low_lev_effect, high_lev_effect,
+        lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+        lhs_diff_zm, C7_Skw_fnc,
+        lhs_tp, lhs_ta_xm, lhs_pr1_wprtp,
+        l_implemented, solution[:, :, 0],
+        tridiag_solve_method, fill_holes_type,
+        l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+        l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+        l_mono_flux_lim_um, l_mono_flux_lim_vm,
+        l_mono_flux_lim_spikefix,
+        stats,
+        rtm, rt_tol_mfl, wprtp, err_info,
+        wpxp_cl_num=wprtp_cl_num,
+    )
+
+    thlm, wpthlp, err_info, wpthlp_cl_num, stats = xm_wpxp_clipping_and_stats(
+        nzm, nzt, ngrdcol, gr, xm_wpxp_thlm, dt, wp2, thlp2, wm_zt,
+        thlm_forcing, rho_ds_zm, rho_ds_zt,
+        invrs_rho_ds_zm, invrs_rho_ds_zt,
+        thl_tol ** 2, thl_tol, rcond,
+        low_lev_effect, high_lev_effect,
+        lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+        lhs_diff_zm, C7_Skw_fnc,
+        lhs_tp, lhs_ta_xm, lhs_pr1_wprtp,
+        l_implemented, solution[:, :, 1],
+        tridiag_solve_method, fill_holes_type,
+        l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+        l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+        l_mono_flux_lim_um, l_mono_flux_lim_vm,
+        l_mono_flux_lim_spikefix,
+        stats,
+        thlm, thl_tol_mfl, wpthlp, err_info,
+        wpxp_cl_num=wpthlp_cl_num,
+    )
+
+    for sclr in range(sclr_dim):
+        sclrm_s, wpsclrp_s, err_info, _wpxp_cl_num, stats = xm_wpxp_clipping_and_stats(
+            nzm, nzt, ngrdcol, gr, xm_wpxp_scalar, dt, wp2, sclrp2[:, :, sclr], wm_zt,
+            sclrm_forcing[:, :, sclr], rho_ds_zm, rho_ds_zt,
+            invrs_rho_ds_zm, invrs_rho_ds_zt,
+            sclr_tol[sclr] ** 2, sclr_tol[sclr], rcond,
+            low_lev_effect, high_lev_effect,
+            lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+            lhs_diff_zm, C7_Skw_fnc,
+            lhs_tp, lhs_ta_xm, lhs_pr1_wprtp,
+            l_implemented, solution[:, :, 2 + sclr],
+            tridiag_solve_method, fill_holes_type,
+            l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+            l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+            l_mono_flux_lim_um, l_mono_flux_lim_vm,
+            l_mono_flux_lim_spikefix,
+            stats,
+            sclrm[:, :, sclr], sclr_tol[sclr], wpsclrp[:, :, sclr], err_info,
+        )
+        sclrm = sclrm.at[:, :, sclr].set(sclrm_s)
+        wpsclrp = wpsclrp.at[:, :, sclr].set(wpsclrp_s)
+
+    if l_predict_upwp_vpwp:
+        um, upwp, err_info, upwp_cl_num, stats = xm_wpxp_clipping_and_stats(
+            nzm, nzt, ngrdcol, gr, xm_wpxp_um, dt, wp2, up2, wm_zt,
+            um_tndcy, rho_ds_zm, rho_ds_zt,
+            invrs_rho_ds_zm, invrs_rho_ds_zt,
+            w_tol_sqd, w_tol, rcond,
+            low_lev_effect, high_lev_effect,
+            lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+            lhs_diff_zm, C7_Skw_fnc,
+            lhs_tp, lhs_ta_xm, lhs_pr1_wprtp,
+            l_implemented, solution[:, :, 2 + sclr_dim],
+            tridiag_solve_method, fill_holes_type,
+            l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+            l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+            l_mono_flux_lim_um, l_mono_flux_lim_vm,
+            l_mono_flux_lim_spikefix,
+            stats,
+            um, w_tol, upwp, err_info,
+            wpxp_cl_num=upwp_cl_num,
+        )
+
+        vm, vpwp, err_info, vpwp_cl_num, stats = xm_wpxp_clipping_and_stats(
+            nzm, nzt, ngrdcol, gr, xm_wpxp_vm, dt, wp2, vp2, wm_zt,
+            vm_tndcy, rho_ds_zm, rho_ds_zt,
+            invrs_rho_ds_zm, invrs_rho_ds_zt,
+            w_tol_sqd, w_tol, rcond,
+            low_lev_effect, high_lev_effect,
+            lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+            lhs_diff_zm, C7_Skw_fnc,
+            lhs_tp, lhs_ta_xm, lhs_pr1_wprtp,
+            l_implemented, solution[:, :, 3 + sclr_dim],
+            tridiag_solve_method, fill_holes_type,
+            l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+            l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+            l_mono_flux_lim_um, l_mono_flux_lim_vm,
+            l_mono_flux_lim_spikefix,
+            stats,
+            vm, w_tol, vpwp, err_info,
+            wpxp_cl_num=vpwp_cl_num,
+        )
+
+        if l_perturbed_wind:
+            um_pert, upwp_pert, err_info, _wpxp_cl_num, stats = xm_wpxp_clipping_and_stats(
+                nzm, nzt, ngrdcol, gr, xm_wpxp_um, dt, wp2, up2, wm_zt,
+                um_tndcy, rho_ds_zm, rho_ds_zt,
+                invrs_rho_ds_zm, invrs_rho_ds_zt,
+                w_tol_sqd, w_tol, rcond,
+                low_lev_effect, high_lev_effect,
+                lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+                lhs_diff_zm, C7_Skw_fnc,
+                lhs_tp, lhs_ta_xm, lhs_pr1_wprtp,
+                l_implemented, solution[:, :, 4 + sclr_dim],
+                tridiag_solve_method, fill_holes_type,
+                l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+                l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+                l_mono_flux_lim_um, l_mono_flux_lim_vm,
+                l_mono_flux_lim_spikefix,
+                stats,
+                um_pert, w_tol, upwp_pert, err_info,
+            )
+            vm_pert, vpwp_pert, err_info, _wpxp_cl_num, stats = xm_wpxp_clipping_and_stats(
+                nzm, nzt, ngrdcol, gr, xm_wpxp_vm, dt, wp2, vp2, wm_zt,
+                vm_tndcy, rho_ds_zm, rho_ds_zt,
+                invrs_rho_ds_zm, invrs_rho_ds_zt,
+                w_tol_sqd, w_tol, rcond,
+                low_lev_effect, high_lev_effect,
+                lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+                lhs_diff_zm, C7_Skw_fnc,
+                lhs_tp, lhs_ta_xm, lhs_pr1_wprtp,
+                l_implemented, solution[:, :, 5 + sclr_dim],
+                tridiag_solve_method, fill_holes_type,
+                l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+                l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+                l_mono_flux_lim_um, l_mono_flux_lim_vm,
+                l_mono_flux_lim_spikefix,
+                stats,
+                vm_pert, w_tol, vpwp_pert, err_info,
+            )
+
+    return (
+        wprtp_cl_num, wpthlp_cl_num, upwp_cl_num, vpwp_cl_num,
+        rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, um, upwp, vm, vpwp,
+        um_pert, vm_pert, upwp_pert, vpwp_pert, err_info, stats,
+    )
+
+
+def solve_xm_wpxp_with_multiple_lhs(
+    nzm, nzt, ngrdcol, sclr_dim, sclr_tol, gr, dt,
+    l_iter, nrhs, wm_zt, wp2,
+    rtpthvp, rtm_forcing, wprtp_forcing, thlpthvp,
+    thlm_forcing, wpthlp_forcing, rho_ds_zm,
+    rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+    thv_ds_zm, rtp2, thlp2, l_implemented,
+    sclrpthvp, sclrm_forcing, sclrp2,
+    low_lev_effect, high_lev_effect, C7_Skw_fnc,
+    lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm,
+    lhs_ta_wprtp, lhs_ta_wpthlp, lhs_ta_wpsclrp,
+    rhs_ta_wprtp, rhs_ta_wpthlp, rhs_ta_wpsclrp,
+    lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1_wprtp,
+    lhs_pr1_wpthlp, lhs_pr1_wpsclrp,
+    penta_solve_method,
+    tridiag_solve_method,
+    fill_holes_type,
+    l_diffuse_rtm_and_thlm,
+    l_upwind_xm_ma,
+    l_tke_aniso,
+    l_enable_relaxed_clipping,
+    l_mono_flux_lim_thlm,
+    l_mono_flux_lim_rtm,
+    l_mono_flux_lim_um,
+    l_mono_flux_lim_vm,
+    l_mono_flux_lim_spikefix,
+    wprtp_cl_num, wpthlp_cl_num,
+    stats,
+    rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, err_info,
+):
+    """Solve xm_wpxp when LHS matrices differ by field."""
+    del nrhs
+    l_sample = stats.l_sample
+    rtm, wprtp, err_info, wprtp_cl_num, stats = _solve_one_xm_wpxp(
+        nzm, nzt, ngrdcol, gr, xm_wpxp_rtm, dt, l_iter, wm_zt, wp2, rtp2,
+        rtm_forcing, wprtp_forcing, C7_Skw_fnc, rtpthvp, rhs_ta_wprtp,
+        thv_ds_zm, rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+        rt_tol ** 2, rt_tol, rt_tol_mfl, low_lev_effect, high_lev_effect,
+        lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm, lhs_ta_wprtp,
+        lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1_wprtp, l_implemented,
+        penta_solve_method, tridiag_solve_method, fill_holes_type,
+        l_diffuse_rtm_and_thlm, l_upwind_xm_ma, l_tke_aniso,
+        l_enable_relaxed_clipping, l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+        l_mono_flux_lim_um, l_mono_flux_lim_vm, l_mono_flux_lim_spikefix,
+        stats, rtm, wprtp, err_info, wpxp_cl_num=wprtp_cl_num,
+    )
+
+    thlm, wpthlp, err_info, wpthlp_cl_num, stats = _solve_one_xm_wpxp(
+        nzm, nzt, ngrdcol, gr, xm_wpxp_thlm, dt, l_iter, wm_zt, wp2, thlp2,
+        thlm_forcing, wpthlp_forcing, C7_Skw_fnc, thlpthvp, rhs_ta_wpthlp,
+        thv_ds_zm, rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+        thl_tol ** 2, thl_tol, thl_tol_mfl, low_lev_effect, high_lev_effect,
+        lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm, lhs_ta_wpthlp,
+        lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1_wpthlp, l_implemented,
+        penta_solve_method, tridiag_solve_method, fill_holes_type,
+        l_diffuse_rtm_and_thlm, l_upwind_xm_ma, l_tke_aniso,
+        l_enable_relaxed_clipping, l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+        l_mono_flux_lim_um, l_mono_flux_lim_vm, l_mono_flux_lim_spikefix,
+        stats, thlm, wpthlp, err_info, wpxp_cl_num=wpthlp_cl_num,
+    )
+
+    wpsclrp_forcing = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    for sclr in range(sclr_dim):
+        sclrm_s, wpsclrp_s, err_info, _wpxp_cl_num, stats = _solve_one_xm_wpxp(
+            nzm, nzt, ngrdcol, gr, xm_wpxp_scalar, dt, l_iter, wm_zt, wp2, sclrp2[:, :, sclr],
+            sclrm_forcing[:, :, sclr], wpsclrp_forcing, C7_Skw_fnc,
+            sclrpthvp[:, :, sclr], rhs_ta_wpsclrp[:, :, sclr],
+            thv_ds_zm, rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+            sclr_tol[sclr] ** 2, sclr_tol[sclr], sclr_tol[sclr],
+            low_lev_effect, high_lev_effect,
+            lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm, lhs_ta_wpsclrp[:, :, :, sclr],
+            lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1_wpsclrp, l_implemented,
+            penta_solve_method, tridiag_solve_method, fill_holes_type,
+            l_diffuse_rtm_and_thlm, l_upwind_xm_ma, l_tke_aniso,
+            l_enable_relaxed_clipping, l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+            l_mono_flux_lim_um, l_mono_flux_lim_vm, l_mono_flux_lim_spikefix,
+            stats, sclrm[:, :, sclr], wpsclrp[:, :, sclr], err_info,
+        )
+        sclrm = sclrm.at[:, :, sclr].set(sclrm_s)
+        wpsclrp = wpsclrp.at[:, :, sclr].set(wpsclrp_s)
+
+    return wprtp_cl_num, wpthlp_cl_num, rtm, wprtp, thlm, wpthlp, sclrm, wpsclrp, err_info, stats
+
+
+def xm_wpxp_solve(
+    nzm, ngrdcol, nrhs, gr,
+    penta_solve_method, l_implemented,
+    old_solution, lhs, rhs, err_info,
+    use_rcond=False,
+):
+    """Solve for xm / w'x' using the band diagonal solver."""
+    ndim = 2 * nzm - 1
+    lhs_work = jnp.asarray(lhs, dtype=jnp.float64)
+    rhs_work = jnp.asarray(rhs, dtype=jnp.float64)
+    old_work = jnp.asarray(old_solution, dtype=jnp.float64)
+
+    if l_force_descending_solves and gr.grid_dir_indx > 0:
+        lhs_work = lhs_work[::-1, :, ::-1]
+        rhs_work = rhs_work[:, ::-1, :]
+        if penta_solve_method == penta_bicgstab:
+            old_work = old_work[:, ::-1, :]
+
+    err_info, solution, rcond = band_solve(
+        "xm_wpxp", penta_solve_method, ngrdcol, nsup,
+        nsub, ndim, nrhs, l_implemented,
+        lhs_work, rhs_work, err_info,
+        old_soln=old_work, use_rcond=use_rcond,
+    )
+
+    if l_force_descending_solves and gr.grid_dir_indx > 0:
+        solution = jnp.asarray(solution)[:, ::-1, :]
+
+    return solution, jnp.asarray(rcond, dtype=jnp.float64), err_info
 
 
 def xm_wpxp_clipping_and_stats(
-    solve_type, xm, wpxp_preclip, xm_old, xp2, xp2_clip, wp2,
-    wm_zt, xm_forcing, rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
-    xp2_threshold, xm_tol, low_lev_effect, high_lev_effect,
-    field_tol, fill_holes_type, l_mono_flux_lim, dt, gr,
+    nzm, nzt, ngrdcol, gr, solve_type, dt, wp2, xp2, wm_zt,
+    xm_forcing, rho_ds_zm, rho_ds_zt,
+    invrs_rho_ds_zm, invrs_rho_ds_zt,
+    xp2_threshold, xm_threshold, rcond,
+    low_lev_effect, high_lev_effect,
+    lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+    lhs_diff_zm, C7_Skw_fnc,
+    lhs_tp, lhs_ta_xm, lhs_pr1,
+    l_implemented, solution,
+    tridiag_solve_method,
+    fill_holes_type,
+    l_upwind_xm_ma,
+    l_tke_aniso,
+    l_enable_relaxed_clipping,
+    l_mono_flux_lim_thlm,
+    l_mono_flux_lim_rtm,
+    l_mono_flux_lim_um,
+    l_mono_flux_lim_vm,
+    l_mono_flux_lim_spikefix,
+    stats,
+    xm, xm_tol, wpxp, err_info,
+    wpxp_cl_num=None,
 ):
-    """Per-field post-solve clipping for advance_xm_wpxp — mirrors the Fortran
-    `xm_wpxp_clipping_and_stats` (advance_xm_wpxp_module.F90:4410), applied once per scalar
-    after its xm/wpxp solve:
-
-      1. the monotonic turbulent-flux limiter (`monotonic_turbulent_flux_limit`, no-op unless
-         `l_mono_flux_lim`; adjusts BOTH the mean field `xm` and the flux `wpxp` — fixes atex),
-      2. `fill_holes_vertical` on the mean field `xm` (gated `fill_holes_type/=0` AND
-         `solve_type/=um,vm` — the Fortran skips the mean-field fill for the wind components;
-         zt-level, full zt range, threshold=`field_tol`; a bitwise no-op where xm>=field_tol
-         everywhere, fires only at a stretched dry top — e.g. rico's moist/dry interface),
-      3. `clip_covar` on the flux `wpxp` (bounded by `wp2` and `xp2_clip`).
-
-    Called once per scalar (rt/thl) and once per wind component (um/vm); `solve_type` is the field's
-    MFL id (MFL_RTM/MFL_THLM/MFL_UM/MFL_VM). `xp2` (raw) feeds the limiter; `xp2_clip` (the
-    relaxed-clipping-floored variance) bounds the covariance clip. Returns `(xm, wpxp)`. The Fortran
-    subroutine's clip *budget* stat_updates are not reproduced here (the JAX path omits them)."""
-    if l_mono_flux_lim:
-        xm, wpxp_preclip = monotonic_turbulent_flux_limit(
-            solve_type, xm, wpxp_preclip, xm_old, xp2, wm_zt, xm_forcing,
-            rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
-            xp2_threshold, xm_tol, low_lev_effect, high_lev_effect, gr, dt)
-    if fill_holes_type != 0 and solve_type not in (MFL_UM, MFL_VM):
-        xm = jnp.asarray(fill_holes_vertical(
-            field=jnp.asarray(xm), rho_ds=jnp.asarray(rho_ds_zt),
-            dz=jnp.asarray(gr.dzt), threshold=float(field_tol),
-            lower_k=gr.k_lb_zt, upper_k=gr.k_ub_zt,
-            fill_holes_type=fill_holes_type))
-    wpxp = clip_covar(wpxp_preclip, wp2, xp2_clip)
-    # NOTE: the Fortran here optionally calls `xm_correction_wpxp_cl` to adjust xm for the
-    # amount w'x' was clipped — but ONLY under `l_clip_turb_adv`, which is OFF in the validated
-    # config (the covariance clip DOES fire here, so applying the correction would change the
-    # prognostics — verified: wiring it in fails the bit gate with ProgFail 16). The correction
-    # is therefore intentionally NOT applied; `xm_correction_wpxp_cl` (below) is the faithful
-    # mirror of that Fortran routine, kept + unit-tested for the `l_clip_turb_adv=.true.` config.
-    return xm, wpxp
-
-
-def xm_correction_wpxp_cl(xm, wpxp_chnge, invrs_dzt, dt):
-    """Correct xm when w'x' was clipped — the Fortran `xm_correction_wpxp_cl`
-    (advance_xm_wpxp_module.F90:5766). Because xm's time-tendency carries the implicit
-    turbulent-advection term -d(w'x')/dz, clipping w'x' by `wpxp_chnge`
-    (= clipped - unclipped, zm-level) needs the explicit adjuster
-
-        xm_tndcy_wpxp_cl(k) = -invrs_dzt(k) * ( wpxp_chnge(k+1) - wpxp_chnge(k) )
-        xm(k) += xm_tndcy_wpxp_cl(k) * dt                       (k over the zt levels)
-
-    applied per column only where any |wpxp_chnge| > eps (the Fortran `l_clipping_needed(i)`
-    gate; columns with no clipping are left untouched). `xm`/`invrs_dzt`: (ngrdcol, nzt);
-    `wpxp_chnge`: (ngrdcol, nzm), nzm = nzt+1. Pure-jnp (jnp.where gate) → differentiable.
-
-    NOT called from the live `xm_wpxp_clipping_and_stats` path: the Fortran gates this
-    correction on `l_clip_turb_adv`, which is OFF in the validated config (the covariance clip
-    DOES fire there, so applying the correction changes the prognostics — verified to fail the
-    bit gate with ProgFail 16). This is the faithful, unit-tested mirror kept for the
-    `l_clip_turb_adv=.true.` config. (The Fortran's `xm_tacl` budget stat_update is not done.)"""
-    xm = jnp.asarray(xm)
-    wpxp_chnge = jnp.asarray(wpxp_chnge)
-    invrs_dzt = jnp.asarray(invrs_dzt)
-    l_clip = jnp.any(jnp.abs(wpxp_chnge) > _EPS, axis=1, keepdims=True)   # (ngrdcol, 1)
-    xm_tndcy = -invrs_dzt * (wpxp_chnge[:, 1:] - wpxp_chnge[:, :-1])      # (ngrdcol, nzt)
-    return jnp.where(l_clip, xm + xm_tndcy * dt, xm)
-
-
-def advance_xm_wpxp(*, Cx_fnc_Richardson, Kh_zt, clubb_params, dt_advance, fcor, fcor_y, flags, gr,
-    invrs_rho_ds_zm, invrs_rho_ds_zt, invrs_tau_C6_zm, l_sample, mixt_frac_zm, ngrdcol,
-    nu_vert_res_dep, nzm, nzt, rc_coef_zm, rho_ds_zm, rho_ds_zt, rtm_forcing, rtm_ref, rtp2,
-    rtpthvp, sigma_sqd_w, sponge_cfg, stats_writer, thlm_forcing, thlm_ref, thlp2, thlpthvp,
-    thv_ds_zm, ts_nudge, ug, um_forcing, um_ref, up2, uprcp, varnce_w_1_zm, varnce_w_2_zm,
-    vg, vm_forcing, vm_ref, vp2, vprcp, w_1_zm, w_2_zm, wm_zm, wm_zt, wp2, wp3_on_wp2_zt,
-    wprtp_forcing, wpthlp_forcing,
-    rcm, rtm, thlm, um, upwp, vm, vpwp, wprtp, wpthlp):
-    """Whole-driver advance of the xm/w'x' system — mirrors advance_xm_wpxp_module.F90:advance_xm_wpxp.
-    Advances the rt/thl scalar pairs and (l_predict_upwp_vpwp) the um/vm wind pairs: builds the shared
-    TA + LHS terms (calc_xm_wpxp_ta_terms / calc_xm_wpxp_lhs_terms), solves each field via
-    solve_xm_wpxp_with_single_lhs, applies the per-field clipping (xm_wpxp_clipping_and_stats), the
-    wind forcing/Coriolis/diagnose_upxp setup, the sponge/nudge, clip_rcm, and the budget stat_updates.
-    Relocated verbatim from advance_clubb_core's inline Block V (iter 160). Returns the advanced state as a
-    dict (wprtp/rtm/wpthlp/thlm/upwp/um/vpwp/vm/rcm)."""
-    # ---- Save pre-call state for advance_xm_wpxp ----
-    _wprtp_pre_xw = wprtp.copy()
-    _rtm_pre_xw   = rtm.copy()
-    _wpthlp_pre_xw = wpthlp.copy()
-    _thlm_pre_xw   = thlm.copy()
-    # ---- Save pre-call state for the upwp/vpwp wind prediction ----
-    _um_pre_uv   = _asarray(um,   dtype=np.float64).copy()
-    _vm_pre_uv   = _asarray(vm,   dtype=np.float64).copy()
-    _upwp_pre_uv = _asarray(upwp, dtype=np.float64).copy()
-    _vpwp_pre_uv = _asarray(vpwp, dtype=np.float64).copy()
-
-
-    # ============================================================ #
-    # Block V: advance_xm_wpxp (wprtp/rtm, wpthlp/thlm)            #
-    # ARM: ADG1, l_diag_Lscale_from_tau=True, l_use_C7_Richardson   #
-    # ============================================================ #
-    _c_K6_xw = float(clubb_params[0, ic_K6 - 1])
-    _Kw6_xw = _c_K6_xw * Kh_zt   # (ngrdcol, nzt)
-    _nu6_xw = float(_asarray(nu_vert_res_dep.nu6, dtype=np.float64).flat[0])
-    # For ARM l_diag_Lscale_from_tau=True: C6 is constant per column
-    _C6rt_xw = jnp.broadcast_to(
-        jnp.array(clubb_params[:, iC6rt - 1])[:, None], (ngrdcol, nzm))
-    _C6thl_xw = jnp.broadcast_to(
-        jnp.array(clubb_params[:, iC6thl - 1])[:, None], (ngrdcol, nzm))
-    # For ARM l_use_C7_Richardson=True: C7 = Cx_fnc_Richardson
-    _C7_xw = jnp.array(Cx_fnc_Richardson)   # (ngrdcol, nzm)
-
-    # advance_xm_wpxp_module.F90 stats (C6/C7 Skw_fnc, C6_term)
-    if l_sample and stats_writer is not None:
-        stats_writer.update("C7_Skw_fnc",   _asarray(_C7_xw,   dtype=np.float64))
-        stats_writer.update("C6rt_Skw_fnc", _asarray(_C6rt_xw, dtype=np.float64))
-        stats_writer.update("C6thl_Skw_fnc",_asarray(_C6thl_xw,dtype=np.float64))
-        _C6_term_xw = _C6rt_xw * jnp.asarray(invrs_tau_C6_zm)
-        stats_writer.update("C6_term",      _asarray(_C6_term_xw, dtype=np.float64))
-        # coef_wp2rtp/thlp_implicit (ADG1): a1_zt * wp3_on_wp2_zt
-        _a1_zm_xw = 1.0 / (1.0 - jnp.asarray(sigma_sqd_w))
-        _a1_zt_xw = jnp.maximum(zm2zt_jax(_a1_zm_xw, gr), zero_threshold)
-        _coef_wp2rtp_xw = _a1_zt_xw * jnp.asarray(wp3_on_wp2_zt)
-        stats_writer.update("coef_wp2rtp_implicit",  _asarray(_coef_wp2rtp_xw, dtype=np.float64))
-        stats_writer.update("coef_wp2thlp_implicit", _asarray(_coef_wp2rtp_xw, dtype=np.float64))
-        # coef_wprtp2/thlp2/rtpthlp_implicit (ADG1): (1/3)*beta*a1_zt*wp3_on_wp2_zt
-        _beta_xw = jnp.asarray(clubb_params[:, ibeta - 1])[:, None]
-        _coef_wprtp2_xw = (1.0 / 3.0) * _beta_xw * _a1_zt_xw * jnp.asarray(wp3_on_wp2_zt)
-        stats_writer.update("coef_wprtp2_implicit",    _asarray(_coef_wprtp2_xw, dtype=np.float64))
-        stats_writer.update("coef_wpthlp2_implicit",   _asarray(_coef_wprtp2_xw, dtype=np.float64))
-        stats_writer.update("coef_wprtpthlp_implicit", _asarray(_coef_wprtp2_xw, dtype=np.float64))
-
-    # ADG1 turbulent-advection LHS operator (mirrors the Fortran calc_xm_wpxp_ta_terms routine),
-    # shared across the rt/thl/um/vm pairs.
-    _lhs_ta_wprtp_xw = calc_xm_wpxp_ta_terms(
-        sigma_sqd_w=jnp.array(sigma_sqd_w),
-        wp3_on_wp2_zt=jnp.array(wp3_on_wp2_zt),
-        rho_ds_zt=jnp.array(rho_ds_zt),
-        invrs_rho_ds_zm=jnp.array(invrs_rho_ds_zm),
-        gr=gr,
-    )
-    # The remaining shared LHS terms (diffusion, MA, TP, AC+PR2, ta_xm)
-    _sh_xw = calc_xm_wpxp_lhs_terms(
-        wm_zm=jnp.array(wm_zm), wm_zt=jnp.array(wm_zt),
-        wp2=jnp.array(wp2), Kw6=jnp.array(_Kw6_xw), nu6=_nu6_xw,
-        C7_Skw_fnc=_C7_xw,
-        invrs_rho_ds_zm=jnp.array(invrs_rho_ds_zm),
-        rho_ds_zt=jnp.array(rho_ds_zt),
-        rho_ds_zm=jnp.array(rho_ds_zm),
-        invrs_rho_ds_zt=jnp.array(invrs_rho_ds_zt),
-        gr=gr,
-    )
-    _sh_xw['lhs_ta_wprtp'] = _lhs_ta_wprtp_xw
-
-    # Clipping parameters (matches xm_wpxp_clipping_and_stats in Fortran)
-    # l_enable_relaxed_clipping: xp2_floor = 1e-7 for rtp2, 0.01 for thlp2
-    _wp2_jax = jnp.array(wp2)
-    _rtp2_jax = jnp.array(rtp2)
-    _thlp2_jax = jnp.array(thlp2)
-    if flags.l_enable_relaxed_clipping:
-        _rtp2_clip = jnp.maximum(_rtp2_jax, 1e-7)
-        _thlp2_clip = jnp.maximum(_thlp2_jax, 0.01)
+    """Clip solved xm/w'x' fields and finalize implicit stats."""
+    l_sample = stats.l_sample
+    if solve_type == xm_wpxp_rtm:
+        name_xm_ta = "rtm_ta"
+        name_xm_ma = "rtm_ma"
+        name_xm_pd = "rtm_pd"
+        name_xm_cl = "rtm_cl"
+        name_xm_matrix_condt_num = "rtm_matrix_condt_num"
+        name_wpxp_ma = "wprtp_ma"
+        name_wpxp_ta = "wprtp_ta"
+        name_wpxp_tp = "wprtp_tp"
+        name_wpxp_ac = "wprtp_ac"
+        name_wpxp_pr1 = "wprtp_pr1"
+        name_wpxp_pr2 = "wprtp_pr2"
+        name_wpxp_dp1 = "wprtp_dp1"
+        name_wpxp_pd = "wprtp_pd"
+    elif solve_type == xm_wpxp_thlm:
+        name_xm_ta = "thlm_ta"
+        name_xm_ma = "thlm_ma"
+        name_xm_pd = ""
+        name_xm_cl = "thlm_cl"
+        name_xm_matrix_condt_num = "thlm_matrix_condt_num"
+        name_wpxp_ma = "wpthlp_ma"
+        name_wpxp_ta = "wpthlp_ta"
+        name_wpxp_tp = "wpthlp_tp"
+        name_wpxp_ac = "wpthlp_ac"
+        name_wpxp_pr1 = "wpthlp_pr1"
+        name_wpxp_pr2 = "wpthlp_pr2"
+        name_wpxp_dp1 = "wpthlp_dp1"
+        name_wpxp_pd = ""
+    elif solve_type == xm_wpxp_um:
+        name_xm_ta = "um_ta"
+        name_xm_ma = "um_ma"
+        name_xm_pd = ""
+        name_xm_cl = ""
+        name_xm_matrix_condt_num = ""
+        name_wpxp_ma = "upwp_ma"
+        name_wpxp_ta = "upwp_ta"
+        name_wpxp_tp = "upwp_tp"
+        name_wpxp_ac = "upwp_ac"
+        name_wpxp_pr1 = "upwp_pr1"
+        name_wpxp_pr2 = "upwp_pr2"
+        name_wpxp_dp1 = "upwp_dp1"
+        name_wpxp_pd = ""
+    elif solve_type == xm_wpxp_vm:
+        name_xm_ta = "vm_ta"
+        name_xm_ma = "vm_ma"
+        name_xm_pd = ""
+        name_xm_cl = ""
+        name_xm_matrix_condt_num = ""
+        name_wpxp_ma = "vpwp_ma"
+        name_wpxp_ta = "vpwp_ta"
+        name_wpxp_tp = "vpwp_tp"
+        name_wpxp_ac = "vpwp_ac"
+        name_wpxp_pr1 = "vpwp_pr1"
+        name_wpxp_pr2 = "vpwp_pr2"
+        name_wpxp_dp1 = "vpwp_dp1"
+        name_wpxp_pd = ""
     else:
-        _rtp2_clip = _rtp2_jax
-        _thlp2_clip = _thlp2_jax
+        name_xm_ta = ""
+        name_xm_ma = ""
+        name_xm_pd = ""
+        name_xm_cl = ""
+        name_xm_matrix_condt_num = ""
+        name_wpxp_ma = ""
+        name_wpxp_ta = ""
+        name_wpxp_tp = ""
+        name_wpxp_ac = ""
+        name_wpxp_pr1 = ""
+        name_wpxp_pr2 = ""
+        name_wpxp_dp1 = ""
+        name_wpxp_pd = ""
 
-    # monotonic flux limiter setup. The turbulent-advection range is
-    # field-independent — compute once, reuse for rtm/thlm/um/vm. The limiter is
-    # applied after each solve and before clip_covar (matching the Fortran
-    # xm_wpxp_clipping_and_stats order). It is a no-op unless w'x' exceeds the
-    # monotonic bounds (fixes atex; no-op for the bit-faithful set).
-    _lle_mfl, _hle_mfl = calc_turb_adv_range(
-        w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm, mixt_frac_zm,
-        gr, float(dt_advance))
-    _rho_ds_zm_mfl = _asarray(rho_ds_zm, np.float64)
-    _rho_ds_zt_mfl = _asarray(rho_ds_zt, np.float64)
-    _irho_zm_mfl = _asarray(invrs_rho_ds_zm, np.float64)
-    _irho_zt_mfl = _asarray(invrs_rho_ds_zt, np.float64)
-    _wm_zt_mfl = _asarray(wm_zt, np.float64)
-    # The field-path limiter (monotonic_turbulent_flux_limit, now invoked inside
-    # xm_wpxp_clipping_and_stats for each of rtm/thlm/um/vm — mirroring the Fortran which calls
-    # monotonic_turbulent_flux_limit per field) is JAX (lax.scan), bit-exact to the NumPy reference
-    # (tests/test_mono_flux_limiter.py) and differentiable w.r.t. the fields. calc_turb_adv_range
-    # (the integer ranges _lle_mfl/_hle_mfl) stays NumPy — they derive from the w-PDF, not the
-    # limited fields, so they are structural constants for the grad.
+    xm_old = jnp.asarray(xm, dtype=jnp.float64)
 
-    # Solve wprtp/rtm pair — no clipping in solve; apply separately to get pre-clip value
-    _wprtp_preclip_xw, _rtm_jax_xw = solve_xm_wpxp_with_single_lhs(
-        wpxp=jnp.array(_wprtp_pre_xw),
-        xm=jnp.array(_rtm_pre_xw),
-        wpxp_forcing=jnp.array(wprtp_forcing),
-        xm_forcing=jnp.array(rtm_forcing),
-        C6_Skw_fnc=_C6rt_xw,
-        C7_Skw_fnc=_C7_xw,
-        invrs_tau_C6_zm=jnp.array(invrs_tau_C6_zm),
-        lhs_ta_wpxp=_sh_xw['lhs_ta_wprtp'],
-        lhs_diff_zm=_sh_xw['lhs_diff_zm'],
-        lhs_ma_zm=_sh_xw['lhs_ma_zm'],
-        lhs_ma_zt=_sh_xw['lhs_ma_zt'],
-        lhs_ta_xm=_sh_xw['lhs_ta_xm'],
-        lhs_tp=_sh_xw['lhs_tp'],
-        lhs_ac_pr2=_sh_xw['lhs_ac_pr2'],
-        thv_ds_zm=jnp.array(thv_ds_zm),
-        xpthvp=jnp.array(rtpthvp),
-        wm_zt=jnp.array(wm_zt),
-        dt=float(dt_advance),
-        gr=gr,
-    )
-    # Per-field post-solve clipping (MFL + fill_holes + clip_covar) — the Fortran
-    # xm_wpxp_clipping_and_stats (advance_xm_wpxp_module.F90:4410), called once per scalar.
-    _rtm_jax_xw, _wprtp_jax_xw = xm_wpxp_clipping_and_stats(
-        MFL_RTM, _rtm_jax_xw, _wprtp_preclip_xw, _rtm_pre_xw, rtp2, _rtp2_clip, _wp2_jax,
-        _wm_zt_mfl, rtm_forcing, _rho_ds_zm_mfl, _rho_ds_zt_mfl, _irho_zm_mfl, _irho_zt_mfl,
-        _RT_TOL ** 2, _RT_TOL_MFL, _lle_mfl, _hle_mfl,
-        rt_tol, flags.fill_holes_type, getattr(flags, 'l_mono_flux_lim_rtm', False),
-        float(dt_advance), gr)
+    sol = jnp.asarray(solution, dtype=jnp.float64)
+    xm = sol[:, 1:2 * nzt + 1:2]
+    wpxp = sol[:, 0:2 * nzm - 1:2]
 
-    # Solve wpthlp/thlm pair (same lhs_ta_wprtp for ADG1)
-    _wpthlp_preclip_xw, _thlm_jax_xw = solve_xm_wpxp_with_single_lhs(
-        wpxp=jnp.array(_wpthlp_pre_xw),
-        xm=jnp.array(_thlm_pre_xw),
-        wpxp_forcing=jnp.array(wpthlp_forcing),
-        xm_forcing=jnp.array(thlm_forcing),
-        C6_Skw_fnc=_C6thl_xw,
-        C7_Skw_fnc=_C7_xw,
-        invrs_tau_C6_zm=jnp.array(invrs_tau_C6_zm),
-        lhs_ta_wpxp=_sh_xw['lhs_ta_wprtp'],
-        lhs_diff_zm=_sh_xw['lhs_diff_zm'],
-        lhs_ma_zm=_sh_xw['lhs_ma_zm'],
-        lhs_ma_zt=_sh_xw['lhs_ma_zt'],
-        lhs_ta_xm=_sh_xw['lhs_ta_xm'],
-        lhs_tp=_sh_xw['lhs_tp'],
-        lhs_ac_pr2=_sh_xw['lhs_ac_pr2'],
-        thv_ds_zm=jnp.array(thv_ds_zm),
-        xpthvp=jnp.array(thlpthvp),
-        wm_zt=jnp.array(wm_zt),
-        dt=float(dt_advance),
-        gr=gr,
-    )
-    # Per-field post-solve clipping (xm_wpxp_clipping_and_stats, F90:4410) for the thl pair.
-    _thlm_jax_xw, _wpthlp_jax_xw = xm_wpxp_clipping_and_stats(
-        MFL_THLM, _thlm_jax_xw, _wpthlp_preclip_xw, _thlm_pre_xw, thlp2, _thlp2_clip, _wp2_jax,
-        _wm_zt_mfl, thlm_forcing, _rho_ds_zm_mfl, _rho_ds_zt_mfl, _irho_zm_mfl, _irho_zt_mfl,
-        _THL_TOL ** 2, _THL_TOL_MFL, _lle_mfl, _hle_mfl,
-        thl_tol, flags.fill_holes_type, getattr(flags, 'l_mono_flux_lim_thlm', False),
-        float(dt_advance), gr)
+    if l_sample:
+        C7_Skw_fnc_zeros = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        C7_Skw_fnc_plus_one = jnp.asarray(C7_Skw_fnc) + one
+        wpxp_ac = wpxp_terms_ac_pr2_lhs(
+            nzm, nzt, ngrdcol, gr, C7_Skw_fnc_zeros, wm_zt, gr.invrs_dzm,
+        )
+        wpxp_pr2 = wpxp_terms_ac_pr2_lhs(
+            nzm, nzt, ngrdcol, gr, C7_Skw_fnc_plus_one, wm_zt, gr.invrs_dzm,
+        )
 
+        if (
+            name_xm_matrix_condt_num.strip()
+            and stats.var_on_stats_list(name_xm_matrix_condt_num)
+        ):
+            stats = stats.update(name_xm_matrix_condt_num, one / jnp.asarray(rcond))
 
-    # ============================================================ #
-    # Override advance_xm_wpxp state with JAX values        #
-    # wprtp/rtm/wpthlp/thlm computed in JAX.                        #
-    # ============================================================ #
-    wprtp  = _asarray(_wprtp_jax_xw,  dtype=np.float64).copy()
-    rtm    = _asarray(_rtm_jax_xw,    dtype=np.float64).copy()
-    wpthlp = _asarray(_wpthlp_jax_xw, dtype=np.float64).copy()
-    thlm   = _asarray(_thlm_jax_xw,   dtype=np.float64).copy()
-
-    # Sponge-layer damping for rtm/thlm (advance_xm_wpxp_module.F90:1053-1093).
-    # No-op unless sponge_cfg enables the field (e.g. ekman).
-    rtm  = apply_sponge_field_jax('rtm',  rtm,  rtm_ref, gr, dt_advance, sponge_cfg)
-    thlm = apply_sponge_field_jax('thlm', thlm, thlm_ref, gr, dt_advance, sponge_cfg)
-
-    # clip_rcm using JAX-updated rtm
-    _rcm_presave = _asarray(rcm, dtype=np.float64).copy()
-    _rcm_adg = _asarray(clip_rcm(
-        rcm=jnp.asarray(_rcm_presave),
-        rtm=jnp.asarray(_asarray(rtm, dtype=np.float64)),
-    ))
-    rcm = _asarray(_rcm_adg, dtype=np.float64).copy()
-
-    # ============================================================ #
-    # advance_xm_wpxp wind pair: um/upwp and vm/vpwp               #
-    # ARM: l_predict_upwp_vpwp=True, l_implemented=False,           #
-    # l_lmm_stepping=False, l_ho_trad/nontrad_coriolis=False        #
-    # ============================================================ #
-    # upwp_forcing = C_uu_shr * wp2 * ddzt(um_pre)  (zm-level)
-    _C_uu_shr_uv = _asarray(
-        clubb_params[:, iC_uu_shr - 1], dtype=np.float64
-    )[:, np.newaxis]
-    _wp2_uv     = _asarray(wp2, dtype=np.float64)
-    _ddzt_um_uv  = _asarray(ddzt(jnp.asarray(_um_pre_uv), gr))
-    _ddzt_vm_uv  = _asarray(ddzt(jnp.asarray(_vm_pre_uv), gr))
-    _upwp_forcing_uv = _C_uu_shr_uv * _wp2_uv * _ddzt_um_uv  # (ngrdcol, nzm)
-    _vpwp_forcing_uv = _C_uu_shr_uv * _wp2_uv * _ddzt_vm_uv  # (ngrdcol, nzm)
-    # Nontraditional Coriolis term for upwp (advance_xm_wpxp_module.F90:3098-3106).
-    if getattr(flags, 'l_ho_nontrad_coriolis', False):
-        _fcy_uv = _asarray(fcor_y, dtype=np.float64)[:, np.newaxis]
-        _upwp_forcing_uv = _upwp_forcing_uv + _fcy_uv * (
-            _asarray(up2, dtype=np.float64) - _wp2_uv)
-
-    # Coriolis + large-scale forcing for um/vm  (l_implemented=False)
-    # um_tndcy = um_forcing - fcor * (vg - vm_pre)
-    _fcor_uv = _asarray(fcor, dtype=np.float64)[:, np.newaxis]  # (ngrdcol,1)
-    _um_tndcy_uv = (_asarray(um_forcing, dtype=np.float64)
-                   - _fcor_uv * (_asarray(vg, dtype=np.float64) - _vm_pre_uv))
-    _vm_tndcy_uv = (_asarray(vm_forcing, dtype=np.float64)
-                   + _fcor_uv * (_asarray(ug, dtype=np.float64) - _um_pre_uv))
-
-    # diagnose_upxp: upthvp via upthlp + ep1*thv_ds*uprtp + rc_coef*uprcp
-    # um_smth = zt2zm2zt(um)  (smoothed zt-level)
-    _um_smth_uv = _asarray(zt2zm2zt(jnp.asarray(_um_pre_uv), gr))
-    _vm_smth_uv = _asarray(zt2zm2zt(jnp.asarray(_vm_pre_uv), gr))
-
-    _invrs_tau_C6_uv  = _asarray(invrs_tau_C6_zm, dtype=np.float64)
-    _tau_C6_uv        = _xp.where(_invrs_tau_C6_uv > 1e-30,
-                                 1.0 / _invrs_tau_C6_uv, 0.0)
-    _C6thl_uv = _xp.broadcast_to(
-        _asarray(clubb_params[:, iC6thl - 1], dtype=np.float64)[:, np.newaxis],
-        (ngrdcol, nzm)).copy()
-    _C6rt_uv  = _xp.broadcast_to(
-        _asarray(clubb_params[:, iC6rt - 1], dtype=np.float64)[:, np.newaxis],
-        (ngrdcol, nzm)).copy()
-    _C7_uv    = _asarray(Cx_fnc_Richardson, dtype=np.float64)  # (ngrdcol, nzm)
-
-    _wpthlp_uv = _asarray(_wpthlp_pre_xw, dtype=np.float64)
-    _wprtp_uv  = _asarray(_wprtp_pre_xw,  dtype=np.float64)
-
-    # diagnose_upxp (advance_xm_wpxp_module.F90:6052) — horizontal scalar fluxes
-    # upthlp/uprtp/vpthlp/vprtp. ym = um_smth/vm_smth (the Fortran smoothed-velocity
-    # arg); d/dz of xm and ym are formed inside the routine.
-    _upthlp_uv = _asarray(diagnose_upxp(
-        _upwp_pre_uv, _thlm_pre_xw, _wpthlp_uv, _um_smth_uv, _C6thl_uv, _tau_C6_uv, _C7_uv, gr))
-    _uprtp_uv  = _asarray(diagnose_upxp(
-        _upwp_pre_uv, _rtm_pre_xw,  _wprtp_uv,  _um_smth_uv, _C6rt_uv,  _tau_C6_uv, _C7_uv, gr))
-    _vpthlp_uv = _asarray(diagnose_upxp(
-        _vpwp_pre_uv, _thlm_pre_xw, _wpthlp_uv, _vm_smth_uv, _C6thl_uv, _tau_C6_uv, _C7_uv, gr))
-    _vprtp_uv  = _asarray(diagnose_upxp(
-        _vpwp_pre_uv, _rtm_pre_xw,  _wprtp_uv,  _vm_smth_uv, _C6rt_uv,  _tau_C6_uv, _C7_uv, gr))
-
-    _ep1_uv   = float(ep1)
-    _thv_ds_uv = _asarray(thv_ds_zm, dtype=np.float64)
-    _rc_cf_uv  = _asarray(rc_coef_zm, dtype=np.float64)
-    _uprcp_uv  = _asarray(uprcp, dtype=np.float64)
-    _vprcp_uv  = _asarray(vprcp, dtype=np.float64)
-
-    _upthvp_tmp_uv = _upthlp_uv + _ep1_uv * _thv_ds_uv * _uprtp_uv + _rc_cf_uv * _uprcp_uv
-    _vpthvp_tmp_uv = _vpthlp_uv + _ep1_uv * _thv_ds_uv * _vprtp_uv + _rc_cf_uv * _vprcp_uv
-    # smooth via zm2zt2zm
-    _upthvp_uv = _asarray(zm2zt2zm(jnp.asarray(_upthvp_tmp_uv), gr))
-    _vpthvp_uv = _asarray(zm2zt2zm(jnp.asarray(_vpthvp_tmp_uv), gr))
-
-    # Clipping floor: up2/vp2 (l_tke_aniso=True → use up2 directly, no relaxed floor)
-    _up2_uv = jnp.asarray(_asarray(up2, dtype=np.float64))
-    _vp2_uv = jnp.asarray(_asarray(vp2, dtype=np.float64))
-
-    # Solve upwp/um pair — no clipping in solve; apply separately
-    _upwp_preclip_uv, _um_jax_uv = solve_xm_wpxp_with_single_lhs(
-        wpxp=jnp.asarray(_upwp_pre_uv),
-        xm=jnp.asarray(_um_pre_uv),
-        wpxp_forcing=jnp.asarray(_upwp_forcing_uv),
-        xm_forcing=jnp.asarray(_um_tndcy_uv),
-        C6_Skw_fnc=_C6rt_xw,
-        C7_Skw_fnc=_C7_xw,
-        invrs_tau_C6_zm=jnp.asarray(_invrs_tau_C6_uv),
-        lhs_ta_wpxp=_sh_xw['lhs_ta_wprtp'],
-        lhs_diff_zm=_sh_xw['lhs_diff_zm'],
-        lhs_ma_zm=_sh_xw['lhs_ma_zm'],
-        lhs_ma_zt=_sh_xw['lhs_ma_zt'],
-        lhs_ta_xm=_sh_xw['lhs_ta_xm'],
-        lhs_tp=_sh_xw['lhs_tp'],
-        lhs_ac_pr2=_sh_xw['lhs_ac_pr2'],
-        thv_ds_zm=jnp.asarray(_thv_ds_uv),
-        xpthvp=jnp.asarray(_upthvp_uv),
-        wm_zt=jnp.asarray(_asarray(wm_zt, dtype=np.float64)),
-        dt=float(dt_advance),
-        gr=gr,
-    )
-    # Per-component post-solve clipping (xm_wpxp_clipping_and_stats, F90:4410); the wind
-    # components skip the mean-field fill_holes (gated solve_type/=um,vm inside the routine).
-    _um_jax_uv, _upwp_jax_uv = xm_wpxp_clipping_and_stats(
-        MFL_UM, _um_jax_uv, _upwp_preclip_uv, _um_pre_uv, up2, _up2_uv, _wp2_jax,
-        _wm_zt_mfl, _um_tndcy_uv, _rho_ds_zm_mfl, _rho_ds_zt_mfl, _irho_zm_mfl, _irho_zt_mfl,
-        _W_TOL_SQD, _W_TOL, _lle_mfl, _hle_mfl,
-        rt_tol, flags.fill_holes_type, getattr(flags, 'l_mono_flux_lim_um', False),
-        float(dt_advance), gr)
-
-    # Solve vpwp/vm pair — no clipping in solve; apply separately
-    _vpwp_preclip_uv, _vm_jax_uv = solve_xm_wpxp_with_single_lhs(
-        wpxp=jnp.asarray(_vpwp_pre_uv),
-        xm=jnp.asarray(_vm_pre_uv),
-        wpxp_forcing=jnp.asarray(_vpwp_forcing_uv),
-        xm_forcing=jnp.asarray(_vm_tndcy_uv),
-        C6_Skw_fnc=_C6rt_xw,
-        C7_Skw_fnc=_C7_xw,
-        invrs_tau_C6_zm=jnp.asarray(_invrs_tau_C6_uv),
-        lhs_ta_wpxp=_sh_xw['lhs_ta_wprtp'],
-        lhs_diff_zm=_sh_xw['lhs_diff_zm'],
-        lhs_ma_zm=_sh_xw['lhs_ma_zm'],
-        lhs_ma_zt=_sh_xw['lhs_ma_zt'],
-        lhs_ta_xm=_sh_xw['lhs_ta_xm'],
-        lhs_tp=_sh_xw['lhs_tp'],
-        lhs_ac_pr2=_sh_xw['lhs_ac_pr2'],
-        thv_ds_zm=jnp.asarray(_thv_ds_uv),
-        xpthvp=jnp.asarray(_vpthvp_uv),
-        wm_zt=jnp.asarray(_asarray(wm_zt, dtype=np.float64)),
-        dt=float(dt_advance),
-        gr=gr,
-    )
-    # Per-component post-solve clipping (xm_wpxp_clipping_and_stats, F90:4410) for the vm pair.
-    _vm_jax_uv, _vpwp_jax_uv = xm_wpxp_clipping_and_stats(
-        MFL_VM, _vm_jax_uv, _vpwp_preclip_uv, _vm_pre_uv, vp2, _vp2_uv, _wp2_jax,
-        _wm_zt_mfl, _vm_tndcy_uv, _rho_ds_zm_mfl, _rho_ds_zt_mfl, _irho_zm_mfl, _irho_zt_mfl,
-        _W_TOL_SQD, _W_TOL, _lle_mfl, _hle_mfl,
-        rt_tol, flags.fill_holes_type, getattr(flags, 'l_mono_flux_lim_vm', False),
-        float(dt_advance), gr)
-
-
-    # ============================================================ #
-    # Store advance_xm_wpxp wind state (um/upwp, vm/vpwp)           #
-    # computed in JAX.                                              #
-    # ============================================================ #
-    upwp = _asarray(_upwp_jax_uv, dtype=np.float64).copy()
-    um   = _asarray(_um_jax_uv,   dtype=np.float64).copy()
-    vpwp = _asarray(_vpwp_jax_uv, dtype=np.float64).copy()
-    vm   = _asarray(_vm_jax_uv,   dtype=np.float64).copy()
-
-    # Sponge-layer damping for um/vm (advance_xm_wpxp_module.F90:1095-1123,
-    # under l_predict_upwp_vpwp + uv_sponge). No-op unless sponge_cfg enables 'uv'.
-    um = apply_sponge_field_jax('uv', um, um_ref, gr, dt_advance, sponge_cfg)
-    vm = apply_sponge_field_jax('uv', vm, vm_ref, gr, dt_advance, sponge_cfg)
-
-    # uv nudging toward the initial reference profiles (advance_xm_wpxp_module.F90:
-    # 1126-1151, under l_predict_upwp_vpwp + l_uv_nudge). No-op unless l_uv_nudge
-    # (none of the cloud/dry cases use it; coriolis_test does, ts_nudge=dt → full reset).
-    if getattr(flags, 'l_uv_nudge', False):
-        _nf = float(dt_advance) / float(ts_nudge)
-        um = um - (um - _asarray(um_ref, dtype=np.float64)) * _nf
-        vm = vm - (vm - _asarray(vm_ref, dtype=np.float64)) * _nf
-
-    # ============================================================ #
-    # advance_xm_wpxp budget term stats writes               #
-    # ============================================================ #
-    if l_sample and stats_writer is not None:
-        _grav_dg = float(grav)
-        _gamma_dg = gamma_over_implicit_ts
-
-        # --- Pre-advance snapshots ---
-        stats_writer.update("rtm_old",  _asarray(_rtm_pre_xw,   dtype=np.float64))
-        stats_writer.update("thlm_old", _asarray(_thlm_pre_xw,  dtype=np.float64))
-
-        # --- Forcings ---
-        stats_writer.update("rtm_forcing",  _asarray(rtm_forcing,  dtype=np.float64))
-        stats_writer.update("thlm_forcing", _asarray(thlm_forcing, dtype=np.float64))
-
-        # --- Geostrophic and Coriolis terms for um/vm ---
-        _fcor_dg = _asarray(fcor, dtype=np.float64)[:, np.newaxis]  # (ngrdcol,1)
-        stats_writer.update("um_gf", -_fcor_dg * _asarray(vg, dtype=np.float64))
-        stats_writer.update("vm_gf",  _fcor_dg * _asarray(ug, dtype=np.float64))
-        stats_writer.update("um_cf",  _fcor_dg * _vm_pre_uv)
-        stats_writer.update("vm_cf", -_fcor_dg * _um_pre_uv)
-
-        # --- diagnose_upxp results ---
-        stats_writer.update("upthlp", _upthlp_uv)
-        stats_writer.update("uprtp",  _uprtp_uv)
-        stats_writer.update("upthvp", _upthvp_uv)
-        stats_writer.update("vpthlp", _vpthlp_uv)
-        stats_writer.update("vprtp",  _vprtp_uv)
-        stats_writer.update("vpthvp", _vpthvp_uv)
-
-        # --- Shared LHS terms (already computed in _sh_xw) ---
-        _lhs_ta_wpxp_dg = _asarray(_sh_xw['lhs_ta_wprtp'], dtype=np.float64)
-        _lhs_diff_dg    = _asarray(_sh_xw['lhs_diff_zm'],  dtype=np.float64)
-        _lhs_tp_dg      = _asarray(_sh_xw['lhs_tp'],       dtype=np.float64)
-        _lhs_ta_xm_dg   = _asarray(_sh_xw['lhs_ta_xm'],    dtype=np.float64)
-        _thv_ds_dg      = _asarray(thv_ds_zm,             dtype=np.float64)
-
-        # lhs_pr1 for each pair (variable-specific)
-        _invrs_tau_C6_dg  = _asarray(invrs_tau_C6_zm, dtype=np.float64)
-        _lhs_pr1_rtp_dg   = _asarray(wpxp_term_pr1_lhs(
-            jnp.asarray(_asarray(_C6rt_xw)),
-            jnp.asarray(_invrs_tau_C6_dg)), dtype=np.float64)
-        _lhs_pr1_thl_dg   = _asarray(wpxp_term_pr1_lhs(
-            jnp.asarray(_asarray(_C6thl_xw)),
-            jnp.asarray(_invrs_tau_C6_dg)), dtype=np.float64)
-
-        def _wpxp_budgets_dg(name_bp, name_pr3, name_ta, name_pr1,
-                             name_tp, name_dp1, name_xm_ta,
-                             wpxp_pre, wpxp_new, xm_new, xpthvp_np,
-                             C7_np, lhs_pr1_np):
-            """Write wpxp and xm budget term stats for one variable pair."""
-            # bp / pr3: exactly as the Fortran (advance_xm_wpxp_module.F90:1894-1913), the two explicit
-            # contributions are obtained by calling wpxp_terms_bp_pr3_rhs with C7_Skw_fnc=0 (→ bp) and
-            # C7_Skw_fnc+1 (→ pr3); the routine itself zeros the boundaries and returns the full profile.
-            _C7_j = jnp.asarray(C7_np)
-            _thv_j = jnp.asarray(_thv_ds_dg)
-            _xpthvp_j = jnp.asarray(xpthvp_np)
-            _bp = _asarray(wpxp_terms_bp_pr3_rhs(
-                jnp.zeros_like(_C7_j), _thv_j, _xpthvp_j, _grav_dg), dtype=np.float64)
-            stats_writer.update(name_bp, _bp)
-            _pr3 = _asarray(wpxp_terms_bp_pr3_rhs(
-                _C7_j + 1.0, _thv_j, _xpthvp_j, _grav_dg), dtype=np.float64)
-            stats_writer.update(name_pr3, _pr3)
-            # ta: explicit over-implicit part (1-gamma, pre-solve) + implicit finalize (gamma,
-            # post-solve), both the same 3-band turb-adv LHS applied via the shared band3 kernel.
-            _ta_over = (1.0 - _gamma_dg) * (-apply_lhs_band3_interior_jax(_lhs_ta_wpxp_dg, wpxp_pre))
-            _ta_impl = -_gamma_dg * apply_lhs_band3_interior_jax(_lhs_ta_wpxp_dg, wpxp_new)
-            stats_writer.update(name_ta, _ta_over + _ta_impl)
-            # pr1: begin -(1-gamma)*lhs_pr1*wpxp_pre, finalize -gamma*lhs_pr1*wpxp_new
-            _pr1 = _xp.zeros_like(wpxp_pre)
-            _pr1 = _iset(_pr1, np.s_[:, 1:-1], (
-                -(1.0 - _gamma_dg) * lhs_pr1_np[:, 1:-1] * wpxp_pre[:, 1:-1]
-                - _gamma_dg * lhs_pr1_np[:, 1:-1] * wpxp_new[:, 1:-1]
-            ))
-            stats_writer.update(name_pr1, _pr1)
-            # tp: implicit, uses post-solve xm — shared zt→zm 2-band apply kernel
-            _tp = -apply_lhs_band2_zt2zm_interior_jax(_lhs_tp_dg, xm_new)
-            stats_writer.update(name_tp, _tp)
-            # dp1: diffusion, implicit, uses post-solve wpxp — shared band3 kernel
-            _dp1 = -apply_lhs_band3_interior_jax(_lhs_diff_dg, wpxp_new)
-            stats_writer.update(name_dp1, _dp1)
-            # xm_ta: implicit, uses post-solve wpxp
-            _xm_ta = (
-                -_lhs_ta_xm_dg[1] * wpxp_new[:, :-1]
-                - _lhs_ta_xm_dg[0] * wpxp_new[:, 1:]
+        if not l_implemented:
+            lhs_ma_zt = jnp.asarray(lhs_ma_zt, dtype=jnp.float64)
+            k_zt = jnp.arange(nzt)
+            km1_zt = jnp.clip(k_zt - gr.grid_dir_indx, 0, nzt - 1)
+            kp1_zt = jnp.clip(k_zt + gr.grid_dir_indx, 0, nzt - 1)
+            tmp_zt_stats = (
+                -lhs_ma_zt[1 + gr.grid_dir_indx, :, :] * jnp.take(xm, km1_zt, axis=1)
+                - lhs_ma_zt[1, :, :] * xm
+                - lhs_ma_zt[1 - gr.grid_dir_indx, :, :] * jnp.take(xm, kp1_zt, axis=1)
             )
-            stats_writer.update(name_xm_ta, _xm_ta)
+            if name_xm_ma.strip():
+                stats = stats.update(name_xm_ma, tmp_zt_stats)
 
-        _C7_np_dg = _asarray(_C7_xw, dtype=np.float64)
-        _dt_dg    = float(dt_advance)
-
-        # wprtp/rtm budget terms — use pre-clip wprtp for dp1/ta/pr1
-        _wprtp_pc_xw = _asarray(_wprtp_preclip_xw, dtype=np.float64)
-        _wpxp_budgets_dg(
-            "wprtp_bp", "wprtp_pr3", "wprtp_ta", "wprtp_pr1",
-            "wprtp_tp", "wprtp_dp1", "rtm_ta",
-            _asarray(_wprtp_pre_xw, dtype=np.float64),
-            _wprtp_pc_xw,
-            _asarray(_rtm_jax_xw,   dtype=np.float64),
-            _asarray(rtpthvp,      dtype=np.float64),
-            _C7_np_dg, _lhs_pr1_rtp_dg,
+        lhs_ta_xm = jnp.asarray(lhs_ta_xm, dtype=jnp.float64)
+        tmp_zt_stats = (
+            -lhs_ta_xm[1, :, :] * wpxp[:, :nzt]
+            - lhs_ta_xm[0, :, :] * wpxp[:, 1:nzt + 1]
         )
-        # wprtp_cl: clipping rate = (post_clip - pre_clip) / dt
-        _wprtp_jax_xw_np = _asarray(_wprtp_jax_xw, dtype=np.float64)
-        stats_writer.update("wprtp_cl", (_wprtp_jax_xw_np - _wprtp_pc_xw) / _dt_dg)
+        if name_xm_ta.strip():
+            stats = stats.update(name_xm_ta, tmp_zt_stats)
 
-        # wpthlp/thlm budget terms — use pre-clip wpthlp
-        _wpthlp_pc_xw = _asarray(_wpthlp_preclip_xw, dtype=np.float64)
-        _wpxp_budgets_dg(
-            "wpthlp_bp", "wpthlp_pr3", "wpthlp_ta", "wpthlp_pr1",
-            "wpthlp_tp", "wpthlp_dp1", "thlm_ta",
-            _asarray(_wpthlp_pre_xw, dtype=np.float64),
-            _wpthlp_pc_xw,
-            _asarray(_thlm_jax_xw,   dtype=np.float64),
-            _asarray(thlpthvp,      dtype=np.float64),
-            _C7_np_dg, _lhs_pr1_thl_dg,
+        k_int = slice(1, nzm - 1)
+        k_minus = slice(1 - gr.grid_dir_indx, nzm - 1 - gr.grid_dir_indx)
+        k_plus = slice(1 + gr.grid_dir_indx, nzm - 1 + gr.grid_dir_indx)
+
+        tmp_zm_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        lhs_ma_zm = jnp.asarray(lhs_ma_zm, dtype=jnp.float64)
+        tmp_zm_stats = tmp_zm_stats.at[:, 1:nzm - 1].set(
+            -lhs_ma_zm[1 + gr.grid_dir_indx, :, k_int] * wpxp[:, k_minus]
+            - lhs_ma_zm[1, :, k_int] * wpxp[:, k_int]
+            - lhs_ma_zm[1 - gr.grid_dir_indx, :, k_int] * wpxp[:, k_plus]
         )
-        _wpthlp_jax_xw_np = _asarray(_wpthlp_jax_xw, dtype=np.float64)
-        stats_writer.update("wpthlp_cl", (_wpthlp_jax_xw_np - _wpthlp_pc_xw) / _dt_dg)
+        if name_wpxp_ma.strip():
+            stats = stats.update(name_wpxp_ma, tmp_zm_stats)
 
-        # upwp/um budget terms — use pre-clip upwp
-        _upwp_pc_uv = _asarray(_upwp_preclip_uv, dtype=np.float64)
-        _wpxp_budgets_dg(
-            "upwp_bp", "upwp_pr3", "upwp_ta", "upwp_pr1",
-            "upwp_tp", "upwp_dp1", "um_ta",
-            _asarray(_upwp_pre_uv, dtype=np.float64),
-            _upwp_pc_uv,
-            _asarray(_um_jax_uv,   dtype=np.float64),
-            _upthvp_uv,
-            _C7_np_dg, _lhs_pr1_rtp_dg,
+        tmp_zm_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        lhs_ta_wpxp = jnp.asarray(lhs_ta_wpxp, dtype=jnp.float64)
+        tmp_zm_stats = tmp_zm_stats.at[:, 1:nzm - 1].set(
+            -gamma_over_implicit_ts * lhs_ta_wpxp[1 + gr.grid_dir_indx, :, k_int] * wpxp[:, k_minus]
+            - gamma_over_implicit_ts * lhs_ta_wpxp[1, :, k_int] * wpxp[:, k_int]
+            - gamma_over_implicit_ts * lhs_ta_wpxp[1 - gr.grid_dir_indx, :, k_int] * wpxp[:, k_plus]
         )
-        _upwp_jax_uv_np = _asarray(_upwp_jax_uv, dtype=np.float64)
-        stats_writer.update("upwp_cl", (_upwp_jax_uv_np - _upwp_pc_uv) / _dt_dg)
+        if name_wpxp_ta.strip():
+            stats = stats.finalize_budget(name_wpxp_ta, tmp_zm_stats)
 
-        # vpwp/vm budget terms — use pre-clip vpwp
-        _vpwp_pc_uv = _asarray(_vpwp_preclip_uv, dtype=np.float64)
-        _wpxp_budgets_dg(
-            "vpwp_bp", "vpwp_pr3", "vpwp_ta", "vpwp_pr1",
-            "vpwp_tp", "vpwp_dp1", "vm_ta",
-            _asarray(_vpwp_pre_uv, dtype=np.float64),
-            _vpwp_pc_uv,
-            _asarray(_vm_jax_uv,   dtype=np.float64),
-            _vpthvp_uv,
-            _C7_np_dg, _lhs_pr1_rtp_dg,
+        tmp_zm_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        lhs_tp = jnp.asarray(lhs_tp, dtype=jnp.float64)
+        tmp_zm_stats = tmp_zm_stats.at[:, 1:nzm - 1].set(
+            -lhs_tp[1, :, k_int] * xm[:, :nzt - 1]
+            - lhs_tp[0, :, k_int] * xm[:, 1:nzt]
         )
-        _vpwp_jax_uv_np = _asarray(_vpwp_jax_uv, dtype=np.float64)
-        stats_writer.update("vpwp_cl", (_vpwp_jax_uv_np - _vpwp_pc_uv) / _dt_dg)
+        if name_wpxp_tp.strip():
+            stats = stats.update(name_wpxp_tp, tmp_zm_stats)
 
-        # upwp_pr4/vpwp_pr4: C_uu_shr * wp2 * ddzt_um/vm (zt-level gradient)
-        # Mirrors Fortran advance_xm_wpxp_module: tmp_zm=C_uu_shr*wp2*ddzt_um
-        stats_writer.update("upwp_pr4", _C_uu_shr_uv * _wp2_uv * _ddzt_um_uv)
-        stats_writer.update("vpwp_pr4", _C_uu_shr_uv * _wp2_uv * _ddzt_vm_uv)
+        tmp_zm_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        wpxp_ac = jnp.asarray(wpxp_ac)
+        tmp_zm_stats = tmp_zm_stats.at[:, 1:nzm - 1].set(
+            -wpxp_ac[:, k_int] * wpxp[:, k_int]
+        )
+        if name_wpxp_ac.strip():
+            stats = stats.update(name_wpxp_ac, tmp_zm_stats)
 
-        # ---- MFL stats: mean_w_up/down + rtm/thlm MFL bounds ----
-        # Uses previous-timestep PDF params (w_1_zm etc.) per ARM post-advance path.
-        # Fortran: mono_flux_limiter.F90 / calc_turb_adv_range / mean_vert_vel_up_down
-        _l_mfl_rt  = getattr(flags, 'l_mono_flux_lim_rtm',  False)
-        _l_mfl_thl = getattr(flags, 'l_mono_flux_lim_thlm', False)
-        _l_mfl_spk = getattr(flags, 'l_mono_flux_lim_spikefix', True)
+        tmp_zm_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        lhs_pr1 = jnp.asarray(lhs_pr1, dtype=jnp.float64)
+        tmp_zm_stats = tmp_zm_stats.at[:, 1:nzm - 1].set(
+            -gamma_over_implicit_ts * lhs_pr1[:, k_int] * wpxp[:, k_int]
+        )
+        if name_wpxp_pr1.strip():
+            stats = stats.finalize_budget(name_wpxp_pr1, tmp_zm_stats)
 
-        if _l_mfl_rt or _l_mfl_thl:
-            _gd_mfl  = float(gr.grid_dir)
-            _idt_mfl = 1.0 / float(dt_advance)
-            _dt_mfl  = float(dt_advance)
-            _dzm_mfl = _asarray(gr.dzm, dtype=np.float64)
-            _dzt_mfl = (_asarray(gr.zm)[:, 1:] - _asarray(gr.zm)[:, :-1]) * _gd_mfl
+        tmp_zm_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        wpxp_pr2 = jnp.asarray(wpxp_pr2)
+        tmp_zm_stats = tmp_zm_stats.at[:, 1:nzm - 1].set(
+            -wpxp_pr2[:, k_int] * wpxp[:, k_int]
+        )
+        if name_wpxp_pr2.strip():
+            stats = stats.update(name_wpxp_pr2, tmp_zm_stats)
 
-            # mean_w_up/down (Fortran mean_vert_vel_up_down) + the turb-adv ranges, both
-            # via mono_flux_limiter. The per-component means are mf-weighted (as the Fortran
-            # caller / calc_turb_adv_range does); the integer ranges coincide with the
-            # field-MFL call above (same w-PDF inputs + dt), so reuse _lle_mfl/_hle_mfl.
-            _wm_mfl = _gd_mfl * _dzm_mfl * _idt_mfl
-            _vvd_mfl, _vvu_mfl = mean_vert_vel_up_down(
-                w_1_zm, w_2_zm, varnce_w_1_zm, varnce_w_2_zm, mixt_frac_zm, _wm_mfl)
-            _vvd_mfl = _asarray(_vvd_mfl, dtype=np.float64)
-            _vvu_mfl = _asarray(_vvu_mfl, dtype=np.float64)
-            stats_writer.update("mean_w_down", _vvd_mfl)
-            stats_writer.update("mean_w_up",   _vvu_mfl)
-            _ll_mfl, _hl_mfl = _lle_mfl, _hle_mfl
+        tmp_zm_stats = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        lhs_diff_zm = jnp.asarray(lhs_diff_zm, dtype=jnp.float64)
+        tmp_zm_stats = tmp_zm_stats.at[:, 1:nzm - 1].set(
+            -lhs_diff_zm[1 + gr.grid_dir_indx, :, k_int] * wpxp[:, k_minus]
+            - lhs_diff_zm[1, :, k_int] * wpxp[:, k_int]
+            - lhs_diff_zm[1 - gr.grid_dir_indx, :, k_int] * wpxp[:, k_plus]
+        )
+        if name_wpxp_dp1.strip():
+            stats = stats.update(name_wpxp_dp1, tmp_zm_stats)
 
-            _rdszt = _asarray(rho_ds_zt,       dtype=np.float64)
-            _rdszm = _asarray(rho_ds_zm,       dtype=np.float64)
-            _irdzm = _asarray(invrs_rho_ds_zm, dtype=np.float64)
+    if (
+        (l_mono_flux_lim_thlm and solve_type == xm_wpxp_thlm)
+        or (l_mono_flux_lim_rtm and solve_type == xm_wpxp_rtm)
+        or (l_mono_flux_lim_um and solve_type == xm_wpxp_um)
+        or (l_mono_flux_lim_vm and solve_type == xm_wpxp_vm)
+    ):
+        xm, wpxp, err_info, stats = monotonic_turbulent_flux_limit(
+            nzm, nzt, ngrdcol, gr, solve_type, dt,
+            xm_old, xp2, wm_zt, xm_forcing, rho_ds_zm, rho_ds_zt,
+            invrs_rho_ds_zm, invrs_rho_ds_zt, xp2_threshold, xm_tol,
+            l_implemented, low_lev_effect, high_lev_effect, tridiag_solve_method,
+            l_upwind_xm_ma, l_mono_flux_lim_spikefix, stats, xm, wpxp, err_info,
+        )
 
-            def _mfl_scalar(xm_old_np, xm_new, xm_frc_np,
-                            xp2_zm, xm_tol_v, max_xp2_v, xp2_thr,
-                            wpxp_in,
-                            nm_xe, nm_xx, nm_wta, nm_xmn, nm_xmx,
-                            nm_we, nm_wx, nm_wmn, nm_wmx,
-                            l_spk):
-                _xm_n = _asarray(xm_new,   dtype=np.float64)
-                _wp   = _asarray(wpxp_in,  dtype=np.float64)
-                # Entry stats
-                stats_writer.update(nm_xe, _xm_n)
-                stats_writer.update(nm_we, _wp)
-                # xm_without_ta = xm_old + dt * xm_forcing  (m_adv_term = 0)
-                _wta = (_asarray(xm_old_np, dtype=np.float64)
-                        + _dt_mfl * _asarray(xm_frc_np, dtype=np.float64))
-                stats_writer.update(nm_wta, _wta)
-                # Clip xp2 zm → zt
-                _xp2z = _xp.clip(
-                    _asarray(zm2zt_jax(jnp.asarray(xp2_zm), gr), dtype=np.float64),
-                    xp2_thr, max_xp2_v)
-                _mxd = _xp.maximum(2.0 * _xp.sqrt(_xp2z), xm_tol_v)
-                _mnl = _xp.maximum(_wta - _mxd, 0.0)   # positive-definite (rt, thl)
-                _mxl = _wta + _mxd
-                # Multi-level min/max over advection range
-                _mna = _xp.empty_like(_wta)
-                _mxa = _xp.empty_like(_wta)
-                for _ii in range(ngrdcol):
-                    for _kk in range(nzt):
-                        _lo = int(_ll_mfl[_ii, _kk])
-                        _hi = int(_hl_mfl[_ii, _kk])
-                        _mna = _iset(_mna, np.s_[_ii, _kk], _xp.min(_mnl[_ii, _lo:_hi+1]))
-                        _mxa = _iset(_mxa, np.s_[_ii, _kk], _xp.max(_mxl[_ii, _lo:_hi+1]))
-                stats_writer.update(nm_xmn, _mna)
-                stats_writer.update(nm_xmx, _mxa)
-                # wpxp MFL bounds (Fortran lines 672-756)
-                _thr_zt = _idt_mfl * _gd_mfl * _dzt_mfl * (_wta - _mna)
-                _mxt_zt = _rdszt * _thr_zt
-                _mnt_zt = _rdszt * _idt_mfl * _gd_mfl * _dzt_mfl * (_wta - _mxa)
-                _thr_zm = _asarray(zt2zm_jax(jnp.asarray(_thr_zt), gr), dtype=np.float64)
-                _wpmx   = np.zeros((ngrdcol, nzm))
-                _wpmn   = np.zeros((ngrdcol, nzm))
-                for _ii in range(ngrdcol):
-                    for _kk in range(1, nzm - 1):
-                        _km1 = _kk - 1   # k - grid_dir_indx (ascending)
-                        _kzt = _kk - 1   # k_zt (ascending)
-                        if (l_spk
-                                and abs(_wp[_ii, _km1]) > _thr_zm[_ii, _km1]
-                                and _wp[_ii, _km1] < 0.0):
-                            _wpmx = _iset(_wpmx, np.s_[_ii, _kk], 0.0)
-                        else:
-                            _wpmx = _iset(_wpmx, np.s_[_ii, _kk], _irdzm[_ii, _kk] * (
-                                _mxt_zt[_ii, _kzt] + _rdszm[_ii, _km1] * _wp[_ii, _km1]))
-                        _wpmn = _iset(_wpmn, np.s_[_ii, _kk], _irdzm[_ii, _kk] * (
-                            _mnt_zt[_ii, _kzt] + _rdszm[_ii, _km1] * _wp[_ii, _km1]))
-                stats_writer.update(nm_wmx, _wpmx)
-                stats_writer.update(nm_wmn, _wpmn)
-                # Exit stats (= entry for ARM; MFL rarely adjusts)
-                stats_writer.update(nm_xx, _xm_n)
-                stats_writer.update(nm_wx, _wp)
+    if solve_type == xm_wpxp_rtm and l_pos_def:
+        xm_pd = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        wpxp_pd = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        l_do_pos_def = jnp.any(xm < zero) & ~jnp.any(xm_old < zero)
 
-            if _l_mfl_rt:
-                _mfl_scalar(
-                    _rtm_pre_xw, _rtm_jax_xw, rtm_forcing,
-                    rtp2, 1e-4, 5e-6, float(rt_tol**2),
-                    _wprtp_preclip_xw,
-                    "rtm_enter_mfl", "rtm_exit_mfl", "rtm_without_ta",
-                    "rtm_mfl_min", "rtm_mfl_max",
-                    "wprtp_enter_mfl", "wprtp_exit_mfl",
-                    "wprtp_mfl_min", "wprtp_mfl_max",
-                    _l_mfl_spk,
-                )
-            if _l_mfl_thl:
-                _mfl_scalar(
-                    _thlm_pre_xw, _thlm_jax_xw, thlm_forcing,
-                    thlp2, 0.2, 5.0, float(thl_tol**2),
-                    _wpthlp_preclip_xw,
-                    "thlm_enter_mfl", "thlm_exit_mfl", "thlm_without_ta",
-                    "thlm_mfl_min", "thlm_mfl_max",
-                    "wpthlp_enter_mfl", "wpthlp_exit_mfl",
-                    "wpthlp_mfl_min", "wpthlp_mfl_max",
-                    False,
-                )
-    return dict(wprtp=wprtp, rtm=rtm, wpthlp=wpthlp, thlm=thlm,
-                upwp=upwp, um=um, vpwp=vpwp, vm=vm, rcm=rcm)
+        def pos_definite_branch(fields):
+            xm_in, wpxp_in = fields
+            return pos_definite_adj(
+                nzm, nzt, ngrdcol, gr, dt, xm_in, wpxp_in, xm_old,
+            )
+
+        def no_pos_definite_branch(fields):
+            xm_in, wpxp_in = fields
+            return xm_in, wpxp_in, xm_pd, wpxp_pd
+
+        xm, wpxp, xm_pd, wpxp_pd = jax.lax.cond(
+            l_do_pos_def,
+            pos_definite_branch,
+            no_pos_definite_branch,
+            (xm, wpxp),
+        )
+
+        if l_sample:
+            if name_wpxp_pd.strip():
+                stats = stats.update(name_wpxp_pd, wpxp_pd)
+            if name_xm_pd.strip():
+                stats = stats.update(name_xm_pd, xm_pd)
+
+    if l_sample and name_xm_cl.strip():
+        stats = stats.begin_budget(name_xm_cl, xm / dt)
+
+    if fill_holes_type != 0 and solve_type not in (xm_wpxp_um, xm_wpxp_vm):
+        xm = fill_holes_vertical(
+            nzt, ngrdcol, xm_threshold,
+            gr.k_lb_zt, gr.k_ub_zt,
+            gr.dzt, rho_ds_zt, gr.grid_dir_indx,
+            fill_holes_type, xm,
+        )
+
+    if l_sample and name_xm_cl.strip():
+        stats = stats.finalize_budget(name_xm_cl, xm / dt)
+
+    if l_enable_relaxed_clipping:
+        if solve_type == xm_wpxp_thlm:
+            xp2_relaxed = jnp.maximum(0.01, jnp.asarray(xp2))
+        else:
+            xp2_relaxed = jnp.maximum(1.0e-7, jnp.asarray(xp2))
+    else:
+        xp2_relaxed = jnp.asarray(xp2, dtype=jnp.float64)
+
+    if solve_type == xm_wpxp_rtm:
+        solve_type_cl = clip_wprtp
+        wpxp_cl_max = wprtp_cl_max
+        clip_name = "wprtp_cl"
+    elif solve_type == xm_wpxp_thlm:
+        solve_type_cl = clip_wpthlp
+        wpxp_cl_max = wpthlp_cl_max
+        clip_name = "wpthlp_cl"
+    elif solve_type == xm_wpxp_um:
+        solve_type_cl = clip_upwp
+        wpxp_cl_max = upwp_cl_max
+        clip_name = "upwp_cl"
+    elif solve_type == xm_wpxp_vm:
+        solve_type_cl = clip_vpwp
+        wpxp_cl_max = vpwp_cl_max
+        clip_name = "vpwp_cl"
+    else:
+        solve_type_cl = clip_wpsclrp
+        wpxp_cl_max = 0
+        clip_name = ""
+
+    if wpxp_cl_num is not None and l_sample and clip_name.strip():
+        if wpxp_cl_num == 0:
+            stats = stats.begin_budget(clip_name, wpxp / dt)
+        else:
+            stats = stats.update_budget(clip_name, -wpxp / dt)
+
+    if solve_type not in (xm_wpxp_um, xm_wpxp_vm):
+        if wpxp_cl_num is not None:
+            wpxp_cl_num += 1
+        wpxp, wpxp_chnge = clip_covar(
+            nzm, ngrdcol, solve_type_cl, wp2, xp2_relaxed, wpxp,
+        )
+        if wpxp_cl_num is not None and l_sample and clip_name.strip():
+            if wpxp_cl_num == wpxp_cl_max:
+                stats = stats.finalize_budget(clip_name, wpxp / dt)
+            else:
+                stats = stats.update_budget(clip_name, wpxp / dt)
+    else:
+        if wpxp_cl_num is not None:
+            wpxp_cl_num += 1
+        denom = xp2 if l_tke_aniso else wp2
+        wpxp, wpxp_chnge = clip_covar(
+            nzm, ngrdcol, solve_type_cl, wp2, denom, wpxp,
+        )
+        if wpxp_cl_num is not None and l_sample and clip_name.strip():
+            if wpxp_cl_num == wpxp_cl_max:
+                stats = stats.finalize_budget(clip_name, wpxp / dt)
+            else:
+                stats = stats.update_budget(clip_name, wpxp / dt)
+
+    if l_clip_turb_adv:
+        xm, stats = xm_correction_wpxp_cl(
+            nzm, nzt, ngrdcol, solve_type, dt, wpxp_chnge,
+            gr.invrs_dzt, stats, xm,
+        )
+
+    return xm, wpxp, err_info, wpxp_cl_num, stats
+
+
+def xm_term_ta_lhs(nzm, nzt, ngrdcol, gr, rho_ds_zm, invrs_rho_ds_zt):
+    """Turbulent advection of xm: implicit portion of the code."""
+    lhs_ta_xm = jnp.zeros((ndiags2, ngrdcol, nzt), dtype=jnp.float64)
+    lhs_ta_xm = lhs_ta_xm.at[0, :, :].set(
+        jnp.asarray(invrs_rho_ds_zt) * jnp.asarray(gr.invrs_dzt) * jnp.asarray(rho_ds_zm[:, 1:nzm])
+    )
+    lhs_ta_xm = lhs_ta_xm.at[1, :, :].set(
+        -jnp.asarray(invrs_rho_ds_zt) * jnp.asarray(gr.invrs_dzt) * jnp.asarray(rho_ds_zm[:, :nzt])
+    )
+    return lhs_ta_xm
+
+
+def wpxp_term_tp_lhs(nzm, ngrdcol, gr, wp2):
+    """Turbulent production of w'x': implicit portion of the code."""
+    lhs_tp = jnp.zeros((ndiags2, ngrdcol, nzm), dtype=jnp.float64)
+    lhs_tp = lhs_tp.at[0, :, 1:nzm - 1].set(
+        jnp.asarray(wp2[:, 1:nzm - 1]) * jnp.asarray(gr.invrs_dzm[:, 1:nzm - 1])
+    )
+    lhs_tp = lhs_tp.at[1, :, 1:nzm - 1].set(
+        -jnp.asarray(wp2[:, 1:nzm - 1]) * jnp.asarray(gr.invrs_dzm[:, 1:nzm - 1])
+    )
+    return lhs_tp
+
+
+def wpxp_terms_ac_pr2_lhs(nzm, nzt, ngrdcol, gr, C7_Skw_fnc, wm_zt, invrs_dzm):
+    """Accumulation of w'x' and w'x' pressure term 2."""
+    lhs_ac_pr2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    lhs_ac_pr2 = lhs_ac_pr2.at[:, 1:nzm - 1].set(
+        (one - jnp.asarray(C7_Skw_fnc[:, 1:nzm - 1]))
+        * jnp.asarray(invrs_dzm[:, 1:nzm - 1])
+        * (jnp.asarray(wm_zt[:, 1:nzt]) - jnp.asarray(wm_zt[:, :nzt - 1]))
+    )
+    return lhs_ac_pr2
+
+
+def wpxp_term_pr1_lhs(
+    nzm, ngrdcol, gr, C6rt_Skw_fnc,
+    C6thl_Skw_fnc, C7_Skw_fnc,
+    invrs_tau_C6_zm, l_scalar_calc,
+):
+    """Pressure term 1 for w'x': implicit portion of the code."""
+    lhs_pr1_wprtp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    lhs_pr1_wpthlp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    lhs_pr1_wpsclrp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+
+    lhs_pr1_wprtp = lhs_pr1_wprtp.at[:, 1:nzm - 1].set(
+        jnp.asarray(C6rt_Skw_fnc[:, 1:nzm - 1]) * jnp.asarray(invrs_tau_C6_zm[:, 1:nzm - 1])
+    )
+    lhs_pr1_wpthlp = lhs_pr1_wpthlp.at[:, 1:nzm - 1].set(
+        jnp.asarray(C6thl_Skw_fnc[:, 1:nzm - 1]) * jnp.asarray(invrs_tau_C6_zm[:, 1:nzm - 1])
+    )
+
+    if l_scalar_calc:
+        lhs_pr1_wpsclrp = lhs_pr1_wpsclrp.at[:, 1:nzm - 1].set(
+            jnp.asarray(C7_Skw_fnc[:, 1:nzm - 1]) * jnp.asarray(invrs_tau_C6_zm[:, 1:nzm - 1])
+        )
+
+    return lhs_pr1_wprtp, lhs_pr1_wpthlp, lhs_pr1_wpsclrp
+
+
+def wpxp_terms_bp_pr3_rhs(nzm, ngrdcol, gr, C7_Skw_fnc, thv_ds_zm, xpthvp):
+    """Buoyancy production of w'x' and w'x' pressure term 3."""
+    rhs_bp_pr3 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    rhs_bp_pr3 = rhs_bp_pr3.at[:, 1:nzm - 1].set(
+        (grav / jnp.asarray(thv_ds_zm[:, 1:nzm - 1]))
+        * (one - jnp.asarray(C7_Skw_fnc[:, 1:nzm - 1]))
+        * jnp.asarray(xpthvp[:, 1:nzm - 1])
+    )
+    return rhs_bp_pr3
+
+
+def xm_correction_wpxp_cl(
+    nzm, nzt, ngrdcol, solve_type, dt,
+    wpxp_chnge, invrs_dzt,
+    stats,
+    xm,
+):
+    """Correct xm after w'x' clipping changes turbulent advection."""
+    l_sample = stats.l_sample
+    wpxp_chnge = jnp.asarray(wpxp_chnge)
+    xm = jnp.asarray(xm, dtype=jnp.float64)
+    l_clipping_needed = jnp.any(jnp.abs(wpxp_chnge) > eps, axis=1)
+
+    if solve_type == xm_wpxp_rtm:
+        name_xm_tacl = "rtm_tacl"
+    elif solve_type == xm_wpxp_thlm:
+        name_xm_tacl = "thlm_tacl"
+    else:
+        name_xm_tacl = ""
+
+    invrs_dzt = jnp.asarray(invrs_dzt)
+    xm_tndcy_wpxp_cl = -invrs_dzt * (wpxp_chnge[:, 1:] - wpxp_chnge[:, :-1])
+    xm_tndcy_wpxp_cl = jnp.where(l_clipping_needed[:, None], xm_tndcy_wpxp_cl, zero)
+    xm = jnp.where(l_clipping_needed[:, None], xm + xm_tndcy_wpxp_cl * dt, xm)
+
+    if l_sample and name_xm_tacl.strip():
+        stats = stats.update(name_xm_tacl, xm_tndcy_wpxp_cl)
+
+    return xm, stats
+
+
+def damp_coefficient(
+    nzm, ngrdcol, gr, coefficient, Cx_Skw_fnc,
+    max_coeff_value, altitude_threshold,
+    threshold, Lscale_zm,
+):
+    """Damp a coefficient linearly based on Lscale above an altitude threshold."""
+    coefficient = jnp.asarray(coefficient)
+    max_coeff_value = jnp.asarray(max_coeff_value)
+    altitude_threshold = jnp.asarray(altitude_threshold)
+    threshold = jnp.asarray(threshold)
+    Cx_Skw_fnc = jnp.asarray(Cx_Skw_fnc)
+    Lscale_zm = jnp.asarray(Lscale_zm)
+
+    mask = (Lscale_zm < threshold[:, None]) & (jnp.asarray(gr.zm) > altitude_threshold[:, None])
+    threshold_safe = jnp.where(jnp.abs(threshold) > zero, threshold, one)
+    damped = (
+        max_coeff_value[:, None]
+        + ((coefficient - max_coeff_value) / threshold_safe)[:, None] * Lscale_zm
+    )
+    return jnp.where(mask, damped, Cx_Skw_fnc)
+
+
+def diagnose_upxp(
+    nzm, nzt, ngrdcol, gr, ypwp, xm, wpxp, ym,
+    C6x_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
+):
+    """Diagnose turbulent horizontal flux of a conserved scalar."""
+    ddzt_xm = ddzt(nzm, nzt, ngrdcol, gr, xm)
+    ddzt_ym = ddzt(nzm, nzt, ngrdcol, gr, ym)
+    ypxp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    ypxp_interior = (
+        (jnp.asarray(tau_C6_zm)[:, 1:nzm - 1] / jnp.asarray(C6x_Skw_fnc)[:, 1:nzm - 1])
+        * (
+            -jnp.asarray(ypwp)[:, 1:nzm - 1] * ddzt_xm[:, 1:nzm - 1]
+            - (one - jnp.asarray(C7_Skw_fnc)[:, 1:nzm - 1])
+            * (jnp.asarray(wpxp)[:, 1:nzm - 1] * ddzt_ym[:, 1:nzm - 1])
+        )
+    )
+    ypxp = ypxp.at[:, 1:nzm - 1].set(ypxp_interior)
+    ypxp = ypxp.at[:, gr.k_lb_zm].set(zero)
+    ypxp = ypxp.at[:, gr.k_ub_zm].set(zero)
+    return ypxp
+
+
+def error_prints_xm_wpxp(*args, **kwargs):
+    """Print a concise diagnostic for fatal errors in advance_xm_wpxp."""
+    del args, kwargs
+    print("Error in advance_xm_wpxp")
+
+
+# JAX adaptation: this target-only helper compresses repeated multiple-LHS solve
+# blocks. Keep it small and limited to the repeated Fortran call pattern; expand
+# it back into explicit call sites if it starts hiding field-specific behavior.
+def _solve_one_xm_wpxp(
+    nzm, nzt, ngrdcol, gr, solve_type, dt, l_iter, wm_zt, wp2, xp2,
+    xm_forcing, wpxp_forcing, C7_Skw_fnc, xpthvp, rhs_ta,
+    thv_ds_zm, rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm, invrs_rho_ds_zt,
+    xp2_threshold, xm_threshold, xm_tol, low_lev_effect, high_lev_effect,
+    lhs_diff_zm, lhs_diff_zt, lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+    lhs_tp, lhs_ta_xm, lhs_ac_pr2, lhs_pr1, l_implemented,
+    penta_solve_method, tridiag_solve_method, fill_holes_type,
+    l_diffuse_rtm_and_thlm, l_upwind_xm_ma, l_tke_aniso,
+    l_enable_relaxed_clipping, l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+    l_mono_flux_lim_um, l_mono_flux_lim_vm, l_mono_flux_lim_spikefix,
+    stats, xm, wpxp, err_info, wpxp_cl_num=None,
+):
+    l_sample = stats.l_sample
+    lhs = xm_wpxp_lhs(
+        nzm, nzt, ngrdcol, l_iter, dt,
+        l_implemented, lhs_diff_zm, lhs_diff_zt,
+        lhs_ma_zm, lhs_ma_zt, lhs_ta_wpxp, lhs_ta_xm,
+        lhs_tp, lhs_pr1, lhs_ac_pr2,
+        l_diffuse_rtm_and_thlm,
+    )
+    rhs_2d, stats = xm_wpxp_rhs(
+        nzm, nzt, ngrdcol, gr, solve_type, l_iter, dt,
+        xm, wpxp, xm_forcing, wpxp_forcing, C7_Skw_fnc,
+        xpthvp, rhs_ta, thv_ds_zm, lhs_pr1, lhs_ta_wpxp,
+        stats,
+    )
+    rhs = rhs_2d[:, :, None]
+    old_solution = jnp.zeros((ngrdcol, 2 * nzm - 1, 1), dtype=jnp.float64)
+    if penta_solve_method == penta_bicgstab:
+        old_solution = old_solution.at[:, 1:2 * (nzm - 1) + 1:2, 0].set(
+            jnp.asarray(xm)
+        )
+        old_solution = old_solution.at[:, 0:2 * nzm - 1:2, 0].set(
+            jnp.asarray(wpxp)
+        )
+
+    if solve_type == xm_wpxp_rtm:
+        cond_name = "rtm_matrix_condt_num"
+    elif solve_type == xm_wpxp_thlm:
+        cond_name = "thlm_matrix_condt_num"
+    else:
+        cond_name = ""
+
+    solution, rcond, err_info = xm_wpxp_solve(
+        nzm, ngrdcol, 1, gr, penta_solve_method, l_implemented,
+        old_solution, lhs, rhs, err_info,
+        use_rcond=bool(
+            l_sample
+            and cond_name.strip()
+            and stats.var_on_stats_list(cond_name)
+        ),
+    )
+
+    return xm_wpxp_clipping_and_stats(
+        nzm, nzt, ngrdcol, gr, solve_type, dt, wp2, xp2, wm_zt,
+        xm_forcing, rho_ds_zm, rho_ds_zt,
+        invrs_rho_ds_zm, invrs_rho_ds_zt,
+        xp2_threshold, xm_threshold, rcond,
+        low_lev_effect, high_lev_effect,
+        lhs_ma_zt, lhs_ma_zm, lhs_ta_wpxp,
+        lhs_diff_zm, C7_Skw_fnc,
+        lhs_tp, lhs_ta_xm, lhs_pr1,
+        l_implemented, solution[:, :, 0],
+        tridiag_solve_method, fill_holes_type,
+        l_upwind_xm_ma, l_tke_aniso, l_enable_relaxed_clipping,
+        l_mono_flux_lim_thlm, l_mono_flux_lim_rtm,
+        l_mono_flux_lim_um, l_mono_flux_lim_vm,
+        l_mono_flux_lim_spikefix,
+        stats,
+        xm, xm_tol, wpxp, err_info,
+        wpxp_cl_num=wpxp_cl_num,
+    )

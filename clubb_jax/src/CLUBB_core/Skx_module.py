@@ -1,66 +1,129 @@
-"""JAX port of Skx_module.F90 — skewness-of-x diagnostics.
+"""JAX port of `src/CLUBB_core/Skx_module.F90`.
 
-Mirrors clubb_release/src/CLUBB_core/Skx_module.F90:
-  Skx_func             — skewness of x with the sensitivity-reduction denominator
-  compute_gamma_Skw    — the tunable gamma(Skw) Gaussian function
-  LG_2005_ansatz       — Larson & Golaz (2005) skewness ansatz (eqs. 11, 16, 33)
-  xp3_LG_2005_ansatz   — <x'^3> from the LG05 skewness ansatz (inverse of Skx_func)
-
-advance_xp3_module.py imports `Skx_func`/`xp3_LG_2005_ansatz` from here, exactly as the Fortran
-advance_xp3_module `use`s Skx_module. Pure-jnp → differentiable.
+Description:
+  Skewness diagnostics and Larson-Golaz (2005) ansatz helpers.
 """
+
+from __future__ import annotations
+
+from functools import partial
+
+import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.constants_clubb import iSkw_denom_coef, igamma_coef, igamma_coefb, igamma_coefc, eps, w_tol_sqd
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    eps,
+    iSkw_denom_coef,
+    ibeta,
+    igamma_coef,
+    igamma_coefb,
+    igamma_coefc,
+    one,
+    one_half,
+    w_tol_sqd,
+)
 
 
-def Skx_func(xp2, xp3, x_tol, clubb_params):
-    """Compute skewness of x with sensitivity-reduction formula (Skx_module.F90:Skx_func).
+@partial(jax.jit, static_argnames=("nz", "ngrdcol"))
+def Skx_func(nz: int, ngrdcol: int, xp2, xp3, x_tol: float, clubb_params):
+    """Calculate the skewness of x.
 
-    Skx = xp3 * (xp2 + denom_tol)^(-3/2)
-    where denom_tol = iSkw_denom_coef * x_tol^2
+    Calculation of skewness to help reduce the sensitivity of this value to
+    small values of xp2.
     """
-    denom_tol = clubb_params[:, iSkw_denom_coef - 1:iSkw_denom_coef] * x_tol ** 2
-    return xp3 * (xp2 + denom_tol) ** (-1.5)
+    del nz, ngrdcol
+    Skx_denom_tol = jnp.asarray(clubb_params)[:, iSkw_denom_coef, None] * x_tol ** 2
+    return jnp.asarray(xp3) * jnp.sqrt(jnp.asarray(xp2) + Skx_denom_tol) ** (-3)
 
 
-def compute_gamma_Skw(Skw, clubb_params, l_gamma_Skw):
-    """Gamma coefficient as a Gaussian function of w skewness (Skx_module.F90:compute_gamma_Skw).
-
-    When l_gamma_Skw and the two coefficients differ meaningfully
-    (|γ_coef − γ_coefb| > |γ_coef + γ_coefb|·eps/2):
-        gamma = γ_coefb + (γ_coef − γ_coefb)·exp(−½ (Skw/γ_coefc)²),
-    otherwise (degenerate coefficients, or l_gamma_Skw off) gamma = γ_coef (constant). The branch depends only
-    on the per-column tunable parameters, not on Skw. Skw is (ngrdcol, nz) — pass Skw_zm or Skw_zt. Pure-jnp →
-    differentiable. Returns gamma_Skw_fnc with Skw's shape."""
+@partial(jax.jit, static_argnames=("nz", "ngrdcol", "l_gamma_Skw"))
+def compute_gamma_Skw(nz: int, ngrdcol: int, Skw, clubb_params, l_gamma_Skw: bool):
+    """Compute gamma as a function of Skw on a single vertical grid."""
+    del nz, ngrdcol
     Skw = jnp.asarray(Skw, dtype=jnp.float64)
-    cp = jnp.asarray(clubb_params, dtype=jnp.float64)
-    gc = cp[:, igamma_coef - 1:igamma_coef]      # (ngrdcol, 1)
-    gb = cp[:, igamma_coefb - 1:igamma_coefb]
-    gcf = cp[:, igamma_coefc - 1:igamma_coefc]
-    if not l_gamma_Skw:
-        return gc + jnp.zeros_like(Skw)               # broadcast (ngrdcol,1) over (ngrdcol,nz)
-    cond = jnp.abs(gc - gb) > jnp.abs(gc + gb) * eps / 2.0
-    varying = gb + (gc - gb) * jnp.exp(-0.5 * (Skw / gcf) ** 2)
-    return jnp.where(cond, varying, gc + jnp.zeros_like(Skw))
+    clubb_params = jnp.asarray(clubb_params, dtype=jnp.float64)
+    gamma_coef = clubb_params[:, igamma_coef, None]
+    gamma_coefb = clubb_params[:, igamma_coefb, None]
+    gamma_coefc = clubb_params[:, igamma_coefc, None]
+
+    if l_gamma_Skw:
+        varying = gamma_coefb + (gamma_coef - gamma_coefb) * jnp.exp(
+            -one_half * (Skw / gamma_coefc) ** 2
+        )
+        l_varying = (
+            jnp.abs(gamma_coef - gamma_coefb)
+            > jnp.abs(gamma_coef + gamma_coefb) * eps / 2.0
+        )
+        gamma_Skw_fnc = jnp.where(l_varying, varying, gamma_coef)
+    else:
+        gamma_Skw_fnc = gamma_coef + jnp.zeros_like(Skw)
+
+    return gamma_Skw_fnc
 
 
-def xp3_LG_2005_ansatz(Skw_zt, wpxp_zt, wp2_zt, xp2_zt, sigma_sqd_w_zt,
-                        beta, clubb_params, x_tol):
-    """Compute <x'^3> via LG05 ansatz (Skx_module.F90:xp3_LG_2005_ansatz)."""
-    Skx_denom_tol = clubb_params[:, iSkw_denom_coef - 1:iSkw_denom_coef] * x_tol ** 2
-    Skx_zt = LG_2005_ansatz(Skw_zt, wpxp_zt, wp2_zt, xp2_zt, sigma_sqd_w_zt, beta, x_tol)
-    # Reverse of Skx_func: xp3 = Skx * (xp2 + denom_tol)^(3/2)
-    xp3 = Skx_zt * (xp2_zt + Skx_denom_tol) * jnp.sqrt(xp2_zt + Skx_denom_tol)
-    return xp3
+@partial(jax.jit, static_argnames=("nz", "ngrdcol"))
+def LG_2005_ansatz(
+    nz: int,
+    ngrdcol: int,
+    Skw,
+    wpxp,
+    wp2,
+    xp2,
+    beta,
+    sigma_sqd_w,
+    x_tol: float,
+):
+    """Calculate the skewness of x using the diagnostic ansatz of Larson and Golaz (2005)."""
+    del nz, ngrdcol
+    Skw = jnp.asarray(Skw, dtype=jnp.float64)
+    wpxp = jnp.asarray(wpxp, dtype=jnp.float64)
+    wp2 = jnp.asarray(wp2, dtype=jnp.float64)
+    xp2 = jnp.asarray(xp2, dtype=jnp.float64)
+    beta = jnp.asarray(beta, dtype=jnp.float64)
+    sigma_sqd_w = jnp.asarray(sigma_sqd_w, dtype=jnp.float64)
 
-
-def LG_2005_ansatz(Skw, wpxp, wp2, xp2, sigma_sqd_w, beta, x_tol):
-    """LG 2005 eqs. 11, 16, 33 (Skx_module.F90:LG_2005_ansatz) — skewness of x from skewness of w."""
-    one_minus_ssw = 1.0 - sigma_sqd_w
+    one_minus_sigma_sqd_w = one - sigma_sqd_w
     nrmlzd_corr_wx = wpxp / jnp.sqrt(
-        jnp.maximum(wp2, w_tol_sqd) * jnp.maximum(xp2, x_tol ** 2) * one_minus_ssw
+        jnp.maximum(wp2, w_tol_sqd)
+        * jnp.maximum(xp2, x_tol ** 2)
+        * one_minus_sigma_sqd_w
     )
-    nrmlzd_Skw = Skw / (one_minus_ssw * jnp.sqrt(one_minus_ssw))
-    Skx = nrmlzd_Skw * nrmlzd_corr_wx * (beta + (1.0 - beta) * nrmlzd_corr_wx ** 2)
-    return Skx
+    nrmlzd_Skw = Skw / (one_minus_sigma_sqd_w * jnp.sqrt(one_minus_sigma_sqd_w))
+    return nrmlzd_Skw * nrmlzd_corr_wx * (
+        beta[:, None] + (one - beta[:, None]) * nrmlzd_corr_wx ** 2
+    )
+
+
+@partial(jax.jit, static_argnames=("nzt", "ngrdcol"))
+def xp3_LG_2005_ansatz(
+    nzt: int,
+    ngrdcol: int,
+    Skw_zt,
+    wpxp_zt,
+    wp2_zt,
+    xp2_zt,
+    sigma_sqd_w_zt,
+    clubb_params,
+    x_tol: float,
+):
+    """Compute <x'^3> from the LG05 ansatz skewness closure."""
+    del ngrdcol
+    clubb_params = jnp.asarray(clubb_params, dtype=jnp.float64)
+    Skx_denom_tol = clubb_params[:, iSkw_denom_coef, None] * x_tol ** 2
+    beta = clubb_params[:, ibeta]
+    Skx_zt = LG_2005_ansatz(
+        nzt,
+        clubb_params.shape[0],
+        Skw_zt,
+        wpxp_zt,
+        wp2_zt,
+        xp2_zt,
+        beta,
+        sigma_sqd_w_zt,
+        x_tol,
+    )
+    return Skx_zt * (jnp.asarray(xp2_zt) + Skx_denom_tol) * jnp.sqrt(
+        jnp.asarray(xp2_zt) + Skx_denom_tol
+    )

@@ -8,26 +8,38 @@ mixture fraction); rt, thl, u, v, and passive scalars are *responders*. This mod
   * calc_responder_driver  — clips a responder's skewness Skx to the representable [min_Skx, max_Skx] range,
                              then builds its component params via calculate_responder_params.
   * new_hybrid_pdf_driver  — the full orchestration returning all w/rt/thl/u/v/sclr PDF component params,
-                             the clipped responder skewnesses, the mixture fraction, and sigma_sqd_w = 1 - F_w.
+                             the clipped responder skewnesses, the mixture fraction, sigma_sqd_w = 1 - F_w,
+                             and the implicit_coefs_terms turbulent-advection coefficients.
 
 The leaf component-parameter routines (calculate_w_params / calculate_responder_params / calculate_mixture_
-fraction) live in new_pdf.py. This module is an alternative closure — not used by the gated ADG1 config — so it
-is a completeness port, validated end-to-end against f2py_new_hybrid_pdf_driver (the 31 exposed PDF-param /
-skewness / mixt_frac / sigma_sqd_w outputs; the implicit_coefs_terms derived type is not f2py-exposed and is
-not needed by those outputs, so it is omitted). Pure-jnp, nan-safe sqrt and guarded denominators → differentiable.
+fraction) live in new_pdf.py. The coefficient-packing block mirrors new_hybrid_pdf_main.F90 and stores the
+Fortran implicit_coefs_terms fields needed by the downstream turbulent-advection solvers. Pure-jnp, nan-safe
+sqrt and guarded denominators → differentiable.
 
 Reference: clubb_release/src/CLUBB_core/new_hybrid_pdf_main.F90
 """
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.new_pdf import _ssqrt
 from clubb_jax.src.CLUBB_core.new_hybrid_pdf import (
-    calculate_w_params, calculate_responder_params)
+    calculate_w_params,
+    calculate_responder_params,
+    calculate_coef_wp4_implicit,
+    calc_coef_wp2xp_implicit,
+    calc_coefs_wpxp2_semiimpl,
+    calc_coefs_wpxpyp_semiimpl,
+)
 
 # new_hybrid_pdf_main.F90 `use constants_clubb, only: max_mag_correlation_flux` (line 903)
-from clubb_jax.src.CLUBB_core.constants_clubb import max_mag_correlation_flux as _MAX_MAG_CORRELATION_FLUX
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    max_mag_correlation_flux as _MAX_MAG_CORRELATION_FLUX,
+    l_explicit_turbulent_adv_wp3,
+    l_explicit_turbulent_adv_wpxp,
+    l_explicit_turbulent_adv_xpyp,
+)
 # (the calc_F_w_zeta_w lambda=0.5 constant was removed iter 609 — the JAX uses the ADG1-like gamma form, not the
 #  lambda form, so it was never referenced; cf. the lambda form new_pdf_main.py uses via its own _LAMBDA_W.)
 
@@ -125,15 +137,15 @@ def calc_responder_driver(xm, xp2, wpxp, wp2, mixt_frac, F_w, Skx):
 def new_hybrid_pdf_driver(wm, rtm, thlm, um, vm, wp2, rtp2, thlp2, up2, vp2,
                           Skw, wprtp, wpthlp, upwp, vpwp,
                           gamma_Skw_fnc, slope_coef_spread_DG_means_w, pdf_component_stdev_factor_w,
-                          Skrt, Skthl, Sku, Skv,
+                          Skrt, Skthl, Sku, Skv, pdf_implicit_coefs_terms,
                           sclrm=None, sclrp2=None, wpsclrp=None, Sksclr=None):
     """new_hybrid_pdf_main.F90:new_hybrid_pdf_driver — full new-hybrid PDF-parameter driver.
 
-    w is the setter; rt/thl/u/v/sclr are responders. Returns the dict of all f2py-exposed outputs:
-    clipped responder skewnesses (Skrt/Skthl/Sku/Skv[/Sksclr]), component means mu_{w,rt,thl,u,v}_{1,2}
-    [+sclr], component variances sigma_{...}_{1,2}_sqd, mixt_frac, and sigma_sqd_w = 1 − F_w. The implicit-
-    coefs terms (turbulent-advection closure) are not f2py-exposed and are omitted. Scalar args are optional
-    (ngrdcol,nz,sclr_dim) arrays; when omitted sclr handling is skipped (max_corr_w_sclr_sqd = 0).
+    w is the setter; rt/thl/u/v/sclr are responders. Returns the dict of component means
+    mu_{w,rt,thl,u,v}_{1,2} [+sclr], component variances sigma_{...}_{1,2}_sqd, mixt_frac,
+    sigma_sqd_w = 1 − F_w, clipped responder skewnesses, and the packed implicit-coefs
+    terms. Scalar args are optional (ngrdcol,nz,sclr_dim) arrays; when omitted sclr handling
+    is skipped (max_corr_w_sclr_sqd = 0).
     Pure-jnp → differentiable. All inputs (ngrdcol,nz) except slope/stdev-factor which are (ngrdcol,) or scalar."""
     wp2 = jnp.asarray(wp2, dtype=jnp.float64)
     slope = jnp.asarray(slope_coef_spread_DG_means_w, dtype=jnp.float64)
@@ -157,7 +169,8 @@ def new_hybrid_pdf_driver(wm, rtm, thlm, um, vm, wp2, rtp2, thlp2, up2, vp2,
         Skw, wprtp, wpthlp, upwp, vpwp, wp2, rtp2, thlp2, up2, vp2,
         gamma_Skw_fnc, slope, pstdev, max_corr_w_sclr_sqd)
 
-    mu_w_1, mu_w_2, sigma_w_1, sigma_w_2, mixt_frac, _cw1, _cw2 = calculate_w_params(
+    (mu_w_1, mu_w_2, sigma_w_1, sigma_w_2, mixt_frac,
+     coef_sigma_w_1_sqd, coef_sigma_w_2_sqd) = calculate_w_params(
         wm, wp2, Skw, F_w, zeta_w)
 
     out = dict(mu_w_1=mu_w_1, mu_w_2=mu_w_2,
@@ -166,23 +179,169 @@ def new_hybrid_pdf_driver(wm, rtm, thlm, um, vm, wp2, rtp2, thlp2, up2, vp2,
 
     responders = (('rt', rtm, rtp2, wprtp, Skrt), ('thl', thlm, thlp2, wpthlp, Skthl),
                   ('u', um, up2, upwp, Sku), ('v', vm, vp2, vpwp, Skv))
+    coef_sigma_1_sqd = {}
+    coef_sigma_2_sqd = {}
     for name, xm, xp2, wpxp, Skx in responders:
-        Skx_c, mu1, mu2, s1, s2, _c1, _c2 = calc_responder_driver(xm, xp2, wpxp, wp2, mixt_frac, F_w, Skx)
+        Skx_c, mu1, mu2, s1, s2, c1, c2 = calc_responder_driver(
+            xm, xp2, wpxp, wp2, mixt_frac, F_w, Skx)
         out[f'Sk{name}'] = Skx_c
         out[f'mu_{name}_1'] = mu1; out[f'mu_{name}_2'] = mu2
         out[f'sigma_{name}_1_sqd'] = s1; out[f'sigma_{name}_2_sqd'] = s2
+        coef_sigma_1_sqd[name] = c1
+        coef_sigma_2_sqd[name] = c2
 
+    zero = jnp.zeros_like(wp2)
     if sclrm is not None and jnp.asarray(sclrm).shape[-1] > 0:
         sclrm_a = jnp.asarray(sclrm, dtype=jnp.float64)
         Sksclr_a = jnp.asarray(Sksclr, dtype=jnp.float64)
-        nd = sclrm_a.shape[-1]
-        sk_l, mu1_l, mu2_l, s1_l, s2_l = [], [], [], [], []
-        for j in range(nd):
-            Skx_c, mu1, mu2, s1, s2, _c1, _c2 = calc_responder_driver(
-                sclrm_a[..., j], sclrp2_a[..., j], wpsclrp_a[..., j], wp2, mixt_frac, F_w, Sksclr_a[..., j])
-            sk_l.append(Skx_c); mu1_l.append(mu1); mu2_l.append(mu2); s1_l.append(s1); s2_l.append(s2)
-        out['Sksclr'] = jnp.stack(sk_l, axis=-1)
-        out['mu_sclr_1'] = jnp.stack(mu1_l, axis=-1); out['mu_sclr_2'] = jnp.stack(mu2_l, axis=-1)
-        out['sigma_sclr_1_sqd'] = jnp.stack(s1_l, axis=-1); out['sigma_sclr_2_sqd'] = jnp.stack(s2_l, axis=-1)
+        (
+            out['Sksclr'],
+            out['mu_sclr_1'],
+            out['mu_sclr_2'],
+            out['sigma_sclr_1_sqd'],
+            out['sigma_sclr_2_sqd'],
+            coef_sigma_sclr_1_sqd,
+            coef_sigma_sclr_2_sqd,
+        ) = jax.vmap(
+            lambda sclrm_s, sclrp2_s, wpsclrp_s, Sksclr_s: calc_responder_driver(
+                sclrm_s, sclrp2_s, wpsclrp_s, wp2, mixt_frac, F_w, Sksclr_s,
+            ),
+            in_axes=(2, 2, 2, 2),
+            out_axes=-1,
+        )(sclrm_a, sclrp2_a, wpsclrp_a, Sksclr_a)
+    else:
+        coef_sigma_sclr_1_sqd = None
+        coef_sigma_sclr_2_sqd = None
+
+    if not l_explicit_turbulent_adv_wp3:
+        coef_wp4_implicit = calculate_coef_wp4_implicit(
+            mixt_frac, F_w, coef_sigma_w_1_sqd, coef_sigma_w_2_sqd)
+    else:
+        coef_wp4_implicit = zero
+
+    if not l_explicit_turbulent_adv_wpxp:
+        coef_wp2rtp_implicit = calc_coef_wp2xp_implicit(
+            wp2, mixt_frac, F_w, coef_sigma_w_1_sqd, coef_sigma_w_2_sqd)
+        coef_wp2thlp_implicit = coef_wp2rtp_implicit
+        coef_wp2up_implicit = coef_wp2rtp_implicit
+        coef_wp2vp_implicit = coef_wp2rtp_implicit
+        if coef_sigma_sclr_1_sqd is not None:
+            coef_wp2sclrp_implicit = jnp.broadcast_to(
+                coef_wp2rtp_implicit[..., None], coef_sigma_sclr_1_sqd.shape)
+            term_wp2sclrp_explicit = jnp.zeros_like(coef_wp2sclrp_implicit)
+        else:
+            coef_wp2sclrp_implicit = pdf_implicit_coefs_terms.coef_wp2sclrp_implicit
+            term_wp2sclrp_explicit = pdf_implicit_coefs_terms.term_wp2sclrp_explicit
+    else:
+        coef_wp2rtp_implicit = zero
+        coef_wp2thlp_implicit = zero
+        coef_wp2up_implicit = zero
+        coef_wp2vp_implicit = zero
+        if coef_sigma_sclr_1_sqd is not None:
+            coef_wp2sclrp_implicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+            term_wp2sclrp_explicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+        else:
+            coef_wp2sclrp_implicit = pdf_implicit_coefs_terms.coef_wp2sclrp_implicit
+            term_wp2sclrp_explicit = pdf_implicit_coefs_terms.term_wp2sclrp_explicit
+
+    if not l_explicit_turbulent_adv_xpyp:
+        coef_wprtp2_implicit, term_wprtp2_explicit = calc_coefs_wpxp2_semiimpl(
+            wp2, wprtp, mixt_frac, F_w, coef_sigma_1_sqd['rt'], coef_sigma_2_sqd['rt'])
+        coef_wpthlp2_implicit, term_wpthlp2_explicit = calc_coefs_wpxp2_semiimpl(
+            wp2, wpthlp, mixt_frac, F_w, coef_sigma_1_sqd['thl'], coef_sigma_2_sqd['thl'])
+        coef_wprtpthlp_implicit, term_wprtpthlp_explicit = calc_coefs_wpxpyp_semiimpl(
+            wp2, wprtp, wpthlp, mixt_frac, F_w,
+            coef_sigma_1_sqd['rt'], coef_sigma_2_sqd['rt'],
+            coef_sigma_1_sqd['thl'], coef_sigma_2_sqd['thl'])
+        coef_wpup2_implicit, term_wpup2_explicit = calc_coefs_wpxp2_semiimpl(
+            wp2, upwp, mixt_frac, F_w, coef_sigma_1_sqd['u'], coef_sigma_2_sqd['u'])
+        coef_wpvp2_implicit, term_wpvp2_explicit = calc_coefs_wpxp2_semiimpl(
+            wp2, vpwp, mixt_frac, F_w, coef_sigma_1_sqd['v'], coef_sigma_2_sqd['v'])
+        if coef_sigma_sclr_1_sqd is not None:
+            coef_wpsclrp2_implicit, term_wpsclrp2_explicit = jax.vmap(
+                lambda coef_s1, coef_s2, wpsclrjp: calc_coefs_wpxp2_semiimpl(
+                    wp2, wpsclrjp, mixt_frac, F_w, coef_s1, coef_s2,
+                ),
+                in_axes=(2, 2, 2),
+                out_axes=-1,
+            )(coef_sigma_sclr_1_sqd, coef_sigma_sclr_2_sqd, wpsclrp_a)
+            coef_wprtpsclrp_implicit, term_wprtpsclrp_explicit = jax.vmap(
+                lambda coef_s1, coef_s2, wpsclrjp: calc_coefs_wpxpyp_semiimpl(
+                    wp2, wprtp, wpsclrjp, mixt_frac, F_w,
+                    coef_sigma_1_sqd['rt'], coef_sigma_2_sqd['rt'], coef_s1, coef_s2,
+                ),
+                in_axes=(2, 2, 2),
+                out_axes=-1,
+            )(coef_sigma_sclr_1_sqd, coef_sigma_sclr_2_sqd, wpsclrp_a)
+            coef_wpthlpsclrp_implicit, term_wpthlpsclrp_explicit = jax.vmap(
+                lambda coef_s1, coef_s2, wpsclrjp: calc_coefs_wpxpyp_semiimpl(
+                    wp2, wpthlp, wpsclrjp, mixt_frac, F_w,
+                    coef_sigma_1_sqd['thl'], coef_sigma_2_sqd['thl'], coef_s1, coef_s2,
+                ),
+                in_axes=(2, 2, 2),
+                out_axes=-1,
+            )(coef_sigma_sclr_1_sqd, coef_sigma_sclr_2_sqd, wpsclrp_a)
+        else:
+            coef_wpsclrp2_implicit = pdf_implicit_coefs_terms.coef_wpsclrp2_implicit
+            term_wpsclrp2_explicit = pdf_implicit_coefs_terms.term_wpsclrp2_explicit
+            coef_wprtpsclrp_implicit = pdf_implicit_coefs_terms.coef_wprtpsclrp_implicit
+            term_wprtpsclrp_explicit = pdf_implicit_coefs_terms.term_wprtpsclrp_explicit
+            coef_wpthlpsclrp_implicit = pdf_implicit_coefs_terms.coef_wpthlpsclrp_implicit
+            term_wpthlpsclrp_explicit = pdf_implicit_coefs_terms.term_wpthlpsclrp_explicit
+    else:
+        coef_wprtp2_implicit = zero
+        term_wprtp2_explicit = zero
+        coef_wpthlp2_implicit = zero
+        term_wpthlp2_explicit = zero
+        coef_wprtpthlp_implicit = zero
+        term_wprtpthlp_explicit = zero
+        coef_wpup2_implicit = zero
+        term_wpup2_explicit = zero
+        coef_wpvp2_implicit = zero
+        term_wpvp2_explicit = zero
+        if coef_sigma_sclr_1_sqd is not None:
+            coef_wpsclrp2_implicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+            term_wpsclrp2_explicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+            coef_wprtpsclrp_implicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+            term_wprtpsclrp_explicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+            coef_wpthlpsclrp_implicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+            term_wpthlpsclrp_explicit = jnp.zeros_like(coef_sigma_sclr_1_sqd)
+        else:
+            coef_wpsclrp2_implicit = pdf_implicit_coefs_terms.coef_wpsclrp2_implicit
+            term_wpsclrp2_explicit = pdf_implicit_coefs_terms.term_wpsclrp2_explicit
+            coef_wprtpsclrp_implicit = pdf_implicit_coefs_terms.coef_wprtpsclrp_implicit
+            term_wprtpsclrp_explicit = pdf_implicit_coefs_terms.term_wprtpsclrp_explicit
+            coef_wpthlpsclrp_implicit = pdf_implicit_coefs_terms.coef_wpthlpsclrp_implicit
+            term_wpthlpsclrp_explicit = pdf_implicit_coefs_terms.term_wpthlpsclrp_explicit
+
+    out['pdf_implicit_coefs_terms'] = pdf_implicit_coefs_terms.replace(
+        coef_wp4_implicit=coef_wp4_implicit,
+        coef_wp2rtp_implicit=coef_wp2rtp_implicit,
+        term_wp2rtp_explicit=zero,
+        coef_wp2thlp_implicit=coef_wp2thlp_implicit,
+        term_wp2thlp_explicit=zero,
+        coef_wp2up_implicit=coef_wp2up_implicit,
+        term_wp2up_explicit=zero,
+        coef_wp2vp_implicit=coef_wp2vp_implicit,
+        term_wp2vp_explicit=zero,
+        coef_wprtp2_implicit=coef_wprtp2_implicit,
+        term_wprtp2_explicit=term_wprtp2_explicit,
+        coef_wpthlp2_implicit=coef_wpthlp2_implicit,
+        term_wpthlp2_explicit=term_wpthlp2_explicit,
+        coef_wprtpthlp_implicit=coef_wprtpthlp_implicit,
+        term_wprtpthlp_explicit=term_wprtpthlp_explicit,
+        coef_wpup2_implicit=coef_wpup2_implicit,
+        term_wpup2_explicit=term_wpup2_explicit,
+        coef_wpvp2_implicit=coef_wpvp2_implicit,
+        term_wpvp2_explicit=term_wpvp2_explicit,
+        coef_wp2sclrp_implicit=coef_wp2sclrp_implicit,
+        term_wp2sclrp_explicit=term_wp2sclrp_explicit,
+        coef_wpsclrp2_implicit=coef_wpsclrp2_implicit,
+        term_wpsclrp2_explicit=term_wpsclrp2_explicit,
+        coef_wprtpsclrp_implicit=coef_wprtpsclrp_implicit,
+        term_wprtpsclrp_explicit=term_wprtpsclrp_explicit,
+        coef_wpthlpsclrp_implicit=coef_wpthlpsclrp_implicit,
+        term_wpthlpsclrp_explicit=term_wpthlpsclrp_explicit,
+    )
 
     return out

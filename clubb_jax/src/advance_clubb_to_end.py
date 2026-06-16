@@ -8,18 +8,45 @@ radiation and microphysics, and accumulates stats. Split out from the previous m
 import gc
 
 import numpy as np
-import jax.numpy as jnp
+from numpy import asfortranarray as f_arr
 
-from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
+import clubb_f2py
+from clubb_python import clubb_api
+from clubb_python.derived_types.err_info_converter import get_fortran_err_info, set_fortran_err_info
+from clubb_python.derived_types.grid_class_converter import set_fortran_grid
+from clubb_python.derived_types.sclr_idx_converter import set_fortran_sclr_idx
+from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
-from clubb_jax.src.CLUBB_core.constants_clubb import Cp as _ARM_Cp, Lv as _ARM_Lv
-from clubb_jax.src.Benchmark_cases.prescribe_forcings import prescribe_forcings_arm, prescribe_forcings_generic
-from clubb_jax.src.CLUBB_core.advance_clubb_core_module import advance_clubb_core
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.Microphys.microphys_driver import calc_microphys_scheme_tendcies
-# Tracer-transparent shim (REFACTOR B5): _asarray behaves exactly like np.asarray for concrete
-# arrays (normal runs bit-identical) but routes to jnp under a jax.grad trace so the whole-driver
-# autodiff graph survives the imperative `state[k] = ...` writebacks. See CLUBB_core/tracer_numpy.py.
-from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray
+from clubb_jax.src.derived_types.converters import (
+    err_info_from_api,
+    err_info_to_api,
+    grid_from_api,
+    implicit_coefs_terms_from_api,
+    nu_vert_res_dep_from_api,
+    pdf_parameter_from_api,
+    sclr_idx_from_api,
+)
+
+
+def _err_code_summary(err_info) -> str:
+    if err_info is None:
+        return "err_info=None"
+    err_info = err_info_from_api(err_info)
+    err_code = getattr(err_info, "err_code", None)
+    reason_code = getattr(err_info, "reason_code", None)
+    reason_messages = err_info.reason_messages_host()
+    pieces = []
+    if err_code is None:
+        pieces.append("err_code=None")
+    else:
+        pieces.append(f"err_code={err_code}")
+    if reason_code is not None:
+        pieces.append(f"reason_code={reason_code}")
+    if reason_messages:
+        pieces.append("message=" + " | ".join(reason_messages))
+    return "; ".join(pieces)
 
 
 def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | None = None):
@@ -33,7 +60,6 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
 
     rad_interval = int(dt_rad / dt_main)
     n_steps = ifinal if max_steps is None else min(ifinal, max_steps)
-    sw = state.get('stats_writer')  # Python stats writer; None → stats sampling is skipped (no Fortran fallback)
 
     _GC_INTERVAL = 10          # force a cyclic-GC pass every N sampled steps (Iter325 OOM fix)
     _samples_since_gc = 0
@@ -41,12 +67,9 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
     for itime_idx in range(n_steps):
         itime = itime_idx + 1
         time_current = time_initial + (itime - 1) * dt_main
-        l_sample = False
-        l_last_sample = False
 
         # ── Stats: begin timestep ───────────────────────────────────────
-        if l_stats and sw is not None:
-            l_sample, l_last_sample = sw.begin_timestep(itime_idx)
+        l_sample, l_last_sample = _begin_timestep_stats(state, itime_idx)
 
         # ── Compute thvm ────────────────────────────────────────────────
         _calculate_thvm(state)
@@ -61,7 +84,9 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         # Morrison microphysics source (computed at the END of the previous step; absent on step 1):
         # rtm_forcing += rcm_mc + rvm_mc (vapor+cloud water), thlm_forcing += thlm_mc.
         if state.get('_morr_rcm_mc') is not None:
-            state['rtm_forcing'] = state['rtm_forcing'] + state['_morr_rcm_mc'] + state['_morr_rvm_mc']
+            state['rtm_forcing'] = (
+                state['rtm_forcing'] + state['_morr_rcm_mc'] + state['_morr_rvm_mc']
+            )
             state['thlm_forcing'] = state['thlm_forcing'] + state['_morr_thlm_mc']
 
         # KK second-moment microphysics source (clubb_driver.F90:3348-3353): *_forcing += *_mc, on zm.
@@ -77,6 +102,8 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         # ── Advance CLUBB core ──────────────────────────────────────────
         state['l_sample'] = l_sample
         _advance_clubb_core(state)
+        if l_stats:
+            state['_jax_stats'].to_api()
 
         # ── Radiation ───────────────────────────────────────────────────
         l_rad_itime = (itime % rad_interval == 0) or (itime == 1)
@@ -101,45 +128,12 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         calc_microphys_scheme_tendcies(state, time_current)
 
         # ── Driver-owned stats updates (mirrors Fortran driver) ────────
-        # For Morrison cases the Ncm / Nc_in_cloud stats are written INSIDE advance_microphys
-        # (advance_microphys_module.F90:425-431). That routine early-returns before those writes
-        # whenever time_current < microphys_start_time (line 258), so during the pre-activation
-        # spin-up the Fortran leaves both stats at their zero-initialized fill. Mirror that exactly:
-        # write zeros in that window instead of the init-time Nc_in_cloud*cloud_frac diagnostic.
-        _micro_pending = (state.get('microphys_scheme', 'none') == 'morrison'
-                          and time_current < state.get('microphys_start_time', 0.0))
-        if l_stats and l_sample and sw is not None:
-            if _micro_pending:
-                _zero = state['Nc_in_cloud'] * 0.0
-                sw.update("Ncm", _zero)
-                sw.update("Nc_in_cloud", _zero)
-            else:
-                state['Ncm'] = state['Nc_in_cloud'] * state['cloud_frac']
-                sw.update("Ncm", state['Ncm'])
-                sw.update("Nc_in_cloud", state['Nc_in_cloud'])
-            if state.get('_morr_rcm_mc') is not None:   # Morrison tendencies (for diagnosis vs oracle)
-                sw.update("rcm_mc", state['_morr_rcm_mc'])
-                sw.update("rvm_mc", state['_morr_rvm_mc'])
-                sw.update("thlm_mc", state['_morr_thlm_mc'])
-                sw.update("rtm_mc", state['_morr_rcm_mc'] + state['_morr_rvm_mc'])
-            for _f in ('wprtp_mc', 'wpthlp_mc', 'rtp2_mc', 'thlp2_mc', 'rtpthlp_mc'):
-                _v = state.get('_kk_' + _f)
-                if _v is not None:
-                    sw.update(_f, _v)
-            if state.get('hm_metadata') is not None and state.get('hydromet') is not None:
-                _hmm = state['hm_metadata']
-                sw.update("rrm", np.asarray(state['hydromet'])[..., int(_hmm.iirr)])
-                sw.update("Nrm", np.asarray(state['hydromet'])[..., int(_hmm.iiNr)])
-                if state.get('_kk_rrm_mc') is not None:
-                    sw.update("rrm_mc", state['_kk_rrm_mc'])
-                    sw.update("Nrm_mc", state['_kk_Nrm_mc'])
-                if state.get('_kk_precip_frac') is not None:
-                    sw.update("precip_frac", state['_kk_precip_frac'])
+        if l_stats and l_sample:
+            _update_driver_stats(state, time_current)
 
         # ── Stats: end timestep ─────────────────────────────────────────
-        if l_stats and l_last_sample and sw is not None:
-            stats_time = float(time_current + state['cfg']['stats_tout'])
-            sw.end_timestep(stats_time)
+        if l_last_sample:
+            _end_timestep_stats(state, time_current)
 
         # ── Update time ─────────────────────────────────────────────────
         time_current = time_initial + itime * dt_main
@@ -162,15 +156,96 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
                   f" -- time = {time_current:10.1f} / {state['time_final']:10.1f}")
 
 
+def _begin_timestep_stats(state: dict, itime_idx: int) -> tuple[bool, bool]:
+    """Begin stats collection and create the JAX stats bridge for core updates."""
+    if state['l_stats']:
+        clubb_api.stats_begin_timestep(itime_idx)
+        stats_cfg = clubb_api.get_stats_config()
+        l_sample = bool(stats_cfg[7])
+        l_last_sample = bool(stats_cfg[8])
+        state['_jax_stats'] = JaxStats.from_api(
+            ngrdcol=state['ngrdcol'],
+            nzm=state['nzm'],
+            nzt=state['nzt'],
+            max_events=8192,
+        )
+        return l_sample, l_last_sample
+
+    state['_jax_stats'] = JaxStats.empty(
+        l_sample=False,
+        names=(),
+        ncol=state['ngrdcol'],
+        max_nlev=max(state['nzm'], state['nzt'], 1),
+        max_events=1,
+    )
+    return False, False
+
+
+def _end_timestep_stats(state: dict, time_current: float) -> None:
+    """Finalize a sampled stats timestep through the Fortran-backed API."""
+    stats_time = float(time_current + state['cfg']['stats_tout'])
+    state['err_info'] = err_info_from_api(
+        clubb_api.stats_end_timestep(
+            stats_time,
+            err_info=err_info_to_api(state['err_info']),
+        )
+    )
+
+
+def _update_driver_stats(state: dict, time_current: float) -> None:
+    """Write driver-owned stats outside the jitted core."""
+    # For Morrison cases the Ncm / Nc_in_cloud stats are written INSIDE advance_microphys
+    # (advance_microphys_module.F90:425-431). That routine early-returns before those writes
+    # whenever time_current < microphys_start_time (line 258), so during the pre-activation
+    # spin-up the Fortran leaves both stats at their zero-initialized fill. Mirror that exactly:
+    # write zeros in that window instead of the init-time Nc_in_cloud*cloud_frac diagnostic.
+    micro_pending = (
+        state.get('microphys_scheme', 'none') == 'morrison'
+        and time_current < state.get('microphys_start_time', 0.0)
+    )
+    if micro_pending:
+        zero = state['Nc_in_cloud'] * 0.0
+        clubb_api.stats_update("Ncm", zero)
+        clubb_api.stats_update("Nc_in_cloud", zero)
+    else:
+        state['Ncm'] = state['Nc_in_cloud'] * state['cloud_frac']
+        clubb_api.stats_update("Ncm", state['Ncm'])
+        clubb_api.stats_update("Nc_in_cloud", state['Nc_in_cloud'])
+
+    if state.get('_morr_rcm_mc') is not None:
+        clubb_api.stats_update("rcm_mc", state['_morr_rcm_mc'])
+        clubb_api.stats_update("rvm_mc", state['_morr_rvm_mc'])
+        clubb_api.stats_update("thlm_mc", state['_morr_thlm_mc'])
+        clubb_api.stats_update("rtm_mc", state['_morr_rcm_mc'] + state['_morr_rvm_mc'])
+
+    for field in ('wprtp_mc', 'wpthlp_mc', 'rtp2_mc', 'thlp2_mc', 'rtpthlp_mc'):
+        value = state.get('_kk_' + field)
+        if value is not None:
+            clubb_api.stats_update(field, value)
+
+    if state.get('hm_metadata') is not None and state.get('hydromet') is not None:
+        hm_metadata = state['hm_metadata']
+        hydromet = np.asarray(state['hydromet'])
+        clubb_api.stats_update("rrm", hydromet[..., int(hm_metadata.iirr)])
+        clubb_api.stats_update("Nrm", hydromet[..., int(hm_metadata.iiNr)])
+        if state.get('_kk_rrm_mc') is not None:
+            clubb_api.stats_update("rrm_mc", state['_kk_rrm_mc'])
+            clubb_api.stats_update("Nrm_mc", state['_kk_Nrm_mc'])
+        if state.get('_kk_precip_frac') is not None:
+            clubb_api.stats_update("precip_frac", state['_kk_precip_frac'])
+
+
 def _calculate_thvm(state: dict):
-    """Update virtual potential temperature diagnostic (calculate_thvm)."""
-    state['thvm'] = _asarray(calculate_thvm(
-        jnp.asarray(state['thlm']),
-        jnp.asarray(state['rtm']),
-        jnp.asarray(state['rcm']),
-        jnp.asarray(state['exner']),
-        jnp.asarray(state['thv_ds_zt']),
-    ), dtype=np.float64)
+    """Update virtual potential temperature diagnostic."""
+    state['thvm'] = clubb_api.calculate_thvm(
+        nzt=state['nzt'],
+        ngrdcol=state['ngrdcol'],
+        thlm=state['thlm'],
+        rtm=state['rtm'],
+        rcm=state['rcm'],
+        exner=state['exner'],
+        thv_ds_zt=state['thv_ds_zt'],
+    )
 
 
 def _calculate_thlp2_rad(state: dict):
@@ -178,14 +253,17 @@ def _calculate_thlp2_rad(state: dict):
     if not state['l_calc_thlp2_rad']:
         return
 
-    increment = calculate_thlp2_rad(
-        rcm=state['rcm'],
-        thlprcp=state['thlprcp'],
-        radht=state['radht'],
-        clubb_params=state['clubb_params'],
-        gr=state['gr'],
+    state['thlp2_forcing'] = calculate_thlp2_rad(
+        state['ngrdcol'],
+        state['nzm'],
+        state['nzt'],
+        grid_from_api(state['gr']),
+        state['rcm'],
+        state['thlprcp'],
+        state['radht'],
+        state['clubb_params'],
+        state['thlp2_forcing'],
     )
-    state['thlp2_forcing'] = state['thlp2_forcing'] + _asarray(increment, dtype=np.float64)
 
 
 def _cloud_drop_sed(state: dict, l_sample: bool = False):
@@ -196,20 +274,157 @@ def _cloud_drop_sed(state: dict, l_sample: bool = False):
     next step's forcings.
     """
     from clubb_jax.src.Microphys.cloud_sed_module import cloud_drop_sed
-    Ncm = state['Nc_in_cloud'] * state['cloud_frac']
-    rcm_mc, thlm_mc, Fcsed = cloud_drop_sed(
-        state['rcm'], Ncm, state['rho_zm'], state['rho'],
-        state['exner'], state['sigma_g'], state['gr'])
+
+    ncm = state['Nc_in_cloud'] * state['cloud_frac']
+    rcm_mc, thlm_mc, fcsed = cloud_drop_sed(
+        state['rcm'],
+        ncm,
+        state['rho_zm'],
+        state['rho'],
+        state['exner'],
+        state['sigma_g'],
+        state['gr'],
+    )
     state['rcm_mc'] = rcm_mc
     state['thlm_mc'] = thlm_mc
-    if l_sample and state.get('stats_writer') is not None:
-        # sed_rcm == rcm_mc for the cloud-sed-only path.
-        state['stats_writer'].update("sed_rcm", rcm_mc)
-        state['stats_writer'].update("Fcsed", Fcsed)
+    if l_sample:
+        clubb_api.stats_update("sed_rcm", rcm_mc)
+        clubb_api.stats_update("Fcsed", fcsed)
 
 
 def _advance_clubb_core(state: dict):
-    """Advance the CLUBB core using the translated Python port (mirrors advance_clubb_core)."""
+    """Advance the CLUBB core using the JAX translated core."""
+    result = advance_clubb_core_module.advance_clubb_core(
+        gr=grid_from_api(state['gr']),
+        nzm=state['nzm'],
+        nzt=state['nzt'],
+        ngrdcol=state['ngrdcol'],
+        l_implemented=False,
+        dt=state['dt_main'],
+        fcor=state['fcor'],
+        fcor_y=state['fcor_y'],
+        sfc_elevation=state['sfc_elevation'],
+        hydromet_dim=state['hydromet_dim'],
+        sclr_dim=state['sclr_dim'],
+        sclr_tol=state['sclr_tol'],
+        edsclr_dim=state['edsclr_dim'],
+        sclr_idx=sclr_idx_from_api(state['sclr_idx']),
+        thlm_forcing=state['thlm_forcing'],
+        rtm_forcing=state['rtm_forcing'],
+        um_forcing=state['um_forcing'],
+        vm_forcing=state['vm_forcing'],
+        sclrm_forcing=state['sclrm_forcing'],
+        edsclrm_forcing=state['edsclrm_forcing'],
+        wprtp_forcing=state['wprtp_forcing'],
+        wpthlp_forcing=state['wpthlp_forcing'],
+        rtp2_forcing=state['rtp2_forcing'],
+        thlp2_forcing=state['thlp2_forcing'],
+        rtpthlp_forcing=state['rtpthlp_forcing'],
+        wm_zm=state['wm_zm'],
+        wm_zt=state['wm_zt'],
+        wpthlp_sfc=state['wpthlp_sfc'],
+        wprtp_sfc=state['wprtp_sfc'],
+        upwp_sfc=state['upwp_sfc'],
+        vpwp_sfc=state['vpwp_sfc'],
+        p_sfc=state['p_sfc'],
+        wpsclrp_sfc=state['wpsclrp_sfc'],
+        wpedsclrp_sfc=state['wpedsclrp_sfc'],
+        upwp_sfc_pert=state['upwp_sfc_pert'],
+        vpwp_sfc_pert=state['vpwp_sfc_pert'],
+        rtm_ref=state['rtm_ref'],
+        thlm_ref=state['thlm_ref'],
+        um_ref=state['um_ref'],
+        vm_ref=state['vm_ref'],
+        ug=state['ug'],
+        vg=state['vg'],
+        p_in_Pa=state['p_in_Pa'],
+        rho_zm=state['rho_zm'],
+        rho=state['rho'],
+        exner=state['exner'],
+        rho_ds_zm=state['rho_ds_zm'],
+        rho_ds_zt=state['rho_ds_zt'],
+        invrs_rho_ds_zm=state['invrs_rho_ds_zm'],
+        invrs_rho_ds_zt=state['invrs_rho_ds_zt'],
+        thv_ds_zm=state['thv_ds_zm'],
+        thv_ds_zt=state['thv_ds_zt'],
+        l_mix_rat_hm=state['l_mix_rat_hm'],
+        rfrzm=state['rfrzm'],
+        wphydrometp=state['wphydrometp'],
+        wp2hmp=state['wp2hmp'],
+        rtphmp_zt=state['rtphmp_zt'],
+        thlphmp_zt=state['thlphmp_zt'],
+        host_dx=state['host_dx'],
+        host_dy=state['host_dy'],
+        clubb_params=state['clubb_params'],
+        nu_vert_res_dep=nu_vert_res_dep_from_api(state['nu_vert_res_dep']),
+        lmin=state['lmin'],
+        mixt_frac_max_mag=state['mixt_frac_max_mag'],
+        t0=state['T0'],
+        ts_nudge=state['ts_nudge'],
+        rtm_min=state['rtm_min'],
+        rtm_nudge_max_altitude=state['rtm_nudge_max_altitude'],
+        clubb_config_flags=state['flags'],
+        stats=state['_jax_stats'],
+        um=state['um'],
+        vm=state['vm'],
+        upwp=state['upwp'],
+        vpwp=state['vpwp'],
+        up2=state['up2'],
+        vp2=state['vp2'],
+        up3=state['up3'],
+        vp3=state['vp3'],
+        thlm=state['thlm'],
+        rtm=state['rtm'],
+        wprtp=state['wprtp'],
+        wpthlp=state['wpthlp'],
+        wp2=state['wp2'],
+        wp3=state['wp3'],
+        rtp2=state['rtp2'],
+        rtp3=state['rtp3'],
+        thlp2=state['thlp2'],
+        thlp3=state['thlp3'],
+        rtpthlp=state['rtpthlp'],
+        sclrm=state['sclrm'],
+        sclrp2=state['sclrp2'],
+        sclrp3=state['sclrp3'],
+        sclrprtp=state['sclrprtp'],
+        sclrpthlp=state['sclrpthlp'],
+        wpsclrp=state['wpsclrp'],
+        edsclrm=state['edsclrm'],
+        rcm=state['rcm'],
+        cloud_frac=state['cloud_frac'],
+        wpthvp=state['wpthvp'],
+        wp2thvp=state['wp2thvp'],
+        wp2up=state['wp2up'],
+        rtpthvp=state['rtpthvp'],
+        thlpthvp=state['thlpthvp'],
+        sclrpthvp=state['sclrpthvp'],
+        wp2rtp=state['wp2rtp'],
+        wp2thlp=state['wp2thlp'],
+        uprcp=state['uprcp'],
+        vprcp=state['vprcp'],
+        rc_coef_zm=state['rc_coef_zm'],
+        wp4=state['wp4'],
+        wpup2=state['wpup2'],
+        wpvp2=state['wpvp2'],
+        wp2up2=state['wp2up2'],
+        wp2vp2=state['wp2vp2'],
+        ice_supersat_frac=state['ice_supersat_frac'],
+        um_pert=state['um_pert'],
+        vm_pert=state['vm_pert'],
+        upwp_pert=state['upwp_pert'],
+        vpwp_pert=state['vpwp_pert'],
+        pdf_params=pdf_parameter_from_api(state['pdf_params']),
+        pdf_params_zm=pdf_parameter_from_api(state['pdf_params_zm']),
+        pdf_implicit_coefs_terms=implicit_coefs_terms_from_api(state['pdf_implicit_coefs_terms']),
+        err_info=err_info_from_api(state['err_info']),
+    )
+    if result is None:
+        raise RuntimeError(
+            "advance_clubb_core returned without outputs; "
+            f"{_err_code_summary(state.get('err_info'))}"
+        )
+
     (
         state['um'],
         state['vm'],
@@ -299,176 +514,80 @@ def _advance_clubb_core(state: dict):
         state['_sclrprcp'],
         state['_wpsclrprtp'],
         state['_wpsclrpthlp'],
-    ) = advance_clubb_core(
-        gr=state['gr'],
-        nzm=state['nzm'],
-        nzt=state['nzt'],
-        ngrdcol=state['ngrdcol'],
-        dt_main=state['dt_main'],
-        flags=state['flags'],
-        sclr_dim=state['sclr_dim'],
-        edsclr_dim=state['edsclr_dim'],
-        hydromet_dim=state['hydromet_dim'],
-        clubb_params=state['clubb_params'],
-        fcor=state['fcor'],
-        fcor_y=state['fcor_y'],
-        host_dx=state['host_dx'],
-        host_dy=state['host_dy'],
-        wm_zm=state['wm_zm'],
-        wm_zt=state['wm_zt'],
-        rho_ds_zt=state['rho_ds_zt'],
-        rtm=state['rtm'],
-        thlm=state['thlm'],
-        rho=state['rho'],
-        rfrzm=state['rfrzm'],
-        sfc_elevation=state['sfc_elevation'],
-        upwp_sfc=state['upwp_sfc'],
-        vpwp_sfc=state['vpwp_sfc'],
-        wpthlp=state['wpthlp'],
-        wprtp_sfc=state['wprtp_sfc'],
-        upwp=state['upwp'],
-        vpwp=state['vpwp'],
-        upwp_sfc_pert=state['upwp_sfc_pert'],
-        vpwp_sfc_pert=state['vpwp_sfc_pert'],
-        wpsclrp=state['wpsclrp'],
-        wpedsclrp_sfc=state['wpedsclrp_sfc'],
-        p_sfc=state['p_sfc'],
-        thv_ds_zm=state['thv_ds_zm'],
-        thv_ds_zt=state['thv_ds_zt'],
-        wp2=state['wp2'],
-        wp3=state['wp3'],
-        thlp2=state['thlp2'],
-        rtp2=state['rtp2'],
-        rtpthlp=state['rtpthlp'],
-        um=state['um'],
-        vm=state['vm'],
-        p_in_Pa=state['p_in_Pa'],
-        exner=state['exner'],
-        rcm=state['rcm'],
-        ice_supersat_frac=state['ice_supersat_frac'],
-        up2=state['up2'],
-        vp2=state['vp2'],
-        wprtp=state['wprtp'],
-        wpthlp_sfc=state['wpthlp_sfc'],
-        wp2thvp=state['wp2thvp'],
-        wp2up=state['wp2up'],
-        rtpthvp=state['rtpthvp'],
-        thlpthvp=state['thlpthvp'],
-        wpthvp=state['wpthvp'],
-        wphydrometp=state['wphydrometp'],
-        wp2hmp=state['wp2hmp'],
-        rtphmp_zt=state['rtphmp_zt'],
-        thlphmp_zt=state['thlphmp_zt'],
-        lmin=state['lmin'],
-        mixt_frac_max_mag=state['mixt_frac_max_mag'],
-        T0=state['T0'],
-        ts_nudge=state['ts_nudge'],
-        rtm_min=state['rtm_min'],
-        rtm_nudge_max_altitude=state['rtm_nudge_max_altitude'],
-        um_forcing=state['um_forcing'],
-        vm_forcing=state['vm_forcing'],
-        thlm_forcing=state['thlm_forcing'],
-        rtm_forcing=state['rtm_forcing'],
-        wprtp_forcing=state['wprtp_forcing'],
-        wpthlp_forcing=state['wpthlp_forcing'],
-        rtp2_forcing=state['rtp2_forcing'],
-        thlp2_forcing=state['thlp2_forcing'],
-        rtpthlp_forcing=state['rtpthlp_forcing'],
-        err_info=state['err_info'],
-        sclr_tol=state['sclr_tol'],
-        thlm_ref=state['thlm_ref'],
-        rtm_ref=state['rtm_ref'],
-        um_ref=state['um_ref'],
-        vm_ref=state['vm_ref'],
-        ug=state['ug'],
-        vg=state['vg'],
-        sclrm_forcing=state['sclrm_forcing'],
-        edsclrm_forcing=state['edsclrm_forcing'],
-        sclrp2=state['sclrp2'],
-        sclrprtp=state['sclrprtp'],
-        sclrpthlp=state['sclrpthlp'],
-        sclr_idx=state['sclr_idx'],
-        pdf_params=state['pdf_params'],
-        pdf_params_zm=state['pdf_params_zm'],
-        pdf_implicit_coefs_terms=state['pdf_implicit_coefs_terms'],
-        nu_vert_res_dep=state['nu_vert_res_dep'],
-        sclrm=state['sclrm'],
-        sclrpthvp=state['sclrpthvp'],
-        up3=state['up3'],
-        vp3=state['vp3'],
-        um_pert=state['um_pert'],
-        vm_pert=state['vm_pert'],
-        uprcp=state['uprcp'],
-        vprcp=state['vprcp'],
-        rc_coef_zm=state['rc_coef_zm'],
-        wp4=state['wp4'],
-        wpup2=state['wpup2'],
-        wpvp2=state['wpvp2'],
-        wp2up2=state['wp2up2'],
-        wp2vp2=state['wp2vp2'],
-        wp2rtp=state['wp2rtp'],
-        wp2thlp=state['wp2thlp'],
-        upwp_pert=state['upwp_pert'],
-        vpwp_pert=state['vpwp_pert'],
-        sclrp3=state['sclrp3'],
-        cloud_frac=state['cloud_frac'],
-        thlp3=state['thlp3'],
-        rtp3=state['rtp3'],
-        edsclrm=state['edsclrm'],
-        wpsclrp_sfc=state['wpsclrp_sfc'],
-        l_mix_rat_hm=state['l_mix_rat_hm'],
-        rho_ds_zm=state['rho_ds_zm'],
-        invrs_rho_ds_zm=state['invrs_rho_ds_zm'],
-        invrs_rho_ds_zt=state['invrs_rho_ds_zt'],
-        rho_zm=state['rho_zm'],
-        l_sample=state.get('l_sample', False),
-        l_gamma_Skw=state.get('l_gamma_Skw', True),
-        l_advance_xp3=state.get('l_advance_xp3', False),
-        l_use_invrs_tau_N2_iso=state.get('l_use_invrs_tau_N2_iso', False),
-        order_xm_wpxp=state.get('order_xm_wpxp', 1),
-        order_xp2_xpyp=state.get('order_xp2_xpyp', 2),
-        order_wp2_wp3=state.get('order_wp2_wp3', 3),
-        order_windm=state.get('order_windm', 4),
-        debug_level=state['cfg']['debug_level'],
-        stats_writer=state.get('stats_writer'),
-        wprtp2_carry=state.get('_wprtp2'),
-        wpthlp2_carry=state.get('_wpthlp2'),
-        wprtpthlp_carry=state.get('_wprtpthlp'),
-        sponge_cfg=state.get('sponge'),
-    )
+        state['_jax_stats'],
+    ) = result
+    if err_info_from_api(state['err_info']).is_fatal():
+        message = (
+            "advance_clubb_core returned fatal err_info; "
+            f"{_err_code_summary(state['err_info'])}"
+        )
+        print(message)
+        raise RuntimeError(message)
+
 
 def _prescribe_forcings(state: dict, itime: int, l_sample: bool = False):
-    """Set forcings for the current timestep.
+    """Set forcings for the current timestep using Fortran prescribe_forcings."""
+    del l_sample  # Sampling logic is handled internally by Fortran stats state.
 
-    ARM: pure-Python port. Non-ARM cases: the prescribe_forcings_generic dispatcher (bomex, fire,
-    generic, neutral, coriolis_test, ekman, and any case with l_t_dependent=True + a {runtype}_forcings.in).
-    An unported runtype fails loud with prescribe_forcings_generic's NotImplementedError (the old dead
-    clubb_python Fortran fallback was removed iter 388).
-    """
-    time_current = state['time_initial'] + (itime - 1) * state['dt_main']
+    set_fortran_grid(state['gr'])
+    set_fortran_sclr_idx(state['sclr_idx'])
+    set_fortran_err_info(err_info_to_api(state['err_info']))
+    result = clubb_f2py.f2py_prescribe_forcings(
+        int(state['sclr_dim']), int(state['edsclr_dim']), str(state['runtype']), int(state['sfctype']),
+        float(state['time_initial'] + (itime - 1) * state['dt_main']),
+        float(state['time_initial']), float(state['dt_main']),
+        f_arr(state['um']), f_arr(state['vm']), f_arr(state['thlm']), f_arr(state['p_in_Pa']),
+        f_arr(state['exner']), f_arr(state['rho']), f_arr(state['rho_zm']), f_arr(state['thvm']),
+        f_arr(state['gr'].zt),
+        bool(state['l_t_dependent']), bool(state['l_ignore_forcings']), bool(state['l_input_xpwp_sfc']),
+        bool(state['l_modify_bc_for_cnvg_test']),
+        int(state['flags'].saturation_formula), bool(state['flags'].l_add_dycore_grid),
+        int(state['flags'].grid_remap_method), int(state['flags'].grid_adapt_in_time_method),
+        f_arr(state['rtm']), f_arr(state['wm_zm']), f_arr(state['wm_zt']), f_arr(state['ug']),
+        f_arr(state['vg']), f_arr(state['um_ref']), f_arr(state['vm_ref']),
+        f_arr(state['thlm_forcing']), f_arr(state['rtm_forcing']), f_arr(state['um_forcing']),
+        f_arr(state['vm_forcing']), f_arr(state['wprtp_forcing']), f_arr(state['wpthlp_forcing']),
+        f_arr(state['rtp2_forcing']), f_arr(state['thlp2_forcing']), f_arr(state['rtpthlp_forcing']),
+        f_arr(state['wpsclrp']), f_arr(state['sclrm_forcing']), f_arr(state['edsclrm_forcing']),
+        f_arr(state['wpthlp_sfc']), f_arr(state['wprtp_sfc']), f_arr(state['upwp_sfc']),
+        f_arr(state['vpwp_sfc']), f_arr(state['T_sfc']), f_arr(state['p_sfc']),
+        float(state['sens_ht']), float(state['latent_ht']),
+        f_arr(state['wpsclrp_sfc']), f_arr(state['wpedsclrp_sfc']),
+        nzm=int(state['nzm']), nzt=int(state['nzt']), ngrdcol=int(state['ngrdcol']),
+    )
 
-    if state['runtype'] == 'arm':
-        prescribe_forcings_arm(state, time_current)
-        sw = state.get('stats_writer')
-        if l_sample and sw is not None and state.get('rho_zm') is not None:
-            rho_zm_sfc = state['rho_zm'][:, 0]
-            sw.update("wpthlp_sfc", state['wpthlp_sfc'])
-            sw.update("wprtp_sfc", state['wprtp_sfc'])
-            sw.update("upwp_sfc", state['upwp_sfc'])
-            sw.update("vpwp_sfc", state['vpwp_sfc'])
-            sw.update("sh", state['wpthlp_sfc'] * rho_zm_sfc * _ARM_Cp)
-            sw.update("lh", state['wprtp_sfc'] * rho_zm_sfc * _ARM_Lv)
-            ustar = state.get('ustar', np.zeros(state['ngrdcol']))
-            sw.update("ustar", ustar)
-            T_sfc = state.get('T_sfc', np.zeros(state['ngrdcol']))
-            sw.update("T_sfc", T_sfc)
-        return
-
-    # Generic Python dispatcher. For an unported runtype it raises a clear NotImplementedError
-    # ("...not yet ported... Add to prescribe_forcings.py"). The old dead clubb_python.clubb_api
-    # Fortran fallback was removed iter 388 — clubb_python is absent in this tree, so it only ever
-    # crashed with a cryptic ModuleNotFoundError that MASKED that clear message.
-    prescribe_forcings_generic(state, time_current, l_sample=l_sample)
+    (
+        state['rtm'],
+        state['wm_zm'],
+        state['wm_zt'],
+        state['ug'],
+        state['vg'],
+        state['um_ref'],
+        state['vm_ref'],
+        state['thlm_forcing'],
+        state['rtm_forcing'],
+        state['um_forcing'],
+        state['vm_forcing'],
+        state['wprtp_forcing'],
+        state['wpthlp_forcing'],
+        state['rtp2_forcing'],
+        state['thlp2_forcing'],
+        state['rtpthlp_forcing'],
+        state['wpsclrp'],
+        state['sclrm_forcing'],
+        state['edsclrm_forcing'],
+        state['wpthlp_sfc'],
+        state['wprtp_sfc'],
+        state['upwp_sfc'],
+        state['vpwp_sfc'],
+        state['T_sfc'],
+        state['p_sfc'],
+        state['sens_ht'],
+        state['latent_ht'],
+        state['wpsclrp_sfc'],
+        state['wpedsclrp_sfc'],
+        state['err_info'],
+    ) = (*result, err_info_from_api(get_fortran_err_info()))
 
 
 def _advance_radiation(
@@ -477,6 +596,6 @@ def _advance_radiation(
     l_sample: bool = False,
 ):
     """Advance radiation tendencies for currently supported schemes."""
-    from clubb_jax.src.Radiation.radiation_module import advance_clubb_radiation
+    from clubb_jax.src.Radiation.radiation import advance_radiation
 
-    advance_clubb_radiation(state=state, time_current=time_current, l_sample=l_sample)
+    advance_radiation(state=state, time_current=time_current, l_sample=l_sample)

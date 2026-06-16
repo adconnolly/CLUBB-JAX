@@ -13,10 +13,14 @@ The PDF moment-integral closures (calc_{wp2xp,wpxp2,wp2xp2,wp4,wpxpyp}_pdf and c
 live in pdf_closure_module.py, mirroring their Fortran home pdf_closure_module.F90.
 """
 
+import jax
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt  # REFACTOR B5: finite grad for sqrt(max(0,·))
-from clubb_jax.src.CLUBB_core.constants_clubb import rt_tol, thl_tol, w_tol_sqd, zero_threshold, eps
+from clubb_jax.src.CLUBB_core.clubb_constants import rt_tol, thl_tol, w_tol_sqd, zero_threshold, eps
+
+
+def _safe_sqrt(value):
+    return jnp.sqrt(jnp.maximum(value, 0.0))
 
 
 def ADG1_w_closure(wm, wp2, Skw, sigma_sqd_w, sqrt_wp2, mixt_frac_max_mag):
@@ -175,6 +179,7 @@ def ADG1_pdf_driver(wm, rtm, thlm, um, vm,
 
     return {
         'w_1': w_1, 'w_2': w_2,
+        'w_1_n': w_1_n, 'w_2_n': w_2_n,
         'varnce_w_1': varnce_w_1, 'varnce_w_2': varnce_w_2,
         'mixt_frac': mixt_frac,
         'rt_1': rt_1, 'rt_2': rt_2,
@@ -258,7 +263,7 @@ def max_cubic_root(a_coef, b_coef, c_coef, d_coef):
     max over all three real parts, else the always-real first root. Pure-jnp (uses the iter-71-corrected
     cubic_solve) → differentiable away from the root-multiplicity branch points. Inputs broadcast elementwise."""
     from clubb_jax.src.CLUBB_core.calc_roots import cubic_solve, quadratic_solve
-    from clubb_jax.src.CLUBB_core.constants_clubb import eps
+    from clubb_jax.src.CLUBB_core.clubb_constants import eps
     a = jnp.asarray(a_coef, dtype=jnp.float64); b = jnp.asarray(b_coef, dtype=jnp.float64)
     c = jnp.asarray(c_coef, dtype=jnp.float64); d = jnp.asarray(d_coef, dtype=jnp.float64)
 
@@ -287,7 +292,7 @@ def backsolve_Luhar_params(Sk_max, Skx, big_m_max, mixt_frac):
     otherwise alpha = mf(1−mf)/(1−2mf)²·Skx², and m² is the largest real root of
     (alpha−1)(m²)³ + (3alpha−6)(m²)² + (3alpha−9)(m²) + alpha = 0 (floored at 0.05²). Pure-jnp → differentiable.
     Returns (big_m_x, small_m_x)."""
-    from clubb_jax.src.CLUBB_core.constants_clubb import eps
+    from clubb_jax.src.CLUBB_core.clubb_constants import eps
     Skx = jnp.asarray(Skx, dtype=jnp.float64)
     mf = jnp.asarray(mixt_frac, dtype=jnp.float64)
 
@@ -350,13 +355,18 @@ def Luhar_3D_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, Skrt, Skthl, wprtp
     return (w1, w2, rt1, rt2, thl1, thl2, vw1, vw2, vrt1, vrt2, vthl1, vthl2, mixt_frac)
 
 
-def ADG2_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, wprtp, wpthlp, sqrt_wp2, beta):
+def ADG2_pdf_driver(nz, ngrdcol, sclr_dim, sclr_tol,
+                    wm, rtm, thlm, wp2, rtp2, thlp2,
+                    Skw, wprtp, wpthlp, sqrt_wp2, beta,
+                    sclrm, sclrp2, wpsclrp, l_scalar_calc):
     """ADG2 PDF driver (adg1_adg2_3d_luhar_pdf.F90:ADG2_pdf_driver), PDF-parameter outputs for w/rt/thl
-    (the passive-scalar branch is omitted; the gated config uses sclr_dim=0). w's PDF comes from the Luhar
-    closure (calc_Luhar_params + close_Luhar_pdf, with sigma_sqd_w overwritten to min(1/(1+m²), 0.99) for ADG1
-    consistency); rt and thl are responders via ADG1_ADG2_responder_params. Pure-jnp → differentiable.
+    and passive scalars. w's PDF comes from the Luhar closure (calc_Luhar_params + close_Luhar_pdf, with
+    sigma_sqd_w overwritten to min(1/(1+m²), 0.99) for ADG1 consistency); rt, thl, and scalar variables are
+    responders via ADG1_ADG2_responder_params. Pure-jnp → differentiable.
     Returns (w_1, w_2, rt_1, rt_2, thl_1, thl_2, varnce_w_1, varnce_w_2, varnce_rt_1, varnce_rt_2,
-    varnce_thl_1, varnce_thl_2, mixt_frac, alpha_rt, alpha_thl, sigma_sqd_w)."""
+    varnce_thl_1, varnce_thl_2, mixt_frac, alpha_rt, alpha_thl, sigma_sqd_w, sclr_1, sclr_2, varnce_sclr_1,
+    varnce_sclr_2, alpha_sclr)."""
+    del nz, ngrdcol
     wm = jnp.asarray(wm, dtype=jnp.float64); wp2 = jnp.asarray(wp2, dtype=jnp.float64)
     Skw = jnp.asarray(Skw, dtype=jnp.float64); sqrt_wp2 = jnp.asarray(sqrt_wp2, dtype=jnp.float64)
     w_tsq = w_tol_sqd
@@ -370,5 +380,30 @@ def ADG2_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, wprtp, wpthlp, sqrt_wp
     thl1, thl2, vthl1, vthl2, alpha_thl = ADG1_ADG2_responder_params(
         thlm, thlp2, wp2, sqrt_wp2, wpthlp, w_1_n, w_2_n, mixt_frac, sigma_sqd_w, beta)
 
+    if l_scalar_calc:
+        sclr1, sclr2, varnce_sclr1, varnce_sclr2, alpha_sclr = jax.vmap(
+            lambda sclrm_s, sclrp2_s, wpsclrp_s: ADG1_ADG2_responder_params(
+                sclrm_s,
+                sclrp2_s,
+                wp2,
+                sqrt_wp2,
+                wpsclrp_s,
+                w_1_n,
+                w_2_n,
+                mixt_frac,
+                sigma_sqd_w,
+                beta,
+            ),
+            in_axes=(2, 2, 2),
+            out_axes=-1,
+        )(sclrm, sclrp2, wpsclrp)
+    else:
+        sclr1 = jnp.zeros_like(sclrm)
+        sclr2 = jnp.zeros_like(sclrm)
+        varnce_sclr1 = jnp.zeros_like(sclrm)
+        varnce_sclr2 = jnp.zeros_like(sclrm)
+        alpha_sclr = jnp.zeros_like(sclrm)
+
     return (w1, w2, rt1, rt2, thl1, thl2, vw1, vw2, vrt1, vrt2, vthl1, vthl2,
-            mixt_frac, alpha_rt, alpha_thl, sigma_sqd_w)
+            mixt_frac, alpha_rt, alpha_thl, sigma_sqd_w, sclr1, sclr2,
+            varnce_sclr1, varnce_sclr2, alpha_sclr)
