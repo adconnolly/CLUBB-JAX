@@ -8,16 +8,15 @@ radiation and microphysics, and accumulates stats. Split out from the previous m
 import gc
 
 import numpy as np
-from numpy import asfortranarray as f_arr
 
-import clubb_f2py
 from clubb_python import clubb_api
-from clubb_python.derived_types.err_info_converter import get_fortran_err_info, set_fortran_err_info
-from clubb_python.derived_types.grid_class_converter import set_fortran_grid
-from clubb_python.derived_types.sclr_idx_converter import set_fortran_sclr_idx
 from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
+from clubb_jax.src.Benchmark_cases.prescribe_forcings import (
+    prescribe_forcings_arm,
+    prescribe_forcings_generic,
+)
 from clubb_jax.src.Microphys.microphys_driver import calc_microphys_scheme_tendcies
 from clubb_jax.src.derived_types.converters import (
     err_info_from_api,
@@ -525,68 +524,13 @@ def _advance_clubb_core(state: dict):
 
 
 def _prescribe_forcings(state: dict, itime: int, l_sample: bool = False):
-    """Set forcings for the current timestep using Fortran prescribe_forcings."""
-    del l_sample  # Sampling logic is handled internally by Fortran stats state.
-
-    set_fortran_grid(state['gr'])
-    set_fortran_sclr_idx(state['sclr_idx'])
-    set_fortran_err_info(err_info_to_api(state['err_info']))
-    result = clubb_f2py.f2py_prescribe_forcings(
-        int(state['sclr_dim']), int(state['edsclr_dim']), str(state['runtype']), int(state['sfctype']),
-        float(state['time_initial'] + (itime - 1) * state['dt_main']),
-        float(state['time_initial']), float(state['dt_main']),
-        f_arr(state['um']), f_arr(state['vm']), f_arr(state['thlm']), f_arr(state['p_in_Pa']),
-        f_arr(state['exner']), f_arr(state['rho']), f_arr(state['rho_zm']), f_arr(state['thvm']),
-        f_arr(state['gr'].zt),
-        bool(state['l_t_dependent']), bool(state['l_ignore_forcings']), bool(state['l_input_xpwp_sfc']),
-        bool(state['l_modify_bc_for_cnvg_test']),
-        int(state['flags'].saturation_formula), bool(state['flags'].l_add_dycore_grid),
-        int(state['flags'].grid_remap_method), int(state['flags'].grid_adapt_in_time_method),
-        f_arr(state['rtm']), f_arr(state['wm_zm']), f_arr(state['wm_zt']), f_arr(state['ug']),
-        f_arr(state['vg']), f_arr(state['um_ref']), f_arr(state['vm_ref']),
-        f_arr(state['thlm_forcing']), f_arr(state['rtm_forcing']), f_arr(state['um_forcing']),
-        f_arr(state['vm_forcing']), f_arr(state['wprtp_forcing']), f_arr(state['wpthlp_forcing']),
-        f_arr(state['rtp2_forcing']), f_arr(state['thlp2_forcing']), f_arr(state['rtpthlp_forcing']),
-        f_arr(state['wpsclrp']), f_arr(state['sclrm_forcing']), f_arr(state['edsclrm_forcing']),
-        f_arr(state['wpthlp_sfc']), f_arr(state['wprtp_sfc']), f_arr(state['upwp_sfc']),
-        f_arr(state['vpwp_sfc']), f_arr(state['T_sfc']), f_arr(state['p_sfc']),
-        float(state['sens_ht']), float(state['latent_ht']),
-        f_arr(state['wpsclrp_sfc']), f_arr(state['wpedsclrp_sfc']),
-        nzm=int(state['nzm']), nzt=int(state['nzt']), ngrdcol=int(state['ngrdcol']),
-    )
-
-    (
-        state['rtm'],
-        state['wm_zm'],
-        state['wm_zt'],
-        state['ug'],
-        state['vg'],
-        state['um_ref'],
-        state['vm_ref'],
-        state['thlm_forcing'],
-        state['rtm_forcing'],
-        state['um_forcing'],
-        state['vm_forcing'],
-        state['wprtp_forcing'],
-        state['wpthlp_forcing'],
-        state['rtp2_forcing'],
-        state['thlp2_forcing'],
-        state['rtpthlp_forcing'],
-        state['wpsclrp'],
-        state['sclrm_forcing'],
-        state['edsclrm_forcing'],
-        state['wpthlp_sfc'],
-        state['wprtp_sfc'],
-        state['upwp_sfc'],
-        state['vpwp_sfc'],
-        state['T_sfc'],
-        state['p_sfc'],
-        state['sens_ht'],
-        state['latent_ht'],
-        state['wpsclrp_sfc'],
-        state['wpedsclrp_sfc'],
-        state['err_info'],
-    ) = (*result, err_info_from_api(get_fortran_err_info()))
+    """Set forcings for the current timestep using the JAX prescribe_forcings port."""
+    time_current = float(state['time_initial'] + (itime - 1) * state['dt_main'])
+    if str(state['runtype']).strip() == "arm":
+        del l_sample
+        prescribe_forcings_arm(state, time_current)
+    else:
+        prescribe_forcings_generic(state, time_current, l_sample=l_sample)
 
 
 def _advance_radiation(

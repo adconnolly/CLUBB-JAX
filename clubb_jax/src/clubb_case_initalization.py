@@ -27,6 +27,8 @@ from clubb_jax.src.io.sounding import (
     interpolate_scalar_sounding,
 )
 from clubb_jax.src.io.surface import read_surface
+from clubb_jax.src.Benchmark_cases.arm import load_arm_forcings_data
+from clubb_jax.src.Benchmark_cases.time_dependent_input import load_generic_forcings_data
 
 
 def _repo_root() -> Path:
@@ -965,6 +967,19 @@ def init_clubb_case(namelist_path: str) -> dict:
         # Output / diagnostic
         thlprcp=np.zeros((ngrdcol, nzm)),
     )
+
+    # ── Case forcing data: pre-load and vertically interpolate ──────────────
+    if runtype == 'arm':
+        arm_forcings_path = _resolve_case_input_path(namelist_dir, 'arm', '_forcings.in')
+        arm_sfc_path = _resolve_case_input_path(namelist_dir, 'arm', '_sfc.in')
+        state['_arm_forcings_data'] = load_arm_forcings_data(
+            str(arm_forcings_path), str(arm_sfc_path), gr.zt[0, :]
+        )
+    else:
+        case_setups_dir = str(_clubb_release_root() / "input" / "case_setups")
+        state['_forcings_data'] = load_generic_forcings_data(
+            runtype, case_setups_dir, gr.zt[0, :], p_in_Pa=np.asarray(p_in_Pa)[0, :]
+        )
 
     print(f"Initialized {runtype} case: nzm={nzm}, nzt={nzt}, ngrdcol={ngrdcol}")
     print(f"  dt_main={dt_main}s, time={time_initial}s to {time_final}s, {ifinal} steps")

@@ -20,7 +20,7 @@ from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 # Tracer-transparency (REFACTOR B5): _asarray/_xp/_iset behave EXACTLY like numpy for concrete arrays
 # (normal runs bit-identical) but route to jnp under a jax.grad trace, so the whole-driver autodiff graph
 # survives the surface-BC interpolation. See CLUBB_core/tracer_numpy.py.
-from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray, _xp, _iset
+from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray, _xp, _iset, _is_tracer_arg
 from clubb_jax.src.CLUBB_core.interpolation import mono_cubic_interp, linear_interp_factor
 from clubb_jax.src.Benchmark_cases.spec_hum_to_mixing_ratio import flux_spec_hum_to_mixing_ratio
 from clubb_jax.src.Benchmark_cases.sfc_flux import (
@@ -164,6 +164,54 @@ def _zero_forcings(state: dict) -> None:
     state['rtm_forcing'][:] = 0.0
 
 
+def _prepare_mutable_state(state: dict) -> None:
+    """Provide writable host arrays for Fortran-style in-place forcing updates.
+
+    The translated forcing routines intentionally mirror the Fortran mutation
+    style. After the JAX core advances, some state fields are concrete JAX
+    arrays; convert only fields mutated by this forcing layer back to writable
+    NumPy arrays for normal forward runs. Tracers are left untouched so the
+    tracer-transparent helpers can preserve autodiff paths.
+    """
+    mutable_keys = (
+        "rtm",
+        "wm_zm",
+        "wm_zt",
+        "ug",
+        "vg",
+        "um_ref",
+        "vm_ref",
+        "thlm_forcing",
+        "rtm_forcing",
+        "um_forcing",
+        "vm_forcing",
+        "wprtp_forcing",
+        "wpthlp_forcing",
+        "rtp2_forcing",
+        "thlp2_forcing",
+        "rtpthlp_forcing",
+        "wpsclrp",
+        "sclrm_forcing",
+        "edsclrm_forcing",
+        "wpthlp_sfc",
+        "wprtp_sfc",
+        "upwp_sfc",
+        "vpwp_sfc",
+        "T_sfc",
+        "p_sfc",
+        "wpsclrp_sfc",
+        "wpedsclrp_sfc",
+    )
+
+    for key in mutable_keys:
+        value = state.get(key)
+        if value is None or _is_tracer_arg(value):
+            continue
+        if isinstance(value, np.ndarray) and value.flags.writeable:
+            continue
+        state[key] = np.array(value, copy=True)
+
+
 # ── RICO ─────────────────────────────────────────────────────────────────────
 
 # ── RICO: rico_sfclyr / rico_tndcy now live in their Fortran-home module Benchmark_cases/rico.py
@@ -301,6 +349,8 @@ def prescribe_forcings_arm(state: dict, time_current: float) -> None:
     Mirrors the ARM branch of prescribe_forcings.F90 when l_t_dependent=True.
     Modifies state in-place.
     """
+    _prepare_mutable_state(state)
+
     fd     = state['_arm_forcings_data']
     ngrdcol = state['ngrdcol']
     nzt    = state['nzt']
@@ -351,8 +401,8 @@ def prescribe_forcings_arm(state: dict, time_current: float) -> None:
     state['thlm_forcing'][:, -1] = 0.0
 
     # ── read_surface_var_for_bc (l_modify_bc_for_cnvg_test=False) ────────────
-    # Fortran uses gr%zt(i,1) which in Python 0-indexed is zt[col, 0]
-    z_bot = float(state['gr'].zt[0, 0])   # grid: always concrete
+    # Fortran uses gr%zt(i,1), which in Python 0-indexed is zt[col, 0].
+    z_bot = np.asarray(state['gr'].zt)[:, 0]
 
     # ── arm_sfclyr ───────────────────────────────────────────────────────────
     arm_sfclyr(state, time_current, ngrdcol, fd, z_bot)
@@ -368,6 +418,8 @@ def prescribe_forcings_generic(state: dict, time_current: float,
     Cases with l_t_dependent=True and a *_forcings.in file use the generic
     time-dependent framework. Other cases raise NotImplementedError.
     """
+    _prepare_mutable_state(state)
+
     runtype = state['runtype']
     ngrdcol = state['ngrdcol']
     l_t_dependent = state.get('l_t_dependent', False)
