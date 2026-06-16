@@ -16,6 +16,7 @@ _CLUBB_RELEASE_ROOT = Path(__file__).resolve().parents[2] / "clubb_release"
 
 import jax.numpy as jnp
 import numpy as np
+from clubb_python import clubb_api
 
 # JAX core
 from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq, rcm_sat_adj
@@ -31,17 +32,18 @@ from clubb_jax.src.CLUBB_core.parameters_tunable import (
 )
 from clubb_jax.src.CLUBB_core.model_flags import get_default_config_flags
 from clubb_jax.src.CLUBB_core.numerical_check import check_clubb_settings
+from clubb_jax.src.CLUBB_core.error_code import set_debug_level as set_jax_debug_level
 from clubb_jax.src.derived_types.config_flags import ConfigFlags
 from clubb_jax.src.derived_types.grid_class import setup_grid
 from clubb_jax.src.derived_types.sclr_idx import SclrIdx
 from clubb_jax.src.derived_types.err_info import ErrInfo
+from clubb_jax.src.derived_types.converters import err_info_from_api, err_info_to_api
 from clubb_jax.src.derived_types.pdf_params import (
     init_pdf_implicit_coefs_terms_api,
     init_pdf_params,
 )
 
 # I/O
-from clubb_jax.src.io.stats_writer import StatsWriter
 from clubb_jax.src.Input_fields.grid_file import read_grid_file
 from clubb_jax.src.Input_fields.namelist import read_namelist
 from clubb_jax.src.Input_fields.sounding import (
@@ -518,10 +520,6 @@ def init_clubb_case(namelist_path: str) -> dict:
 
     Returns a dict containing all model state arrays and config.
     """
-    # Reset cross-timestep core state so each init starts clean (reentrancy — allows running
-    # multiple cases in one process without the previous case's ADG1 state leaking, Iter281).
-    from clubb_jax.src.CLUBB_core.advance_clubb_core_module import reset_clubb_core_state
-    reset_clubb_core_state()
     # Resolve to absolute path before any chdir so subsequent uses remain valid.
     namelist_path = str(Path(namelist_path).resolve())
     cfg = read_namelist(namelist_path)
@@ -539,6 +537,10 @@ def init_clubb_case(namelist_path: str) -> dict:
     runtype = cfg['runtype']
     sclr_dim = cfg['sclr_dim']
     edsclr_dim = cfg['edsclr_dim']
+
+    clubb_api.init_err_info(ngrdcol)
+    clubb_api.set_debug_level(cfg['debug_level'])
+    set_jax_debug_level(cfg['debug_level'])
 
     # ── 1. Get config flags ─────────────────────────────────────────────────
     flags = get_default_config_flags()
@@ -720,8 +722,13 @@ def init_clubb_case(namelist_path: str) -> dict:
     # calculate_thvm replaced with calculate_thvm
     _thv_ds_zt = thm * (1.0 + ep2 * (rtm - rcm))**kappa
     thvm = np.asarray(calculate_thvm(
-        jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
-        jnp.asarray(exner), jnp.asarray(_thv_ds_zt),
+        nzt,
+        ngrdcol,
+        jnp.asarray(thlm),
+        jnp.asarray(rtm),
+        jnp.asarray(rcm),
+        jnp.asarray(exner),
+        jnp.asarray(_thv_ds_zt),
     ), dtype=np.float64)
     # second hydrostatic call also replaced with hydrostatic
     _hyd2 = hydrostatic(jnp.asarray(thvm), jnp.asarray(p_sfc), gr)
@@ -1008,35 +1015,47 @@ def init_clubb_case(namelist_path: str) -> dict:
         output_dir_path = repo_root / "output"
     stats_output_path = output_dir_path / f"{stats_prefix}_stats.nc"
 
-    stats_writer = None
     if l_stats:
         if not stats_registry_path.exists():
             raise FileNotFoundError(f"Stats registry file not found: {stats_registry_path}")
         stats_output_path.parent.mkdir(parents=True, exist_ok=True)
-        stats_writer = StatsWriter(
-            registry_path=str(stats_registry_path),
-            output_path=str(stats_output_path),
-            nzt=nzt,
-            nzm=nzm,
-            ngrdcol=ngrdcol,
-            zt=gr.zt[0, :],
-            zm=gr.zm[0, :],
-            stats_tsamp=float(cfg['stats_tsamp']),
-            stats_tout=float(cfg['stats_tout']),
-            dt_main=float(dt_main),
-            day=int(cfg['day']),
-            month=int(cfg['month']),
-            year=int(cfg['year']),
-            time_initial=float(time_initial),
-            clubb_params_vals=clubb_params,
-            param_names=get_param_names(),
-            sclr_dim=sclr_dim,
-            edsclr_dim=edsclr_dim,
+        err_info = err_info_from_api(
+            clubb_api.init_stats(
+                registry_path=str(stats_registry_path),
+                output_path=str(stats_output_path),
+                ncol=ngrdcol,
+                stats_tsamp=float(cfg['stats_tsamp']),
+                stats_tout=float(cfg['stats_tout']),
+                dt_main=float(dt_main),
+                day_in=int(cfg['day']),
+                month_in=int(cfg['month']),
+                year_in=int(cfg['year']),
+                time_initial=float(time_initial),
+                nzt=nzt,
+                zt=np.asarray(gr.zt[0, :], dtype=np.float64),
+                nzm=nzm,
+                zm=np.asarray(gr.zm[0, :], dtype=np.float64),
+                clubb_params=clubb_params,
+                param_names=get_param_names(),
+                err_info=err_info_to_api(err_info),
+                sclr_dim=sclr_dim,
+                edsclr_dim=edsclr_dim,
+            )
         )
+        err = clubb_api.get_err_code(ngrdcol)
+        if np.any(err != 0):
+            raise RuntimeError(f"stats_init failed with err_code={err}")
+        stats_enabled = bool(clubb_api.get_stats_config()[0])
+        if not stats_enabled:
+            raise RuntimeError("stats_init completed but stats are not enabled")
 
     # ── 14. Zero PDF params ─────────────────────────────────────────────
     pdf_params = init_pdf_params(nzt, ngrdcol)
     pdf_params_zm = init_pdf_params(nzm, ngrdcol)
+
+    # ── 15. Clear any accumulated error codes from init ──────────────
+    clubb_api.reset_err_code()
+    err_info = err_info.reset_code()
 
     # ── Build state dict ────────────────────────────────────────────────
     state = dict(
@@ -1161,8 +1180,9 @@ def init_clubb_case(namelist_path: str) -> dict:
         latent_ht=float(cfg.get('latent_ht', 0.0)),
         # Output / diagnostic
         thlprcp=np.zeros((ngrdcol, nzm)),
-        # Python stats writer (replaces Fortran stats API)
-        stats_writer=stats_writer,
+        # The JAX core records stats through JaxStats and replays to clubb_api.
+        # Keep this key for driver-side modules that still check it explicitly.
+        stats_writer=None,
     )
 
     # ── Case forcing data: pre-load and vertically interpolate ──────────────
@@ -1203,7 +1223,8 @@ def init_clubb_case(namelist_path: str) -> dict:
 def clean_up_clubb(state: dict):
     """Clean up state."""
     if state['l_stats']:
-        sw = state.get('stats_writer')
-        if sw is not None:
-            sw.finalize()
+        state['err_info'] = err_info_from_api(
+            clubb_api.finalize_stats(err_info=err_info_to_api(state['err_info']))
+        )
+    clubb_api.cleanup_err_info(err_info=err_info_to_api(state['err_info']))
     print("CLUBB cleanup complete.")
