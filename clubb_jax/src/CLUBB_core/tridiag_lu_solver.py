@@ -1,4 +1,69 @@
-"""JAX port of `src/CLUBB_core/tridiag_lu_solver.F90`."""
+"""JAX implementation of ``tridiag_lu_solver.F90``.
+
+Description:
+  These routines solve lhs*soln=rhs using LU decomp.
+
+  LHS is stored in band diagonal form.
+    lhs = | lhs(0,1)  lhs(-1,1)      0          0          0          0      0
+          | lhs(1,2)  lhs( 0,2)  lhs(-1,2)      0          0          0      0
+          |     0     lhs( 1,3)  lhs( 0,3)  lhs(-1,3)      0          0      0
+          |     0         0      lhs( 1,4)  lhs( 0,4)  lhs(-1,4)      0      0
+          |     0         0          0      lhs( 1,5)  lhs( 0,5)  lhs(-1,5)  0 ...
+          |    ...
+
+   U is stored in band diagonal form
+    U = |   1    upper(1)  0       0       0       0       0
+        |   0      1     upper(2)  0       0       0       0
+        |   0      0       1     upper(3)  0       0       0
+        |   0      0       0       1     upper(4)  0       0
+        |   0      0       0       0       1     upper(5)  0  ...
+        |  ...
+
+  L is also stored in band diagonal form, but the lowest most band is equivalent to the
+  lowermost band of LHS, thus we don't need to store it
+    L = | l_diag(1)       0           0            0          0        0
+        |  lower(2)      l_diag(2)    0            0          0        0
+        |    0           lower(3)   l_diag(3)      0          0        0
+        |    0            0         lower(4)    l_diag(4)     0        0
+        |    0            0           0         lower(5)    l_diag(5)   0   ...
+        |  ...
+
+  To perform the LU decomposition, we go element by element.
+  First we start by noting that we want lhs=LU, so the first step of calculating
+  L*U, by multiplying the first row of L by the columns of U, gives us
+
+    l_diag(1)*1        = lhs( 0,1)  =>  l_diag(1)   = lhs( 0,1)
+    l_diag(1)*upper(1) = lhs(-1,1)  =>  upper(1)    = lhs(-1,1) / l_diag(1)
+
+  Now that we're passed the k=1 step, each following step uses all the bands,
+  allowing us to write the general step
+
+    lower(k)*1 = lhs(1,k)                         =>  lower(k)    = lhs( 1,k)
+    lower(k)*upper(k-1)+l_diag(k)*1  = lhs( 0,k)  =>  l_diag(k) = lhs( 0,k)
+                                                                  - lower(k)*upper(k-1)
+    l_diag(k)*upper(k)               = lhs(-1,k)  =>  upper(k)  = lhs(-1,k) / l_diag(k)
+
+  This general step is done for k from 2 to ndim-1 (do k = 2, ndim-), and the last
+  step is tweaked similarly to the first one, where we disclude the upper band
+  since it becomes no longer relevant. Note from this general step that the lower band
+  is always equivalent to first subdiagonal band of lhs, thus we do not need to
+  calculate or store lower. Also note that we only ever need l_diag so that we can divide
+  by it, so instead we compute lower_diag_invrs to reduce divide operations.
+
+  After L and U are computed, normally we do forward substitution using L,
+  then backward substitution using U to find the solution. This is replicated
+  for every right hand side we want to solve for.
+
+References:
+  none
+
+Porting deviations:
+The Fortran generic interface is implemented as a Python rank-dispatch wrapper.
+The explicit Fortran loops are represented by ``jax.lax.scan`` sweeps.  Fortran
+mutates ``soln`` output arrays; the JAX routines return the solution arrays.
+The band dimension uses Python indices ``0, 1, 2`` for Fortran bands
+``-1, 0, 1``.
+"""
 
 from __future__ import annotations
 
@@ -12,18 +77,25 @@ import jax.numpy as jnp
 
 @partial(jax.jit, static_argnames=("ndim",))
 def tridiag_lu_solve_single_rhs_lhs(ndim: int, lhs, rhs):
-    """Written for single RHS and single LHS."""
+    """Solve one tridiagonal system with one right-hand side.
+
+    Description:
+      Written for single RHS and single LHS.
+    """
     del ndim
 
-    # LHS is stored in band diagonal form:
-    #   lhs[0, k] = Fortran lhs(-1,k), first superdiagonal
-    #   lhs[1, k] = Fortran lhs( 0,k), diagonal
-    #   lhs[2, k] = Fortran lhs( 1,k), first subdiagonal
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
     upper_band = lhs[0]
     diag_band = lhs[1]
     lower_band = lhs[2]
 
+    # ----------------------- Begin Code -----------------------
+
+    # Inverse of the diagonal of L
     lower_diag_invrs_0 = 1.0 / diag_band[0]
+
+    # First U band
     upper_0 = lower_diag_invrs_0 * upper_band[0]
 
     def lu_step(upper_prev, x):
@@ -80,19 +152,26 @@ def tridiag_lu_solve_single_rhs_lhs(ndim: int, lhs, rhs):
 
 @partial(jax.jit, static_argnames=("ndim", "ngrdcol"))
 def tridiag_lu_solve_single_rhs_multiple_lhs(ndim: int, ngrdcol: int, lhs, rhs):
-    """Written for single RHS and multiple LHS."""
+    """Solve multiple tridiagonal systems with one right-hand side each.
+
+    Description:
+      Written for single RHS and multiple LHS.
+    """
     del ndim, ngrdcol
 
-    # LHS is stored in band diagonal form:
-    #   lhs[0, i, k] = Fortran lhs(-1,i,k), first superdiagonal
-    #   lhs[1, i, k] = Fortran lhs( 0,i,k), diagonal
-    #   lhs[2, i, k] = Fortran lhs( 1,i,k), first subdiagonal
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
     upper_band = lhs[0].T
     diag_band = lhs[1].T
     lower_band = lhs[2].T
     rhs_t = rhs.T
 
+    # ----------------------- Begin Code -----------------------
+
+    # Inverse of the diagonal of L
     lower_diag_invrs_0 = 1.0 / diag_band[0]
+
+    # First U band
     upper_0 = lower_diag_invrs_0 * upper_band[0]
 
     def lu_step(upper_prev, x):
@@ -151,19 +230,26 @@ def tridiag_lu_solve_single_rhs_multiple_lhs(ndim: int, ngrdcol: int, lhs, rhs):
 def tridiag_lu_solve_multiple_rhs_lhs(
     ndim: int, nrhs: int, ngrdcol: int, lhs, rhs
 ):
-    """Written for multiple RHS and multiple LHS."""
+    """Solve multiple tridiagonal systems with multiple right-hand sides.
+
+    Description:
+      Written for multiple RHS and multiple LHS.
+    """
     del ndim, nrhs, ngrdcol
 
-    # LHS is stored in band diagonal form:
-    #   lhs[0, i, k] = Fortran lhs(-1,i,k), first superdiagonal
-    #   lhs[1, i, k] = Fortran lhs( 0,i,k), diagonal
-    #   lhs[2, i, k] = Fortran lhs( 1,i,k), first subdiagonal
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
     upper_band = lhs[0].T
     diag_band = lhs[1].T
     lower_band = lhs[2].T
     rhs_t = jnp.transpose(rhs, (1, 0, 2))
 
+    # ----------------------- Begin Code -----------------------
+
+    # Inverse of the diagonal of L
     lower_diag_invrs_0 = 1.0 / diag_band[0]
+
+    # First U band
     upper_0 = lower_diag_invrs_0 * upper_band[0]
 
     def lu_step(upper_prev, x):

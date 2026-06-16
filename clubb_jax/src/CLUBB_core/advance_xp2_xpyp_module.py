@@ -13,7 +13,11 @@ References:
     Method and Model Description'' Golaz, et al. (2002)
     JAS, Vol. 59, pp. 3540--3551.
 
-Adaptation notes:
+See also:
+  ``Equations for CLUBB'', Section 4:
+  /Steady-state solution for the variances/
+
+Porting deviations:
 - Sponge damping is intentionally omitted because the JAX case initialization
   rejects sponge-enabled cases before this routine is called.
 - xp2_xpyp_single_lhs_valid is a JAX compile-time guard for the single-LHS
@@ -94,17 +98,18 @@ from clubb_jax.src.derived_types.err_info_codes import (
 )
 
 
-xp2_xpyp_rtp2 = 1
-xp2_xpyp_thlp2 = 2
-xp2_xpyp_rtpthlp = 3
-xp2_xpyp_up2_vp2 = 4
-xp2_xpyp_up2 = 5
-xp2_xpyp_vp2 = 6
-xp2_xpyp_scalars = 7
-xp2_xpyp_sclrp2 = 8
-xp2_xpyp_sclrprtp = 9
-xp2_xpyp_sclrpthlp = 10
-xp2_xpyp_single_lhs = 11
+# Private named constants to avoid string comparisons
+xp2_xpyp_rtp2 = 1  # Named constant for rtp2 solves
+xp2_xpyp_thlp2 = 2  # Named constant for thlp2 solves
+xp2_xpyp_rtpthlp = 3  # Named constant for rtpthlp solves
+xp2_xpyp_up2_vp2 = 4  # Named constant for up2_vp2 solves
+xp2_xpyp_up2 = 5  # Named constant for up2 solves
+xp2_xpyp_vp2 = 6  # Named constant for vp2 solves
+xp2_xpyp_scalars = 7  # Named constant for scalar solves
+xp2_xpyp_sclrp2 = 8  # Named constant for sclrp2 solves
+xp2_xpyp_sclrprtp = 9  # Named constant for sclrprtp solves
+xp2_xpyp_sclrpthlp = 10  # Named constant for sclrpthlp solves
+xp2_xpyp_single_lhs = 11  # Named constant for single lhs solve
 
 clip_sclrp2 = 14
 clip_sclrprtp = 15
@@ -194,7 +199,7 @@ def advance_xp2_xpyp(
     rtp2, thlp2, rtpthlp, up2, vp2,
     sclrp2, sclrprtp, sclrpthlp, err_info: ErrInfo,
 ):
-    """Advance scalar variances/covariances and horizontal turbulence."""
+    """Prognose scalar variances, scalar covariances, and horizontal turbulence components."""
     l_sample = stats.l_sample
     l_scalar_calc = sclr_dim > 0
     initial_rtp2, initial_thlp2, initial_rtpthlp = rtp2, thlp2, rtpthlp
@@ -2101,6 +2106,20 @@ def calc_xp2_xpyp_ta_terms(
 
 @partial(jax.jit, static_argnames=("nzm", "nzt", "ngrdcol"))
 def term_tp_rhs(nzm, nzt, ngrdcol, xam, xbm, wpxbp, wpxap, invrs_dzm):
+    """Turbulent production of x_a'x_b':  explicit portion of the code.
+
+    The d(x_a'x_b')/dt equation contains a turbulent production term:
+
+    - w'x_b' d(x_am)/dz - w'x_a' d(x_bm)/dz.
+
+    This term is solved for completely explicitly and is discretized as
+    follows:
+
+    The values of w'x_a' and w'x_b' are found on the momentum levels, whereas
+    the values of x_am and x_bm are found on the thermodynamic levels.
+
+    invrs_dzm(k) = 1 / ( zt(k) - zt(k-1) )
+    """
     del nzt
     rhs = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
     interior = slice(1, nzm - 1)
@@ -2117,22 +2136,53 @@ def term_tp_rhs(nzm, nzt, ngrdcol, xam, xbm, wpxbp, wpxap, invrs_dzm):
 
 @partial(jax.jit, static_argnames=("nzm", "ngrdcol"))
 def term_dp1_lhs(nzm, ngrdcol, gr, Cn, invrs_tau_zm):
+    """Dissipation term 1 for x_a'x_b':  implicit portion of the code.
+
+    The d(x_a'x_b')/dt equation contains dissipation term 1:
+
+    - ( C_n / tau_zm ) * x_a'x_b'.
+
+    For cases where x_a'x_b' is a variance (in other words, where x_a and x_b
+    are the same variable), the term is damped to a certain positive
+    threshold.
+    """
     lhs = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
     interior = slice(1, nzm - 1)
+    # Momentum main diagonal: [ x xapxbp(k,<t+1>) ]
     lhs = lhs.at[:, interior].set(Cn[:, interior] * invrs_tau_zm[:, interior])
+    # Set lower boundary to 0
     lhs = lhs.at[:, gr.k_lb_zm].set(zero)
+    # Set upper boundary to 0
     lhs = lhs.at[:, gr.k_ub_zm].set(zero)
     return lhs
 
 
 @partial(jax.jit, static_argnames=("nzm", "ngrdcol"))
 def term_dp1_rhs(nzm, ngrdcol, Cn, invrs_tau_zm, threshold):
+    """Dissipation term 1 for x_a'x_b':  explicit portion of the code.
+
+    The explicit portion of this term is:
+
+    + ( C_n / tau_zm ) * threshold.
+
+    The values of time-scale tau_zm and the threshold are found on the
+    momentum levels.
+    """
     del ngrdcol
     return Cn[:, :nzm] * invrs_tau_zm[:, :nzm] * threshold
 
 
 @partial(jax.jit, static_argnames=("nzm", "ngrdcol"))
 def term_pr1(nzm, ngrdcol, C4, C14, xbp2, wp2, invrs_tau_C4_zm, invrs_tau_C14_zm):
+    """Pressure term 1 for x_a'x_b':  explicit portion of the code.
+
+    Note:  Pressure term 1 is only used when x_a'x_b' is either u'^2 or v'^2.
+
+    The combined term has both implicit and explicit components.
+    The implicit component of the combined dp1 and pr1 term is solved in
+    function "term_dp1_lhs" above, where "( 2*C_4 + C_14 ) / 3" is sent in
+    as "C_n".
+    """
     rhs = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
     interior = slice(1, nzm - 1)
     rhs = rhs.at[:, interior].set(
@@ -2154,6 +2204,17 @@ def term_pr2(
     nzm, nzt, ngrdcol, gr, C_uu_shr, C_uu_buoy,
     thv_ds_zm, wpthvp, upwp, vpwp, um, vm,
 ):
+    """Pressure term 2 for x_a'x_b':  explicit portion of the code.
+
+    Note:  Pressure term 2 is only used when x_a'x_b' is either u'^2 or v'^2.
+
+    The d(u'^2)/dt equation contains pressure term 2:
+
+    + (2/3) C_5 [ (g/thv_ds) w'th_v' - u'w' du/dz - v'w' dv/dz ].
+
+    Note that below we have broken up C5 into C_uu_shr for shear terms and
+    C_uu_buoy for buoyancy terms.
+    """
     del nzt
     rhs_pr2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
     interior = slice(1, nzm - 1)
@@ -2174,6 +2235,10 @@ def term_pr2(
     rhs_pr2 = rhs_pr2.at[:, interior].set(
         jnp.maximum(rhs_pr2_interior, zero_threshold)
     )
+    # Added by dschanen for ticket #36
+    # We have found that when shear generation is zero this term will only be
+    # offset by hole-filling (up2_pd/vp2_pd) and reduces turbulence
+    # unrealistically at lower altitudes to make up the difference.
     return rhs_pr2
 
 
@@ -2185,6 +2250,7 @@ def pos_definite_variances(
     nzm, ngrdcol, gr, solve_type, fill_holes_type, dt, tolerance, rho_ds_zm,
     stats, xp2_np1,
 ):
+    """Use the hole filling code to make a variance term positive definite."""
     l_sample = stats.l_sample
     if solve_type == xp2_xpyp_rtp2:
         name_pd = "rtp2_pd"
@@ -2198,9 +2264,14 @@ def pos_definite_variances(
         name_pd = ""
 
     if l_sample and name_pd:
+        # Store previous value for effect of the positive definite scheme
         stats = stats.begin_budget(name_pd, xp2_np1 / dt)
 
     if fill_holes_type != 0:
+        # Call the hole-filling scheme.
+        # The first pass-through should draw from only two levels on either side
+        # of the hole.
+        # upper_hf_level = nz-1 since we are filling the zm levels
         xp2_np1 = fill_holes_vertical(
             nzm, ngrdcol, tolerance,
             gr.k_lb_zm + gr.grid_dir_indx,

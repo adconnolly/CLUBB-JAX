@@ -4,7 +4,7 @@ Description:
   Compute CLUBB's mixing length and dissipation time scales, including
   Richardson-number-dependent damping terms and Lscale-related stats.
 
-Adaptation notes:
+Porting deviations:
 - Stats are threaded explicitly with JaxStats because the Fortran routine uses
   global stats side effects that are not JAX-compatible state.
 - ``compute_mixing_length`` uses small scan helpers to express the Fortran
@@ -12,6 +12,9 @@ Adaptation notes:
   dynamic loop structure, not physics abstractions.
 - The direct parcel-length branch currently mirrors the ascending-grid path
   used by the SCM cases. The diagnosed-Lscale branch is fully vectorized.
+- ``calc_Lscale_directly`` keeps the Fortran ``l_avg_Lscale = .false.`` path.
+  The dormant perturbation/plume-centered branches are not expanded because the
+  Fortran parameter disables them in production.
 """
 
 from __future__ import annotations
@@ -108,9 +111,14 @@ def calc_Lscale(
     stats: JaxStats,
     err_info,
 ):
-    """Compute CLUBB's mixing length and dissipation time scales."""
+    """Compute CLUBB's mixing length and dissipation time scales.
+
+    References:
+      Guo et al. (2021, JAMES) for the diagnosed Lscale-from-tau option.
+    """
     l_smooth_min_max = False
 
+    # Determine the maximum allowable value for Lscale (in meters).
     Lscale_max = set_Lscale_max(ngrdcol, l_implemented, host_dx, host_dy)
 
     # Interpolate rtpthlp here so the diagnostic stats value is generated at
@@ -335,7 +343,25 @@ def set_Lscale_max(
     host_dx,
     host_dy,
 ):
-    """Set the maximum allowable value of Lscale."""
+    """Set the maximum allowable value of Lscale.
+
+    Description:
+      This subroutine sets the value of Lscale_max, which is the maximum
+      allowable value of Lscale.  For standard CLUBB, it is set to a very large
+      value so that Lscale will not be limited.  However, when CLUBB is running
+      as part of a host model, the value of Lscale_max is dependent on the size
+      of the host model's horizontal grid spacing.  The smaller the host model's
+      horizontal grid spacing, the smaller the value of Lscale_max.  When Lscale
+      is limited to a small value, the value of time-scale Tau is reduced, which
+      in turn produces greater damping on CLUBB's turbulent parameters.  This
+      is the desired effect on turbulent parameters for a host model with small
+      horizontal grid spacing, for small areas usually contain much less
+      variation in meteorological quantities than large areas.
+
+    References:
+      None
+    """
+    # Determine the maximum allowable value for Lscale (in meters).
     if l_implemented:
         return 0.25 * jnp.minimum(host_dx, host_dy)
     return jnp.full((ngrdcol,), 1.0e5)
@@ -359,15 +385,26 @@ def _bounded_while(cond_fn, body_fn, init_state, max_iters: int):
 
 
 def _parcel_thv(thl_par, rt_par, exner_j, p_j, thv_ds_j, Lv_coef_j, saturation_formula):
+    # Include effects of latent heating on Lscale_up 6/12/00
+    # Use thermodynamic formula of Bougeault 1981 JAS Vol. 38, 2416
+    # Probably should use properties of bump 1 in Gaussian, not mean!!!
     tl_par_j = thl_par * exner_j
     rsatl_par_j = sat_mixrat_liq(p_j, tl_par_j, saturation_formula)
     tl_par_j_sqd = tl_par_j**2
+    # s from Lewellen and Yoh 1993 (LY) eqn. 1
+    #                         s = ( rt - rsatl ) / ( 1 + beta * rsatl )
+    # and SD's beta (eqn. 8),
+    #                         beta = ep * ( Lv / ( Rd * tl ) ) * ( Lv / ( cp * tl ) )
+    #
+    # Simplified by multiplying top and bottom by tl^2 to avoid a
+    # divide and precalculating ep * Lv**2 / ( Rd * cp )
     s_par_j = (
         (rt_par - rsatl_par_j)
         * tl_par_j_sqd
         / (tl_par_j_sqd + ep * Lv**2 / (Rd * Cp) * rsatl_par_j)
     )
     rc_par_j = jnp.maximum(s_par_j, zero_threshold)
+    # theta_v of entraining parcel at grid level j
     return thl_par + ep1 * thv_ds_j * rt_par + Lv_coef_j * rc_par_j
 
 
@@ -411,7 +448,21 @@ def _upward_inner_while(
 
     def body_fn(state):
         j, tke, thl_par_j, rt_par_j, dCAPE_dz_j_minus_1, done, j_last, tke_exit, dCAPE_exit_prev, dCAPE_exit_j = state
+        # thl, rt of parcel are conserved except for entrainment
+        #
+        # The values of thl_env and rt_env are treated as changing linearly for a parcel
+        # of air ascending from level j-1 to level j
+
+        # theta_l of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(thl_par)/dz = - mu * ( thl_par - thl_env )
         thl_par_j_new = thl_par_j_precalc[j] + thl_par_j * exp_mu_dzm[j]
+
+        # r_t of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(rt_par)/dz = - mu * ( rt_par - rt_env )
         rt_par_j_new = rt_par_j_precalc[j] + rt_par_j * exp_mu_dzm[j]
         thv_par_j = _parcel_thv(
             thl_par_j_new,
@@ -422,9 +473,13 @@ def _upward_inner_while(
             Lv_coef[j],
             saturation_formula,
         )
+        # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
         dCAPE_dz_j = grav_on_thvm[j] * (thv_par_j - thvm[j])
+        # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+        # Trapezoidal estimate between grid levels j and j-1
         CAPE_incr = one_half * (dCAPE_dz_j + dCAPE_dz_j_minus_1) * dzm[j]
         tke_new = tke + CAPE_incr
+        # Exit loop early if tke has been exhaused between level j and j+1
         exhausted = tke_new <= zero
         newly_exhausted = exhausted & (~done)
 
@@ -487,7 +542,21 @@ def _downward_inner_while(
 
     def body_fn(state):
         j, tke, thl_par_j, rt_par_j, dCAPE_dz_j_plus_1, done, j_last, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j = state
+        # thl, rt of parcel are conserved except for entrainment
+        #
+        # The values of thl_env and rt_env are treated as changing linearly for a parcel
+        # of air descending from level j to level j-1
+
+        # theta_l of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(thl_par)/dz = - mu * ( thl_par - thl_env )
         thl_par_j_new = thl_par_j_precalc[j] + thl_par_j * exp_mu_dzm[j + 1]
+
+        # r_t of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(rt_par)/dz = - mu * ( rt_par - rt_env )
         rt_par_j_new = rt_par_j_precalc[j] + rt_par_j * exp_mu_dzm[j + 1]
         thv_par_j = _parcel_thv(
             thl_par_j_new,
@@ -498,9 +567,13 @@ def _downward_inner_while(
             Lv_coef[j],
             saturation_formula,
         )
+        # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
         dCAPE_dz_j = grav_on_thvm[j] * (thv_par_j - thvm[j])
+        # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+        # Trapezoidal estimate between grid levels j+1 and j
         CAPE_incr = one_half * (dCAPE_dz_j + dCAPE_dz_j_plus_1) * dzm[j + 1]
         tke_new = tke - CAPE_incr
+        # Exit loop early if tke has been exhaused between level j+1 and j
         exhausted = tke_new <= zero
         newly_exhausted = exhausted & (~done)
 
@@ -547,8 +620,12 @@ def _compute_lscale_up_col(
     zlmin = 0.1
 
     def outer_step(Lscale_up_max_alt, k):
+        # If the initial turbulent kinetic energy (tke) has not been exhausted for this grid level
         tke_after_first_level = tke_i[k] + CAPE_incr_1[k + 1]
         dCAPE_dz_k_plus_1 = dCAPE_dz_1[k + 1]
+        # Find the remaining distance z - z_0 that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula. Simplified
+        # since dCAPE_dz_j_minus_1 = 0.0
         dCAPE_safe = jnp.where(jnp.abs(dCAPE_dz_k_plus_1) > 0.0, dCAPE_dz_k_plus_1, 1.0)
         frac_first = (
             -jnp.sqrt(jnp.maximum(zero_threshold, -two * tke_i[k] * dzm[k + 1] * dCAPE_dz_k_plus_1))
@@ -584,11 +661,20 @@ def _compute_lscale_up_col(
             saturation_formula,
         )
 
+        # Loop terminated early, meaning TKE was completely exhaused at grid level j.
+        # Add the thickness z - z_0 (where z_0 < z <= z_1) to Lscale_up.
         dCAPE_diff = dCAPE_exit_j - dCAPE_exit_prev
         linear_case = jnp.abs(dCAPE_diff) * two <= jnp.abs(dCAPE_exit_j + dCAPE_exit_prev) * eps
         dCAPE_j_safe = jnp.where(jnp.abs(dCAPE_exit_j) > 0.0, dCAPE_exit_j, 1.0)
+        # Special case where dCAPE/dz|_(z_1) - dCAPE/dz|_(z_0) = 0
+        # Find the remaining distance z - z_0 that it takes to
+        # exhaust the remaining TKE
         frac_linear = -tke_exit / dCAPE_j_safe
 
+        # Case used for most scenarios where dCAPE/dz|_(z_1) /= dCAPE/dz|_(z_0)
+        # Find the remaining distance z - z_0 that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula (only the
+        # negative (-) root works in this scenario).
         dCAPE_diff_safe = jnp.where(jnp.abs(dCAPE_diff) > 0.0, dCAPE_diff, 1.0)
         invrs_dCAPE_diff = one / dCAPE_diff_safe
         discriminant = dCAPE_exit_prev**2 - two * tke_exit * invrs_dzm[j] * dCAPE_diff
@@ -605,6 +691,9 @@ def _compute_lscale_up_col(
             zlmin + frac_first,
         )
         parcel_top = zt[k] + Lscale_up_k
+        # If a parcel at a previous grid level can rise past the parcel at this grid level
+        # then this one should also be able to rise up to that height. This feature insures
+        # that the profile of Lscale_up will be smooth, thus reducing numerical instability.
         Lscale_up_k = jnp.where(
             parcel_top < Lscale_up_max_alt,
             Lscale_up_max_alt - zt[k],
@@ -648,8 +737,12 @@ def _compute_lscale_down_col(
 
     def outer_step(Lscale_down_min_alt, offset):
         k = nzt - 1 - offset
+        # If the initial turbulent kinetic energy (tke) has not been exhausted for this grid level
         tke_after_first_level = tke_i[k] - CAPE_incr_1[k - 1]
         dCAPE_dz_k_minus_1 = dCAPE_dz_1[k - 1]
+        # Find the remaining distance z_0 - z that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula. Simplified
+        # since dCAPE_dz_j_plus_1 = 0.0
         dCAPE_safe = jnp.where(jnp.abs(dCAPE_dz_k_minus_1) > 0.0, dCAPE_dz_k_minus_1, 1.0)
         frac_first = (
             jnp.sqrt(jnp.maximum(zero_threshold, two * tke_i[k] * dzm[k] * dCAPE_dz_k_minus_1))
@@ -686,11 +779,23 @@ def _compute_lscale_down_col(
             saturation_formula,
         )
 
+        # Loop terminated early, meaning TKE was completely exhaused at grid level j.
+        # Add the thickness z - z_0 (where z_0 < z <= z_1) to Lscale_up.
         dCAPE_diff = dCAPE_exit_j - dCAPE_exit_plus1
         linear_case = jnp.abs(dCAPE_diff) * two <= jnp.abs(dCAPE_exit_j + dCAPE_exit_plus1) * eps
         dCAPE_j_safe = jnp.where(jnp.abs(dCAPE_exit_j) > 0.0, dCAPE_exit_j, 1.0)
+        # Special case where dCAPE/dz|_(z_(-1)) - dCAPE/dz|_(z_0) = 0
+        # Find the remaining distance z_0 - z that it takes to
+        # exhaust the remaining TKE
         frac_linear = tke_exit / dCAPE_j_safe
 
+        # Case used for most scenarios where dCAPE/dz|_(z_(-1)) /= dCAPE/dz|_(z_0)
+        # Find the remaining distance z_0 - z that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula (only the
+        # negative (-) root works in this scenario) -- however, the
+        # negative (-) root is divided by another negative (-) factor,
+        # which results in an overall plus (+) sign in front of the
+        # square root term in the equation below).
         dCAPE_diff_safe = jnp.where(jnp.abs(dCAPE_diff) > 0.0, dCAPE_diff, 1.0)
         invrs_dCAPE_diff = one / dCAPE_diff_safe
         discriminant = dCAPE_exit_plus1**2 + two * tke_exit * invrs_dzm[j + 1] * dCAPE_diff
@@ -707,6 +812,9 @@ def _compute_lscale_down_col(
             zlmin + frac_first,
         )
         parcel_bottom = zt[k] - Lscale_down_k
+        # If a parcel at a previous grid level can descend past the parcel at this grid level
+        # then this one should also be able to descend down to that height. This feature insures
+        # that the profile of Lscale_down will be smooth, thus reducing numerical instability.
         Lscale_down_k = jnp.where(
             parcel_bottom > Lscale_down_min_alt,
             zt[k] - Lscale_down_min_alt,
@@ -747,7 +855,85 @@ def compute_mixing_length(
     l_implemented: bool,
     err_info,
 ):
-    """Larson's fifth moist, nonlocal length scale."""
+    """Larson's 5th moist, nonlocal length scale.
+
+    References:
+      Section 3b ( /Eddy length formulation/ ) of
+      ``A PDF-Based Model for Boundary Layer Clouds. Part I:
+      Method and Model Description'' Golaz, et al. (2002)
+      JAS, Vol. 59, pp. 3540--3551.
+
+    Notes:
+
+      The equation for the rate of change of theta_l and r_t of the parcel with
+      respect to height, due to entrainment, is:
+
+              d(thl_par)/dz = - mu * ( thl_parcel - thl_environment );
+
+              d(rt_par)/dz = - mu * ( rt_parcel - rt_environment );
+
+      where mu is the entrainment rate,
+      such that:
+
+              mu = (1/m)*(dm/dz);
+
+      where m is the mass of the parcel.  The value of mu is set to be a
+      constant.
+
+      The differential equations are solved for given the boundary condition
+      and given the fact that the value of thl_environment and rt_environment
+      are treated as changing linearly for a parcel of air from one grid level
+      to the next.
+
+      For the special case where entrainment rate, mu, is set to 0,
+      thl_parcel and rt_parcel remain constant
+
+
+      The equation for Lscale_up is:
+
+          INT(z_i:z_i+Lscale_up) g * ( thv_par - thvm ) / thvm dz = -em(z_i);
+
+      and for Lscale_down
+
+          INT(z_i-Lscale_down:z_i) g * ( thv_par - thvm ) / thvm dz = em(z_i);
+
+      where thv_par is theta_v of the parcel, thvm is the mean
+      environmental value of theta_v, z_i is the altitude that the parcel
+      started from, and em is the mean value of TKE at
+      altitude z_i (which gives the parcel its initial boost)
+
+      The increment of CAPE (convective air potential energy) for any two
+      successive vertical levels is:
+
+          Upwards:
+              CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+
+          Downwards:
+              CAPE_incr = INT(z_(-1):z_0) g * ( thv_par - thvm ) / thvm dz
+
+      Thus, the derivative of CAPE with respect to height is:
+
+              dCAPE/dz = g * ( thv_par - thvm ) / thvm.
+
+      A purely trapezoidal rule is used between levels, and is considered
+      to vary linearly at all altitudes.  Thus, dCAPE/dz is considered to be
+      of the form:  A * (z-zo) + dCAPE/dz|_(z_0),
+      where A = ( dCAPE/dz|_(z_1) - dCAPE/dz|_(z_0) ) / ( z_1 - z_0 )
+
+      The integral is evaluated to find the CAPE increment between two
+      successive vertical levels.  The result either adds to or depletes
+      from the total amount of energy that keeps the parcel ascending/descending.
+
+
+    IMPORTANT NOTE:
+      This subroutine has been optimized by adding precalculations, rearranging
+      equations to avoid divides, and modifying the algorithm entirely.
+          -Gunther Huebler
+
+      The algorithm previously used looped over every grid level, following a
+      a parcel up from its initial grid level to its max. The very nature of this
+      algorithm is an N^2
+    """
     if gr.grid_dir_indx != 1:
         raise NotImplementedError(
             "JAX compute_mixing_length currently supports ascending grids only."
@@ -765,6 +951,7 @@ def compute_mixing_length(
     thv_ds = jnp.asarray(thv_ds)
     mu = jnp.asarray(mu)
 
+    # Error in grid column i -> set ith entry to clubb_fatal_error
     mu_bad = jnp.abs(mu) < eps
     err_info = err_info.set_fatal(mask=mu_bad)
     mu = jnp.where(mu_bad, one, mu)
@@ -773,14 +960,24 @@ def compute_mixing_length(
     Lscale_sfclyr_depth = 500.0
     invrs_Lscale_sfclyr_depth = one / Lscale_sfclyr_depth
 
+    # Calculate initial turbulent kinetic energy for each grid level
     tke_i = zm2zt(nzm, nzt, ngrdcol, gr, em)
+    # Initialize arrays and precalculate values for computational efficiency
     grav_on_thvm = grav / thvm
     Lv_coef = Lv / (exner * Cp) - ep2 * thv_ds
 
+    # Precalculate values to avoid unnecessary calculations later
     exp_mu_dzm = jnp.exp(-mu[:, None] * gr.dzm)
     invrs_dzm_on_mu = gr.invrs_dzm / mu[:, None]
     entrain_coef = (one - exp_mu_dzm) * invrs_dzm_on_mu
 
+    # Precalculations of single values to avoid unnecessary calculations later
+
+    # ---------------- Upwards Length Scale Calculation ----------------
+
+    # Precalculate values for upward Lscale, these are useful only if a parcel can rise
+    # more than one level. They are used in the equations that calculate thl and rt
+    # recursively for a parcel as it ascends
     thl_par_j_precalc_up = jnp.concatenate(
         [
             jnp.zeros((ngrdcol, 1)),
@@ -804,6 +1001,15 @@ def compute_mixing_length(
         axis=1,
     )
 
+    # Calculate the initial change in TKE for each level. This is done for computational
+    # efficiency, it helps because there will be at least one calculation for each grid level,
+    # meaning the first one can be done for every grid level and therefore the calculations can
+    # be vectorized, clubb:ticket:834. After the initial calculation however, it is uncertain
+    # how many more iterations should be done for each individual grid level, and calculating
+    # one change in TKE for each level until all are exhausted will result in many unnessary
+    # and expensive calculations.
+
+    # Calculate initial thl, tl, and rt for parcels at each grid level
     thl_par_1_up_int = (
         thlm[:, 1:] - (thlm[:, 1:] - thlm[:, :-1]) * entrain_coef[:, 1:nzt]
     )
@@ -817,20 +1023,31 @@ def compute_mixing_length(
         saturation_formula,
     )
     tl_par_1_up_sqd = tl_par_1_up_int**2
+    # s from Lewellen and Yoh 1993 (LY) eqn. 1
+    #                           s = ( rt - rsatl ) / ( 1 + beta * rsatl )
+    # and SD's beta (eqn. 8),
+    #                           beta = ep * ( Lv / ( Rd * tl ) ) * ( Lv / ( cp * tl ) )
+    #
+    # Simplified by multiplying top and bottom by tl^2 to avoid a divide and precalculating
+    # ep * Lv**2 / ( Rd * cp )
     s_par_1_up_int = (
         (rt_par_1_up_int - rsatl_par_1_up_int)
         * tl_par_1_up_sqd
         / (tl_par_1_up_sqd + ep * Lv**2 / (Rd * Cp) * rsatl_par_1_up_int)
     )
     rc_par_1_up_int = jnp.maximum(s_par_1_up_int, zero_threshold)
+    # theta_v of entraining parcel at grid level j
     thv_par_1_up_int = (
         thl_par_1_up_int
         + ep1 * thv_ds[:, 1:] * rt_par_1_up_int
         + Lv_coef[:, 1:] * rc_par_1_up_int
     )
+    # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
     dCAPE_dz_1_up_int = grav_on_thvm[:, 1:] * (
         thv_par_1_up_int - thvm[:, 1:]
     )
+    # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+    # Trapezoidal estimate between grid levels, dCAPE at z_0 = 0 for this initial calculation
     CAPE_incr_1_up_int = one_half * dCAPE_dz_1_up_int * gr.dzm[:, 1:nzt]
 
     thl_par_1_up = jnp.concatenate(
@@ -850,6 +1067,11 @@ def compute_mixing_length(
         axis=1,
     )
 
+    # ---------------- Downwards Length Scale Calculation ----------------
+
+    # Precalculate values for downward Lscale, these are useful only if a parcel can descend
+    # more than one level. They are used in the equations that calculate thl and rt
+    # recursively for a parcel as it descends
     thl_par_j_precalc_down = jnp.concatenate(
         [
             thlm[:, :-1]
@@ -869,6 +1091,15 @@ def compute_mixing_length(
         axis=1,
     )
 
+    # Calculate the initial change in TKE for each level. This is done for computational
+    # efficiency, it helps because there will be at least one calculation for each grid level,
+    # meaning the first one can be done for every grid level and therefore the calculations can
+    # be vectorized, clubb:ticket:834. After the initial calculation however, it is uncertain
+    # how many more iterations should be done for each individual grid level, and calculating
+    # one change in TKE for each level until all are exhausted will result in many unnessary
+    # and expensive calculations.
+
+    # Calculate initial thl, tl, and rt for parcels at each grid level
     thl_par_1_down_int = (
         thlm[:, :-1] - (thlm[:, :-1] - thlm[:, 1:]) * entrain_coef[:, 1:nzt]
     )
@@ -882,20 +1113,31 @@ def compute_mixing_length(
         saturation_formula,
     )
     tl_par_1_down_sqd = tl_par_1_down_int**2
+    # s from Lewellen and Yoh 1993 (LY) eqn. 1
+    #                           s = ( rt - rsatl ) / ( 1 + beta * rsatl )
+    # and SD's beta (eqn. 8),
+    #                           beta = ep * ( Lv / ( Rd * tl ) ) * ( Lv / ( cp * tl ) )
+    #
+    # Simplified by multiplying top and bottom by tl^2 to avoid a divide and precalculating
+    # ep * Lv**2 / ( Rd * cp )
     s_par_1_down_int = (
         (rt_par_1_down_int - rsatl_par_1_down_int)
         * tl_par_1_down_sqd
         / (tl_par_1_down_sqd + ep * Lv**2 / (Rd * Cp) * rsatl_par_1_down_int)
     )
     rc_par_1_down_int = jnp.maximum(s_par_1_down_int, zero_threshold)
+    # theta_v of entraining parcel at grid level j
     thv_par_1_down_int = (
         thl_par_1_down_int
         + ep1 * thv_ds[:, :-1] * rt_par_1_down_int
         + Lv_coef[:, :-1] * rc_par_1_down_int
     )
+    # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
     dCAPE_dz_1_down_int = grav_on_thvm[:, :-1] * (
         thv_par_1_down_int - thvm[:, :-1]
     )
+    # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+    # Trapezoidal estimate between grid levels, dCAPE at z_0 = 0 for this initial calculation
     CAPE_incr_1_down_int = (
         one_half * dCAPE_dz_1_down_int * gr.dzm[:, 1:nzt]
     )
@@ -973,7 +1215,12 @@ def compute_mixing_length(
     Lscale_up = jnp.stack(Lscale_up_cols)
     Lscale_down = jnp.stack(Lscale_down_cols)
 
+    # ---------------- Final Lscale Calculation ----------------
+
+    # Make lminh a linear function starting at value lmin at the bottom
+    # and going to zero at 500 meters in altitude.
     if l_implemented:
+        # Within a host model, increase mixing length in 500 m layer above *ground*
         lminh = (
             jnp.maximum(
                 zero_threshold,
@@ -983,6 +1230,7 @@ def compute_mixing_length(
             * invrs_Lscale_sfclyr_depth
         )
     else:
+        # In standalone mode, increase mixing length in 500 m layer above *mean sea level*
         lminh = (
             jnp.maximum(zero_threshold, Lscale_sfclyr_depth - gr.zt)
             * lmin
@@ -991,10 +1239,18 @@ def compute_mixing_length(
 
     Lscale_up = jnp.maximum(lminh, Lscale_up)
     Lscale_down = jnp.maximum(lminh, Lscale_down)
+    # When L is large, turbulence is weakly damped
+    # When L is small, turbulence is strongly damped
+    # Use a geometric mean to determine final Lscale so that L tends to become small
+    # if either Lscale_up or Lscale_down becomes small.
     Lscale = jnp.sqrt(jnp.maximum(zero_threshold, Lscale_up * Lscale_down))
+    # Set the value of Lscale at the upper and lower boundaries.
     Lscale = Lscale.at[:, gr.k_ub_zt].set(Lscale[:, gr.k_ub_zt - gr.grid_dir_indx])
+    # Vince Larson limited Lscale to allow host
+    # model to take over deep convection.  13 Feb 2008.
     Lscale = jnp.minimum(Lscale, Lscale_max[:, None])
 
+    # Ensure that no Lscale values are NaN
     if clubb_at_least_debug_level(1):
         err_info = err_info.set_fatal(mask=jnp.any(jnp.isnan(Lscale), axis=1))
         err_info = err_info.set_fatal(mask=jnp.any(jnp.isnan(Lscale_up), axis=1))
@@ -1032,10 +1288,17 @@ def calc_Lscale_directly(
     """Diagnose Lscale directly from thermodynamic profiles and PDF data."""
     del rtp2_zt, thlp2_zt, rtpthlp_zt, pdf_params
 
+    # Lscale is calculated in subroutine compute_mixing_length
+    # if l_avg_Lscale is true, compute_mixing_length is called
+    # two additional times with
+    # perturbed values of rtm and thlm.  An average value of Lscale
+    # from the three calls to compute_mixing_length is then calculated.
+    # This reduces temporal noise in RICO, BOMEX, LBA, and other cases.
     l_avg_Lscale = False
 
     if clubb_at_least_debug_level(0):
         if l_Lscale_plume_centered and not l_avg_Lscale:
+            # General error -> set all entries to clubb_fatal_error
             err_info = err_info.set_fatal()
             return (
                 err_info,
@@ -1048,12 +1311,16 @@ def calc_Lscale_directly(
     Lscale_pert_1 = jnp.full((ngrdcol, nzt), unused_var)
     Lscale_pert_2 = jnp.full((ngrdcol, nzt), unused_var)
 
+    # Undefined
     stats = stats.update("Lscale_pert_1", Lscale_pert_1)
+    # Undefined
     stats = stats.update("Lscale_pert_2", Lscale_pert_2)
 
+    # ********** NOTE: **********
     # This call to compute_mixing_length must be last. Otherwise, the values of
     # Lscale_up and Lscale_down in stats will be based on perturbation length
     # scales rather than the mean length scale.
+    # Diagnose CLUBB's turbulent mixing length scale.
     err_info, Lscale, Lscale_up, Lscale_down = compute_mixing_length(
         nzm,
         nzt,
@@ -1099,12 +1366,17 @@ def diagnose_Lscale_from_tau(
     Ri_zm,
     err_info,
 ):
-    """Diagnose inverse damping time scales and turbulent mixing length."""
+    """Diagnose inverse damping time scales (invrs_tau_...) and turbulent mixing length (Lscale).
+
+    References:
+        Guo et al.(2021, JAMES)
+    """
     l_smooth_min_max = False
     heaviside_smth_range = 1.0
 
     em_zt = zm2zt(nzm, nzt, ngrdcol, gr, em, em_min)
 
+    # Error in grid column i -> set ith entry to clubb_fatal_error
     lowest_zm_below_ground = (
         gr.zm[:, gr.k_lb_zm]
         - sfc_elevation
@@ -1116,6 +1388,8 @@ def diagnose_Lscale_from_tau(
     tmp_calc_ngrdcol = (upwp_sfc**2 + vpwp_sfc**2) ** one_fourth
 
     if l_smooth_min_max:
+        # tmp_calc_ngrdcol used here because openacc has an issue with
+        #  a variable being both input and output of a function
         ustar = smooth_max(
             ngrdcol,
             ngrdcol,
@@ -1158,6 +1432,7 @@ def diagnose_Lscale_from_tau(
         * (ustar[:, None] / vonk)
         / z_eff
     )
+    # C_invrs_tau_sfc * ( wp2 / vonk /ustar ) / ( gr%zm(1,:) -sfc_elevation + z_displace )
 
     invrs_tau_no_N2_zm = invrs_tau_bkgnd + invrs_tau_sfc + invrs_tau_shear
 
@@ -1198,7 +1473,7 @@ def diagnose_Lscale_from_tau(
         brunt_freq_out_cloud,
     )
 
-    # Write both bv extra terms to disk.
+    # Write both bv extra terms to invrs_taus to disk
     stats = stats.update("bv_freq_pos", brunt_freq_pos)
     stats = stats.update("bv_freq_out_cloud", brunt_freq_out_cloud)
 
@@ -1254,6 +1529,7 @@ def diagnose_Lscale_from_tau(
             * brunt_freq_out_cloud
         )
     else:
+        # l_e3sm_config = false
         invrs_tau_xp2_zm = (
             invrs_tau_no_N2_zm
             + clubb_params[:, iC_invrs_tau_N2][:, None] * brunt_freq_pos
@@ -1287,6 +1563,7 @@ def diagnose_Lscale_from_tau(
             heaviside_smth_range,
         )
     else:
+        # l_smooth_Heaviside_tau_wpxp = .false.
         H_invrs_tau_wpxp_N2 = jnp.where(
             brunt_vaisala_freq_sqd_smth
             > clubb_params[:, iC_invrs_tau_wpxp_N2_thresh][:, None],
@@ -1297,6 +1574,7 @@ def diagnose_Lscale_from_tau(
     if l_smooth_min_max:
         raise NotImplementedError("l_smooth_min_max is a disabled Fortran parameter.")
     else:
+        # l_smooth_min_max
         invrs_tau_wpxp_zm = jnp.where(
             gr.zm > clubb_params[:, ialtitude_threshold][:, None],
             invrs_tau_wpxp_zm
@@ -1319,6 +1597,8 @@ def diagnose_Lscale_from_tau(
         * brunt_freq_out_cloud
     )
 
+    # Calculate the maximum allowable value of time-scale tau,
+    # which depends of the value of Lscale_max.
     if l_smooth_min_max:
         raise NotImplementedError("l_smooth_min_max is a disabled Fortran parameter.")
     else:

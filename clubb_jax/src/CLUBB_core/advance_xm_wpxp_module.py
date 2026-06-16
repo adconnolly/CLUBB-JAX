@@ -12,7 +12,11 @@ References:
     Method and Model Description'' Golaz, et al. (2002)
     JAS, Vol. 59, pp. 3540--3551.
 
-Adaptation notes:
+See Also
+  ``Equations for CLUBB'' Section 5:
+    /Implicit solutions for the means and fluxes/
+
+Porting deviations:
 - This JAX entry point preserves the Fortran argument and return contract while
   using JAX-side stats, limiter, positive-definite, skewness, and matrix-solver
   helpers inside the jitted region.
@@ -113,13 +117,14 @@ from clubb_jax.src.derived_types import (
     implicit_coefs_terms,
 )
 
-nsub = 2
-nsup = 2
-xm_wpxp_thlm = 1
-xm_wpxp_rtm = 2
-xm_wpxp_scalar = 3
-xm_wpxp_um = 4
-xm_wpxp_vm = 5
+# Parameter Constants
+nsub = 2  # Number of subdiagonals in the LHS matrix
+nsup = 2  # Number of superdiagonals in the LHS matrix
+xm_wpxp_thlm = 1  # Named constant for thlm and wpthlp solving
+xm_wpxp_rtm = 2  # Named constant for rtm and wprtp solving
+xm_wpxp_scalar = 3  # Named constant for sclrm and wpsclrp solving
+xm_wpxp_um = 4  # Named constant for optional um and upwp solving
+xm_wpxp_vm = 5  # Named constant for optional vm and vpwp solving
 
 ndiags2 = 2
 ndiags3 = 3
@@ -192,7 +197,7 @@ def advance_xm_wpxp(
     um_pert, vm_pert, upwp_pert, vpwp_pert,
     err_info: ErrInfo,
 ):
-    """Advance mean fields and turbulent fluxes one model timestep."""
+    """Advance the mean and flux terms by one timestep."""
     l_iter = True
     l_sample = stats.l_sample
     l_perturbed_wind = l_predict_upwp_vpwp and l_linearize_pbl_winds
@@ -1860,11 +1865,28 @@ def xm_wpxp_clipping_and_stats(
 
 
 def xm_term_ta_lhs(nzm, nzt, ngrdcol, gr, rho_ds_zm, invrs_rho_ds_zt):
-    """Turbulent advection of xm: implicit portion of the code."""
+    """Turbulent advection of xm:  implicit portion of the code.
+
+    The d(xm)/dt equation contains a turbulent advection term:
+
+    - (1/rho_ds) * d( rho_ds * w'x' )/dz.
+
+    This term is solved for completely implicitly, such that:
+
+    - (1/rho_ds) * d( rho_ds * w'x'(t+1) )/dz.
+
+    Note:  When the term is brought over to the left-hand side, the sign
+           is reversed and the leading "-" in front of the term is changed
+           to a "+".
+
+    invrs_dzt(k) = 1 / ( zm(k+1) - zm(k) )
+    """
     lhs_ta_xm = jnp.zeros((ndiags2, ngrdcol, nzt), dtype=jnp.float64)
+    # Momentum superdiagonal [ x wpxp(k+1,<t+1>) ]
     lhs_ta_xm = lhs_ta_xm.at[0, :, :].set(
         jnp.asarray(invrs_rho_ds_zt) * jnp.asarray(gr.invrs_dzt) * jnp.asarray(rho_ds_zm[:, 1:nzm])
     )
+    # Momentum subdiagonal [ x wpxp(k,<t+1>) ]
     lhs_ta_xm = lhs_ta_xm.at[1, :, :].set(
         -jnp.asarray(invrs_rho_ds_zt) * jnp.asarray(gr.invrs_dzt) * jnp.asarray(rho_ds_zm[:, :nzt])
     )
@@ -1872,11 +1894,24 @@ def xm_term_ta_lhs(nzm, nzt, ngrdcol, gr, rho_ds_zm, invrs_rho_ds_zt):
 
 
 def wpxp_term_tp_lhs(nzm, ngrdcol, gr, wp2):
-    """Turbulent production of w'x': implicit portion of the code."""
+    """Turbulent production of w'x':  implicit portion of the code.
+
+    The d(w'x')/dt equation contains a turbulent production term:
+
+    - w'^2 d(xm)/dz.
+
+    This term is solved for completely implicitly, such that:
+
+    - w'^2 d(xm(t+1))/dz.
+
+    invrs_dzm(k) = 1 / ( zt(k) - zt(k-1) )
+    """
     lhs_tp = jnp.zeros((ndiags2, ngrdcol, nzm), dtype=jnp.float64)
+    # Thermodynamic superdiagonal [ x xm(k,<t+1>) ]
     lhs_tp = lhs_tp.at[0, :, 1:nzm - 1].set(
         jnp.asarray(wp2[:, 1:nzm - 1]) * jnp.asarray(gr.invrs_dzm[:, 1:nzm - 1])
     )
+    # Thermodynamic subdiagonal [ x xm(k-1,<t+1>) ]
     lhs_tp = lhs_tp.at[1, :, 1:nzm - 1].set(
         -jnp.asarray(wp2[:, 1:nzm - 1]) * jnp.asarray(gr.invrs_dzm[:, 1:nzm - 1])
     )
@@ -1884,8 +1919,23 @@ def wpxp_term_tp_lhs(nzm, ngrdcol, gr, wp2):
 
 
 def wpxp_terms_ac_pr2_lhs(nzm, nzt, ngrdcol, gr, C7_Skw_fnc, wm_zt, invrs_dzm):
-    """Accumulation of w'x' and w'x' pressure term 2."""
+    """Accumulation of w'x' and w'x' pressure term 2:  implicit portion of the
+    code.
+
+    The d(w'x')/dt equation contains an accumulation term:
+
+    - w'x' dw/dz;
+
+    and pressure term 2:
+
+    - C_7 ( -w'x' dw/dz ).
+
+    Note:  When the term is brought over to the left-hand side, the sign
+           is reversed and the leading "-" in front of the term is changed
+           to a "+".
+    """
     lhs_ac_pr2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Momentum main diagonal: [ x wpxp(k,<t+1>) ]
     lhs_ac_pr2 = lhs_ac_pr2.at[:, 1:nzm - 1].set(
         (one - jnp.asarray(C7_Skw_fnc[:, 1:nzm - 1]))
         * jnp.asarray(invrs_dzm[:, 1:nzm - 1])
@@ -1899,19 +1949,35 @@ def wpxp_term_pr1_lhs(
     C6thl_Skw_fnc, C7_Skw_fnc,
     invrs_tau_C6_zm, l_scalar_calc,
 ):
-    """Pressure term 1 for w'x': implicit portion of the code."""
+    """Pressure term 1 for w'x':  implicit portion of the code.
+
+    The d(w'x')/dt equation contains pressure term 1:
+
+    - ( C_6 / tau_m ) w'x'.
+
+    This term is solved for completely implicitly, such that:
+
+    - ( C_6 / tau_m ) w'x'(t+1).
+
+    Note:  When the term is brought over to the left-hand side, the sign
+           is reversed and the leading "-" in front of the term is changed
+           to a "+".
+    """
     lhs_pr1_wprtp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
     lhs_pr1_wpthlp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
     lhs_pr1_wpsclrp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
 
+    # Momentum main diagonals: [ x wpxp(k,<t+1>) ]
     lhs_pr1_wprtp = lhs_pr1_wprtp.at[:, 1:nzm - 1].set(
         jnp.asarray(C6rt_Skw_fnc[:, 1:nzm - 1]) * jnp.asarray(invrs_tau_C6_zm[:, 1:nzm - 1])
     )
+    # Momentum main diagonals: [ x wpxp(k,<t+1>) ]
     lhs_pr1_wpthlp = lhs_pr1_wpthlp.at[:, 1:nzm - 1].set(
         jnp.asarray(C6thl_Skw_fnc[:, 1:nzm - 1]) * jnp.asarray(invrs_tau_C6_zm[:, 1:nzm - 1])
     )
 
     if l_scalar_calc:
+        # Momentum main diagonals: [ x wpxp(k,<t+1>) ]
         lhs_pr1_wpsclrp = lhs_pr1_wpsclrp.at[:, 1:nzm - 1].set(
             jnp.asarray(C7_Skw_fnc[:, 1:nzm - 1]) * jnp.asarray(invrs_tau_C6_zm[:, 1:nzm - 1])
         )
@@ -1920,8 +1986,19 @@ def wpxp_term_pr1_lhs(
 
 
 def wpxp_terms_bp_pr3_rhs(nzm, ngrdcol, gr, C7_Skw_fnc, thv_ds_zm, xpthvp):
-    """Buoyancy production of w'x' and w'x' pressure term 3."""
+    """Buoyancy production of w'x' and w'x' pressure term 3:  explicit portion of
+    the code.
+
+    The d(w'x')/dt equation contains a buoyancy production term:
+
+    + (g/thv_ds) x'th_v';
+
+    and pressure term 3:
+
+    - C_7 ( (g/thv_ds) x'th_v' ).
+    """
     rhs_bp_pr3 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
     rhs_bp_pr3 = rhs_bp_pr3.at[:, 1:nzm - 1].set(
         (grav / jnp.asarray(thv_ds_zm[:, 1:nzm - 1]))
         * (one - jnp.asarray(C7_Skw_fnc[:, 1:nzm - 1]))
@@ -1936,7 +2013,19 @@ def xm_correction_wpxp_cl(
     stats,
     xm,
 ):
-    """Correct xm after w'x' clipping changes turbulent advection."""
+    """Corrects the value of xm if w'x' needed to be clipped, for xm is partially
+    based on the derivative of w'x' with respect to altitude.
+
+    The time-tendency equation for xm is:
+
+    d(xm)/dt = -w d(xm)/dz - d(w'x')/dz + d(xm)/dt|_ls;
+
+    where d(xm)/dt|_ls is the rate of change of xm over time due to radiation,
+    microphysics, and/or any other large-scale forcing(s).
+
+    Note:  The results of this xm adjustment are highly dependent on the
+           order in which clipping and positive-definite adjustments are applied.
+    """
     l_sample = stats.l_sample
     wpxp_chnge = jnp.asarray(wpxp_chnge)
     xm = jnp.asarray(xm, dtype=jnp.float64)
@@ -1950,6 +2039,7 @@ def xm_correction_wpxp_cl(
         name_xm_tacl = ""
 
     invrs_dzt = jnp.asarray(invrs_dzt)
+    # The adjustment to xm due to turbulent advection term clipping
     xm_tndcy_wpxp_cl = -invrs_dzt * (wpxp_chnge[:, 1:] - wpxp_chnge[:, :-1])
     xm_tndcy_wpxp_cl = jnp.where(l_clipping_needed[:, None], xm_tndcy_wpxp_cl, zero)
     xm = jnp.where(l_clipping_needed[:, None], xm + xm_tndcy_wpxp_cl * dt, xm)
@@ -1965,7 +2055,10 @@ def damp_coefficient(
     max_coeff_value, altitude_threshold,
     threshold, Lscale_zm,
 ):
-    """Damp a coefficient linearly based on Lscale above an altitude threshold."""
+    """Damps a given coefficient linearly based on the value of Lscale.
+
+    For additional information see CLUBB ticket #431.
+    """
     coefficient = jnp.asarray(coefficient)
     max_coeff_value = jnp.asarray(max_coeff_value)
     altitude_threshold = jnp.asarray(altitude_threshold)
@@ -1986,10 +2079,16 @@ def diagnose_upxp(
     nzm, nzt, ngrdcol, gr, ypwp, xm, wpxp, ym,
     C6x_Skw_fnc, tau_C6_zm, C7_Skw_fnc,
 ):
-    """Diagnose turbulent horizontal flux of a conserved scalar."""
+    """Diagnose turbulent horizontal flux of a conserved scalar.
+
+    References:
+      None
+    """
     ddzt_xm = ddzt(nzm, nzt, ngrdcol, gr, xm)
     ddzt_ym = ddzt(nzm, nzt, ngrdcol, gr, ym)
     ypxp = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # The value of ypxp is irrelevant to the calculations at the upper and
+    # lower boundaries
     ypxp_interior = (
         (jnp.asarray(tau_C6_zm)[:, 1:nzm - 1] / jnp.asarray(C6x_Skw_fnc)[:, 1:nzm - 1])
         * (
@@ -2005,7 +2104,13 @@ def diagnose_upxp(
 
 
 def error_prints_xm_wpxp(*args, **kwargs):
-    """Print a concise diagnostic for fatal errors in advance_xm_wpxp."""
+    """Prints values of model fields when fatal errors (LU decomp.) occur.
+
+    Porting deviation:
+      The JAX implementation prints a concise placeholder because the full
+      Fortran diagnostic dump relies on host-side I/O and extensive mutable
+      argument state that is intentionally not carried through the jitted path.
+    """
     del args, kwargs
     print("Error in advance_xm_wpxp")
 

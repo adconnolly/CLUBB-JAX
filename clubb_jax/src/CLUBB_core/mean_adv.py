@@ -1,5 +1,6 @@
-"""JAX port of `src/CLUBB_core/mean_adv.F90`.
+"""JAX port of ``src/CLUBB_core/mean_adv.F90``.
 
+Description:
 Module mean_adv computes the mean advection terms for all of the time-tendency
 (prognostic) equations in the CLUBB parameterization.  All of the mean
 advection terms are solved for completely implicitly, and therefore become part
@@ -12,6 +13,14 @@ all hydrometeor species, and sclrm.
 Function term_ma_zm_lhs handles the mean advection terms for the variables
 located at momentum grid levels.  The variables are: wprtp, wpthlp, wp2, rtp2,
 thlp2, rtpthlp, up2, vp2, wpsclrp, sclrprtp, sclrpthlp, and sclrp2.
+
+Porting deviations:
+  * Fortran fills the ``lhs_ma`` out-argument; JAX returns the array.
+  * Fortran uses 1-based band indices ``kp1_*diag``, ``k_*diag``, and
+    ``km1_*diag``.  JAX stacks the same diagonals in Python order
+    ``[superdiagonal, main diagonal, subdiagonal]``.
+  * Fortran loops over columns and levels; JAX uses array slices and
+    ``jnp.where`` for the upwind branch.
 """
 
 from __future__ import annotations
@@ -137,8 +146,9 @@ def term_ma_zt_lhs(
     with diagonal order [superdiagonal, main diagonal, subdiagonal].  Fortran
     1-based grid indices are represented by 0-based Python slices.
     """
-    # Use centered differencing.
-    if not l_upwind_xm_ma:
+    # -------------------------- Begin Code --------------------------
+
+    if (not l_upwind_xm_ma):  # Use centered differencing
         # Most of the interior model; normal conditions.
         fac = wm_zt[:, 1:-1] * invrs_dzt[:, 1:-1]
 
@@ -154,15 +164,21 @@ def term_ma_zt_lhs(
         # Thermodynamic subdiagonal: [ x var_zt(k-1,<t+1>) ]
         sub_int = -fac * weights_zt2zm[:, 1:-2, 1]
 
-        # Upper Boundary for an Ascending Grid or Lower Boundary for a
-        # Descending Grid.  This is the zero-derivative boundary method.
+        # Upper Boundary for an Ascending Grid
+        # or Lower Boundary for a Descending Grid.
+
+        # Special discretization for zero derivative method, where the
+        # derivative d(var_zt)/dz over the model boundary is set to 0.
         fac_top = wm_zt[:, -1:] * invrs_dzt[:, -1:]
         super_top = jnp.zeros((ngrdcol, 1), dtype=jnp.float64)
         main_top = fac_top * (1.0 - weights_zt2zm[:, nzm - 2:nzm - 1, 0])
         sub_top = -fac_top * weights_zt2zm[:, nzm - 2:nzm - 1, 1]
 
-        # Lower Boundary for an Ascending Grid or Upper Boundary for a
-        # Descending Grid.  This is the zero-derivative boundary method.
+        # Lower Boundary for an Ascending Grid
+        # or Upper Boundary for a Descending Grid.
+
+        # Special discretization for zero derivative method, where the
+        # derivative d(var_zt)/dz over the model boundary is set to 0.
         fac_bot = wm_zt[:, :1] * invrs_dzt[:, :1]
         super_bot = fac_bot * weights_zt2zm[:, 1:2, 0]
         main_bot = -fac_bot * (1.0 - weights_zt2zm[:, 1:2, 1])
@@ -173,7 +189,7 @@ def term_ma_zt_lhs(
         subdiag = jnp.concatenate([sub_bot, sub_int, sub_top], axis=1)
         return jnp.stack([superdiag, maindiag, subdiag], axis=0)
 
-    # l_upwind_xm_ma == true; use "upwind" differencing.
+    # l_upwind_xm_ma == .true.; use "upwind" differencing
 
     # Most of the interior model; normal conditions.
     wm_int = wm_zt[:, 1:-1]
@@ -181,8 +197,13 @@ def term_ma_zt_lhs(
     invrs_dzm_k = invrs_dzm[:, 1:-2]
     invrs_dzm_kp1 = invrs_dzm[:, 2:-1]
 
-    # grid_dir * wm_zt >= 0: mean wind is upward for an ascending grid
-    # or downward for a descending grid.  Otherwise the stencil is reversed.
+    # Mean wind is in an upward direction and an ascending grid is used
+    # or mean wind is in a downward direction and a descending grid
+    # is used.
+    #
+    # Otherwise, mean wind is in a downward direction and an ascending grid is
+    # used or mean wind is in an upward direction and a descending grid
+    # is used.
     super_int = jnp.where(grid_wm_int >= 0.0, 0.0, wm_int * invrs_dzm_kp1)
     main_int = jnp.where(
         grid_wm_int >= 0.0,
@@ -191,7 +212,8 @@ def term_ma_zt_lhs(
     )
     sub_int = jnp.where(grid_wm_int >= 0.0, -wm_int * invrs_dzm_k, 0.0)
 
-    # Upper Boundary for an Ascending Grid or Lower Boundary for a Descending Grid.
+    # Upper Boundary for an Ascending Grid
+    # or Lower Boundary for a Descending Grid.
     wm_top = wm_zt[:, -1:]
     grid_wm_top = grid_dir * wm_top
     invrs_dzm_top = invrs_dzm[:, nzm - 2:nzm - 1]
@@ -199,7 +221,8 @@ def term_ma_zt_lhs(
     main_top = jnp.where(grid_wm_top >= 0.0, wm_top * invrs_dzm_top, 0.0)
     sub_top = jnp.where(grid_wm_top >= 0.0, -wm_top * invrs_dzm_top, 0.0)
 
-    # Lower Boundary for an Ascending Grid or Upper Boundary for a Descending Grid.
+    # Lower Boundary for an Ascending Grid
+    # or Upper Boundary for a Descending Grid.
     wm_bot = wm_zt[:, :1]
     grid_wm_bot = grid_dir * wm_bot
     invrs_dzm_bot = invrs_dzm[:, 1:2]
@@ -272,7 +295,11 @@ def term_ma_zm_lhs(
     with diagonal order [superdiagonal, main diagonal, subdiagonal].  Fortran
     1-based grid indices are represented by 0-based Python slices.
     """
-    # Set lower boundary array to 0.
+    # -------------------------- Begin Code --------------------------
+
+    # Set boundary array to 0
+    # This is the Lower Boundary for an Ascending Grid
+    # or the Upper Boundary for a Descending Grid.
     # Most of the interior model; normal conditions.
     fac = wm_zm[:, 1:-1] * invrs_dzm[:, 1:-1]
 
@@ -288,7 +315,9 @@ def term_ma_zm_lhs(
     # Momentum subdiagonal: [ x var_zm(k-1,<t+1>) ]
     sub_int = -fac * weights_zm2zt[:, :-1, 1]
 
-    # Set upper boundary array to 0.
+    # Set boundary array to 0
+    # This is the Upper Boundary for an Ascending Grid
+    # or the Lower Boundary for a Descending Grid.
     zeros_bnd = jnp.zeros((ngrdcol, 1), dtype=jnp.float64)
     superdiag = jnp.concatenate([zeros_bnd, super_int, zeros_bnd], axis=1)
     maindiag = jnp.concatenate([zeros_bnd, main_int, zeros_bnd], axis=1)

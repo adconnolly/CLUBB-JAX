@@ -1,18 +1,33 @@
 """Zero-based JAX mirror of ``src/CLUBB_core/parameter_indices.F90``.
 
 Description:
-  Since f90/95 lacks enumeration, CLUBB numbers each parameter by hand in
-  ``parameter_indices.F90``. Adding a new parameter there requires updating the
-  common parameter storage, ``params_list``, pack/unpack routines, and namelists.
+  Since f90/95 lacks enumeration, we're stuck numbering each
+  parameter by hand like this.
 
-Fortran numbers the tunable parameters from 1 because it indexes
-``clubb_params(ngrdcol, nparams)`` with 1-based array subscripts.  The JAX
-``clubb_params`` array has shape ``(ngrdcol, nparams)`` with no padding column,
-so these constants are the corresponding Python column indices.
+  Adding new parameters is relatively simple.  First, the
+  parameter should be added in the common block of the parameters
+  module so it can be used in other parts of the code. Each
+  variable needs a unique number in this module, and nparams must
+  be incremented for the new variable.  Next, the params_list
+  variable in module parameters should have new variable added to
+  it.  The subroutines pack_parameters and uppack_parameters will
+  need to have the variable added to their list, but the order
+  doesn't actually matter, since the i variables in here determine
+  where in the params vector the number is placed.
+  Finally, the namelists clubb_params_nl and initspread will need to
+  have the parameter added to them.
+
+Porting deviations:
+- Fortran numbers the tunable parameters from 1 because it indexes
+  ``clubb_params(ngrdcol, nparams)`` with 1-based array subscripts.  The JAX
+  ``clubb_params`` array has shape ``(ngrdcol, nparams)`` with no padding
+  column, so these constants are the corresponding zero-based Python column
+  indices.
 
 IMPORTANT:
-  If you change the order of these parameters, you must also change the order
-  of ``params_list`` or the tuner will break.
+  If you change the order of these parameters, you will need to
+  change the order of params_list as well or the tuner will
+  break!
 """
 
 nparams = 102

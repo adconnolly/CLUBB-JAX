@@ -2,17 +2,22 @@
 
 Description:
   Limits the value of w'x' and corrects the value of xm when the xm turbulent
-  advection term is not monotonic.
+  advection term is not monotonic.  A monotonic turbulent advection scheme
+  will not create new extrema for variable x, based only on turbulent
+  advection (not considering mean advection and xm forcings).
 
   A monotonic turbulent advection scheme does not allow new extrema for variable
   x to be created by turbulent advection.  When w'x' would move xm outside the
   allowable range implied by nearby previous-time values, forcings, and mean
   advection, w'x' is limited and xm is re-solved.
 
-JAX adaptation:
+Porting deviations:
   `calc_turb_adv_range` keeps the Fortran routine boundary, but its ascending
   and descending grid loops are split into adjacent private helpers so the
   branch-specific `lax.while_loop` carries stay small and static.
+  The Fortran constant-thickness branch is represented only by the disabled
+  `l_constant_thickness = False` guard because the Fortran parameter is
+  `.false.`.
 """
 
 from __future__ import annotations
@@ -90,7 +95,59 @@ def monotonic_turbulent_flux_limit(
     wpxp,
     err_info,
 ):
-    """Limit w'x' and correct xm when turbulent advection is not monotonic."""
+    """Description:
+    Limits the value of w'x' and corrects the value of xm when the xm turbulent
+    advection term is not monotonic.  A monotonic turbulent advection scheme
+    will not create new extrema for variable x, based only on turbulent
+    advection (not considering mean advection and xm forcings).
+
+    Montonic turbulent advection
+    ----------------------------
+
+    A monotonic turbulent advection scheme does not allow new extrema for
+    variable x to be created (by means of turbulent advection).  In a
+    monotonic turbulent advection scheme, when only the effects of turbulent
+    advection are considered (neglecting forcings and mean advection), the
+    value of variable x at a given point should not increase above the
+    greatest value of variable x at nearby points, nor decrease below the
+    smallest value of variable x at nearby points.  Nearby points are points
+    that are close enough to the given point so that the value of variable x
+    at the given point is effected by the values of variable x at the nearby
+    points by means of transfer by turbulent winds during a time step.  Again,
+    a monotonic scheme insures that advection only transfers around values of
+    variable x and does not create new extrema for variable x.  A monotonic
+    turbulent advection scheme is useful because the turbulent advection term
+    (w'x') may go numerically unstable, resulting in large instabilities in
+    the mean field (xm).  A monotonic turbulent advection scheme will limit
+    the change in xm, and also in w'x'.
+
+    Formula for the limitation of w'x' and xm
+    -----------------------------------------
+
+    The equation for change in the mean field, xm, over time is:
+
+    d(xm)/dt = -w*d(xm)/dz - (1/rho_ds) * d( rho_ds * w'x' )/dz + xm_forcing;
+
+    where w*d(xm)/dz is the mean advection component,
+    (1/rho_ds) * d( rho_ds * w'x' )/dz is the turbulent advection component,
+    and xm_forcing is the xm forcing component.
+
+    Approximating maximum and minimum values of x at any given vertical level
+    -------------------------------------------------------------------------
+
+    The CLUBB code provides means, variances, and covariances for certain
+    variables at all vertical levels.  However, there is no way to find the
+    maximum or minimum point value of any variable on any vertical level.
+    Without that information, x_max_dev_low and x_max_dev_high can't be found,
+    and the inequality above is useless.  However, there is a way to
+    approximate the maximum and minimum point values at any given vertical
+    level.  The maximum and minimum point values can be approximated through
+    the use of the variance, x'^2.
+
+    JAX port note: the long Fortran derivation is summarized here; the active
+    implementation below follows the same limiter equations but expresses the
+    vertical scan with `jax.lax.scan`.
+    """
     xm = jnp.asarray(xm, dtype=jnp.float64)
     wpxp = jnp.asarray(wpxp, dtype=jnp.float64)
     xm_old = jnp.asarray(xm_old, dtype=jnp.float64)
@@ -413,7 +470,17 @@ def mfl_xm_lhs(
     l_upwind_xm_ma: bool,
     grid_dir: float,
 ):
-    """Set up the left-hand side of the monotonic-flux xm tridiagonal system."""
+    """Description:
+    This subroutine is part of the process of re-solving for xm at timestep
+    index (t+1).  This is done because the original solving process produced
+    values outside of what is deemed acceptable by the monotonic flux limiter.
+    Unlike the original formulation for advancing xm one timestep, which
+    combines w'x' and xm in a band-diagonal solver, this formulation uses a
+    tridiagonal solver to solve for only the value of xm(t+1), for w'x'(t+1)
+    is known.
+
+    Subroutine mfl_xm_lhs sets up the left-hand side of the matrix equation.
+    """
     if not l_implemented:
         lhs = term_ma_zt_lhs(
             nzm,
@@ -447,7 +514,17 @@ def mfl_xm_rhs(
     rho_ds_zm,
     invrs_rho_ds_zt,
 ):
-    """Set up the right-hand side of the monotonic-flux xm tridiagonal system."""
+    """Description:
+    This subroutine is part of the process of re-solving for xm at timestep
+    index (t+1).  This is done because the original solving process produced
+    values outside of what is deemed acceptable by the monotonic flux limiter.
+    Unlike the original formulation for advancing xm one timestep, which
+    combines w'x' and xm in a band-diagonal solver, this formulation uses a
+    tridiagonal solver to solve for only the value of xm(t+1), for w'x'(t+1)
+    is known.
+
+    Subroutine mfl_xm_rhs sets up the right-hand side of the matrix equation.
+    """
     del nzm, nzt, ngrdcol
     invrs_dt = one / dt
     return (
@@ -477,7 +554,18 @@ def mfl_xm_solve(
     rhs,
     err_info,
 ):
-    """Solve the monotonic-flux xm tridiagonal matrix equation."""
+    """Description:
+    This subroutine is part of the process of re-solving for xm at timestep
+    index (t+1).  This is done because the original solving process produced
+    values outside of what is deemed acceptable by the monotonic flux limiter.
+    Unlike the original formulation for advancing xm one timestep, which
+    combines w'x' and xm in a band-diagonal solver, this formulation uses a
+    tridiagonal solver to solve for only the value of xm(t+1), for w'x'(t+1)
+    is known.
+
+    Subroutine mfl_xm_solve solves the tridiagonal matrix equation for xm at
+    timestep index (t+1).
+    """
     if solve_type == mono_flux_rtm:
         solve_type_str = "rtm"
     elif solve_type == mono_flux_thlm:
@@ -486,9 +574,14 @@ def mfl_xm_solve(
         solve_type_str = "scalars"
 
     if l_force_descending_solves and gr.grid_dir_indx > 0:
+        # Matrix solves are bit-different between ascending and descending.
+        # This ensures matrices are solved in the same (descending) order,
+        # which is useful for ensuring BFBness between grid modes
+        # We need to flip in both the vertical dimensions and the bands for the lhs
         lhs = lhs[::-1, :, ::-1]
         rhs = rhs[:, ::-1]
 
+    # Solve for xm at timestep index (t+1) using the tridiagonal solver.
     err_info, xm, _rcond = tridiag_solve(
         solve_type_str,
         tridiag_solve_method,
@@ -501,6 +594,8 @@ def mfl_xm_solve(
     )
 
     if l_force_descending_solves and gr.grid_dir_indx > 0:
+        # Flip the back to the ascending direction if we forced the solve
+        # to be in descending mode
         xm = xm[:, ::-1]
 
     return xm, err_info
@@ -520,7 +615,25 @@ def calc_turb_adv_range(
     mixt_frac_zm,
     stats,
 ):
-    """Calculate the lowermost and uppermost levels affected by turbulent advection."""
+    """Description:
+    Calculates the lowermost and uppermost thermodynamic grid levels that can
+    effect the base (or central) thermodynamic level through the effects of
+    turbulent advection over the course of one time step.  This is used as
+    part of the monotonic turbulent advection scheme.
+
+    One method is to use the vertical velocity at each level to determine the
+    amount of time that it takes to travel across that particular grid level.
+    The method is to keep on advancing one grid level until either (a) the
+    total sum of time taken reaches or exceeds the model time step length,
+    (b) the top or bottom of the model is reached, or (c) a level is reached
+    where the vertical velocity component (with turbulence included) is
+    oriented completely opposite of the direction of travel towards the base
+    (or central) thermodynamic level.
+
+    JAX port note: Fortran keeps both grid-direction loops inside this routine.
+    The JAX port delegates to adjacent private helpers so the `lax.while_loop`
+    carries stay small and static.
+    """
     # Toggle constant or variable thickness. The Fortran parameter is .false.
     l_constant_thickness = False
     del l_constant_thickness
@@ -530,6 +643,8 @@ def calc_turb_adv_range(
 
     # Find the average upwards vertical velocity and the average downwards
     # vertical velocity.
+    # Note:  A level that has all vertical wind moving downwards will have a
+    #        vert_vel_up value that is 0, and vice versa.
     mean_w_down_zm, mean_w_up_zm, stats = mean_vert_vel_up_down(
         nzm,
         ngrdcol,
@@ -558,11 +673,19 @@ def calc_turb_adv_range(
 # Target-only split of the two grid-direction branches inside Fortran
 # `calc_turb_adv_range`; keep these helpers adjacent to that routine.
 def _calc_turb_adv_range_ascending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w_up_zm):
-    """Ascending-grid branch of calc_turb_adv_range."""
+    """Ascending-grid branch of calc_turb_adv_range.
+
+    Porting deviation: this helper is extracted from the active non-constant
+    thickness branch of Fortran `calc_turb_adv_range` solely to keep JAX loop
+    carries small and static.
+    """
     low_lev_effect = jnp.zeros((ngrdcol, nzt), dtype=jnp.int32)
     high_lev_effect = jnp.zeros((ngrdcol, nzt), dtype=jnp.int32)
 
     for k in range(1, nzt - 2):
+        # Compute the number of levels that effect the central thermodynamic
+        # level through upwards motion (traveling from lower thermodynamic
+        # levels to reach the central thermodynamic level).
         start_low = jnp.full((ngrdcol,), k - 1, dtype=jnp.int32)
 
         def low_cond(carry):
@@ -573,12 +696,20 @@ def _calc_turb_adv_range_ascending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w_
             j, dt_all, low, done = carry
             active = (j >= 0) & (~done)
             j_adj = j + 1
+            # Continue if there is some component of upwards vertical velocity.
             vert_vel_up = jnp.take_along_axis(mean_w_up_zm, j_adj[:, None], axis=1)[:, 0]
             dzm = jnp.take_along_axis(gr.dzm, j_adj[:, None], axis=1)[:, 0]
             has_up = vert_vel_up > zero
+            # Compute the amount of time it takes to travel one grid level
+            # upwards:  delta_t = delta_z / vert_vel_up_zm.
             dt_one = gr.grid_dir * dzm / jnp.where(has_up, vert_vel_up, one)
+            # Total time elapsed for crossing all grid levels that have been
+            # passed, thus far.
             dt_next = jnp.where(active & has_up, dt_all + dt_one, dt_all)
+            # Stop if has taken more than one model time step (overall) to
+            # travel the entire extent of the current vertical grid level.
             reached = active & has_up & (dt_next >= dt)
+            # Stop if there isn't a component of upwards vertical velocity.
             no_up = active & (~has_up)
             low_next = jnp.where(active, j, low)
             low_next = jnp.where(no_up, j + gr.grid_dir_indx, low_next)
@@ -598,6 +729,9 @@ def _calc_turb_adv_range_ascending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w_
         )
         low_lev_effect = low_lev_effect.at[:, k].set(low_k)
 
+        # Compute the number of levels that effect the central thermodynamic
+        # level through downwards motion (traveling from higher thermodynamic
+        # levels to reach the central thermodynamic level).
         start_high = jnp.full((ngrdcol,), k + 1, dtype=jnp.int32)
 
         def high_cond(carry):
@@ -608,12 +742,24 @@ def _calc_turb_adv_range_ascending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w_
             j, dt_all, high, done = carry
             active = (j <= nzt - 1) & (~done)
             j_adj = j
+            # Continue if there is some component of downwards vertical velocity.
             vert_vel_down = jnp.take_along_axis(mean_w_down_zm, j_adj[:, None], axis=1)[:, 0]
             dzm = jnp.take_along_axis(gr.dzm, j_adj[:, None], axis=1)[:, 0]
             has_down = vert_vel_down < zero
+            # Compute the amount of time it takes to travel one grid level
+            # downwards:  delta_t = - delta_z / vert_vel_down_zm.
+            # Note:  There is a (-) sign in front of delta_z because the
+            #        distance traveled is downwards.  Since vert_vel_down
+            #        has a negative value, dt_one_grid_lev will be a
+            #        positive value.
             dt_one = -gr.grid_dir * dzm / jnp.where(has_down, vert_vel_down, -one)
+            # Total time elapsed for crossing all grid levels that have been
+            # passed, thus far.
             dt_next = jnp.where(active & has_down, dt_all + dt_one, dt_all)
+            # Stop if has taken more than one model time step (overall) to
+            # travel the entire extent of the current vertical grid level.
             reached = active & has_down & (dt_next >= dt)
+            # Stop if there isn't a component of downwards vertical velocity.
             no_down = active & (~has_down)
             high_next = jnp.where(active, j, high)
             high_next = jnp.where(no_down, j - gr.grid_dir_indx, high_next)
@@ -649,11 +795,19 @@ def _calc_turb_adv_range_ascending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w_
 
 
 def _calc_turb_adv_range_descending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w_up_zm):
-    """Descending-grid branch of calc_turb_adv_range."""
+    """Descending-grid branch of calc_turb_adv_range.
+
+    Porting deviation: this helper is extracted from the active non-constant
+    thickness branch of Fortran `calc_turb_adv_range` solely to keep JAX loop
+    carries small and static.
+    """
     low_lev_effect = jnp.zeros((ngrdcol, nzt), dtype=jnp.int32)
     high_lev_effect = jnp.zeros((ngrdcol, nzt), dtype=jnp.int32)
 
     for k in range(nzt - 2, 1, -1):
+        # Compute the number of levels that effect the central thermodynamic
+        # level through upwards motion (traveling from lower thermodynamic
+        # levels to reach the central thermodynamic level).
         start_low = jnp.full((ngrdcol,), k - gr.grid_dir_indx, dtype=jnp.int32)
 
         def low_cond(carry):
@@ -664,9 +818,12 @@ def _calc_turb_adv_range_descending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w
             j, dt_all, low, done = carry
             active = (j <= gr.k_lb_zt) & (~done)
             j_adj = j
+            # Continue if there is some component of upwards vertical velocity.
             vert_vel_up = jnp.take_along_axis(mean_w_up_zm, j_adj[:, None], axis=1)[:, 0]
             dzm = jnp.take_along_axis(gr.dzm, j_adj[:, None], axis=1)[:, 0]
             has_up = vert_vel_up > zero
+            # Compute the amount of time it takes to travel one grid level
+            # upwards:  delta_t = delta_z / vert_vel_up_zm.
             dt_one = gr.grid_dir * dzm / jnp.where(has_up, vert_vel_up, one)
             dt_next = jnp.where(active & has_up, dt_all + dt_one, dt_all)
             reached = active & has_up & (dt_next >= dt)
@@ -689,6 +846,9 @@ def _calc_turb_adv_range_descending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w
         )
         low_lev_effect = low_lev_effect.at[:, k].set(low_k)
 
+        # Compute the number of levels that effect the central thermodynamic
+        # level through downwards motion (traveling from higher thermodynamic
+        # levels to reach the central thermodynamic level).
         start_high = jnp.full((ngrdcol,), k + gr.grid_dir_indx, dtype=jnp.int32)
 
         def high_cond(carry):
@@ -699,9 +859,16 @@ def _calc_turb_adv_range_descending(nzt, ngrdcol, gr, dt, mean_w_down_zm, mean_w
             j, dt_all, high, done = carry
             active = (j >= gr.k_ub_zt) & (~done)
             j_adj = j + 1
+            # Continue if there is some component of downwards vertical velocity.
             vert_vel_down = jnp.take_along_axis(mean_w_down_zm, j_adj[:, None], axis=1)[:, 0]
             dzm = jnp.take_along_axis(gr.dzm, j_adj[:, None], axis=1)[:, 0]
             has_down = vert_vel_down < zero
+            # Compute the amount of time it takes to travel one grid level
+            # downwards:  delta_t = - delta_z / vert_vel_down_zm.
+            # Note:  There is a (-) sign in front of delta_z because the
+            #        distance traveled is downwards.  Since vert_vel_down
+            #        has a negative value, dt_one_grid_lev will be a
+            #        positive value.
             dt_one = -gr.grid_dir * dzm / jnp.where(has_down, vert_vel_down, -one)
             dt_next = jnp.where(active & has_down, dt_all + dt_one, dt_all)
             reached = active & has_down & (dt_next >= dt)
@@ -748,7 +915,33 @@ def mean_vert_vel_up_down(
     w_min,
     stats,
 ):
-    """Calculate the mean up and down vertical velocities from the w PDF."""
+    """Description
+    The values of vertical velocity, along a horizontal plane at any given
+    vertical level, are not allowed by CLUBB to be uniform.  In other words,
+    there must be some variance in vertical velocity.  This subroutine
+    calculates the mean of all values of vertical velocity, at any given
+    vertical level, that are greater than a certain reference velocity.  This
+    subroutine also calculates the mean of all values of vertical velocity, at
+    any given vertical level, that are less than a certain reference velocity.
+    The reference velocity is usually 0 m/s, in which case this subroutine
+    calculates the average positive (upward) velocity and the average negative
+    (downward) velocity.
+
+    Method
+    ------
+
+    The CLUBB model uses a joint PDF of vertical velocity, liquid water
+    potential temperature, and total water mixing ratio to determine subgrid
+    variability.
+
+    The values of vertical velocity, w, along an undefined horizontal plane
+    at any vertical level, are considered to approximately follow a
+    distribution that is a mixture of two normal (or Gaussian) distributions.
+
+    The probability density function (PDF) for w, P(w), is:
+
+    P(w) = mixt_frac*P(w_1) + (1-mixt_frac)*P(w_2);
+    """
     mean_w_down_1st, mean_w_up_1st = calc_mean_w_up_down_component(
         nzm, ngrdcol, w_1_zm, varnce_w_1_zm, w_ref, w_min,
     )
@@ -786,7 +979,16 @@ def calc_mean_w_up_down_component(
     w_ref: float,
     w_min,
 ):
-    """Split one PDF component of vertical velocity into upward and downward components."""
+    """Description: This procedure is used to split the PDF component of
+    vertical velocity into upward and downward components.
+
+    The method used is described in the description of
+    mean_vert_vel_up_down, which calls this function.
+
+    Notes: The Fortran calculation has an optional MKL vectorized path. The
+    JAX port uses array expressions directly and does not need the MKL-specific
+    packing/unpacking strategy.
+    """
     del ngrdcol
     w_i_zm = jnp.asarray(w_i_zm, dtype=jnp.float64)
     varnce_w_i_zm = jnp.asarray(varnce_w_i_zm, dtype=jnp.float64)
@@ -798,10 +1000,15 @@ def calc_mean_w_up_down_component(
     sigma_w_i_zm = jnp.sqrt(jnp.maximum(varnce_w_i_zm, zero))
     sigma_safe = jnp.where(sigma_w_i_zm > zero, sigma_w_i_zm, one)
 
+    # The entire normal is too weak to affect adjacent grid levels
+    # w is considered to be 0 in both up and down directions
     too_weak = jnp.abs(w_i_zm) + 3.0 * sigma_w_i_zm <= w_min
+    # The entire normal is on the negative side of w|_ref.
     all_down = (~too_weak) & (w_i_zm + 3.0 * sigma_w_i_zm <= w_ref)
+    # The entire normal is on the positive side of w|_ref.
     all_up = (~too_weak) & (~all_down) & (w_i_zm - 3.0 * sigma_w_i_zm >= w_ref)
 
+    # The normal has significant values on both sides of w_ref.
     exp_cache = jnp.exp(-((w_ref - w_i_zm) ** 2) / (2.0 * sigma_safe ** 2))
     erf_cache = erf((w_ref - w_i_zm) / (sqrt_2 * sigma_safe))
 
@@ -830,4 +1037,3 @@ def calc_mean_w_up_down_component(
     mean_w_down_i = jnp.where(boundary, zero, mean_w_down_i)
     mean_w_up_i = jnp.where(boundary, zero, mean_w_up_i)
     return mean_w_down_i, mean_w_up_i
-

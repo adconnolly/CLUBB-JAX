@@ -1,4 +1,11 @@
-"""JAX port of `src/CLUBB_core/T_in_K_module.F90`."""
+"""JAX port of `src/CLUBB_core/T_in_K_module.F90`.
+
+Porting deviations:
+- The Fortran module exposes scalar, 1D, and 2D ``thlm2T_in_K_api``
+  procedures plus an elemental ``T_in_K2thlm_api``.  The JAX functions use one
+  array-broadcasting implementation for each formula because JAX arrays cover
+  the scalar and array cases without separate overloads.
+"""
 
 from __future__ import annotations
 
@@ -6,23 +13,32 @@ from clubb_jax.src.CLUBB_core.clubb_constants import Cp, Lv
 
 
 def thlm2T_in_K(thlm, exner, rcm):
-    """Absolute temperature from liquid-water potential temperature.
+    """Calculates absolute temperature from liquid water potential temperature.
 
-    Mirrors `thlm2T_in_K_api`:
+    Fortran comments:
+      Description:
+        Calculates absolute temperature from liquid water potential
+        temperature.  (Does not include ice.)
 
-      T_in_K = thlm * exner + Lv * rcm / Cp
+      References:
+        Cotton and Anthes (1989), "Storm and Cloud Dynamics", Eqn. (2.51).
 
-    The Fortran routine is elemental; this JAX version works on matching
-    scalar or array shapes.
+    JAX adaptation: the Fortran scalar, 1D, and 2D overloads share this
+    broadcasting implementation.
     """
+    # ---------------------- Begin Code ----------------------
     return thlm * exner + Lv * rcm / Cp
 
 
 def T_in_K2thlm(T_in_K, exner, rcm):
-    """Liquid-water potential temperature from absolute temperature.
+    """Calculates liquid water potential temperature from absolute temperature.
 
-    Mirrors `T_in_K2thlm_api`:
+    Fortran comments:
+      Description:
+        Calculates liquid water potential temperature from absolute temperature
 
-      thlm = (T_in_K - Lv / Cp * rcm) / exner
+      References:
+        None
     """
+    # ---- Begin Code ----
     return (T_in_K - Lv / Cp * rcm) / exner

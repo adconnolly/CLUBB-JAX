@@ -3,23 +3,36 @@
 Description:
   This module contains helper methods for the advance_* modules.
 
-The public routine names mirror the Fortran module where practical, while
-returning arrays instead of mutating Fortran out-arguments. The Fortran generic
-interfaces for `smooth_min`, `smooth_max`, and `calc_xpwp` are represented by
-JAX functions that rely on broadcasting or input rank instead of separate
-scalar/array overloads.
+Porting deviations:
+- The public routine names mirror the Fortran module where practical, while
+  returning arrays instead of mutating Fortran out-arguments.
+- The Fortran generic interfaces for ``smooth_min``, ``smooth_max``, and
+  ``calc_xpwp`` are represented by JAX functions that rely on broadcasting or
+  input rank instead of separate scalar/array overloads.
+- Optional Fortran stats side effects are returned as diagnostic arrays from
+  JAX helpers so callers can update stats outside JIT-compiled code.
 
-The smooth min and max functions introduce a varyingly steep path between the
-two input variables. The degree to which smoothing is applied depends on the
-value of `smth_coef`. If `smth_coef` goes toward 0, smooth min tends toward
-`0.5 * ((a+b) - abs(a-b))`, while smooth max tends toward
-`0.5 * ((a+b) + abs(a-b))`. For smooth min, if a > b, then this comes out to
-be b; likewise, if a < b, abs(a-b) = b-a, so we get a. For smooth max, if
-a > b, then this comes out to be a; likewise, if a < b, abs(a-b) = b-a, so we
-get b. Increasing the smoothing coefficient increases the degree of smoothing.
-Generally, the coefficient should roughly scale with the magnitude of the data
-structure that is to be smoothed, in order to obtain a sensible degree of
-smoothing.
+These functions smooth the output of the min function
+by introducing a varyingly steep path between the two input variables.
+The degree to which smoothing is applied depends on the value of 'smth_coef'.
+If 'smth_coef' goes toward 0, the output of the min function will be
+       0.5 * ((a+b) - abs(a-b))
+If a > b, then this comes out to be b. Likewise, if a < b, abs(a-b)=b-a so we get a.
+Increasing the smoothing coefficient will lead to a greater degree of smoothing
+in the smooth min and max functions. Generally, the coefficient should roughly scale
+with the magnitude of data in the data structure that is to be smoothed, in order to
+obtain a sensible degree of smoothing (not too much, not too little).
+
+These functions smooth the output of the max functions
+by introducing a varyingly steep path between the two input variables.
+The degree to which smoothing is applied depends on the value of 'smth_coef'.
+If 'smth_coef' goes toward 0, the output of the max function will be
+       0.5 * ((a+b) + abs(a-b))
+If a > b, then this comes out to be a. Likewise, if a < b, abs(a-b)=b-a so we get b.
+Increasing the smoothing coefficient will lead to a greater degree of smoothing
+in the smooth min and max functions. Generally, the coefficient should roughly scale
+with the magnitude of data in the data structure that is to be smoothed, in order to
+obtain a sensible degree of smoothing (not too much, not too little).
 """
 
 from __future__ import annotations
@@ -71,7 +84,7 @@ def set_boundary_conditions_lhs(
     """Set boundary conditions for a left-hand side LAPACK matrix.
 
     References:
-      None
+      none
 
     Fortran indices are 1-based; this JAX/Python port converts them to
     0-based indices before updating `lhs`.
@@ -142,7 +155,8 @@ def set_boundary_conditions_rhs(
 
 @partial(jax.jit, static_argnames=("nzm", "nzt", "ngrdcol"))
 def calc_ddzt_umvm_sqd(nzm: int, nzt: int, ngrdcol: int, gr, um, vm):
-    """Compute the squared vertical norm of the derivative of mean wind.
+    """Computes the squared vertical norm of the derivative of the mean
+    horizontal wind.
 
     `um` and `vm` are mean horizontal winds on thermodynamic levels [m/s].
     The result is squared vertical shear of horizontal wind [s^-2].
@@ -157,7 +171,8 @@ def calc_ddzt_umvm_sqd(nzm: int, nzt: int, ngrdcol: int, gr, um, vm):
 
 @partial(jax.jit, static_argnames=("nzm", "nzt", "ngrdcol"))
 def calc_wp3_on_wp2(nzm: int, nzt: int, ngrdcol: int, gr, wp2, wp3):
-    """Compute a smoothed ratio of w'^3 to w'^2 on zt and zm levels.
+    """Computes a smoothed ratio of w'^3 to w'^2 on thermodynamic and momentum
+    levels.
 
     `wp2` is the variance of vertical velocity on momentum levels [m^2/s^2].
     `wp3` is the third moment of vertical velocity on thermodynamic levels
@@ -247,10 +262,13 @@ def calc_brunt_vaisala_freq_sqd(
     atmospheres from Durran and Klemp (1982). `l_use_thvm_in_bv_freq` uses
     virtual potential temperature in the Brunt-Vaisala calculation.
 
-    `l_modify_limiters_for_cnvg_test` activates modifications on limiters for
-    convergence tests: smoothed max/min for Cx_fnc_Richardson in this module,
-    removing clipping on brunt_vaisala_freq_sqd_smth in mixing_length, and
-    reducing thresholds on Richardson-number limiters in mixing_length.
+    References:
+      ?
+
+    Flag to activate modifications on limiters for convergence test
+    (smoothed max and min for Cx_fnc_Richardson in advance_helper_module.F90)
+    (remove the clippings on brunt_vaisala_freq_sqd_smth in mixing_length.F90)
+    (reduce threshold on limiters for Ri_zm in mixing_length.F90)
 
     `bv_efold` controls the inverse e-folding of cloud fraction in the mixed
     Brunt-Vaisala frequency. `T0` is the reference temperature, usually 300 K.
@@ -259,7 +277,7 @@ def calc_brunt_vaisala_freq_sqd(
     thvm_zm = zt2zm(nzm, nzt, ngrdcol, gr, thvm, zero_threshold)
     ddzt_thvm = ddzt(nzm, nzt, ngrdcol, gr, thvm)
 
-    # Dry Brunt-Vaisala frequency.
+    # Dry Brunt-Vaisala frequency
     if l_use_thvm_in_bv_freq:
         brunt_vaisala_freq_sqd = (grav / thvm_zm) * ddzt_thvm
     else:
@@ -279,7 +297,7 @@ def calc_brunt_vaisala_freq_sqd(
     brunt_vaisala_freq_sqd_dry = (grav / thm_zm) * ddzt_thm
 
     # In-cloud Brunt-Vaisala frequency. This is Eq. (36) of Durran and
-    # Klemp (1982).
+    # Klemp (1982)
     brunt_vaisala_freq_sqd_moist = grav * (
         (
             (1.0 + Lv * rsat_zm / (Rd * T_in_K_zm))
@@ -297,10 +315,10 @@ def calc_brunt_vaisala_freq_sqd(
     )
 
     # The min function below smooths the slope discontinuity in brunt freq
-    # and thereby allows tau to remain large in Sc layers in which thlm may
-    # be slightly stably stratified.
+    #  and thereby allows tau to remain large in Sc layers in which thlm may
+    #  be slightly stably stratified.
     if l_modify_limiters_for_cnvg_test:
-        # Remove the limiters to improve the solution convergence.
+        # Remove the limiters to improve the solution convergence
         brunt_vaisala_freq_sqd_smth = zm2zt2zm(
             nzm, nzt, ngrdcol, gr, brunt_vaisala_freq_sqd_mixed
         )
@@ -332,9 +350,13 @@ def calc_brunt_vaisala_freq_sqd(
 def calc_Ri_zm(nzm: int, ngrdcol: int, bv_freq_sqd, shear, lim_bv: float, lim_shear: float):
     """Calculate Richardson number from clipped Brunt-Vaisala and shear.
 
-    This is the quotient of a clipped Brunt-Vaisala frequency and a clipped
-    shear. The shear variable is usually the norm squared of horizontal wind
-    speeds.
+    Calculate the Richardson number as a quotient of a clipped Brunt-Vaisala frequency
+    and a clipped shear
+
+    References:
+      ?
+
+    `shear` is usually norm squared of horizontal wind speeds.
     """
     del nzm, ngrdcol
     return jnp.maximum(bv_freq_sqd, lim_bv) / jnp.maximum(shear, lim_shear)
@@ -375,6 +397,11 @@ def compute_Cx_fnc_Richardson(
     wind speed [s^-2]. `Lscale_zm` and `rho_ds_zm` are accepted for parity with
     the Fortran interface.
 
+    Flag to activate modifications on limiters for convergence test
+    (smoothed max and min for Cx_fnc_Richardson in advance_helper_module.F90)
+    (remove the clippings on brunt_vaisala_freq_sqd_smth in mixing_length.F90)
+    (reduce threshold on limiters for sqrt_Ri_zm in mixing_length.F90)
+
     The Fortran routine also contains a disabled path that vertically averages
     `Cx_fnc_Richardson` over a distance of `Lscale`. That flag is a compile-time
     `.false.` parameter there, so the JAX port keeps only the active path.
@@ -393,11 +420,10 @@ def compute_Cx_fnc_Richardson(
             1.0e-7,
         )
     else:
-        # Note1: We kind of want this calculation to be done in calc_Ri_zm, as
-        # well. But multiplying by the inverse and dividing are not numerically
-        # equal. So to preserve BFBness, keep this as is.
-        # Note2: Keep in mind that this Brunt-Vaisala variable can contain
-        # negative values.
+        # Note1: We kind of want this calculation to be done in calc_Ri_zm, as well.
+        # But multiplying by the inverse and dividing are not numerically equal.
+        # So to preserve BFBness, we decided to keep this as is, for now.
+        # Note2: Keep in mind, that this Brunt Vaisala variable can contain negative values.
         Ri_zm_Cx = brunt_vaisala_freq_sqd * invrs_num_div_thresh
 
     Richardson_num_max = clubb_params[:, iRichardson_num_max][:, None]
@@ -406,9 +432,9 @@ def compute_Cx_fnc_Richardson(
     Cx_min = clubb_params[:, iCx_min][:, None]
     invrs_min_max_diff = 1.0 / (Richardson_num_max - Richardson_num_min)
 
-    # Cx_fnc_Richardson is interpolated based on Richardson_num. The min
-    # function ensures that Cx does not exceed Cx_max, regardless of
-    # Richardson_num_max.
+    # Cx_fnc_Richardson is interpolated based on the value of Richardson_num
+    # The min function ensures that Cx does not exceed Cx_max, regardless of the
+    #     value of Richardson_num_max.
     if l_modify_limiters_for_cnvg_test:
         fnc_Richardson = (Ri_zm_Cx - Richardson_num_min) * invrs_min_max_diff
         fnc_Richardson_clipped = smooth_min(
@@ -417,8 +443,7 @@ def compute_Cx_fnc_Richardson(
         fnc_Richardson_smooth = smooth_max(
             nzm, ngrdcol, 0.0, fnc_Richardson_clipped, min_max_smth_mag
         )
-        # Use smoothed max and min to achieve a smoothed profile and avoid
-        # discontinuities.
+        # use smoothed max amd min to achive smoothed profile and avoid discontinuities
         Cx_fnc_interp = fnc_Richardson_smooth * (Cx_max - Cx_min) + Cx_min
         Cx_fnc_Richardson = zm2zt2zm(nzm, nzt, ngrdcol, gr, Cx_fnc_interp)
     else:
@@ -464,19 +489,28 @@ def Lscale_width_vert_avg(
     else:
         raise ValueError(f"Unsupported Lscale_width_vert_avg smth_type={smth_type}")
 
-    # Pre-calculate numerator and denominator terms.
+    # Pre calculate numerator and denominator terms
     numer_terms = rho_ds_zm * gr.grid_dir * gr.dzm * var_profile
     denom_terms = rho_ds_zm * gr.grid_dir * gr.dzm
 
-    # Hunt down all vertical levels within one_half_avg_width(k) of gr%zm(k).
+    # For every grid level
+    # -----------------------------------------------------------------------
+    # Hunt down all vertical levels with one_half_avg_width(k) of gr%zm(k).
     #
-    # Fortran note, retained for context:
-    # k_avg_upper and k_avg_lower can be saved each loop iteration; this
-    # reduces iterations because the kth values are likely to be within one or
-    # two grid levels of the k-1th values. Less searching is required by
-    # starting the search at the previous values and incrementing or
-    # decrementing as needed. The vectorized JAX form builds the full window
-    # mask instead.
+    # Note: Outdated explanation of version that improves CPU performance
+    #       below. Reworked due to it requiring a k dependency. Now we
+    #       begin looking for k_avg_upper and k_avg_lower starting at
+    #       the kth level.
+    #
+    # Outdated but potentially useful note:
+    #     k_avg_upper and k_avg_lower can be saved each loop iteration, this
+    #     reduces iterations beacuse the kth values are likely to be within
+    #     one or two grid levels of the k-1th values. Less searching is required
+    #     by starting the search at the previous values and incrementing or
+    #     decrement as needed.
+    #
+    # The vectorized JAX form builds the full window mask instead.
+    # -----------------------------------------------------------------------
     zm_k = gr.zm[:, :, None]
     zm_j = gr.zm[:, None, :]
     in_window = jnp.abs(zm_k - zm_j) <= one_half_avg_width[:, :, None]
@@ -484,12 +518,13 @@ def Lscale_width_vert_avg(
     numer_integral = jnp.sum(numer_terms[:, None, :] * in_window, axis=2)
     denom_integral = jnp.sum(denom_terms[:, None, :] * in_window, axis=2)
 
-    # Add below-ground levels when the averaging window extends below the
-    # lowest momentum level. The number of below-ground levels included is the
-    # distance below the lowest level spanned by one_half_avg_width(k) divided
-    # by the distance between vertical levels below ground; the latter is
-    # assumed to be the same as the distance between the first and second
-    # vertical levels.
+    # Compute the number of levels below ground to include.
+    #
+    # The number of below-ground levels included is equal to the distance
+    # below the lowest level spanned by one_half_avg_width(k)
+    # divided by the distance between vertical levels below ground; the
+    # latter is assumed to be the same as the distance between the first and
+    # second vertical levels.
     dz_lb = gr.zm[:, 1:2] - gr.zm[:, 0:1]
     below_dist = one_half_avg_width - (gr.zm - gr.zm[:, 0:1])
     n_below_ground_levels = jnp.where(
@@ -503,6 +538,7 @@ def Lscale_width_vert_avg(
     )
     denom_integral = denom_integral + n_below_ground_levels * denom_terms[:, 0:1]
 
+    # Add numerator and denominator terms for all above-ground levels
     denom_safe = jnp.where(denom_integral != 0.0, denom_integral, 1.0)
     return numer_integral / denom_safe
 
@@ -607,8 +643,9 @@ def smooth_max(nz: int, ngrdcol: int, input_var1, input_var2, smth_coef: float):
 def smooth_heaviside_peskin(nz: int, ngrdcol: int, input, smth_range: float):
     """Compute a smoothed Heaviside function.
 
-    This follows Lin, Lee et al. (2005), "A level set characteristic Galerkin
-    finite element method for free surface flows", equation (2).
+    Computes a smoothed heaviside function as in
+        [Lin, Lee et al., 2005, A level set characteristic Galerkin
+        finite element method for free surface flows], equation (2)
 
     `smth_range` defines the smooth Heaviside interval
     [-smth_range, smth_range]. The output has the same units as `input`.
@@ -623,9 +660,11 @@ def smooth_heaviside_peskin(nz: int, ngrdcol: int, input, smth_range: float):
         + input_over_smth_range
         + (1.0 / jnp.pi) * jnp.sin(jnp.pi * input_over_smth_range)
     )
-    # In the Fortran branch form, the division by `smth_range` is reached only
-    # when `smth_range != 0`. JAX evaluates both branches, so callers should use
-    # the same nonzero smoothing range assumed by the active formula.
+    # Note that this case will only ever be reached if smth_range != 0,
+    # so this division is fine and should not cause any issues
+    #
+    # JAX evaluates both branches, so callers should use the same nonzero
+    # smoothing range assumed by the active formula.
     return jnp.where(input < -smth_range, 0.0, jnp.where(input > smth_range, 1.0, interior))
 
 
@@ -659,8 +698,9 @@ def vertical_avg(total_idx: int, rho_ds, field, dz):
 
       f_avg = ( INT(a:b) f*g ) / ( INT(a:b) g )
 
-    as long as f is continuous and g is nonnegative and integrable. Therefore,
-    the density-weighted vertical average value of any model field, x, is:
+    as long as f is continous and g is nonnegative and integrable.  Therefore,
+    the density-weighted (by dry, static, base-static density) vertical
+    average value of any model field, x, is calculated by the equation:
 
       x_avg|_z = ( INT(z_bot:z_top) x rho_ds dz )
                  / ( INT(z_bot:z_top) rho_ds dz )
@@ -725,11 +765,15 @@ def vertical_avg(total_idx: int, rho_ds, field, dz):
     References:
       None
     """
-    # Compute the numerator and denominator integral. Multiply rho_ds at level k
-    # by the level thickness at level k. Then, sum over all vertical levels.
-    return jnp.sum(rho_ds[:total_idx] * dz[:total_idx] * field[:total_idx]) / jnp.sum(
+    # Initialize variable
+    # Compute the numerator and denominator integral.
+    # Multiply rho_ds at level k by the level thickness
+    # at level k.  Then, sum over all vertical levels.
+    vertical_avg_result = jnp.sum(rho_ds[:total_idx] * dz[:total_idx] * field[:total_idx]) / jnp.sum(
         rho_ds[:total_idx] * dz[:total_idx]
     )
+    # Find the vertical average of 'field'.
+    return vertical_avg_result
 
 
 def vertical_integral(total_idx: int, rho_ds, field, dz):
@@ -743,8 +787,17 @@ def vertical_integral(total_idx: int, rho_ds, field, dz):
     References:
       None
     """
-    # Compute the integral. Multiply the field at level k by rho_ds at level k
-    # and by the level thickness at level k, then sum over all vertical levels.
+    # Assertion checks: that k_start <= gr%nz - 1
+    #                   that k_end   >= 2
+    #                   that k_start <= k_end
+
+    # Initializing vertical_integral to avoid a compiler warning.
+    # Compute the integral.
+    # Multiply the field at level k by rho_ds at level k and by
+    # the level thickness at level k.  Then, sum over all vertical levels.
+    # Note:  The values of the field and rho_ds are passed into this function
+    #        so that field(1) and rho_ds(1) are actually the field and rho_ds
+    #        at level k_start.
     return jnp.sum(field[:total_idx] * rho_ds[:total_idx] * dz[:total_idx])
 
 
@@ -756,9 +809,14 @@ def pvertinterp(nzt: int, ngrdcol: int, gr, p_mid, p_out: float, input_var):
     output array.
     """
     del nzt, ngrdcol, gr
-    # If the requested pressure is outside the input pressure range, extrapolate
-    # from the bottom or top data level. Otherwise, interpolate between the
-    # stored upper and lower level indices.
+    # Initialize index array and logical flags
+    # If we've fallen through the k=1,nz-1 loop, we cannot interpolate and
+    # must extrapolate from the bottom or top data level for at least some
+    # of the longitude points.
+    #
+    # Store level indices for interpolation.
+    # If all indices for this level have been found,
+    # do the interpolation
     return jax.vmap(lambda p_col, v_col: jnp.interp(p_out, p_col[::-1], v_col[::-1]))(
         p_mid,
         input_var,
@@ -777,7 +835,7 @@ def calculate_thlp2_rad(
     clubb_params,
     thlp2_forcing,
 ):
-    """Compute the contribution of radiative cooling to thlp2.
+    """Computes the contribution of radiative cooling to thlp2.
 
     References:
       See clubb:ticket:632

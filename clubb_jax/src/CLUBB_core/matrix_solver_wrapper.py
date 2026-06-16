@@ -1,15 +1,19 @@
-"""JAX port of `src/CLUBB_core/matrix_solver_wrapper.F90`.
+"""JAX port of ``src/CLUBB_core/matrix_solver_wrapper.F90``.
 
-This module mirrors the Fortran band/tridiag solver dispatch surface. The JAX
-port currently implements the custom `penta_lu` and `tridiag_lu` paths needed
-by the active JAX timestep path.
-
-TODO(JAX port):
-  LAPACK and penta_bicgstab are intentionally left unfinished. Those branches
-  print a warning and set err_info fatal until the corresponding solver paths
-  are ported. LAPACK-style rcond diagnostics are computed in JAX for active
-  paths: band solves mirror `gbsvx` equilibration and condition estimation, and
-  tridiagonal solves use a dense 1-norm reciprocal condition number.
+Porting deviations:
+  * Fortran provides generic ``band_solve`` and ``tridiag_solve`` interfaces;
+    JAX keeps explicit rank-dispatch wrappers.
+  * Fortran mutates ``lhs``, ``rhs``, ``err_info``, and ``soln``.  JAX treats
+    array inputs functionally and returns ``err_info``, ``soln``, and ``rcond``.
+  * LAPACK and ``penta_bicgstab`` solve branches are intentionally left
+    unsupported in JAX.  Those branches print a warning and set ``err_info``
+    fatal rather than silently using a different solver.
+  * The optional Fortran ``rcond`` path calls LAPACK diagnostic solvers.  JAX
+    computes an equivalent reciprocal-condition estimate for active paths:
+    band solves mirror LAPACK band equilibration plus condition estimation, and
+    tridiagonal solves use a dense 1-norm reciprocal condition number.
+  * Fortran prints every NaN location to ``fstderr``.  JAX reduces the NaN mask
+    by column and records a fatal ``err_info`` state, which is jit-friendly.
 """
 
 from __future__ import annotations
@@ -198,6 +202,11 @@ def band_solve_single_rhs_multiple_lhs(
 ):
     """Band solve written for single RHS and multiple LHS."""
     del old_soln
+
+    # ----------------------- Begin Code -----------------------
+
+    # The estimate of the reciprocal condition number of matrix
+    # after equilibration (if done).
     rcond = (
         _band_rcond(ndim, lhs)
         if use_rcond
@@ -265,6 +274,11 @@ def band_solve_multiple_rhs_lhs(
 ):
     """Band solve written for multiple RHS and multiple LHS."""
     del old_soln
+
+    # ----------------------- Begin Code -----------------------
+
+    # The estimate of the reciprocal condition number of matrix
+    # after equilibration (if done).
     rcond = (
         _band_rcond(ndim, lhs)
         if use_rcond
@@ -381,6 +395,10 @@ def tridiag_solve_single_rhs_lhs(
     use_rcond: bool = False,
 ):
     """Tridiagonal solve written for single RHS and single LHS."""
+    # ----------------------- Begin Code -----------------------
+
+    # The estimate of the reciprocal condition number of matrix
+    # after equilibration (if done).
     rcond = (
         _tridiag_rcond_single_lhs(ndim, lhs)
         if use_rcond
@@ -426,6 +444,10 @@ def tridiag_solve_single_rhs_multiple_lhs(
     use_rcond: bool = False,
 ):
     """Tridiagonal solve written for single RHS and multiple LHS."""
+    # ----------------------- Begin Code -----------------------
+
+    # The estimate of the reciprocal condition number of matrix
+    # after equilibration (if done).
     rcond = (
         _tridiag_rcond_multiple_lhs(ndim, lhs)
         if use_rcond
@@ -474,6 +496,10 @@ def tridiag_solve_multiple_rhs_lhs(
     use_rcond: bool = False,
 ):
     """Tridiagonal solve written for multiple RHS and multiple LHS."""
+    # ----------------------- Begin Code -----------------------
+
+    # The estimate of the reciprocal condition number of matrix
+    # after equilibration (if done).
     rcond = (
         _tridiag_rcond_multiple_lhs(ndim, lhs)
         if use_rcond

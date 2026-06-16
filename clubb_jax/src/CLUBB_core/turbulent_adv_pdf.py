@@ -12,6 +12,12 @@ Description:
 The routines are written generally in terms of <x'y'> and
 coef_wpxpyp_implicit or term_wpxpyp_explicit, but also apply to <x'^2> and
 <w'x'> with their corresponding PDF coefficients and explicit terms.
+
+Porting deviations:
+  Fortran intent(out) arrays (`lhs_ta` and `rhs_ta`) are returned directly.
+  The JAX LHS routines return stacked diagonal arrays in the same
+  [superdiagonal, main diagonal, subdiagonal] order used by the Fortran
+  constants. Fortran 1-based grid loops are represented by 0-based slices.
 """
 
 from __future__ import annotations
@@ -159,10 +165,10 @@ def xpyp_term_ta_pdf_lhs_godunov(
 ):
     """Godunov-form implicit turbulent-advection lhs coefficients.
 
-    This subroutine is a revised version of xpyp_term_ta_pdf_lhs_all.  The
-    revisions use the Godunov-like upwind scheme for the vertical
-    discretization of the turbulent advection term.  This subroutine returns
-    values for every grid level.
+    This subroutine is a revised version of xpyp_term_ta_pdf_lhs_all. The
+    revisions are maded to use the  Godunov-like upwind scheme for the
+    vertical discretization of the turbulent advection term. This subroutine
+    returns an array of 3 dimensional arrays, one for every grid level.
 
     Notes:
     This subroutine exists for testing of the Godunov-like upwind scheme.  This
@@ -291,14 +297,20 @@ def xpyp_term_ta_pdf_rhs_godunov(
 ):
     """Godunov-form explicit turbulent-advection rhs term.
 
-    This subroutine intends to add Godunov upwind difference scheme based on
-    xpyp_term_ta_pdf_rhs.  The revisions use the Godunov-like upwind scheme for
-    the vertical discretization.  This subroutine returns an array of values
+    This subroutine intends to add godunov upwind difference scheme based
+    on xpyp_term_ta_pdf_rhs.  The revisions are maded to use the Godunov-like
+    upwind scheme for the vertical discretization.
+    This subroutine returns an array of values
     for every grid level.
 
+    Optional Arguements:
+    The optional arguements can be used to override the default indices.
+    from_level - low index, default 2
+    to level - high index, default gr%nzm-1
+
     Notes:
-    This subroutine exists for testing of the Godunov-like upwind scheme.  This
-    subroutine does not handle boundary conditions and sets them to 0.
+    This subroutine exists for testing of Godunov-like upwind scheme.
+    THIS SUBROUTINE DOES NOT HANDLE BOUNDARY CONDITIONS AND SETS THEM TO 0
     """
     # Set lower boundary value to 0.
     gd = gr.grid_dir

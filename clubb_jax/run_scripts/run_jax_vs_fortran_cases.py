@@ -103,6 +103,7 @@ def _run_case(
     repo_root: Path,
     stats_file: Path,
     max_iters: int | None,
+    debug_level: int,
     bindiff_threshold: float,
     jax_out: Path,
     f90_out: Path,
@@ -117,6 +118,7 @@ def _run_case(
         str(run_scm),
         "-stats", str(stats_file),
         "-multicol", HR_SPEC,
+        "-debug", str(debug_level),
     ]
     if max_iters is not None:
         common_args += ["-max_iters", str(max_iters)]
@@ -199,6 +201,7 @@ def _worker(task: tuple) -> CaseResult:
         repo_root,
         stats_file,
         max_iters,
+        debug_level,
         bindiff_threshold,
         jax_output_root,
         f90_output_root,
@@ -210,6 +213,7 @@ def _worker(task: tuple) -> CaseResult:
         repo_root=Path(repo_root),
         stats_file=Path(stats_file),
         max_iters=max_iters,
+        debug_level=debug_level,
         bindiff_threshold=bindiff_threshold,
         jax_out=Path(jax_output_root),
         f90_out=Path(f90_output_root),
@@ -238,6 +242,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override max_iters for all cases (default: use per-case values from DEFAULT_CASES).",
+    )
+    parser.add_argument(
+        "--debug",
+        type=int,
+        default=2,
+        help="debug_level passed to run_scm.py with -debug (default: 2).",
     )
     parser.add_argument(
         "--bindiff-verbose",
@@ -315,6 +325,7 @@ def main() -> int:
             str(repo_root),
             str(stats_file),
             case_iters[case],
+            args.debug,
             args.bindiff_threshold,
             str(jax_output_root),
             str(f90_output_root),
@@ -328,6 +339,7 @@ def main() -> int:
     print(f"JAX output: {jax_output_root}")
     print(f"Fortran output: {f90_output_root}")
     print(f"Stats file: {stats_file}")
+    print(f"debug_level: {args.debug}")
 
     start = time.time()
     results: list[CaseResult] = []

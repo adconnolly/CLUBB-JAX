@@ -1,4 +1,26 @@
-"""JAX port of selected routines from ``src/CLUBB_core/numerical_check.F90``."""
+"""JAX port of selected routines from ``src/CLUBB_core/numerical_check.F90``.
+
+*_check subroutines were added to ensure that the
+subroutines they are checking perform correctly
+Joshua Fasching February 2008
+
+rad_clipping has been replaced by rad_check as the new
+subroutine only reports if there are invalid values.
+Joshua Fasching March 2008
+
+Porting deviations:
+- The Fortran module reports diagnostics through formatted writes and mutates
+  `err_info`; JAX helper predicates return booleans where the caller only needs
+  validity and uses `ErrInfo` updates only for `parameterization_check`,
+  `check_negative`, and `check_nan`.
+- The Fortran generic `check_nan` has scalar, 1D, and 2D implementations. JAX
+  uses one broadcasting implementation because `jnp.isfinite` handles all
+  ranks used by the port.
+- `check_clubb_settings_api` is kept as a compatibility wrapper because the
+  JAX driver rejects unsupported runtime options elsewhere. The model flag
+  constants used by the Fortran routine are still mirrored below so dispatch
+  values remain source-grounded.
+"""
 
 import jax
 
@@ -7,7 +29,27 @@ import jax.numpy as jnp
 import numpy as np
 
 from clubb_jax.src.CLUBB_core.error_code import CLUBB_FATAL_ERROR
+from clubb_jax.src.CLUBB_core import model_flags as _model_flags
 from clubb_jax.src.derived_types import ErrInfo
+
+_iiPDF_ADG1 = _model_flags.iiPDF_ADG1
+_iiPDF_ADG2 = _model_flags.iiPDF_ADG2
+_iiPDF_3D_Luhar = _model_flags.iiPDF_3D_Luhar
+_iiPDF_new = _model_flags.iiPDF_new
+_iiPDF_TSDADG = _model_flags.iiPDF_TSDADG
+_iiPDF_LY93 = _model_flags.iiPDF_LY93
+_iiPDF_new_hybrid = _model_flags.iiPDF_new_hybrid
+_saturation_bolton = _model_flags.saturation_bolton
+_saturation_gfdl = _model_flags.saturation_gfdl
+_saturation_flatau = _model_flags.saturation_flatau
+_saturation_lookup = _model_flags.saturation_lookup
+_ipdf_pre_advance_fields = _model_flags.ipdf_pre_advance_fields
+_ipdf_pre_post_advance_fields = _model_flags.ipdf_pre_post_advance_fields
+_l_explicit_turbulent_adv_wpxp = _model_flags.l_explicit_turbulent_adv_wpxp
+_order_xm_wpxp = _model_flags.order_xm_wpxp
+_order_xp2_xpyp = _model_flags.order_xp2_xpyp
+_order_wp2_wp3 = _model_flags.order_wp2_wp3
+_order_windm = _model_flags.order_windm
 
 
 def parameterization_check(
@@ -65,7 +107,13 @@ def parameterization_check(
     edsclrm_forcing,
     err_info: ErrInfo,
 ):
-    """Determine what input variables may have NaN or invalid negative values."""
+    """Determine what input variables may have NaN or invalid negative values.
+
+    Description:
+      This subroutine determines what input variables may have NaN values.
+      In addition it checks to see if rho_zm, rho, exner, up2, vp2, rtm, thlm,
+      wp2, rtp2, thlp2, or tau_zm have negative values.
+    """
     del nzm, nzt, ngrdcol
 
     proc_name = "advance_clubb_core"
@@ -189,7 +237,12 @@ def parameterization_check(
 
 
 def check_negative(var, varname, operation, err_info: ErrInfo):
-    """Checks for negative values in the var array."""
+    """Checks for negative values in the var array and reports the column and
+    vertical indices in which the negative values occur.
+
+    JAX updates `err_info` but does not reproduce the formatted per-index
+    diagnostics.
+    """
     del varname, operation
     if not hasattr(err_info, "set_fatal"):
         if np.any(np.asarray(var) < 0.0):
@@ -199,7 +252,11 @@ def check_negative(var, varname, operation, err_info: ErrInfo):
 
 
 def check_nan(var, varname, operation, err_info: ErrInfo):
-    """Checks for a non-finite value in var."""
+    """Checks for a NaN in the var array and reports it.
+
+    JAX treats any non-finite value as fatal and does not reproduce the
+    formatted diagnostic write.
+    """
     del varname, operation
     if not hasattr(err_info, "set_fatal"):
         if np.any(~np.isfinite(np.asarray(var))):
@@ -218,7 +275,10 @@ def calculate_spurious_source(
     integral_forcing,
     dt,
 ):
-    """Return the column-conservation imbalance diagnostic."""
+    """Checks whether there is conservation within the column and returns any
+    imbalance as spurious_source where spurious_source is defined negative
+    for a spurious sink.
+    """
     return (
         (jnp.asarray(integral_after) - jnp.asarray(integral_before))
         / jnp.asarray(dt)
@@ -249,7 +309,7 @@ def sfc_varnce_check(
     sclrprtp_sfc=None,
     sclrpthlp_sfc=None,
 ):
-    """Return True when all surface variance/covariance inputs are finite."""
+    """Determine whether calc_surface_varnce outputs carry values that are nans."""
     values = [wp2_sfc, up2_sfc, vp2_sfc, thlp2_sfc, rtp2_sfc, rtpthlp_sfc]
     if int(sclr_dim) > 0:
         values.extend([sclrp2_sfc, sclrprtp_sfc, sclrpthlp_sfc])
@@ -257,12 +317,12 @@ def sfc_varnce_check(
 
 
 def length_check(Lscale, Lscale_up, Lscale_down):
-    """Return True when all mixing-length arrays are finite."""
+    """Determine whether length_new output variables carry values that are NaNs."""
     return _all_finite(Lscale, Lscale_up, Lscale_down)
 
 
 def pdf_closure_check(closure_fields, pdf_params, sclr_dim=0, sclr_fields=None):
-    """Return True when PDF closure outputs and PDF parameters are finite."""
+    """Determine whether pdf_closure output variables carry values that are NaNs."""
     values = []
     if isinstance(closure_fields, dict):
         values.extend(closure_fields.values())
@@ -280,7 +340,7 @@ def pdf_closure_check(closure_fields, pdf_params, sclr_dim=0, sclr_fields=None):
 
 
 def rad_check(thlm, rcm, rtm, rim, cloud_frac, p_in_Pa, exner, rho_zm):
-    """Return True when radiation inputs are finite and non-negative."""
+    """Checks radiation input variables. If they are < 0 it reports to the console."""
     values = [thlm, rcm, rtm, rim, cloud_frac, p_in_Pa, exner, rho_zm]
     if not _all_finite(*values):
         return False
@@ -290,7 +350,11 @@ def rad_check(thlm, rcm, rtm, rim, cloud_frac, p_in_Pa, exner, rho_zm):
 
 
 def invalid_model_arrays(**arrays):
-    """Return True if any numeric model array contains a non-finite value."""
+    """Checks for invalid floating point values in select model arrays.
+
+    References:
+      None
+    """
     for value in arrays.values():
         if value is None:
             continue
@@ -306,11 +370,15 @@ def invalid_model_arrays(**arrays):
 
 
 def check_clubb_settings(*, err_info, **kwargs):
-    """Compatibility wrapper for driver setup validation.
+    """Subroutine to set up the model for execution.
 
-    The full Fortran routine primarily reports configuration errors and warnings.  The
-    JAX driver handles unsupported options separately, so this wrapper preserves the
-    runtime contract by returning the provided ErrInfo unchanged.
+    References:
+      None
+
+    The full Fortran routine primarily reports configuration errors and
+    warnings. The JAX driver handles unsupported options separately, so this
+    wrapper preserves the runtime contract by returning the provided ErrInfo
+    unchanged.
     """
     del kwargs
     return err_info

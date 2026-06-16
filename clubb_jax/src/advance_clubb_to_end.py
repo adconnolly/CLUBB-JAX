@@ -167,7 +167,6 @@ def _begin_timestep_stats(state: dict, itime_idx: int) -> tuple[bool, bool]:
             ngrdcol=state['ngrdcol'],
             nzm=state['nzm'],
             nzt=state['nzt'],
-            max_events=8192,
         )
         return l_sample, l_last_sample
 

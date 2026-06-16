@@ -11,10 +11,15 @@ References:
     Method and Model Description'' Golaz, et al. (2002)
     JAS, Vol. 59, pp. 3540--3551.
 
-TODO(JAX port):
-  The direct ``clubb_api`` core dependencies have been removed, but this
+Porting deviations:
+- The direct ``clubb_api`` core dependencies have been removed, but this
   routine is still Python orchestration over jitted kernels. A monolithic outer
   JIT currently produces an impractically large XLA compile.
+- The Fortran routine mutates a long intent(inout)/intent(out) argument list;
+  this JAX port returns the full updated state tuple explicitly.
+- Host-model preprocessor branches and full diagnostic print exits are not
+  represented inside this Python/JAX driver. Fatal status is carried through
+  err_info instead of using host-side early returns.
 """
 
 import jax
@@ -116,7 +121,7 @@ def advance_clubb_core(
     pdf_implicit_coefs_terms,
     err_info,
 ):
-    """Advance CLUBB one timestep with an explicit argument surface."""
+    """Subroutine to advance CLUBB one timestep."""
     Kh_zm = jnp.zeros((ngrdcol, nzm))
     Kh_zt = jnp.zeros((ngrdcol, nzt))
     Lscale = jnp.zeros((ngrdcol, nzt))
@@ -977,6 +982,12 @@ def set_sfc_value_of_flux_profiles(
     wpsclrp,
     wpedsclrp,
 ):
+    """Set or clear the surface values of turbulent flux profiles depending on
+    whether the host model applies surface fluxes outside CLUBB.
+
+    References:
+      None
+    """
     k_lb = gr.k_lb_zm
 
     # SET SURFACE VALUES OF FLUXES (BROUGHT IN)

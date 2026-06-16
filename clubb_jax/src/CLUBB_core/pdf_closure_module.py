@@ -1,4 +1,4 @@
-"""JAX port of pdf_closure_module.F90 — PDF moment-integral closures.
+"""JAX port of pdf_closure_module.F90 - PDF moment-integral closures.
 
 Mirrors clubb_release/src/CLUBB_core/pdf_closure_module.F90. The closure
 orchestration lives here as `pdf_closure_driver`; advance_clubb_core.py calls it
@@ -11,7 +11,23 @@ two-component PDF parameters, plus the cloudy-updraft diagnostic:
         PDF integrals used directly by the live pdf_closure body.
   calc_w_up_in_cloud — mean cloudy updraft/downdraft vertical velocity (aerosol activation)
 
-All pure-jnp → differentiable.
+Porting deviations:
+- `pdf_closure` is not yet a full parity port. The hydrometeor/liquid-ice
+  loading branch from Fortran is intentionally omitted, and hydrometeor moment
+  inputs are deleted at the top of the routine.
+- Fortran stats-gated shortcuts are not duplicated here; the JAX routine
+  computes moment fields unconditionally and stats updates are handled outside
+  this low-level function.
+- Fortran intent(out)/intent(inout) arguments are returned through dictionaries
+  or functional derived-type replacements.
+- Unsupported `iiPDF_type` values raise `NotImplementedError` rather than
+  writing to stderr/error-stopping.
+- The Fortran host-model API warning is not directly applicable to this JAX
+  internal function, but the comment is preserved below.
+- Several helper routines are vectorized over caller-provided array shapes
+  instead of using explicit Fortran `nz/ngrdcol` loops.
+
+All pure-jnp -> differentiable where the called PDF path supports it.
 
 References:
   src/CLUBB_core/pdf_closure_module.F90, calc_{wp2xp,wpxp2,wp2xp2,wp4,wpxpyp}_pdf,
@@ -43,12 +59,10 @@ from clubb_jax.src.CLUBB_core.new_hybrid_pdf_main import new_hybrid_pdf_driver
 from clubb_jax.src.CLUBB_core.new_tsdadg_pdf import tsdadg_pdf_driver
 from clubb_jax.src.CLUBB_core.LY93_pdf import LY93_driver
 from clubb_jax.src.CLUBB_core.Skx_module import Skx_func, compute_gamma_Skw
-from clubb_jax.src.CLUBB_core.sigma_sqd_w_module import compute_sigma_sqd_w
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm, zm2zt
 from clubb_jax.src.CLUBB_core.pdf_utilities import calc_corr_chi_x, calc_corr_eta_x
 from clubb_jax.src.derived_types.pdf_params import (
     init_pdf_implicit_coefs_terms_api,
-    pdf_parameter,
 )
 
 
@@ -92,7 +106,31 @@ def pdf_closure(
     pdf_params, pdf_implicit_coefs_terms,
     err_info,
 ):
-    """Port of pdf_closure_module.F90:pdf_closure for the active JAX PDF paths."""
+    """Subroutine that computes pdf parameters analytically.
+
+    Based of the original formulation, but with some tweaks
+    to remove some of the less realistic assumptions and
+    improve transport terms.
+
+    Corrected version that should remove inconsistency
+
+    References:
+      The shape of CLUBB's PDF is given by the expression in
+      https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:clubb_pdf
+
+      Eqn. 29, 30, 31, 32 & 33  on p. 3547 of
+      ``A PDF-Based Model for Boundary Layer Clouds. Part I:
+      Method and Model Description'' Golaz, et al. (2002)
+      JAS, Vol. 59, pp. 3540--3551.
+
+    !#######################################################################
+    !#######################################################################
+    ! If you change the argument list of pdf_closure you also have to
+    ! change the calls to this function in the host models CAM, WRF, SAM
+    ! and GFDL.
+    !#######################################################################
+    !#######################################################################
+    """
     # TODO: port the hydrometeor/liquid-ice-loading branch from the Fortran routine
     # before claiming full pdf_closure parity for hydrometeor prognostic cases.
     del hydromet_dim, wphydrometp, wp2hmp, rtphmp, thlphmp
@@ -119,6 +157,9 @@ def pdf_closure(
     varnce_sclr1 = None
     varnce_sclr2 = None
     if iiPDF_type == iiPDF_ADG1:
+        # Calculate the mixture fraction for the multivariate PDF, as well as both
+        # PDF component means and both PDF component variances for each of w, rt,
+        # theta-l, and passive scalar variables.
         adg1 = ADG1_pdf_driver(
             wm=jnp.asarray(wm),
             rtm=jnp.asarray(rtm),
@@ -141,6 +182,9 @@ def pdf_closure(
             mixt_frac_max_mag=mixt_frac_max_mag,
         )
     elif iiPDF_type == iiPDF_ADG2:
+        # Calculate the mixture fraction for the multivariate PDF, as well as both
+        # PDF component means and both PDF component variances for each of w, rt,
+        # theta-l, and passive scalar variables.
         (
             w_1, w_2, rt_1, rt_2, thl_1, thl_2,
             varnce_w_1, varnce_w_2, varnce_rt_1, varnce_rt_2,
@@ -182,6 +226,9 @@ def pdf_closure(
             "alpha_v": half,
         }
     elif iiPDF_type == iiPDF_3D_Luhar:
+        # Calculate the mixture fraction for the multivariate PDF, as well as both
+        # PDF component means and both PDF component variances for each of w, rt,
+        # theta-l, and passive scalar variables.
         (
             w_1, w_2, rt_1, rt_2, thl_1, thl_2,
             varnce_w_1, varnce_w_2, varnce_rt_1, varnce_rt_2,
@@ -218,6 +265,9 @@ def pdf_closure(
             "alpha_v": half,
         }
     elif iiPDF_type == iiPDF_new:
+        # Calculate the mixture fraction for the multivariate PDF, as well as both
+        # PDF component means and both PDF component variances for each of w, rt,
+        # theta-l, and passive scalar variables.
         new_pdf = new_pdf_driver(
             wm, rtm, thlm, wp2, rtp2, thlp2,
             Skw, wprtp, wpthlp, rtpthlp,
@@ -253,6 +303,9 @@ def pdf_closure(
             "alpha_v": half,
         }
     elif iiPDF_type == iiPDF_TSDADG:
+        # Calculate the mixture fraction for the multivariate PDF, as well as both
+        # PDF component means and both PDF component variances for each of w, rt,
+        # theta-l, and passive scalar variables.
         (
             w_1, w_2, rt_1, rt_2, thl_1, thl_2,
             varnce_w_1, varnce_w_2, varnce_rt_1, varnce_rt_2,
@@ -289,6 +342,9 @@ def pdf_closure(
             "alpha_v": half,
         }
     elif iiPDF_type == iiPDF_LY93:
+        # Calculate the mixture fraction for the multivariate PDF, as well as both
+        # PDF component means and both PDF component variances for each of w, rt,
+        # theta-l, and passive scalar variables.
         (
             w_1, w_2, rt_1, rt_2, thl_1, thl_2,
             varnce_w_1, varnce_w_2, varnce_rt_1, varnce_rt_2,
@@ -322,6 +378,9 @@ def pdf_closure(
             "alpha_v": half,
         }
     elif iiPDF_type == iiPDF_new_hybrid:
+        # Calculate the mixture fraction for the multivariate PDF, as well as both
+        # PDF component means and both PDF component variances for each of w, rt,
+        # theta-l, and passive scalar variables.
         gamma_Skw_fnc = compute_gamma_Skw(
             nz, ngrdcol, Skw, clubb_params, l_gamma_Skw,
         )
@@ -402,6 +461,7 @@ def pdf_closure(
         varnce_sclr1 = jnp.zeros((ngrdcol, nz, 0), dtype=jnp.float64)
         varnce_sclr2 = jnp.zeros((ngrdcol, nz, 0), dtype=jnp.float64)
 
+    # Calculate the PDF component correlations of rt and thl.
     corr_rt_thl_1, corr_rt_thl_2 = calc_comp_corrs_binormal(
         rtpthlp, rtm, thlm,
         adg1["rt_1"], adg1["rt_2"],
@@ -411,11 +471,16 @@ def pdf_closure(
         adg1["mixt_frac"],
     )
     if iiPDF_type in (iiPDF_ADG1, iiPDF_ADG2, iiPDF_new_hybrid):
+        # These PDF types define corr_w_rt_1, corr_w_rt_2, corr_w_thl_1, and
+        # corr_w_thl_2 to all have a value of 0, so skip the calculation.
+        # The values of corr_u_w_1, corr_u_w_2, corr_v_w_1, and corr_v_w_2 are
+        # all defined to be 0, as well.
         corr_w_rt_1 = jnp.zeros_like(adg1["mixt_frac"])
         corr_w_rt_2 = jnp.zeros_like(adg1["mixt_frac"])
         corr_w_thl_1 = jnp.zeros_like(adg1["mixt_frac"])
         corr_w_thl_2 = jnp.zeros_like(adg1["mixt_frac"])
     else:
+        # Calculate the PDF component correlations of w and rt.
         corr_w_rt_1, corr_w_rt_2 = calc_comp_corrs_binormal(
             wprtp, wm, rtm,
             adg1["w_1"], adg1["w_2"],
@@ -424,6 +489,7 @@ def pdf_closure(
             adg1["varnce_rt_1"], adg1["varnce_rt_2"],
             adg1["mixt_frac"],
         )
+        # Calculate the PDF component correlations of w and thl.
         corr_w_thl_1, corr_w_thl_2 = calc_comp_corrs_binormal(
             wpthlp, wm, thlm,
             adg1["w_1"], adg1["w_2"],
@@ -433,6 +499,7 @@ def pdf_closure(
             adg1["mixt_frac"],
         )
     if sclr_dim > 0:
+        # Calculate the PDF component correlations of a passive scalar and thl.
         corr_sclr_thl_1, corr_sclr_thl_2 = jax.vmap(
             lambda sclrpthlp_s, sclrm_s, sclr1_s, sclr2_s, varnce_sclr1_s, varnce_sclr2_s: (
                 calc_comp_corrs_binormal(
@@ -453,6 +520,7 @@ def pdf_closure(
             in_axes=(2, 2, 2, 2, 2, 2),
             out_axes=-1,
         )(sclrpthlp, sclrm, sclr1, sclr2, varnce_sclr1, varnce_sclr2)
+        # Calculate the PDF component correlations of a passive scalar and rt.
         corr_sclr_rt_1, corr_sclr_rt_2 = jax.vmap(
             lambda sclrprtp_s, sclrm_s, sclr1_s, sclr2_s, varnce_sclr1_s, varnce_sclr2_s: (
                 calc_comp_corrs_binormal(
@@ -474,9 +542,12 @@ def pdf_closure(
             out_axes=-1,
         )(sclrprtp, sclrm, sclr1, sclr2, varnce_sclr1, varnce_sclr2)
         if iiPDF_type in (iiPDF_ADG1, iiPDF_ADG2, iiPDF_new_hybrid):
+            # These PDF types define all PDF component correlations involving w
+            # to have a value of 0, so skip the calculation.
             corr_w_sclr_1 = jnp.zeros_like(sclr1)
             corr_w_sclr_2 = jnp.zeros_like(sclr1)
         else:
+            # Calculate the PDF component correlations of w and a passive scalar.
             corr_w_sclr_1, corr_w_sclr_2 = jax.vmap(
                 lambda wpsclrp_s, sclrm_s, sclr1_s, sclr2_s, varnce_sclr1_s, varnce_sclr2_s: (
                     calc_comp_corrs_binormal(
@@ -508,6 +579,11 @@ def pdf_closure(
     mf = adg1["mixt_frac"]
     zero_pdf = jnp.zeros_like(mf)
 
+    # Compute higher order moments that include theta_v.
+
+    # First compute some preliminary quantities.
+    # "1" denotes first Gaussian; "2" denotes 2nd Gaussian
+    # liq water temp (Sommeria & Deardorff 1977 (SD), eqn. 3)
     tl1 = adg1["thl_1"] * exner
     tl2 = adg1["thl_2"] * exner
     rsatl_1 = sat_mixrat_liq(p_in_Pa, tl1, saturation_formula)
@@ -519,7 +595,9 @@ def pdf_closure(
             corr_rt_thl_1,
         )
     )
+    # Calculate cloud fraction component for pdf 1
     cloud_frac_1, rc_1 = calc_liquid_cloud_frac_component(chi_1, stdev_chi_1)
+    # Calc ice_supersat_frac
     ice_supersat_frac_1 = calc_ice_cloud_frac_component(
         chi_1, stdev_chi_1, crt_1, rsatl_1, tl1,
         cloud_frac_1, p_in_Pa,
@@ -531,7 +609,9 @@ def pdf_closure(
             corr_rt_thl_2,
         )
     )
+    # Calculate cloud fraction component for pdf 2
     cloud_frac_2, rc_2 = calc_liquid_cloud_frac_component(chi_2, stdev_chi_2)
+    # Calc ice_supersat_frac
     ice_supersat_frac_2 = calc_ice_cloud_frac_component(
         chi_2, stdev_chi_2, crt_2, rsatl_2, tl2,
         cloud_frac_2, p_in_Pa,
@@ -540,14 +620,20 @@ def pdf_closure(
         mf * ice_supersat_frac_1
         + (1.0 - mf) * ice_supersat_frac_2
     )
+    # Compute cloud fraction and mean cloud water mixing ratio.
+    # Reference:
+    # https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:anl_int_cloud_terms
     cloud_frac = mf * cloud_frac_1 + (1.0 - mf) * cloud_frac_2
     rcm = jnp.maximum(zero_threshold, mf * rc_1 + (1.0 - mf) * rc_2)
     if iiPDF_type in (iiPDF_ADG1, iiPDF_ADG2, iiPDF_new_hybrid):
+        # corr_w_rt and corr_w_thl are zero for these pdf types so
+        # corr_w_chi and corr_w_eta are zero as well
         corr_w_chi_1 = zero_pdf
         corr_w_chi_2 = zero_pdf
         corr_w_eta_1 = zero_pdf
         corr_w_eta_2 = zero_pdf
     else:
+        # Correlation of w and chi for each component.
         corr_w_chi_1 = calc_corr_chi_x(
             crt_1, cthl_1,
             _safe_sqrt(adg1["varnce_rt_1"]),
@@ -564,6 +650,7 @@ def pdf_closure(
             corr_w_rt_2,
             corr_w_thl_2,
         )
+        # Correlation of w and eta for each component.
         corr_w_eta_1 = calc_corr_eta_x(
             crt_1, cthl_1,
             _safe_sqrt(adg1["varnce_rt_1"]),
@@ -581,6 +668,26 @@ def pdf_closure(
             corr_w_thl_2,
         )
 
+    # Compute moments that depend on theta_v
+    #
+    # The moments that depend on th_v' are calculated based on an approximated
+    # and linearized form of the theta_v equation:
+    #
+    # theta_v = theta_l + { (R_v/R_d) - 1 } * thv_ds * r_t
+    #                   + [ {L_v/(C_p*exner)} - (R_v/R_d) * thv_ds ] * r_c;
+    #
+    # and therefore:
+    #
+    # th_v' = th_l' + { (R_v/R_d) - 1 } * thv_ds * r_t'
+    #               + [ {L_v/(C_p*exner)} - (R_v/R_d) * thv_ds ] * r_c';
+    #
+    # where thv_ds is used as a reference value to approximate theta_l.
+    #
+    # Reference:
+    # https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:anl_int_buoy_terms
+    #
+    # Calculate the contributions to <w'rc'>, <w'^2 rc'>, <rt'rc'>, and
+    # <thl'rc'> from the 1st PDF component.
     (
         wprcp_1, wp2rcp_1, rtprcp_1, thlprcp_1,
         uprcp_1, vprcp_1,
@@ -591,6 +698,8 @@ def pdf_closure(
         corr_w_chi_1, corr_chi_eta_1, crt_1, cthl_1, rc_1, cloud_frac_1,
         iiPDF_type,
     )
+    # Calculate the contributions to <w'rc'>, <w'^2 rc'>, <rt'rc'>, and
+    # <thl'rc'> from the 2nd PDF component.
     (
         wprcp_2, wp2rcp_2, rtprcp_2, thlprcp_2,
         uprcp_2, vprcp_2,
@@ -601,6 +710,7 @@ def pdf_closure(
         corr_w_chi_2, corr_chi_eta_2, crt_2, cthl_2, rc_2, cloud_frac_2,
         iiPDF_type,
     )
+    # Calculate <w'rc'>, <w'^2 rc'>, <rt'rc'>, and <thl'rc'>.
     wprcp = mf * wprcp_1 + (1.0 - mf) * wprcp_2
     wp2rcp = mf * wp2rcp_1 + (1.0 - mf) * wp2rcp_2
     rtprcp = mf * rtprcp_1 + (1.0 - mf) * rtprcp_2
@@ -610,6 +720,7 @@ def pdf_closure(
 
     w1, w2 = adg1["w_1"], adg1["w_2"]
     vw1, vw2 = adg1["varnce_w_1"], adg1["varnce_w_2"]
+    # Compute higher order moments (these are interactive)
     wp2rtp = calc_wp2xp_pdf(
         wm, rtm, w1, w2,
         adg1["rt_1"], adg1["rt_2"],
@@ -628,6 +739,7 @@ def pdf_closure(
         vw1, vw2, adg1["varnce_u_1"], adg1["varnce_u_2"],
         zero_pdf, zero_pdf, mf,
     )
+    # Compute higher order moments (these may be interactive)
     wpup2 = calc_wpxp2_pdf(
         wm, um, w1, w2,
         adg1["u_1"], adg1["u_2"],
@@ -674,7 +786,9 @@ def pdf_closure(
         corr_rt_thl_1, corr_rt_thl_2, mf,
     )
 
+    # Calculate rc_coef, which is the coefficient on <x'rc'> in the <x'thv'> equation.
     rc_coef = Lv / (exner * Cp) - ep2 * thv_ds
+    # Calculate <w'thv'>, <w'^2 thv'>, <rt'thv'>, and <thl'thv'>.
     wpthvp = wpthlp + ep1 * thv_ds * wprtp + rc_coef * wprcp
     wp2thvp = wp2thlp + ep1 * thv_ds * wp2rtp + rc_coef * wp2rcp
     rtpthvp = rtpthlp + ep1 * thv_ds * rtp2 + rc_coef * rtprcp
@@ -689,6 +803,7 @@ def pdf_closure(
     )
 
     if sclr_dim > 0:
+        # Scalar Addition to higher order moments
         wp2sclrp = calc_wp2xp_pdf(
             wm[:, :, None],
             sclrm,
@@ -797,6 +912,7 @@ def pdf_closure(
         sclrpthvp = jnp.zeros((ngrdcol, nz, 0), dtype=jnp.float64)
 
     if iiPDF_type in (iiPDF_ADG1, iiPDF_ADG2, iiPDF_new_hybrid):
+        # Calculate mean cloudy updraft speed.
         w_up_in_cloud, w_down_in_cloud, cloudy_updraft_frac, cloudy_downdraft_frac = (
             calc_w_up_in_cloud(
                 adg1["mixt_frac"],
@@ -884,22 +1000,37 @@ def pdf_closure(
 
 def transform_pdf_chi_eta_component(tl, rsatl, rt, exner_in,
                                         varnce_thl, varnce_rt, corr_rt_thl):
-    """pdf_closure_module.F90:transform_pdf_chi_eta_component (line 1699).
+    """pdf_closure_module.F90:transform_pdf_chi_eta_component.
 
-    Sommeria & Deardorff (1977) extended-liquid-water-temperature transform of a single
-    PDF component from (rt, thl) to the (chi, eta) coordinate that diagnoses liquid water.
-    Returns the chi/eta means, standard deviations, the rt/thl→chi sensitivity coefficients
-    (crt, cthl) and the chi-eta correlation for one PDF component.
+    s from Lewellen and Yoh 1993 (LY) eqn. 1
 
-    Returns the Fortran out-arg order:
+    For each normal distribution in the sum of two normal distributions,
+    s' = crt * rt'  +  cthl * thl';
+    therefore, x's' = crt * x'rt'  +  cthl * x'thl'.
+    Larson et al. May, 2001.
+
+    Calculate covariance, correlation, and standard deviation of
+    chi and eta for each component
+    Include subplume correlation of qt, thl
+
+    Returns the Fortran out-arg order with JAX arrays:
         (chi, crt, cthl, stdev_chi, stdev_eta, covar_chi_eta, corr_chi_eta)
     """
+    # SD's beta (eqn. 8)
     beta       = ep * Lv**2 / (Rd * Cp * tl**2)
     invrs      = 1.0 / (1.0 + beta * rsatl)
+    # s from Lewellen and Yoh 1993 (LY) eqn. 1
     chi        = (rt - rsatl) * invrs
+    # For each normal distribution in the sum of two normal distributions,
+    # s' = crt * rt'  +  cthl * thl';
+    # therefore, x's' = crt * x'rt'  +  cthl * x'thl'.
+    # Larson et al. May, 2001.
     crt        = invrs
     cthl       = ((1.0 + beta * rt) * invrs**2
                   * (Cp / Lv) * beta * rsatl * exner_in)
+    # Calculate covariance, correlation, and standard deviation of
+    # chi and eta for each component
+    # Include subplume correlation of qt, thl
     vrnc_rt_t  = crt**2 * varnce_rt
     vrnc_thl_t = cthl**2 * varnce_thl
     corr_t     = (2.0 * corr_rt_thl * crt * cthl
@@ -929,11 +1060,31 @@ def transform_pdf_chi_eta_component(tl, rsatl, rt, exner_in,
 
 
 def calc_wp4_pdf(wm, w_1, w_2, varnce_w_1, varnce_w_2, mixt_frac):
-    """<w'^4> integrated over the two-component-normal PDF of w (pdf_closure_module.F90:calc_wp4_pdf):
-      <w'^4> = Σ_i weight_i (3 σ_w_i^4 + 6 (μ_w_i-<w>)^2 σ_w_i^2 + (μ_w_i-<w>)^4). Pure-jnp → differentiable."""
+    """Description:
+    Calculates <w'^4> by integrating over the PDF of w.  The integral is:
+
+    <w'^4> = INT(-inf:inf) ( w - <w> )^4 P(w) dw;
+
+    where <w> is the overall mean of w and P(w) is a two-component normal
+    distribution of w.  The integrated equation is:
+
+    <w'^4> = mixt_frac * ( 3 * sigma_w_1^4
+                           + 6 * ( mu_w_1 - <w> )^2 * sigma_w_1^2
+                           + ( mu_w_1 - <w> )^4 )
+             + ( 1 - mixt_frac ) * ( 3 * sigma_w_2^4
+                                     + 6 * ( mu_w_2 - <w> )^2 * sigma_w_2^2
+                                     + ( mu_w_2 - <w> )^4 );
+
+    where mu_w_1 is the mean of w in the 1st PDF component, mu_w_2 is the mean
+    of w in the 2nd PDF component, sigma_w_1 is the standard deviation of w in
+    the 1st PDF component, sigma_w_2 is the standard deviation of w in the 2nd
+    PDF component, and mixt_frac is the mixture fraction, which is the weight
+    of the 1st PDF component.
+    """
     wm = jnp.asarray(wm); a = jnp.asarray(mixt_frac)
     d1 = jnp.asarray(w_1) - wm; d2 = jnp.asarray(w_2) - wm
     v1 = jnp.asarray(varnce_w_1); v2 = jnp.asarray(varnce_w_2)
+    # Calculate <w'^4> by integrating over the PDF.
     return (a * (3.0 * v1 ** 2 + 6.0 * d1 ** 2 * v1 + d1 ** 4)
             + (1.0 - a) * (3.0 * v2 ** 2 + 6.0 * d2 ** 2 * v2 + d2 ** 4))
 
@@ -943,13 +1094,42 @@ def calc_wp2xp2_pdf(wm, xm, w_1, w_2, x_1, x_2,
                          varnce_x_1, varnce_x_2,
                          corr_w_x_1, corr_w_x_2,
                          mixt_frac):
-    """pdf_closure_module.F90:calc_wp2xp2_pdf — <w'^2 x'^2> from bivariate PDF integral.
+    """Description:
+    Calculates <w'^2x'^2> by integrating over the PDF of w and x.  The
+    integral
+    is:
 
-    Formula:
-      wp2xp2 = mf * ((dw_1^2 * (dx_1^2 + varnce_x_1)
-                      + 4*corr_w_x_1*sqrt(varnce_w_1*varnce_x_1)*dx_1*dw_1
-                      + (dx_1^2 + (1+2*corr_w_x_1^2)*varnce_x_1)*varnce_w_1))
-             + (1-mf) * (same for component 2)
+    <w'^2x'^2>
+    = INT(-inf:inf) INT(-inf:inf) ( w - <w> )^2 ( x - <x> )^2 P(w,x) dx dw;
+
+    where <w> is the overall mean of w, <x> is the overall mean of x, and
+    P(w,x) is a two-component bivariate normal distribution of w and x.  The
+    integrated equation is:
+
+    <w'^2x'^2>
+      = mixt_frac
+         * ( ( mu_w_1 - <w> )**2 * ( ( mu_x_1 - <x> )**2 + sigma_x_1^2 )
+         + four * corr_w_x_1 * sigma_w_1 * sigma_x_1 * ( mu_x_1 - <x> ) * (
+         mu_w_1 - <w> )
+         + ( ( mu_x_1 - <x> )**2 + ( 1 + 2*corr_w_x_1**2 ) * sigma_x_1^2 ) *
+         sigma_w_1^2 )
+       + ( one - mixt_frac )
+         * ( ( mu_w_2 - <w> )**2 * ( ( mu_x_2 - <x> )**2 + sigma_x_2^2 )
+         + four * corr_w_x_2 * sigma_w_2 * sigma_x_2 * ( mu_x_2 - <x> ) * (
+         mu_w_2 - <w> )
+         + ( ( mu_x_2 - <x> )**2 + ( 1 + 2*corr_w_x_2**2 ) * sigma_x_2^2 ) *
+         sigma_w_2^2 )
+
+    where mu_w_1 is the mean of w in the 1st PDF component, mu_w_2 is the mean
+    of w in the 2nd PDF component, mu_x_1 is the mean of x in the 1st PDF
+    component, mu_x_2 is the mean of x in the 2nd PDF component, sigma_w_1 is
+    the standard deviation of w in the 1st PDF component, sigma_w_2 is the
+    standard deviation of w in the 2nd PDF component, sigma_x_1 is the
+    standard deviation of x in the 1st PDF component, sigma_x_2 is the
+    standard deviation of x in the 2nd PDF component, corr_w_x_1 is the
+    correlation of w and x in the 1st PDF component, corr_w_x_2 is the
+    correlation of w and x in the 2nd PDF component, and mixt_frac is the
+    mixture fraction, which is the weight of the 1st PDF component.
     """
     one_minus_mf = 1.0 - mixt_frac
     dw_1 = w_1 - wm
@@ -964,33 +1144,94 @@ def calc_wp2xp2_pdf(wm, xm, w_1, w_2, x_1, x_2,
              + 4.0 * corr_w_x_2 * _safe_sqrt(varnce_w_2 * varnce_x_2) * dx_2 * dw_2
              + (dx_2 ** 2 + (1.0 + 2.0 * corr_w_x_2 ** 2) * varnce_x_2) * varnce_w_2)
 
+    # Calculate <w'x'^2> by integrating over the PDF.
     return mixt_frac * term1 + one_minus_mf * term2
 
 
 def calc_wp2xp_pdf(wm, xm, w_1, w_2, x_1, x_2, varnce_w_1, varnce_w_2,
                    varnce_x_1, varnce_x_2, corr_w_x_1, corr_w_x_2, mixt_frac):
-    """<w'^2 x'> integrated over the binormal PDF of (w, x) (pdf_closure_module.F90:calc_wp2xp_pdf):
-      Σ_i weight_i [ ((μ_w_i-<w>)^2 + σ_w_i^2)(μ_x_i-<x>) + 2 corr_i σ_w_i σ_x_i (μ_w_i-<w>) ]."""
+    """Description:
+    Calculates <w'^2 x'> by integrating over the PDF of w and x.  The integral
+    is:
+
+    <w'^2 x'>
+    = INT(-inf:inf) INT(-inf:inf) ( w - <w> )^2 ( x - <x> ) P(w,x) dx dw;
+
+    where <w> is the overall mean of w, <x> is the overall mean of x, and
+    P(w,x) is a two-component bivariate normal distribution of w and x.  The
+    integrated equation is:
+
+    <w'^2 x'>
+    = mixt_frac * ( ( mu_x_1 - <x> ) * ( ( mu_w_1 - <w> )^2 + sigma_w_1^2 )
+                    + 2 * corr_w_x_1 * sigma_w_1 * sigma_x_1
+                      * ( mu_w_1 - <w> ) )
+      + ( 1 - mixt_frac ) * ( ( mu_x_2 - <x> )
+                              * ( ( mu_w_2 - <w> )^2 + sigma_w_2^2 )
+                              + 2 * corr_w_x_2 * sigma_w_2 * sigma_x_2
+                                * ( mu_w_2 - <w> ) );
+
+    where mu_w_1 is the mean of w in the 1st PDF component, mu_w_2 is the mean
+    of w in the 2nd PDF component, mu_x_1 is the mean of x in the 1st PDF
+    component, mu_x_2 is the mean of x in the 2nd PDF component, sigma_w_1 is
+    the standard deviation of w in the 1st PDF component, sigma_w_2 is the
+    standard deviation of w in the 2nd PDF component, sigma_x_1 is the
+    standard deviation of x in the 1st PDF component, sigma_x_2 is the
+    standard deviation of x in the 2nd PDF component, corr_w_x_1 is the
+    correlation of w and x in the 1st PDF component, corr_w_x_2 is the
+    correlation of w and x in the 2nd PDF component, and mixt_frac is the
+    mixture fraction, which is the weight of the 1st PDF component.
+    """
     wm = jnp.asarray(wm); xm = jnp.asarray(xm); a = jnp.asarray(mixt_frac)
     dw1 = jnp.asarray(w_1) - wm; dw2 = jnp.asarray(w_2) - wm
     dx1 = jnp.asarray(x_1) - xm; dx2 = jnp.asarray(x_2) - xm
     vw1 = jnp.asarray(varnce_w_1); vw2 = jnp.asarray(varnce_w_2)
     vx1 = jnp.asarray(varnce_x_1); vx2 = jnp.asarray(varnce_x_2)
     c1 = jnp.asarray(corr_w_x_1); c2 = jnp.asarray(corr_w_x_2)
+    # Calculate <w'^2 x'> by integrating over the PDF.
     return (a * ((dw1 ** 2 + vw1) * dx1 + 2.0 * c1 * _safe_sqrt(vw1 * vx1) * dw1)
             + (1.0 - a) * ((dw2 ** 2 + vw2) * dx2 + 2.0 * c2 * _safe_sqrt(vw2 * vx2) * dw2))
 
 
 def calc_wpxp2_pdf(wm, xm, w_1, w_2, x_1, x_2, varnce_w_1, varnce_w_2,
                    varnce_x_1, varnce_x_2, corr_w_x_1, corr_w_x_2, mixt_frac):
-    """<w'x'^2> integrated over the binormal PDF of (w, x) (pdf_closure_module.F90:calc_wpxp2_pdf):
-      Σ_i weight_i [ (μ_w_i-<w>)((μ_x_i-<x>)^2 + σ_x_i^2) + 2 corr_i σ_w_i σ_x_i (μ_x_i-<x>) ]."""
+    """Description:
+    Calculates <w'x'^2> by integrating over the PDF of w and x.  The integral
+    is:
+
+    <w'x'^2>
+    = INT(-inf:inf) INT(-inf:inf) ( w - <w> ) ( x - <x> )^2 P(w,x) dx dw;
+
+    where <w> is the overall mean of w, <x> is the overall mean of x, and
+    P(w,x) is a two-component bivariate normal distribution of w and x.  The
+    integrated equation is:
+
+    <w'x'^2>
+    = mixt_frac * ( ( mu_w_1 - <w> ) * ( ( mu_x_1 - <x> )^2 + sigma_x_1^2 )
+                    + 2 * corr_w_x_1 * sigma_w_1 * sigma_x_1
+                      * ( mu_x_1 - <x> ) )
+      + ( 1 - mixt_frac ) * ( ( mu_w_2 - <w> )
+                              * ( ( mu_x_2 - <x> )^2 + sigma_x_2^2 )
+                              + 2 * corr_w_x_2 * sigma_w_2 * sigma_x_2
+                                * ( mu_x_2 - <x> ) );
+
+    where mu_w_1 is the mean of w in the 1st PDF component, mu_w_2 is the mean
+    of w in the 2nd PDF component, mu_x_1 is the mean of x in the 1st PDF
+    component, mu_x_2 is the mean of x in the 2nd PDF component, sigma_w_1 is
+    the standard deviation of w in the 1st PDF component, sigma_w_2 is the
+    standard deviation of w in the 2nd PDF component, sigma_x_1 is the
+    standard deviation of x in the 1st PDF component, sigma_x_2 is the
+    standard deviation of x in the 2nd PDF component, corr_w_x_1 is the
+    correlation of w and x in the 1st PDF component, corr_w_x_2 is the
+    correlation of w and x in the 2nd PDF component, and mixt_frac is the
+    mixture fraction, which is the weight of the 1st PDF component.
+    """
     wm = jnp.asarray(wm); xm = jnp.asarray(xm); a = jnp.asarray(mixt_frac)
     dw1 = jnp.asarray(w_1) - wm; dw2 = jnp.asarray(w_2) - wm
     dx1 = jnp.asarray(x_1) - xm; dx2 = jnp.asarray(x_2) - xm
     vw1 = jnp.asarray(varnce_w_1); vw2 = jnp.asarray(varnce_w_2)
     vx1 = jnp.asarray(varnce_x_1); vx2 = jnp.asarray(varnce_x_2)
     c1 = jnp.asarray(corr_w_x_1); c2 = jnp.asarray(corr_w_x_2)
+    # Calculate <w'x'^2> by integrating over the PDF.
     return (a * (dw1 * (dx1 ** 2 + vx1) + 2.0 * c1 * _safe_sqrt(vw1 * vx1) * dx1)
             + (1.0 - a) * (dw2 * (dx2 ** 2 + vx2) + 2.0 * c2 * _safe_sqrt(vw2 * vx2) * dx2))
 
@@ -998,9 +1239,49 @@ def calc_wpxp2_pdf(wm, xm, w_1, w_2, x_1, x_2, varnce_w_1, varnce_w_2,
 def calc_wpxpyp_pdf(wm, xm, ym, w_1, w_2, x_1, x_2, y_1, y_2,
                     varnce_w_1, varnce_w_2, varnce_x_1, varnce_x_2, varnce_y_1, varnce_y_2,
                     corr_w_x_1, corr_w_x_2, corr_w_y_1, corr_w_y_2, corr_x_y_1, corr_x_y_2, mixt_frac):
-    """<w'x'y'> integrated over the trinormal PDF of (w, x, y) (pdf_closure_module.F90:calc_wpxpyp_pdf):
-      Σ_i weight_i [ (μ_w-<w>)(μ_x-<x>)(μ_y-<y>) + corr_xy σ_x σ_y (μ_w-<w>)
-                     + corr_wy σ_w σ_y (μ_x-<x>) + corr_wx σ_w σ_x (μ_y-<y>) ]_i."""
+    """Description:
+    Calculates <w'x'y'> by integrating over the PDF of w, x, and y.  The
+    integral is:
+
+    <w'x'y'>
+    = INT(-inf:inf) INT(-inf:inf) INT(-inf:inf)
+      ( w - <w> ) ( x - <x> ) ( y - <y> ) P(w,x,y) dy dx dw;
+
+    where <w> is the overall mean of w, <x> is the overall mean of x, <y> is
+    the overall mean of y, and P(w,x,y) is a two-component trivariate normal
+    distribution of w, x, and y.  The integrated equation is:
+
+    <w'x'y'>
+    = mixt_frac
+      * ( ( mu_w_1 - <w> ) * ( mu_x_1 - <x> ) * ( mu_y_1 - <y> )
+          + corr_x_y_1 * sigma_x_1 * sigma_y_1 * ( mu_w_1 - <w> )
+          + corr_w_y_1 * sigma_w_1 * sigma_y_1 * ( mu_x_1 - <x> )
+          + corr_w_x_1 * sigma_w_1 * sigma_x_1 * ( mu_y_1 - <y> ) )
+      + ( 1 - mixt_frac )
+        * ( ( mu_w_2 - <w> ) * ( mu_x_2 - <x> ) * ( mu_y_2 - <y> )
+            + corr_x_y_2 * sigma_x_2 * sigma_y_2 * ( mu_w_2 - <w> )
+            + corr_w_y_2 * sigma_w_2 * sigma_y_2 * ( mu_x_2 - <x> )
+            + corr_w_x_2 * sigma_w_2 * sigma_x_2 * ( mu_y_2 - <y> ) );
+
+    where mu_w_1 is the mean of w in the 1st PDF component, mu_w_2 is the mean
+    of w in the 2nd PDF component, mu_x_1 is the mean of x in the 1st PDF
+    component, mu_x_2 is the mean of x in the 2nd PDF component, mu_y_1 is the
+    mean of y in the 1st PDF component, mu_y_2 is the mean of y in the 2nd PDF
+    component, sigma_w_1 is the standard deviation of w in the 1st PDF
+    component, sigma_w_2 is the standard deviation of w in the 2nd PDF
+    component, sigma_x_1 is the standard deviation of x in the 1st PDF
+    component, sigma_x_2 is the standard deviation of x in the 2nd PDF
+    component, sigma_y_1 is the standard deviation of y in the 1st PDF
+    component, sigma_y_2 is the standard deviation of y in the 2nd PDF
+    component, corr_w_x_1 is the correlation of w and x in the 1st PDF
+    component, corr_w_x_2 is the correlation of w and x in the 2nd PDF
+    component, corr_w_y_1 is the correlation of w and y in the 1st PDF
+    component, corr_w_y_2 is the correlation of w and y in the 2nd PDF
+    component, corr_x_y_1 is the correlation of x and y in the 1st PDF
+    component, corr_x_y_2 is the correlation of x and y in the 2nd PDF
+    component, and mixt_frac is the mixture fraction, which is the weight of
+    the 1st PDF component.
+    """
     wm = jnp.asarray(wm); xm = jnp.asarray(xm); ym = jnp.asarray(ym); a = jnp.asarray(mixt_frac)
     dw1 = jnp.asarray(w_1) - wm; dw2 = jnp.asarray(w_2) - wm
     dx1 = jnp.asarray(x_1) - xm; dx2 = jnp.asarray(x_2) - xm
@@ -1011,6 +1292,7 @@ def calc_wpxpyp_pdf(wm, xm, ym, w_1, w_2, x_1, x_2, y_1, y_2,
     cwx1 = jnp.asarray(corr_w_x_1); cwx2 = jnp.asarray(corr_w_x_2)
     cwy1 = jnp.asarray(corr_w_y_1); cwy2 = jnp.asarray(corr_w_y_2)
     cxy1 = jnp.asarray(corr_x_y_1); cxy2 = jnp.asarray(corr_x_y_2)
+    # Calculate <w'x'y'> by integrating over the PDF.
     comp1 = (dw1 * dx1 * dy1 + cxy1 * _safe_sqrt(vx1 * vy1) * dw1
              + cwy1 * _safe_sqrt(vw1 * vy1) * dx1 + cwx1 * _safe_sqrt(vw1 * vx1) * dy1)
     comp2 = (dw2 * dx2 * dy2 + cxy2 * _safe_sqrt(vx2 * vy2) * dw2
@@ -1019,11 +1301,56 @@ def calc_wpxpyp_pdf(wm, xm, ym, w_1, w_2, x_1, x_2, y_1, y_2,
 
 
 def calc_liquid_cloud_frac_component(mean_chi, stdev_chi_in):
-    """pdf_closure_module.F90:calc_liquid_cloud_frac_component (lines 2453-2479).
+    """Description:
+    Calculates the PDF component cloud water mixing ratio, rc_i, and cloud
+    fraction, cloud_frac_i, for the ith PDF component.
 
-    Liquid cloud fraction and liquid water mixing ratio of one PDF component from the
-    Gaussian CDF of chi (extended liquid water), with ±max_num_stdevs truncation to the
-    clear / fully-cloudy limits.  Returns (cloud_frac, rc).
+    The equation for cloud water mixing ratio, rc, at any point is:
+
+    rc = chi * H(chi);
+
+    and the equation for cloud fraction at a point, fc, is:
+
+    fc = H(chi);
+
+    where where extended liquid water mixing ratio, chi, is equal to cloud
+    water mixing ratio, rc, when positive.  When the atmosphere is saturated
+    at this point, cloud water is found, and rc = chi, while fc = 1.
+    Otherwise, clear air is found at this point, and rc = fc = 0.
+
+    The mean of rc and fc is calculated by integrating over the PDF, such
+    that:
+
+    <rc> = INT(-inf:inf) chi * H(chi) * P(chi) dchi; and
+
+    cloud_frac = <fc> = INT(-inf:inf) H(chi) * P(chi) dchi.
+
+    This can be rewritten as:
+
+    <rc> = INT(0:inf) chi * P(chi) dchi; and
+
+    cloud_frac = <fc> = INT(0:inf) P(chi) dchi;
+
+    and further rewritten as:
+
+    <rc> = SUM(i=1,N) mixt_frac_i INT(0:inf) chi * P_i(chi) dchi; and
+
+    cloud_frac = SUM(i=1,N) mixt_frac_i INT(0:inf) P_i(chi) dchi;
+
+    where N is the number of PDF components.  The equation for mean rc in the
+    ith PDF component is:
+
+    rc_i = INT(0:inf) chi * P_i(chi) dchi;
+
+    and the equation for cloud fraction in the ith PDF component is:
+
+    cloud_frac_i = INT(0:inf) P_i(chi) dchi.
+
+    The component values are related to the overall values by:
+
+    <rc> = SUM(i=1,N) mixt_frac_i * rc_i; and
+
+    cloud_frac = SUM(i=1,N) mixt_frac_i * cloud_frac_i.
     """
     is_clear = (
         ((jnp.abs(mean_chi) <= eps) & (stdev_chi_in <= chi_tol))
@@ -1035,6 +1362,11 @@ def calc_liquid_cloud_frac_component(mean_chi, stdev_chi_in):
     cf_mid   = 0.5 * (1.0 + jsp.erf(zeta / sqrt_2))
     rc_mid   = (mean_chi * cf_mid
                 + stdev_chi_in * jnp.exp(-0.5 * zeta**2) / sqrt_2pi)
+    # The mean of chi is at saturation and does not vary in the ith PDF component
+    # The mean of chi is multiple standard deviations above the saturation point.
+    # Thus, all cloud in the ith PDF component.
+    # The mean of chi is within max_num_stdevs of the saturation point.
+    # Thus, layer is partly cloudy, requires calculation.
     cf = jnp.where(is_clear, 0.0, jnp.where(is_full, 1.0, cf_mid))
     rc = jnp.where(is_clear, 0.0, jnp.where(is_full, mean_chi, rc_mid))
     return cf, rc
@@ -1042,13 +1374,22 @@ def calc_liquid_cloud_frac_component(mean_chi, stdev_chi_in):
 
 def calc_ice_cloud_frac_component(mean_chi, stdev_chi_in, crt, rsatl, tl,
                                       cf_liq, p_in_Pa):
-    """pdf_closure_module.F90:calc_ice_cloud_frac_component (line 2490).
+    """Description:
+    A version of the cloud fraction calculation modified to work
+    for layers that are potentially below freezing. If there are
+    no below freezing levels, the ice_supersat_frac calculation is
+    the same as cloud_frac.
 
-    Ice supersaturation fraction of one PDF component.  Above freezing it equals the
-    liquid cloud-fraction component; below freezing it is the PDF fraction supersaturated
-    w.r.t. ice (chi above chi_at_ice_sat = crt*(rsat_ice - rsatl)).
+    For the below freezing levels, the saturation point will be
+    non-zero, thus we need to calculate chi_at_ice_sat.
+
+    The description of the equations are located in the description
+    of calc_liquid_cloud_frac_component.
     """
+    # Calculate the saturation mixing ratio of ice
     rsat_ice = sat_mixrat_ice(p_in_Pa, tl)
+    # Temperature is freezing, we must compute chi_at_ice_sat and
+    # calculate the new cloud_frac_component
     delta    = mean_chi - crt * (rsat_ice - rsatl)   # chi - chi_at_ice_sat
     is_clear = (((jnp.abs(delta) <= eps) & (stdev_chi_in <= chi_tol))
                 | (delta < -max_num_stdevs * stdev_chi_in))
@@ -1056,8 +1397,14 @@ def calc_ice_cloud_frac_component(mean_chi, stdev_chi_in, crt, rsatl, tl,
     safe_s   = jnp.maximum(stdev_chi_in, 1.0e-100)
     zeta     = delta / safe_s
     ssf_mid  = 0.5 * (1.0 + jsp.erf(zeta / sqrt_2))
+    # The mean of chi is at saturation and does not vary in the ith PDF component
+    # The mean of chi is multiple standard deviations above the saturation point.
+    # Thus, all cloud in the ith PDF component.
+    # The mean of chi is within max_num_stdevs of the saturation point.
+    # Thus, layer is partly cloudy, requires calculation.
     ssf      = jnp.where(is_clear, 0.0, jnp.where(is_full, 1.0, ssf_mid))
-    # Above freezing: same as the liquid cloud-fraction component.
+    # If a grid boxes is above freezing, then the calculation is the
+    # same as the cloud_frac calculation
     return jnp.where(tl > T_freeze_K, cf_liq, ssf)
 
 
@@ -1066,14 +1413,61 @@ def calc_xprcp_component(wm, rtm, thlm, um, vm, rcm,
                              varnce_w_i, chi_i, stdev_chi_i, stdev_eta_i,
                              corr_w_chi_i, corr_chi_eta_i, crt_i, cthl_i,
                              rc_i, cloud_frac_i, iiPDF_type):
-    """pdf_closure_module.F90:calc_xprcp_component (line 2652).
+    """Description:
+    Calculates the contribution to <w'rc'>, <w'^2 rc'>, <rt'rc'>, and
+    <thl'rc'> from the ith PDF component.
 
-    Per-PDF-component contributions to the cloud-water covariances <w'rc'>, <w'^2 rc'>,
-    <rt'rc'>, <thl'rc'>, <u'rc'>, <v'rc'> for one PDF component, on the zt grid.  Mirrors
-    the ADG1 path (F90:3089-3104) plus the non-ADG corr_w_chi correction
-    (F90:3110-3138, run only for iiPDF_type not in {ADG1, ADG2, new_hybrid}).
+    Use equations for PDF component cloud fraction cloud water mixing ratio
+    -----------------------------------------------------------------------
 
-    Returns: (wprcp, wp2rcp, rtprcp, thlprcp, uprcp, vprcp)
+    The equation for cloud fraction in the ith PDF component, fc_i, is:
+
+    fc_i = 1/2 * ( 1 + erf( mu_chi_i / ( sqrt(2) * sigma_chi_i ) ) ).
+
+    In the special case that sigma_chi_i = 0, the equation becomes:
+
+    fc_i = | 1; when mu_chi_i > 0;
+           | 0; when mu_chi_i <= 0.
+
+    The equation for mean cloud water mixing ratio in the ith PDF component,
+    rc_i, is:
+
+    rc_i
+    = mu_chi_i * 1/2 * ( 1 + erf( mu_chi_i / ( sqrt(2) * sigma_chi_i ) ) )
+      + 1/sqrt(2*pi) * sigma_chi_i
+        * exp{ - mu_chi_i^2 / ( 2 * sigma_chi_i^2 ) }
+    = mu_chi_i * fc_i
+      + 1/sqrt(2*pi) * sigma_chi_i
+        * exp{ - mu_chi_i^2 / ( 2 * sigma_chi_i^2 ) }.
+
+    The above equations can be substituted into the equations for
+    wprcp_contrib_comp_i, wp2rcp_contrib_comp_i, rtprcp_contrib_comp_i, and
+    thlprcp_contrib_comp_i.  The new equations are:
+
+    wprcp_contrib_comp_i
+    = ( mu_w_i - <w> ) * ( rc_i - <rc> )
+      + corr_w_chi_i * sigma_w_i * sigma_chi_i * fc_i;
+
+    wp2rcp_contrib_comp_i
+    = ( ( mu_w_i - <w> )^2 + sigma_w_i^2 ) * ( rc_i - <rc> )
+      + 2 * ( mu_w_i - <w> ) * corr_w_chi_i * sigma_w_i * sigma_chi_i * fc_i
+      + 1/sqrt(2*pi) * corr_w_chi_i^2 * sigma_w_i^2 * sigma_chi_i
+        * exp{ - mu_chi_i^2 / ( 2 * sigma_chi_i^2 ) };
+
+    rtprcp_contrib_comp_i
+    = ( mu_rt_i - <rt> ) * ( rc_i - <rc> )
+      + ( corr_chi_eta_i * sigma_eta_i + sigma_chi_i ) / ( 2 * crt_i )
+        * sigma_chi_i * fc_i; and
+
+    thlprcp_contrib_comp_i
+    = ( mu_thl_i - <thl> ) * ( rc_i - <rc> )
+      + ( corr_chi_eta_i * sigma_eta_i - sigma_chi_i ) / ( 2 * cthl_i )
+        * sigma_chi_i * fc_i.
+
+    JAX port note: this routine returns
+    (wprcp, wp2rcp, rtprcp, thlprcp, uprcp, vprcp). The full derivation in
+    Fortran is much longer; the active code below corresponds to the compact
+    equations above plus the non-ADG corr_w_chi correction.
     """
     drc = rc_i - rcm
     wprcp  = (w_i - wm) * drc
@@ -1088,7 +1482,11 @@ def calc_xprcp_component(wm, rtm, thlm, um, vm, rcm,
                  / (2.0 * cthl_safe) * stdev_chi_i * cloud_frac_i)
     uprcp = (u_i - um) * drc
     vprcp = (v_i - vm) * drc
+    # If iiPDF_type isn't iiPDF_ADG1, iiPDF_ADG2, or iiPDF_new_hybrid, so
+    # corr_w_chi_i /= 0 (and perhaps corr_u_w_i /= 0).
     if iiPDF_type not in (iiPDF_ADG1, iiPDF_ADG2, iiPDF_new_hybrid):
+        # Chi varies significantly in the ith PDF component (stdev_chi > chi_tol)
+        # and there is some cloud (0 < cloud_frac <= 1)
         active = (stdev_chi_i > chi_tol) & (cloud_frac_i > 0.0)
         stdev_chi_safe = jnp.where(active, stdev_chi_i, 1.0)
         wprcp = wprcp + jnp.where(
@@ -1109,15 +1507,26 @@ def calc_xprcp_component(wm, rtm, thlm, um, vm, rcm,
 
 def calc_w_up_in_cloud(mixt_frac, cloud_frac_1, cloud_frac_2,
                        w_1, w_2, varnce_w_1, varnce_w_2):
-    """Mean cloudy updraft / downdraft vertical velocity from the binormal w-PDF
-    (pdf_closure_module.F90:calc_w_up_in_cloud). For aerosol activation, this gives a w representative of
-    cloudy updrafts (an alternative to sqrt(wp2)). Per PDF component, the truncated-Gaussian updraft integral is
-      w_up = 1/2 w (1+erf(r)) + sigma/sqrt(2pi) exp(-r^2),  r = w/(sqrt(2) sigma),  updraft_frac = 1/2(1+erf(r)),
-    with all-updraft / all-downdraft shortcuts when |w| > max_num_stdevs*sigma. The cloudy means weight the two
-    components by mixt_frac*cloud_frac. Returns
-    (w_up_in_cloud, w_down_in_cloud, cloudy_updraft_frac, cloudy_downdraft_frac). Pure-jnp → differentiable.
+    """Description:
+    Subroutine that computes the mean cloudy updraft (and also calculates
+    the mean cloudy downdraft).
 
-    All inputs are (ngrdcol, nz). varnce_w_* are variances (sigma^2)."""
+    In order to activate aerosol, we'd like to feed the activation scheme
+    a vertical velocity that's representative of cloudy updrafts. For skewed
+    layers, like cumulus layers, this might be an improvement over the square
+    root of wp2 that's currently used. At the same time, it would be simpler
+    and less expensive than feeding SILHS samples into the aerosol code
+    (see larson-group/e3sm#19 and larson-group/e3sm#26).
+
+    The formulas are only valid for certain PDFs in CLUBB (ADG1, ADG2,
+    new hybrid), hence we omit calculation if another PDF type is used.
+
+    References: https://www.overleaf.com/project/614a136d47846639af22ae34
+
+    JAX port note: the caller only invokes this for supported PDF types, and
+    this function returns
+    (w_up_in_cloud, w_down_in_cloud, cloudy_updraft_frac, cloudy_downdraft_frac).
+    """
     def _component(w, varnce):
         w = jnp.asarray(w, dtype=jnp.float64)
         stdev = jnp.sqrt(jnp.asarray(varnce, dtype=jnp.float64))
@@ -1129,8 +1538,15 @@ def calc_w_up_in_cloud(mixt_frac, cloud_frac_1, cloud_frac_2,
         w_up_mid = 0.5 * w * (1.0 + erf_r) + (stdev / sqrt_2pi) * exp_neg
         uf_mid = 0.5 * (1.0 + erf_r)
         w_down_mid = 0.5 * w * (1.0 - erf_r) - (stdev / sqrt_2pi) * exp_neg
+        # The mean of w in the PDF component is more than
+        # max_num_stdevs standard deviations above 0.
+        # The entire PDF component is found in an updraft (w > 0).
         w_up = jnp.where(all_up, w, jnp.where(all_down, 0.0, w_up_mid))
         uf = jnp.where(all_up, 1.0, jnp.where(all_down, 0.0, uf_mid))
+        # The mean of w in the PDF component is more than
+        # max_num_stdevs standard deviations below 0.
+        # The entire PDF component is found in a downdraft (w < 0).
+        # Otherwise, the PDF component contains both updraft and downdraft.
         w_down = jnp.where(all_up, 0.0, jnp.where(all_down, w, w_down_mid))
         df = 1.0 - uf   # holds in all three branches (Fortran: 1, 0, 1-uf_mid)
         return w_up, uf, w_down, df
@@ -1140,10 +1556,14 @@ def calc_w_up_in_cloud(mixt_frac, cloud_frac_1, cloud_frac_2,
     w_up_1, uf_1, w_down_1, df_1 = _component(w_1, varnce_w_1)
     w_up_2, uf_2, w_down_2, df_2 = _component(w_2, varnce_w_2)
 
+    # Calculate the total cloudy updraft fraction.
     cloudy_updraft_frac = a * cf1 * uf_1 + (1.0 - a) * cf2 * uf_2
+    # Calculate the total cloudy downdraft fraction.
     cloudy_downdraft_frac = a * cf1 * df_1 + (1.0 - a) * cf2 * df_2
+    # Calculate the mean vertical velocity found in a cloudy updraft.
     w_up_in_cloud = ((a * cf1 * w_up_1 + (1.0 - a) * cf2 * w_up_2)
                      / jnp.maximum(eps, cloudy_updraft_frac))
+    # Calculate the mean vertical velocity found in a cloudy downdraft.
     w_down_in_cloud = ((a * cf1 * w_down_1 + (1.0 - a) * cf2 * w_down_2)
                        / jnp.maximum(eps, cloudy_downdraft_frac))
     return w_up_in_cloud, w_down_in_cloud, cloudy_updraft_frac, cloudy_downdraft_frac
@@ -1833,8 +2253,32 @@ def trapezoidal_rule_zt(
     ice_supersat_frac_zm, rcm_zm, wp2thvp_zm, wp2up_zm,
     wpsclrprtp_zm, wpsclrp2_zm, wpsclrpthlp_zm,
 ):
-    """Port of pdf_closure_module.F90:trapezoidal_rule_zt."""
+    """Description:
+    This subroutine takes the output variables on the thermo.
+    grid and either: interpolates them to the momentum grid, or uses the
+    values output from the second call to pdf_closure on momentum levels if
+    l_call_pdf_closure_twice is true.  It then calls the function
+    trapezoid_zt to recompute the variables on the thermo. grid.
+
+    ldgrant June 2009
+
+    Note:
+    The argument variables in the last 5 lines of the subroutine
+    (wprtp2_zm through pdf_params_zm) are declared intent(inout) because
+    if l_call_pdf_closure_twice is true, these variables will already have
+    values from pdf_closure on momentum levels and will not be altered in
+    this subroutine.  However, if l_call_pdf_closure_twice is false, these
+    variables will not have values yet and will be interpolated to
+    momentum levels in this subroutine.
+    References:
+    None
+    """
     if not l_call_pdf_closure_twice:
+        # If l_call_pdf_closure_twice is true, the _zm variables already have
+        # values from the second call to pdf_closure in advance_clubb_core.
+        # If it is false, the variables are interpolated to the _zm levels.
+
+        # Interpolate thermodynamic variables to the momentum grid.
         wprtp2_zm = zt2zm(nzm, nzt, ngrdcol, gr, wprtp2)
         wpthlp2_zm = zt2zm(nzm, nzt, ngrdcol, gr, wpthlp2)
         wprtpthlp_zm = zt2zm(nzm, nzt, ngrdcol, gr, wprtpthlp)
@@ -1844,6 +2288,8 @@ def trapezoidal_rule_zt(
         wp2thvp_zm = zt2zm(nzm, nzt, ngrdcol, gr, wp2thvp)
         wp2up_zm = zt2zm(nzm, nzt, ngrdcol, gr, wp2up)
 
+        # Since top momentum level is higher than top thermo. level,
+        # set variables at top momentum level to 0.
         wprtp2_zm = wprtp2_zm.at[:, gr.k_ub_zm].set(0.0)
         wpthlp2_zm = wpthlp2_zm.at[:, gr.k_ub_zm].set(0.0)
         wprtpthlp_zm = wprtpthlp_zm.at[:, gr.k_ub_zm].set(0.0)
@@ -1883,6 +2329,7 @@ def trapezoidal_rule_zt(
             )
 
     if stats.names:
+        # Use the trapezoidal rule to recompute the variables on the stats_zt level
         if stats.var_on_stats_list("wprtp2"):
             wprtp2 = calc_trapezoid_zt(nzm, nzt, ngrdcol, gr, wprtp2_zm, wprtp2)
         if stats.var_on_stats_list("wpthlp2"):
@@ -1931,6 +2378,7 @@ def trapezoidal_rule_zt(
     wp2thvp = calc_trapezoid_zt(nzm, nzt, ngrdcol, gr, wp2thvp_zm, wp2thvp)
     wp2up = calc_trapezoid_zt(nzm, nzt, ngrdcol, gr, wp2up_zm, wp2up)
 
+    # End of trapezoidal rule
     return (
         wprtp2, wpthlp2, wprtpthlp, cloud_frac, ice_supersat_frac,
         rcm, wp2thvp, wp2up, wpsclrprtp, wpsclrp2, wpsclrpthlp,
@@ -1944,7 +2392,24 @@ def trapezoidal_rule_zm(
     nzm, nzt, ngrdcol, gr, wpthvp_zt, thlpthvp_zt, rtpthvp_zt,
     wpthvp, thlpthvp, rtpthvp,
 ):
-    """Port of pdf_closure_module.F90:trapezoidal_rule_zm."""
+    """Description:
+    This subroutine recomputes three variables on the
+    momentum grid from pdf_closure -- wpthvp, thlpthvp, and
+    rtpthvp -- by calling the function trapezoid_zm.  Only these three
+    variables are used in this subroutine because they are the only
+    pdf_closure momentum variables used elsewhere in CLUBB.
+
+    The _zt variables are output from the first call to pdf_closure.
+    The _zm variables are output from the second call to pdf_closure
+    on the momentum levels.
+    This is done before the call to this subroutine.
+
+    ldgrant Feb. 2010
+
+    References:
+    None
+    """
+    # Use the trapezoidal rule to recompute the variables on the zm level
     wpthvp = calc_trapezoid_zm(nzm, nzt, ngrdcol, gr, wpthvp_zt, wpthvp)
     thlpthvp = calc_trapezoid_zm(nzm, nzt, ngrdcol, gr, thlpthvp_zt, thlpthvp)
     rtpthvp = calc_trapezoid_zm(nzm, nzt, ngrdcol, gr, rtpthvp_zt, rtpthvp)
@@ -1952,18 +2417,27 @@ def trapezoidal_rule_zm(
 
 
 def calc_trapezoid_zt(nzm, nzt, ngrdcol, gr, variable_zm, variable_zt):
-    """Port of pdf_closure_module.F90:calc_trapezoid_zt."""
+    """Description:
+    Function which uses the trapezoidal rule from calculus
+    to recompute the values for the variables on the thermo. grid which
+    are output from the first call to pdf_closure in module clubb_core.
+
+    ldgrant June 2009
+    """
     del nzm, nzt, ngrdcol
 
     def body(level, variable_zt):
         k = gr.k_lb_zt + gr.grid_dir_indx * level
         if gr.grid_dir_indx > 0:
+            # Ascending grid
             k_zmp1 = k + 1
             k_zm = k
         else:
+            # Descending grid
             k_zmp1 = k
             k_zm = k + 1
 
+        # Trapezoidal rule from calculus
         variable_zt = variable_zt.at[:, k].set(
             0.5
             * (variable_zm[:, k_zmp1] + variable_zt[:, k])
@@ -1982,20 +2456,32 @@ def calc_trapezoid_zt(nzm, nzt, ngrdcol, gr, variable_zm, variable_zt):
 
 
 def calc_trapezoid_zm(nzm, nzt, ngrdcol, gr, variable_zt, variable_zm):
-    """Port of pdf_closure_module.F90:calc_trapezoid_zm."""
+    """Description:
+    Function which uses the trapezoidal rule from calculus
+    to recompute the values for the important variables on the momentum
+    grid which are output from pdf_closure in module clubb_core.
+    These momentum variables only include wpthvp, thlpthvp, and rtpthvp.
+
+    ldgrant Feb. 2010
+    """
     del nzm, nzt, ngrdcol
     start = gr.k_lb_zm + gr.grid_dir_indx
     stop = gr.k_ub_zm - gr.grid_dir_indx
 
+    # Boundary conditions: trapezoidal rule not valid at top zm level, nzmax.
+    # Trapezoidal rule also not used at zm level 1.
     def body(level, variable_zm):
         k = start + gr.grid_dir_indx * level
         if gr.grid_dir_indx > 0:
+            # Ascending grid
             k_zt = k
             k_ztm1 = k - 1
         else:
+            # Descending grid
             k_zt = k - 1
             k_ztm1 = k
 
+        # Trapezoidal rule from calculus
         variable_zm = variable_zm.at[:, k].set(
             0.5
             * (variable_zt[:, k_zt] + variable_zm[:, k])
@@ -2014,7 +2500,23 @@ def calc_trapezoid_zm(nzm, nzt, ngrdcol, gr, variable_zt, variable_zm):
 
 
 def compute_cloud_cover(gr, nzt, ngrdcol, pdf_params, cloud_frac, rcm):
-    """Port of pdf_closure_module.F90:compute_cloud_cover."""
+    """Description:
+    Subroutine to compute cloud cover (the amount of sky
+    covered by cloud) and rcm in layer (liquid water mixing ratio in
+    the portion of the grid box filled by cloud).
+
+    References:
+    Definition of 's' comes from:
+    ``The Gaussian Cloud Model Relations'' G. L. Mellor (1977)
+    JAS, Vol. 34, pp. 356--358.
+
+    Notes:
+    Added July 2009
+
+    JAX port note: the Fortran routine has an unreachable fatal-error branch
+    for invalid condition coverage. This JAX form expresses the same reachable
+    cases with masks and leaves unchanged values outside them.
+    """
     chi_mean = (
         pdf_params.mixt_frac * pdf_params.chi_1
         + (1.0 - pdf_params.mixt_frac) * pdf_params.chi_2
@@ -2041,9 +2543,13 @@ def compute_cloud_cover(gr, nzt, ngrdcol, pdf_params, cloud_frac, rcm):
         no_cloud = rcm[:, k] < rc_tol
         filled = (rcm[:, kp1] >= rc_tol) & (rcm[:, km1] >= rc_tol)
 
+        # First let the cloud fill the entire grid box, then overwrite
+        # vert_cloud_frac_upper(k) and/or vert_cloud_frac_lower(k)
+        # for a cloud top, cloud base, or one-point cloud.
         upper = jnp.full((ngrdcol,), 0.5, dtype=jnp.float64)
         lower = jnp.full((ngrdcol,), 0.5, dtype=jnp.float64)
 
+        # Cloud top
         top = rcm[:, kp1] < rc_tol
         top_scale = (
             (0.5 / (gr.grid_dir * gr.invrs_dzm[:, k_zmp1]))
@@ -2053,9 +2559,12 @@ def compute_cloud_cover(gr, nzt, ngrdcol, pdf_params, cloud_frac, rcm):
             rcm[:, k] / (rcm[:, k] + jnp.abs(chi_mean[:, kp1]))
         )
         top_frac = jnp.minimum(0.5, top_frac)
+        # Make the transition in cloudiness more gradual than using
+        # the above min statement alone.
         top_frac = top_frac + (rcm[:, kp1] / rc_tol) * (0.5 - top_frac)
         upper = jnp.where(top, top_frac, upper)
 
+        # Cloud base
         base = rcm[:, km1] < rc_tol
         base_scale = (
             (0.5 / (gr.grid_dir * gr.invrs_dzm[:, k_zm]))
@@ -2065,6 +2574,8 @@ def compute_cloud_cover(gr, nzt, ngrdcol, pdf_params, cloud_frac, rcm):
             rcm[:, k] / (rcm[:, k] + jnp.abs(chi_mean[:, km1]))
         )
         base_frac = jnp.minimum(0.5, base_frac)
+        # Make the transition in cloudiness more gradual than using
+        # the above min statement alone.
         base_frac = base_frac + (rcm[:, km1] / rc_tol) * (0.5 - base_frac)
         lower = jnp.where(base, base_frac, lower)
 

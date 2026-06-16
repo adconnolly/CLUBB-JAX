@@ -3,9 +3,13 @@
 Description:
   Predicts the value of <x'^3> for <rt'^3>, <thl'^3>, and <sclr'^3>.
 
-Adaptation notes:
+References:
+
+Porting deviations:
 - Stats are threaded explicitly with JaxStats because the Fortran routine uses
   global stats side effects that are not JAX-compatible state.
+- Intent(inout) moments are returned explicitly rather than mutated by Fortran
+  argument side effects.
 """
 
 from functools import partial
@@ -36,9 +40,9 @@ from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.derived_types import Grid
 
 
-xp3_rtp3 = 1
-xp3_thlp3 = 2
-xp3_sclrp3 = 3
+xp3_rtp3 = 1  # Named constant for solving rtp3
+xp3_thlp3 = 2  # Named constant for solving thlp3
+xp3_sclrp3 = 3  # Named constant for solving sclrp3
 
 
 @partial(
@@ -57,7 +61,11 @@ def advance_xp3(
     stats: JaxStats,
     rtp3, thlp3, sclrp3, up3, vp3,
 ):
-    """Advance <rt'^3>, <thl'^3>, and <sclr'^3> one model timestep."""
+    """Advance <rt'^3>, <thl'^3>, and <sclr'^3> one model timestep using a
+    simplified form of the <x'^3> predictive equation.  The simplified <x'^3>
+    equation can either be advanced from its previous value or calculated
+    using a steady-state approximation.
+    """
 
     wp2_zt = zm2zt(nzm, nzt, ngrdcol, gr, wp2, w_tol_sqd)
 
@@ -183,7 +191,12 @@ def diagnose_xp3(
     rtp3, thlp3, up3, vp3,
     sclrp3,
 ):
-    """Diagnose third-order scalar and horizontal-velocity moments."""
+    """Diagnose third-order scalar and horizontal-velocity moments from the
+    current second-order moments and PDF width information.
+
+    References:
+      Larson and Golaz (2005) for the diagnostic ansatz.
+    """
 
     wp2_zt = zm2zt(nzm, nzt, ngrdcol, gr, wp2, w_tol_sqd)
 
@@ -365,7 +378,29 @@ def advance_xp3_simplified(
     stats: JaxStats,
     xp3,
 ):
-    """Predicts the value of <x'^3> using a simplified equation."""
+    """Predicts the value of <x'^3> using a simplified form of the <x'^3>
+    predictive equation.
+
+    The full predictive equation for <x'^3>, where <x'^3> can be <rt'^3>,
+    <thl'^3>, or <sclr'^3>, contains time tendency, mean advection,
+    turbulent advection, accumulation, turbulent production, turbulent
+    dissipation, diffusion, and microphysics/other forcing.
+
+    The microphysics and turbulent advection terms are both found by
+    integration over the subgrid PDF.  This requires new integrated terms.
+    The turbulent advection term may need to be made semi-implicit in order
+    to aid model stability.  This may be difficult to do for <x'^3>.
+
+    This leaves the following equation:
+
+    d<x'^3>/dt = - 3 * <w'x'^2> * d<x>/dz
+                 + 3 * <x'^2> / rho_ds * d( rho_ds * <w'x'> )/dz
+                 - ( C_xp3_dissipation / tau ) * <x'^3>.
+
+    When the flag l_predict_xp3 is enabled, the predictive version of <x'^3>
+    is used.  When the flag is turned off, the steady-state approximation is
+    used.
+    """
 
     # Coefficient in the <x'^3> turbulent dissipation term    [-]
     C_xp3_dissipation = 1.0
@@ -481,7 +516,20 @@ def term_tp_rhs(
     invrs_rho_ds_zt,
     invrs_dzt,
 ):
-    """Turbulent production of <x'^3>: explicit portion of the code."""
+    """Turbulent production of <x'^3>:  explicit portion of the code.
+
+    The d<x'^3>/dt equation contains a turbulent production term:
+
+    + 3 * ( <x'^2> / rho_ds ) * d( rho_ds * <w'x'> )/dz.
+
+    The <x'^3> turbulent production term is completely explicit and is
+    discretized as follows:
+
+    The values of <x'^3> are found on the thermodynamic levels, while the
+    values of <w'x'> and <x'^2> are found on the momentum levels.
+
+    invrs_dzt(k) = 1 / ( zm(k+1) - zm(k) )
+    """
 
     # The <x'^3> turbulent production term.
     term_tp = (
@@ -497,7 +545,19 @@ def term_ac_rhs(
     xm_zmp1, xm_zm, wpxp2,
     invrs_dzt,
 ):
-    """Accumulation of <x'^3>: explicit portion of the code."""
+    """Accumulation of <x'^3>:  explicit portion of the code.
+
+    The d<x'^3>/dt equation contains an accumulation term:
+
+    - 3 * <w'x'^2> * d<x>/dz.
+
+    The <x'^3> accumulation term is completely explicit and is discretized as
+    follows:
+
+    The values of <x'^3>, <x>, and <w'x'^2> are found on thermodynamic levels.
+
+    invrs_dzt(k) = 1 / ( zm(k+1) - zm(k) )
+    """
 
     # The <x'^3> accumulation term.
     term_ac = -three * wpxp2 * invrs_dzt * (xm_zmp1 - xm_zm)

@@ -1,4 +1,16 @@
-"""JAX port of `src/CLUBB_core/clip_explicit.F90`."""
+"""JAX port of `src/CLUBB_core/clip_explicit.F90`.
+
+Porting deviations:
+- Fortran inout arguments are returned as values so clipping routines remain
+  functional and JIT-friendly.
+- Fortran loops over grid columns, levels, and scalar dimensions are expressed
+  as JAX array operations or small Python loops over static dimensions.
+- Fortran stats side effects are represented by functional updates to the JAX
+  stats object.
+- Fortran debug printing and hard stops are omitted from jitted routines; the
+  active callers enforce thresholds before calling or carry error state
+  separately.
+"""
 
 from __future__ import annotations
 
@@ -174,11 +186,19 @@ def clip_covars_denom(
 ):
     """Clip covariances after denominator terms have been altered.
 
-    Some covariances in CLUBB need to be clipped multiple times during each
-    timestep to ensure that the correlation between the two relevant variables
-    stays between -1 and 1. This routine handles clipping away from the time a
-    covariance is set, after denominator terms in the relevant correlation
-    equation have changed.
+    Some of the covariances found in the CLUBB model code need to be clipped
+    multiple times during each timestep to ensure that the correlation between
+    the two relevant variables stays between -1 and 1 at all times during the
+    model run.  The covariances that need to be clipped multiple times are
+    w'r_t', w'th_l', w'sclr', u'w', and v'w'.  One of the times that each one
+    of these covariances is clipped is immediately after each one is set.
+    However, each covariance still needs to be clipped two more times during
+    each timestep (once after advance_xp2_xpyp is called and once after
+    advance_wp2_wp3 is called).  This subroutine handles the times that the
+    covariances are clipped away from the time that they are set.  In other
+    words, this subroutine clips the covariances after the denominator terms
+    in the relevant correlation equation have been altered, ensuring that
+    all correlations will remain between -1 and 1 at all times.
 
     References:
       None
@@ -300,10 +320,39 @@ def clip_skewness(
     stats,
     wp3,
 ):
-    """Clip w'^3 based on the skewness of w, Sk_w.
+    """Clipping the value of w'^3 based on the skewness of w, Sk_w.
 
-    Additionally, to prevent possible crashes due to wp3 growing too large,
-    abs(wp3) is clipped to 100.
+    Aditionally, to prevent possible crashes due to wp3 growing too large,
+    abs(wp3) will be clipped to 100.
+
+    The skewness of w is:
+
+    Sk_w = w'^3 / (w'^2)^(3/2).
+
+    The value of Sk_w is limited to a range between an upper limit and a lower
+    limit.  The values of the limits depend on whether the level altitude is
+    within 100 meters of the surface.
+
+    For altitudes less than or equal to 100 meters above ground level (AGL):
+
+    -0.2_core_rknd*sqrt(2) <= Sk_w <= 0.2_core_rknd*sqrt(2);
+
+    while for all altitudes greater than 100 meters AGL:
+
+    -4.5_core_rknd <= Sk_w <= 4.5_core_rknd.
+
+    Therefore, there is an upper limit on w'^3, such that:
+
+    w'^3  <=  threshold_magnitude * (w'^2)^(3/2);
+
+    and a lower limit on w'^3, such that:
+
+    w'^3  >= -threshold_magnitude * (w'^2)^(3/2).
+
+    The values of w'^3 are found on the thermodynamic levels, while the values
+    of w'^2 are found on the momentum levels.  Therefore, the values of w'^2
+    are interpolated to the thermodynamic levels before being used to
+    calculate the upper and lower limits for w'^3.
 
     References:
       None
@@ -361,12 +410,27 @@ def clip_skewness_core(
     """
     wp3_max = 100.0
 
+    # Compute the upper and lower limits of w'^3 at every level,
+    # based on the skewness of w, Sk_w, such that:
+    # Sk_w = w'^3 / (w'^2)^(3/2);
+    # -4.5 <= Sk_w <= 4.5;
+    # or, if the level altitude is within 100 meters of the surface,
+    # -0.2*sqrt(2) <= Sk_w <= 0.2*sqrt(2).
+
+    # The normal magnitude limit of skewness of w in the CLUBB code is 4.5.
+    # However, according to Andre et al. (1976b & 1978), wp3 should not exceed
+    # [2*(wp2^3)]^(1/2) at any level.  However, this term should be multiplied
+    # by 0.2 close to the surface to include surface effects.  There already is
+    # a wp3 clipping term in place for all other altitudes, but this term will
+    # be included for the surface layer only.  Therefore, the lowest level wp3
+    # should not exceed 0.2 * sqrt(2) * wp2^(3/2).  Brian Griffin.  12/18/05.
+
     # To lower compute time, square both sides of the equation and compute
     # wp2^3 only once.
     wp2_zt_cubed = wp2_zt ** 3
 
     if l_use_wp3_lim_with_smth_Heaviside:
-        # Implement a smoothed Heaviside function to avoid discontinuities.
+        #implement a smoothed Heaviside function to avoid discontinuities
         zagl_thresh = (gr.zt - sfc_elevation[:, None]) / 100.0
         zagl_thresh = zagl_thresh - 1.0
         H_zagl = smooth_heaviside_peskin(nzt, ngrdcol, zagl_thresh, 0.6)
@@ -375,18 +439,20 @@ def clip_skewness_core(
             + (1.0 - H_zagl) * 0.0021 * Skw_max_mag[:, None] ** 2
         )
     else:
-        # Clip for 100 m AGL below the threshold, and clip skewness
-        # consistently with Skw_max_mag above it.
+        # Clip for 100 m. AGL.
+        # Clip skewness consistently with a.
         wp3_lim_sqd = jnp.where(
             gr.zt - sfc_elevation[:, None] <= 100.0,
             0.0021 * Skw_max_mag[:, None] ** 2 * wp2_zt_cubed,
             Skw_max_mag[:, None] ** 2 * wp2_zt_cubed,
         )
 
-    # Set the magnitude to the wp3 limit and apply the sign of the current wp3.
+    # Clipping for w'^3 at an upper and lower limit corresponding with
+    # the appropriate value of Sk_w.
+    # Set the magnitude to the wp3 limit and apply the sign of the current wp3
     wp3 = jnp.where(wp3 ** 2 > wp3_lim_sqd, jnp.sign(wp3) * jnp.sqrt(wp3_lim_sqd), wp3)
 
-    # Clip abs(wp3) to 100. This keeps wp3 from growing too large in some deep
+    # Clipping abs(wp3) to 100. This keeps wp3 from growing too large in some
     # convective cases, which helps prevent these cases from blowing up.
     return jnp.clip(wp3, -wp3_max, wp3_max)
 

@@ -1,4 +1,94 @@
-"""JAX port of `src/CLUBB_core/penta_lu_solver.F90`."""
+"""JAX implementation of ``penta_lu_solver.F90``.
+
+Description:
+  These routines solve lhs*soln=rhs using LU decomp.
+
+  LHS is stored in band diagonal form.
+    lhs = | lhs(0,1)  lhs(-1,1)  lhs(-2,1)     0           0          0          0
+          | lhs(1,2)  lhs( 0,2)  lhs(-1,2)  lhs(-2,2)      0          0          0
+          | lhs(2,3)  lhs( 1,3)  lhs( 0,3)  lhs(-1,3)  lhs(-2,3)      0          0
+          |     0     lhs( 2,4)  lhs( 1,4)  lhs( 0,4)  lhs(-1,4)  lhs(-2,4)      0
+          |     0         0      lhs( 2,5)  lhs( 1,5)  lhs( 0,5)  lhs(-1,5)  lhs(-2,5) ...
+          |    ...
+
+   U is stored in band diagonal form
+    U = |   1    upper_1(1)  upper_2(1)      0           0           0           0
+        |   0        1       upper_1(2)  upper_2(2)      0           0           0
+        |   0        0           1       upper_1(3)  upper_2(3)      0           0
+        |   0        0           0           1       upper_1(4)  upper_2(4)      0
+        |   0        0           0           0           1       upper_1(5)  upper_2(5)  ...
+        |  ...
+
+  L is also stored in band diagonal form, but the lowest most band is equivalent to the
+  lowermost band of LHS, thus we don't need to store it
+    L = | l_diag(1)        0            0           0             0       0
+        | lower_1(2)    l_diag(2)       0           0             0       0
+        |   l_2(3)      lower_1(3)   l_diag(3)      0             0       0
+        |     0           l_2(4)     lower_1(4)  l_diag(4)        0       0
+        |     0             0        l_2(5)      lower_1(5)    l_diag(5)  0   ...
+        |  ...
+
+  To perform the LU decomposition, we go element by element.
+  First we start by noting that we want lhs=LU, so the first step of calculating
+  L*U, by multiplying the first row of L by the columns of U, gives us
+
+    l_diag(1)*1          = lhs( 0,1)  =>  l_diag(1)  = lhs( 0,1)
+    l_diag(1)*upper_1(1) = lhs(-1,1)  =>  upper_1(1) = lhs(-1,1) / l_diag(1)
+    l_diag(1)*upper_2(1) = lhs(-2,1)  =>  upper_2(1) = lhs(-2,1) / l_diag(1)
+
+  Multiplying the second row of L by U now we get
+
+    lower_1(2)*1                               = lhs(1,2)   =>  lower_1(2)  = lhs(1,2)
+    lower_1(2)*upper_1(1)+l_diag(2)*1          = lhs(0,2)   =>  l_diag(2)
+                                                                = lhs(0,2)
+                                                                  - lower_1(2)*upper_1(1)
+    lower_1(2)*upper_2(1)+l_diag(2)*upper_1(2) = lhs(-1,2)  =>  upper_1(2)
+                                                                = ( lhs(-1,2)
+                                                                  - lower_1(2)*upper_2(1) )
+                                                                  / l_diag(2)
+    l_diag(2)*upper_2(2)                       = lhs(-2,2)  =>  upper_2(2)  =
+                                                                            lhs(-2,2)
+                                                                            / l_diag(2)
+
+  Now that we're passed the k=1 and k=2 steps, each following step uses all the bands,
+  allowing us to write the general step
+
+    l_2(k)*1                                    = lhs(2,k)   =>  l_2(k)     = lhs(2,k)
+    l_2(k)*upper_1(k-2)+lower_1(k)*1            = lhs(1,k)   =>  lower_1(k)
+                                                                 = lhs(1,k)
+                                                                   - l_2(k)*upper_1(k-2)
+    l_2(k)*upper_2(k-2)+lower_1(k)*upper_1(k-1) = lhs( 0,k)  =>  l_diag(k)  = lhs(0,k)
+                   +l_diag(k)*1                                               - l_2(k)
+                                                                              *upper_2(k-2)
+                                                                              + lower_1(k)
+                                                                              *upper_1(k-1)
+
+    lower_1(k)*upper_2(k-1)
+    + l_diag(k)*upper_1(k) = lhs(-1,k)  =>  upper_1(k) = ( lhs(-1,k) - lower_1(k)*upper_2(k-1) )
+                                                         / l_diag(k)
+    l_diag(k)*upper_2(k)   = lhs(-2,k)  =>  upper_2(k) = lhs(-2,k) / l_diag(k)
+
+  This general step is done for k from 3 to ndim-2 (do k = 3, ndim-2), and the last two
+  steps are tweaked similarly to the first two, where we disclude one then two bands
+  since they become no longer relevant. Note from this general step that the l_2 band
+  is always equivalent to second subdiagonal band of lhs, thus we do not need to
+  calculate or store l_2. Also note that we only ever need l_diag so that we can divide
+  by it, so instead we compute lower_diag_invrs to reduce divide operations.
+
+  After L and U are computed, normally we do forward substitution using L,
+  then backward substitution using U to find the solution. This is replicated
+  for every right hand side we want to solve for.
+
+References:
+  none
+
+Porting deviations:
+The Fortran generic interface is implemented as a Python rank-dispatch wrapper.
+The explicit Fortran loops are represented by ``jax.lax.scan`` sweeps.  Fortran
+mutates ``soln`` output arrays; the JAX routines return the solution arrays.
+The band dimension uses Python indices ``0, 1, 2, 3, 4`` for Fortran bands
+``-2, -1, 0, 1, 2``.
+"""
 
 from __future__ import annotations
 
@@ -12,15 +102,15 @@ import jax.numpy as jnp
 
 @partial(jax.jit, static_argnames=("ndim", "ngrdcol"))
 def penta_lu_solve_single_rhs_multiple_lhs(ndim: int, ngrdcol: int, lhs, rhs):
-    """Written for single RHS and multiple LHS."""
+    """Solve multiple pentadiagonal systems with one right-hand side each.
+
+    Description:
+      Written for single RHS and multiple LHS.
+    """
     del ngrdcol
 
-    # LHS is stored in band diagonal form:
-    #   lhs[0, i, k] = Fortran lhs(-2,i,k), second superdiagonal
-    #   lhs[1, i, k] = Fortran lhs(-1,i,k), first superdiagonal
-    #   lhs[2, i, k] = Fortran lhs( 0,i,k), diagonal
-    #   lhs[3, i, k] = Fortran lhs( 1,i,k), first subdiagonal
-    #   lhs[4, i, k] = Fortran lhs( 2,i,k), second subdiagonal
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
     upper_2_band = lhs[0].T
     upper_1_band = lhs[1].T
     diag_band = lhs[2].T
@@ -28,10 +118,21 @@ def penta_lu_solve_single_rhs_multiple_lhs(ndim: int, ngrdcol: int, lhs, rhs):
     lower_2_band = lhs[4].T
     rhs_t = rhs.T
 
+    # ----------------------- Begin Code -----------------------
+
+    # Inverse of the diagonal of L
     lower_diag_invrs_0 = 1.0 / diag_band[0]
+
+    # First U band
     upper_1_0 = lower_diag_invrs_0 * upper_1_band[0]
+
+    # Second U band
     upper_2_0 = lower_diag_invrs_0 * upper_2_band[0]
+
+    # First L band
     lower_1_0 = jnp.zeros_like(lower_diag_invrs_0)
+
+    # Second L band
     lower_2_0 = jnp.zeros_like(lower_diag_invrs_0)
 
     lower_1_1 = lower_1_band[1]
@@ -165,15 +266,15 @@ def penta_lu_solve_single_rhs_multiple_lhs(ndim: int, ngrdcol: int, lhs, rhs):
 def penta_lu_solve_multiple_rhs_lhs(
     ndim: int, nrhs: int, ngrdcol: int, lhs, rhs
 ):
-    """Written for multiple RHS and multiple LHS."""
+    """Solve multiple pentadiagonal systems with multiple right-hand sides.
+
+    Description:
+      Written for multiple RHS and multiple LHS.
+    """
     del nrhs, ngrdcol
 
-    # LHS is stored in band diagonal form:
-    #   lhs[0, i, k] = Fortran lhs(-2,i,k), second superdiagonal
-    #   lhs[1, i, k] = Fortran lhs(-1,i,k), first superdiagonal
-    #   lhs[2, i, k] = Fortran lhs( 0,i,k), diagonal
-    #   lhs[3, i, k] = Fortran lhs( 1,i,k), first subdiagonal
-    #   lhs[4, i, k] = Fortran lhs( 2,i,k), second subdiagonal
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
     upper_2_band = lhs[0].T
     upper_1_band = lhs[1].T
     diag_band = lhs[2].T
@@ -181,10 +282,21 @@ def penta_lu_solve_multiple_rhs_lhs(
     lower_2_band = lhs[4].T
     rhs_t = jnp.transpose(rhs, (1, 0, 2))
 
+    # ----------------------- Begin Code -----------------------
+
+    # Inverse of the diagonal of L
     lower_diag_invrs_0 = 1.0 / diag_band[0]
+
+    # First U band
     upper_1_0 = lower_diag_invrs_0 * upper_1_band[0]
+
+    # Second U band
     upper_2_0 = lower_diag_invrs_0 * upper_2_band[0]
+
+    # First L band
     lower_1_0 = jnp.zeros_like(lower_diag_invrs_0)
+
+    # Second L band
     lower_2_0 = jnp.zeros_like(lower_diag_invrs_0)
 
     lower_1_1 = lower_1_band[1]

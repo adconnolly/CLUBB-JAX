@@ -1,5 +1,10 @@
 """tracer_numpy.py — tracer-transparent numpy shim (REFACTOR B4/B5).
 
+Porting deviations:
+- This is JAX-only infrastructure with no corresponding Fortran source file.
+  It exists to preserve reverse-mode tracing through Python orchestration code
+  that still has NumPy-style control and assignment patterns.
+
 The toolkit that lets the imperative numpy orchestration thread reverse-mode ``jax.grad`` WITHOUT a
 rewrite: each helper behaves **exactly like numpy** for concrete arrays (so normal runs are bit-identical
 — the bit-faithful suite is provably unaffected) but routes to ``jnp`` under a JAX trace (so the autodiff

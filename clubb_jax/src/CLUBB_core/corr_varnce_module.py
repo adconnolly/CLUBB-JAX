@@ -3,8 +3,17 @@
 This module owns the default normal-space correlation arrays and the
 hydrometeor PDF metadata used by hydrometeor PDF setup.
 
-JAX/Python adaptation: indices are 0-based, with -1 denoting an absent
-hydrometeor/PDF variable. Fortran intent(out) arguments are returned.
+Porting deviations:
+- Indices are 0-based, with -1 denoting an absent hydrometeor/PDF variable.
+  Fortran uses 1-based indices and disables hydrometeors with -1 or 0,
+  depending on context.
+- Fortran intent(out) arguments are returned from functions.
+- Fortran derived types are represented by dataclasses; ``hm_metadata_type`` is
+  registered as a pytree so it can pass through JAX-transformed call graphs.
+- Fortran allocation of metadata arrays is represented by NumPy arrays stored
+  on immutable dataclass instances.
+- Fortran debug routines that mutate ``err_info`` or write to stderr return
+  booleans or formatted text in the JAX/Python port.
 """
 
 from dataclasses import dataclass, replace
@@ -85,6 +94,13 @@ class HmMetadata:
 
 @dataclass(frozen=True)
 class hmp2_ip_on_hmm2_ip_ratios_type:
+    """Prescribed parameters for hydrometeor values of <hm|_ip'^2> / <hm|_ip>^2,
+    where  <hm|_ip'^2>  is the in-precip. variance of the hydrometeor and
+           <hm|_ip>     is the in-precip. mean of the hydrometeor
+
+    These values are dependent on the horizontal grid spacing of the run, and are calculated
+    using a slope and intercept corresponding to each hydrometer.
+    """
     rr: float = 1.0
     Nr: float = 1.0
     ri: float = 1.0
@@ -97,6 +113,23 @@ class hmp2_ip_on_hmm2_ip_ratios_type:
 
 @dataclass(frozen=True)
 class hmp2_ip_on_hmm2_ip_slope_type:
+    """These slopes and intercepts below are used to calculate the hmp2_ip_on_hmm2_ip_ratios_type
+    values that are defined above. This functionality is described by equations 8, 10, & 11
+    in ``Parameterization of the Spatial Variability of Rain for Large-Scale Models and
+    Remote Sensing`` Lebo, et al, October 2015
+    https://journals.ametsoc.org/doi/pdf/10.1175/JAMC-D-15-0066.1
+    see clubb:ticket:830 for more detail
+
+    hmp2_ip_on_hmm2_ip(iirr) = hmp2_ip_on_hmm2_ip_intrcpt%rr +
+                               hmp2_ip_on_hmm2_ip_slope%rr * max( host_dx, host_dy )
+
+    In Lebo et al. the suggested values were
+        slope = 2.12e-5 [1/m]
+        intercept = 0.54 [-]
+
+    In CLUBB standalone, these parameters can be set based on the value for a
+    given case in the CASE_model.in file.
+    """
     rr: float = 2.12e-5
     Nr: float = 2.12e-5
     ri: float = 2.12e-5
@@ -122,6 +155,14 @@ class hmp2_ip_on_hmm2_ip_intrcpt_type:
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class hm_metadata_type:
+    """Hydrometeor metadata.
+
+    Variables
+    Microphysics mixing ratios
+    Microphysics concentrations
+    Logical fields
+    Latin hypercube indices / Correlation array indices
+    """
     iirr: int = -1
     iirs: int = -1
     iiri: int = -1
@@ -280,8 +321,10 @@ class hm_metadata_type:
 
 d_var_total = 12
 
+# Size of the default correlation arrays
 corr_array_n_cloud_def = np.array(
     [
+        #  chi   eta    w      Ncn     rr      Nr      ri      Ni      rs      Ns      rg      Ng
         1.0, -0.6, 0.09, 0.09, 0.788, 0.675, 0.240, 0.222, 0.240, 0.222, 0.240, 0.222,
         0.0, 1.0, 0.027, 0.027, 0.114, 0.115, -0.029, 0.093, 0.022, 0.013, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.34, 0.315, 0.270, 0.120, 0.167, 0.0, 0.0, 0.0, 0.0,
@@ -300,6 +343,7 @@ corr_array_n_cloud_def = np.array(
 
 corr_array_n_below_def = np.array(
     [
+        #  chi   eta    w      Ncn     rr      Nr      ri      Ni      rs      Ns      rg      Ng
         1.0, 0.3, 0.09, 0.09, 0.788, 0.675, 0.240, 0.222, 0.240, 0.222, 0.240, 0.222,
         0.0, 1.0, 0.027, 0.027, 0.114, 0.115, -0.029, 0.093, 0.022, 0.013, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.34, 0.315, 0.270, 0.120, 0.167, 0.0, 0.0, 0.0, 0.0,
@@ -321,7 +365,12 @@ CORR_ARRAY_N_BELOW_DEF = corr_array_n_below_def
 
 
 def def_corr_idx(iiPDF_x, hm_metadata):
-    """Map an iiPDF index to the corresponding default correlation-array index."""
+    """Map from a iiPDF index to the corresponding index in the default
+    correlation arrays."""
+    # Constant Parameters
+
+    # Indices that represent the order in the default corr arrays
+    # (chi (old s), eta (old t), w, Ncn, rr, Nr, ri, Ni, rs, Ns, rg, Ng)
     ii_chi = 0
     ii_eta = 1
     ii_w = 2
@@ -372,7 +421,8 @@ def _def_corr_idx_from(iiPDF_x, hm_metadata):
 
 
 def set_corr_arrays_to_default(pdf_dim, hm_metadata):
-    """Return the default lower-triangular cloud and below-cloud correlation arrays."""
+    """If there are no corr_array.in files for the current case, default
+    correlations are used."""
     corr_array_n_cloud = np.zeros((pdf_dim, pdf_dim), dtype=np.float64)
     corr_array_n_below = np.zeros((pdf_dim, pdf_dim), dtype=np.float64)
 
@@ -415,7 +465,7 @@ def kk_prescribed_correlations():
 
 
 def get_corr_var_index(var_name, hm_metadata):
-    """Return a PDF variable index by name."""
+    """Returns the index for a variable based on its name."""
     i = -1
 
     var_name = var_name.strip()
@@ -463,7 +513,31 @@ def init_pdf_hydromet_arrays_api(
     hmp2_ip_on_hmm2_ip_slope_in=None,
     hmp2_ip_on_hmm2_ip_intrcpt_in=None,
 ):
-    """Initialize hydrometeor metadata and return ``hm_metadata, pdf_dim``."""
+    """Initialize hydrometeor metadata and return ``hm_metadata, pdf_dim``.
+
+    DESCRIPTION:
+        This subroutine intializes the hydromet arrays(iirr, iiNr, etc.) to the values specified by
+        the input arguements, this determines which hyrometeors are to be used by the microphysics
+        scheme. It also sets up the corresponding pdf and hydromet arrays, and calculates the
+        subgrid variance ratio for each hydrometeor.
+
+    OPTIONAL FUNCTIONALITY:
+        The subgrid variance ratio for each hydrometeor is calculated based on the grid spacing
+        defined by the host model. The calculation is a linear equation defined by a slope and
+        intercept, each of which may or may not be passed in to this subroutine. If the slope
+        and/or intercept are not passed in through the arguement list the default values, which
+        are set in the corresponding type definitions, will be used. Otherwise the values
+        specified by the aruements will be used.
+
+    NOTES:
+        'hmp2_ip_on_hmm2_ip_slope_in' is of type 'hmp2_ip_on_hmm2_ip_slope_type' and
+        'hmp2_ip_on_hmm2_ip_intrcpt_in' is of type 'hmp2_ip_on_hmm2_ip_intrcpt_in', both of which
+        are deinfed in corr_vrnce_module.F90, and made public through this API.
+
+        If full control over the hydrometeor variance ratios is desired, pass in slopes that are
+        initialized to 0.0, this causes the ratios to no longer depend on the grid spacing. Then
+        pass in the intercepts set to the values of the desired ratios.
+    """
     hm_metadata = hm_metadata_type(
         iirr=iirr,
         iirs=iirs,
@@ -487,6 +561,11 @@ def init_pdf_hydromet_arrays_api(
         else hmp2_ip_on_hmm2_ip_intrcpt_type()
     )
 
+    #-----------------------------------------------------------
+    # Calculate the subgrid variances of the hydrometeors
+    #-----------------------------------------------------------
+
+    # If slope and intercept are present in call, then overwrite default values
     max_host_delta = max(host_dx, host_dy)
     hmp2_ip_on_hmm2_ip = np.zeros(hydromet_dim, dtype=np.float64)
 
@@ -537,41 +616,49 @@ def init_pdf_hydromet_arrays_api(
     l_frozen_hm = np.zeros(hydromet_dim, dtype=bool)
 
     if iirr >= 0:
+        # The microphysics scheme predicts rain water mixing ratio, rr.
         hydromet_list[iirr] = "rrm"
         l_mix_rat_hm[iirr] = True
         l_frozen_hm[iirr] = False
         hydromet_tol[iirr] = rr_tol
     if iiri >= 0:
+        # The microphysics scheme predicts ice mixing ratio, ri.
         hydromet_list[iiri] = "rim"
         l_mix_rat_hm[iiri] = True
         l_frozen_hm[iiri] = True
         hydromet_tol[iiri] = ri_tol
     if iirs >= 0:
+        # The microphysics scheme predicts snow mixing ratio, rs.
         hydromet_list[iirs] = "rsm"
         l_mix_rat_hm[iirs] = True
         l_frozen_hm[iirs] = True
         hydromet_tol[iirs] = rs_tol
     if iirg >= 0:
+        # The microphysics scheme predicts graupel mixing ratio, rg.
         hydromet_list[iirg] = "rgm"
         l_mix_rat_hm[iirg] = True
         l_frozen_hm[iirg] = True
         hydromet_tol[iirg] = rg_tol
     if iiNr >= 0:
+        # The microphysics scheme predicts rain drop concentration, Nr.
         hydromet_list[iiNr] = "Nrm"
         l_frozen_hm[iiNr] = False
         l_mix_rat_hm[iiNr] = False
         hydromet_tol[iiNr] = Nr_tol
     if iiNi >= 0:
+        # The microphysics scheme predicts ice concentration, Ni.
         hydromet_list[iiNi] = "Nim"
         l_mix_rat_hm[iiNi] = False
         l_frozen_hm[iiNi] = True
         hydromet_tol[iiNi] = Ni_tol
     if iiNs >= 0:
+        # The microphysics scheme predicts snowflake concentration, Ns.
         hydromet_list[iiNs] = "Nsm"
         l_mix_rat_hm[iiNs] = False
         l_frozen_hm[iiNs] = True
         hydromet_tol[iiNs] = Ns_tol
     if iiNg >= 0:
+        # The microphysics scheme predicts graupel concentration, Ng.
         hydromet_list[iiNg] = "Ngm"
         l_mix_rat_hm[iiNg] = False
         l_frozen_hm[iiNg] = True
@@ -590,9 +677,16 @@ def init_pdf_hydromet_arrays_api(
         iiPDF_Ncn=3,
     )
 
+    #-----------------------------------------------------------
+    # Set up the PDF indices
+    #-----------------------------------------------------------
+
     pdf_count = hm_metadata.iiPDF_Ncn
 
     if hydromet_dim > 0:
+        # Loop over hydrometeors.
+        # Hydrometeor indices in the PDF arrays should be in the same order as
+        # found in the hydrometeor arrays.
         for i in range(hydromet_dim):
             if i == iirr:
                 pdf_count += 1

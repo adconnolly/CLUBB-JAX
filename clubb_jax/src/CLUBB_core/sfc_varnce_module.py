@@ -1,11 +1,21 @@
 """JAX port of ``src/CLUBB_core/sfc_varnce_module.F90``.
 
-Adaptation notes:
+Porting deviations:
 - The Fortran source sets ``l_andre_1978 = .false.`` as a local parameter, so
   this port mirrors the active "Previous code" branch and omits the dead Andre
   et al. 1978 branch.
 - Stats are threaded explicitly with JaxStats because the Fortran routine uses
   global stats side effects that are not JAX-compatible state.
+- Fortran inout arguments are returned as updated arrays, which keeps the
+  routine functional and JIT-friendly.
+- The Fortran debug path calls ``sfc_varnce_check`` and prints diagnostics to
+  stderr.  The JAX path preserves the fatal error state with finite checks but
+  omits host-side debug printing inside the jitted routine.
+
+References:
+Andre, J. C., G. De Moor, P. Lacarrere, G. Therry, and R. Du Vachat, 1978.
+  Modeling the 24-Hour Evolution of the Mean and Turbulent Structures of
+  the Planetary Boundary Layer.  J. Atmos. Sci., 35, 1861 -- 1883.
 """
 
 from functools import partial
@@ -79,7 +89,8 @@ def calc_sfc_varnce(
     sclrpthlp,
     err_info: ErrInfo,
 ):
-    """Compute estimate of the surface thermodynamic and wind moments."""
+    """This subroutine computes estimate of the surface thermodynamic and wind
+    component second order moments."""
     del nzt, um, vm, Lscale_up
 
     # Constant Parameters
@@ -87,8 +98,12 @@ def calc_sfc_varnce(
     # Logical for Andre et al., 1978 parameterization.
     l_andre_1978 = False
 
+    # Defined height of 1 meter                [m]
     z_const = one
+    # This value is made up! - Vince Larson 12 Jul 2005
     sclr_var_coef = 0.4
+
+    #-------------------------- Begin Code --------------------------
 
     # Reflect surface varnce changes in budget
     if stats.l_sample:
@@ -123,6 +138,8 @@ def calc_sfc_varnce(
 
     # Find thickness of layer near surface with positive heat flux.
     # This is used when l_vary_convect_depth=.true. in order to determine wp2.
+    # When sfc heat flux is negative, set depth to 1 m.
+    # When sfc heat flux is positive, march up sounding until wpthlp 1st becomes negative.
     depth_pos_wpthlp = jnp.where(
         wpthlp[:, gr.k_lb_zm] <= zero,
         one,

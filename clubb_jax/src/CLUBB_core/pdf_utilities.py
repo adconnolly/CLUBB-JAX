@@ -1,4 +1,4 @@
-"""JAX port of pdf_utilities.F90 — lognormal <-> normal moment/correlation conversions.
+"""JAX port of pdf_utilities.F90 - lognormal <-> normal moment/correlation conversions.
 
 CLUBB's precipitating hydrometeors (r_r, N_r) and the simplified cloud-nuclei
 concentration N_cn have an assumed LOGNORMAL marginal in each PDF component. The
@@ -16,7 +16,17 @@ the LINEAR-space mean/variance. These elemental functions convert between the tw
                           eta=crt rt+cthl thl decomposition)
   calc_corr_{rt,thl}_x  : the inverses — corr(rt/thl, x) from corr(chi, x), corr(eta, x)
 
-Oracle: pdf_utilities.F90 (the core_rknd variants — mean_L2N keeps its max(.,tiny)
+Porting deviations:
+- The Fortran `_dp` duplicate routines are not separately ported; JAX runs with
+  x64 enabled and uses the core-rknd behavior where it differs.
+- Fortran routines with explicit `nz, ngrdcol` loops broadcast over the shapes
+  supplied by callers.
+- Correlation clipping uses `jnp.clip` where the Fortran uses if/elseif blocks.
+- `_safe_sqrt` is a JAX-only helper for finite inactive-branch gradients; it is
+  forward-equivalent to sqrt(max(value,0)) for the non-negative variance inputs
+  expected here.
+
+Oracle: pdf_utilities.F90 (the core_rknd variants - mean_L2N keeps its max(.,tiny)
 guard; the _dp variants drop it). Inputs use the ratio sigma2_on_mu2 = sigma_x^2/mu_x^2.
 
 mean_L2N, stdev_L2N, corr_NN2NL, corr_NN2LL, calc_corr_chi_x, calc_corr_eta_x are bit-to-bit
@@ -44,71 +54,124 @@ def _safe_sqrt(value):
 
 
 def mean_L2N(mu_x, sigma2_on_mu2):
-    """Mean of ln x for a lognormal x. pdf_utilities.F90:33 (core_rknd variant).
+    """For a lognormally-distributed variable x, this function finds the mean of
+    ln x (mu_x_n) for the ith component of the PDF, given the mean of x (mu_x)
+    and the variance of x (sigma_sqd_x) for the ith component of the PDF. The
+    value ln x is distributed normally when x is distributed lognormally.
 
-    mu_x_n = log( max( mu_x / sqrt(1 + sigma2_on_mu2), tiny ) ).
-    The max(.,tiny) guard prevents log(0); it mirrors the core_rknd Fortran (the _dp
-    variant omits it). Not meant to be called with mu_x <= 0."""
+    References:
+     Garvey, P. R., 2000: Probability methods for cost uncertainty analysis.
+       Marcel Dekker, 401 pp.
+     -- App. B.
+    """
     mu_x = jnp.asarray(mu_x, dtype=jnp.float64)
     sigma2_on_mu2 = jnp.asarray(sigma2_on_mu2, dtype=jnp.float64)
+    # Find the mean of ln x for the ith component of the PDF.
+    # The max( mu_x / sqrt( 1 + sigma_x^2 / mu_x^2 ), tiny( mu_x ) ) statement
+    # is used to prevent taking ln 0, which will produce a result of -infinity.
+    # This would happen when mu_x is 0.  However, this code should not be
+    # entered when mu_x has a value of 0.
     return jnp.log(jnp.maximum(mu_x / jnp.sqrt(1.0 + sigma2_on_mu2), _TINY))
 
 
 def stdev_L2N(sigma2_on_mu2):
-    """Std deviation of ln x for a lognormal x. pdf_utilities.F90:122.
+    """For a lognormally-distributed variable x, this function finds the standard
+    deviation of ln x (sigma_x_n) for the ith component of the PDF, given the
+    mean of x (mu_x) and the variance of x (sigma_sqd_x) for the ith component
+    of the PDF.  The value ln x is distributed normally when x is distributed
+    lognormally.
 
-    sigma_x_n = sqrt( log( 1 + sigma2_on_mu2 ) )."""
+    References:
+     Garvey, P. R., 2000: Probability methods for cost uncertainty analysis.
+       Marcel Dekker, 401 pp.
+     -- App. B.
+    """
     sigma2_on_mu2 = jnp.asarray(sigma2_on_mu2, dtype=jnp.float64)
+    # Find the standard deviation of ln x for the ith component of the PDF.
     return jnp.sqrt(jnp.log(1.0 + sigma2_on_mu2))
 
 
 def corr_NL2NN(corr_x_y, sigma_y_n, y_sigma2_on_mu2):
-    """Correlation of x (normal) and ln y (y lognormal). pdf_utilities.F90:207.
+    """For a normally-distributed variable x and a lognormally-distributed
+    variable y, this function finds the correlation of x and ln y (corr_x_y_n)
+    for the ith component of the PDF, given the correlation of x and y
+    (corr_x_y) and the standard deviation of ln y (sigma_y_n) for the ith
+    component of the PDF.  The value ln y is distributed normally when y is
+    distributed lognormally.
 
-    corr_x_y_n = corr_x_y * sqrt(y_sigma2_on_mu2) / sigma_y_n   if sigma_y_n > 0,
-               = corr_x_y                                        if sigma_y_n = 0,
-    then clipped to +/- max_mag_correlation."""
+    References:
+     Garvey, P. R., 2000: Probability methods for cost uncertainty analysis.
+       Marcel Dekker, 401 pp.
+     -- Eq. B-1.
+    """
     corr_x_y = jnp.asarray(corr_x_y, dtype=jnp.float64)
     sigma_y_n = jnp.asarray(sigma_y_n, dtype=jnp.float64)
     y_sigma2_on_mu2 = jnp.asarray(y_sigma2_on_mu2, dtype=jnp.float64)
-    # guard sigma_y_n in the division so the sigma_y_n==0 branch is finite/clean
+    # Find the correlation of x and ln y for the ith component of the PDF.
+    # When sigma_y = 0 and mu_y > 0, y_sigma2_on_mu2 = 0.  This results in
+    # sigma_y_n = 0.  The resulting corr_x_y_n is undefined.  However, the
+    # divide-by-zero problem needs to be addressed in the code.
     sy_safe = jnp.where(sigma_y_n > 0.0, sigma_y_n, 1.0)
     corr_n = jnp.where(sigma_y_n > 0.0,
                        corr_x_y * jnp.sqrt(y_sigma2_on_mu2) / sy_safe,
                        corr_x_y)
+    # Clip the magnitude of the correlation of x and ln y in the ith PDF
+    # component, just in case the correlation (ith PDF component) of x and y and
+    # the standard deviation (ith PDF component) of ln y are inconsistent,
+    # resulting in an unrealizable value for corr_x_y_n.
     return jnp.clip(corr_n, -MAX_MAG_CORRELATION, MAX_MAG_CORRELATION)
 
 
 def corr_LL2NN(corr_x_y, sigma_x_n, sigma_y_n, x_sigma2_on_mu2, y_sigma2_on_mu2):
-    """Correlation of ln x and ln y (both lognormal). pdf_utilities.F90:439.
+    """For lognormally-distributed variables x and y, this function finds the
+    correlation of ln x and ln y (corr_x_y_n) for the ith component of the PDF,
+    given the correlation of x and y (corr_x_y) and the standard deviations of
+    ln x and ln y (sigma_x_n and sigma_y_n) for the ith component of the PDF.
+    The values ln x and ln y are distributed normally when x and y are
+    distributed lognormally.
 
-    corr_x_y_n = log(1 + corr_x_y*sqrt(x_sigma2_on_mu2*y_sigma2_on_mu2))
-                 / (sigma_x_n*sigma_y_n)   if sigma_x_n>0 and sigma_y_n>0,
-               = corr_x_y                  otherwise,
-    then clipped to +/- max_mag_correlation."""
+    References:
+     Garvey, P. R., 2000: Probability methods for cost uncertainty analysis.
+       Marcel Dekker, 401 pp.
+     -- Eq. C-3.
+    """
     corr_x_y = jnp.asarray(corr_x_y, dtype=jnp.float64)
     sigma_x_n = jnp.asarray(sigma_x_n, dtype=jnp.float64)
     sigma_y_n = jnp.asarray(sigma_y_n, dtype=jnp.float64)
     x_sigma2_on_mu2 = jnp.asarray(x_sigma2_on_mu2, dtype=jnp.float64)
     y_sigma2_on_mu2 = jnp.asarray(y_sigma2_on_mu2, dtype=jnp.float64)
+    # Find the correlation of ln x and ln y for the ith component of the PDF.
+    # If sigma_x_n = 0 or sigma_y_n = 0, the value of corr_x_y_n is undefined,
+    # so set it to corr_x_y.
     both_pos = (sigma_x_n > 0.0) & (sigma_y_n > 0.0)
     denom = jnp.where(both_pos, sigma_x_n * sigma_y_n, 1.0)
     log_arg = 1.0 + corr_x_y * jnp.sqrt(x_sigma2_on_mu2 * y_sigma2_on_mu2)
     corr_n = jnp.where(both_pos, jnp.log(log_arg) / denom, corr_x_y)
+    # Clip the magnitude of the correlation of ln x and ln y.
     return jnp.clip(corr_n, -MAX_MAG_CORRELATION, MAX_MAG_CORRELATION)
 
 
 def corr_NN2NL(corr_x_y_n, sigma_y_n, y_sigma2_on_mu2):
-    """Correlation of x (normal) and y (lognormal) from corr(x, ln y). pdf_utilities.F90:348.
+    """For a normally-distributed variable x and a lognormally-distributed
+    variable y, this function finds the correlation of x and y (corr_x_y) for
+    the ith component of the PDF, given the correlation of x and ln y
+    (corr_x_y_n) and the standard deviation of ln y (sigma_y_n) for the ith
+    component of the PDF.  The value ln y is distributed normally when y is
+    distributed lognormally.
 
-    Inverse of corr_NL2NN: corr_x_y = corr_x_y_n * sigma_y_n / sqrt(max(y_sigma2_on_mu2, tiny))
-    if sigma_y_n > 0, else corr_x_y_n; clipped to +/- max_mag_correlation."""
+    References:
+     Garvey, P. R., 2000: Probability methods for cost uncertainty analysis.
+       Marcel Dekker, 401 pp.
+     -- Eq. B-1.
+    """
     corr_x_y_n = jnp.asarray(corr_x_y_n, dtype=jnp.float64)
     sigma_y_n = jnp.asarray(sigma_y_n, dtype=jnp.float64)
     y_sigma2_on_mu2 = jnp.asarray(y_sigma2_on_mu2, dtype=jnp.float64)
+    # Find the correlation of x and y for the ith component of the PDF.
     corr = jnp.where(sigma_y_n > 0.0,
                      corr_x_y_n * sigma_y_n / jnp.sqrt(jnp.maximum(y_sigma2_on_mu2, _TINY)),
                      corr_x_y_n)
+    # Clip the magnitude of the correlation of x and y.
     return jnp.clip(corr, -MAX_MAG_CORRELATION, MAX_MAG_CORRELATION)
 
 
@@ -165,23 +228,28 @@ def calc_corr_eta_x(crt_i, cthl_i, sigma_rt_i, sigma_thl_i, sigma_eta_i,
 
 
 def compute_mean_binormal(mu_x_1, mu_x_2, mixt_frac):
-    """Overall mean of a two-component (binormal) PDF variable (pdf_utilities.F90:compute_mean_binormal).
+    """For a two-component PDF, this function computes the overall mean of
+    variable x from the mean of x in each PDF component and the mixture fraction.
 
-    xm = mixt_frac * mu_x_1 + (1 - mixt_frac) * mu_x_2
+    xm = mixt_frac * mu_x_1 + ( 1 - mixt_frac ) * mu_x_2
     """
+    # Calculate the overall mean of x.
     return mixt_frac * mu_x_1 + (1.0 - mixt_frac) * mu_x_2
 
 
 def compute_variance_binormal(xm, mu_x_1, mu_x_2, stdev_x_1, stdev_x_2, mixt_frac):
-    """Overall grid-box variance of a two-component (binormal) PDF variable
-    (pdf_utilities.F90:compute_variance_binormal).
+    """For a two-component PDF, this function computes the overall variance of
+    variable x from the overall mean of x, the mean of x in each PDF component,
+    the standard deviation of x in each PDF component, and the mixture fraction.
 
-    xp2 = mixt_frac*((mu_x_1 - xm)^2 + stdev_x_1^2) + (1 - mixt_frac)*((mu_x_2 - xm)^2 + stdev_x_2^2)
+    xp2 = mixt_frac * ( ( mu_x_1 - xm )^2 + stdev_x_1^2 )
+          + ( 1 - mixt_frac ) * ( ( mu_x_2 - xm )^2 + stdev_x_2^2 )
     """
     xm = jnp.asarray(xm, dtype=jnp.float64)
     mu_x_1 = jnp.asarray(mu_x_1, dtype=jnp.float64); mu_x_2 = jnp.asarray(mu_x_2, dtype=jnp.float64)
     stdev_x_1 = jnp.asarray(stdev_x_1, dtype=jnp.float64); stdev_x_2 = jnp.asarray(stdev_x_2, dtype=jnp.float64)
     a = jnp.asarray(mixt_frac, dtype=jnp.float64)
+    # Calculate the overall variance of x.
     return (a * ((mu_x_1 - xm) ** 2 + stdev_x_1 ** 2)
             + (1.0 - a) * ((mu_x_2 - xm) ** 2 + stdev_x_2 ** 2))
 
@@ -217,12 +285,12 @@ def calc_corr_thl_x(cthl_i, sigma_thl_i, sigma_chi_i, sigma_eta_i,
 
 
 def smooth_corr_quotient(numerator, denominator, denom_thresh):
-    """Smoothly bounded correlation quotient num/denom (pdf_utilities.F90:smooth_corr_quotient).
+    """Smoothly bounded correlation quotient num/denom.
 
-    Two smooth_max operations keep the result a valid correlation: the denominator is first raised to at least
-    |num|/max_mag_correlation (so |quotient| <= max_mag_correlation) and then to at least denom_thresh (so it
-    never divides by ~0). smooth_max(a,b,c)=0.5((a+b)+sqrt((a-b)^2+c^2)); smoothing coef = min(min_max_smth_mag,
-    denom_thresh). Pure-jnp → differentiable."""
+    Two smooth_max operations keep the result a valid correlation: the
+    denominator is first raised to at least |num|/max_mag_correlation and then
+    to at least denom_thresh.
+    """
     num = jnp.asarray(numerator, dtype=jnp.float64)
     den = jnp.asarray(denominator, dtype=jnp.float64)
     coef = jnp.minimum(_MIN_MAX_SMTH_MAG, denom_thresh)
@@ -237,11 +305,9 @@ def smooth_corr_quotient(numerator, denominator, denom_thresh):
 
 def calc_comp_corrs_binormal(xpyp, xm, ym, mu_x_1, mu_x_2, mu_y_1, mu_y_2,
                              sigma_x_1_sqd, sigma_x_2_sqd, sigma_y_1_sqd, sigma_y_2_sqd, mixt_frac):
-    """PDF-component correlation of two binormal variables x and y, diagnosed from their overall covariance
-    (pdf_utilities.F90:calc_comp_corrs_binormal). The two PDF components share one correlation
-    (corr_x_y_1 = corr_x_y_2), solved from <x'y'> = sum_i w_i[(mu_x_i-<x>)(mu_y_i-<y>) + corr sigma_x_i sigma_y_i]:
-      corr = (<x'y'> - sum_i w_i (mu_x_i-<x>)(mu_y_i-<y>)) / (sum_i w_i sigma_x_i sigma_y_i),
-    bounded by smooth_corr_quotient. All args are (ngrdcol, nz). Returns (corr_x_y_1, corr_x_y_2)."""
+    """Diagnoses PDF-component correlations of x and y from their overall
+    covariance, component means, component variances, and mixture fraction.
+    """
     xpyp = jnp.asarray(xpyp, dtype=jnp.float64); xm = jnp.asarray(xm, dtype=jnp.float64)
     ym = jnp.asarray(ym, dtype=jnp.float64)
     mu_x_1 = jnp.asarray(mu_x_1, dtype=jnp.float64); mu_x_2 = jnp.asarray(mu_x_2, dtype=jnp.float64)
@@ -250,9 +316,11 @@ def calc_comp_corrs_binormal(xpyp, xm, ym, mu_x_1, mu_x_2, mu_y_1, mu_y_2,
     sy1 = jnp.asarray(sigma_y_1_sqd, dtype=jnp.float64); sy2 = jnp.asarray(sigma_y_2_sqd, dtype=jnp.float64)
     a = jnp.asarray(mixt_frac, dtype=jnp.float64)
 
+    # Calculate the numerator of the component correlation equation.
     numerator = (xpyp - a * (mu_x_1 - xm) * (mu_y_1 - ym)
                  - (1.0 - a) * (mu_x_2 - xm) * (mu_y_2 - ym))
-    # _safe_sqrt (finite grad at sigma^2=0) — forward-identical to jnp.sqrt for sigma^2 >= 0
+    # Calculate the denominator of the component correlation equation.
     denominator = a * _safe_sqrt(sx1 * sy1) + (1.0 - a) * _safe_sqrt(sx2 * sy2)
+    # Calculate corr_x_y_1 and corr_x_y_2.
     corr = smooth_corr_quotient(numerator, denominator, _EPS)
     return corr, corr

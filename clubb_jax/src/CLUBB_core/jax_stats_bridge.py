@@ -1,10 +1,27 @@
-"""JAX-side stats event log that replays to the existing CLUBB API."""
+"""JAX-side stats event log that replays to the existing CLUBB API.
+
+Porting deviations:
+  * This file has no direct Fortran counterpart.  It is bridge infrastructure
+    for calling the Fortran-backed stats API from a JAX core that cannot do
+    Python/Fortran side effects while jitted.
+  * Fortran routines call ``stats_update``, ``stats_begin_budget``,
+    ``stats_update_budget``, and ``stats_finalize_budget`` immediately.
+    JAX records fixed-size events inside the pytree and replays them to
+    ``clubb_python.clubb_api`` after the jitted timestep returns.
+  * Stats payloads are stopped with ``jax.lax.stop_gradient``.  Stats writes
+    are diagnostics, not part of the differentiable model state.
+  * Fortran formatted diagnostic output is not reproduced here.  Event-log
+    overflow or invalid payload metadata is raised as a Python error when the
+    log is replayed.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
 import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_python import clubb_api
@@ -21,8 +38,15 @@ RANK_2D = 2
 
 NO_INDEX = -1
 
+# Setting this low helps keep memory usage small, especially important with lots of stats
+# Most variables only have 1 sample, some have 2, and a few have 3 or more. So we could
+# probably get away with 2, but let's just do 3 for safety in case someone runs with mostly
+# high sample count stats
+EVENTS_PER_STATS_VARIABLE = 3
+
 
 def _clean_stats_string(value) -> str:
+    """Normalize Fortran/f2py character metadata returned by ``clubb_api``."""
     if isinstance(value, bytes):
         text = value.decode("utf-8", errors="ignore")
     elif isinstance(value, np.ndarray):
@@ -121,8 +145,9 @@ class JaxStats:
         ngrdcol: int,
         nzm: int,
         nzt: int,
-        max_events: int = 1024,
+        max_events: int | None = None,
     ):
+        """Create bridge metadata from the active Fortran-backed stats registry."""
         cfg = clubb_api.get_stats_config()
         l_enabled = bool(cfg[0])
         nvars = int(cfg[2]) if l_enabled else 0
@@ -136,6 +161,9 @@ class JaxStats:
             if clean_name:
                 names.append(clean_name)
             max_nlev = max(max_nlev, int(nz))
+
+        if max_events is None:
+            max_events = max(1, EVENTS_PER_STATS_VARIABLE * len(names))
 
         return cls.empty(
             l_sample=l_sample,
@@ -216,15 +244,19 @@ class JaxStats:
         )
 
     def var_on_stats_list(self, name: str) -> bool:
+        """Mirror ``var_on_stats_list`` for code that guards optional stats."""
         return bool(name) and name.strip() in self.name_to_id
 
     def update(self, name: str, values, *, icol: int | None = None, level: int | None = None):
+        """Record a future ``stats_update`` call."""
         return self._record(OP_UPDATE, name, values, icol=icol, level=level)
 
     def begin_budget(self, name: str, values, *, icol: int | None = None):
+        """Record a future ``stats_begin_budget`` call."""
         return self._record(OP_BEGIN_BUDGET, name, values, icol=icol)
 
     def update_budget(self, name: str, values, *, icol: int | None = None, level: int | None = None):
+        """Record a future ``stats_update_budget`` call."""
         return self._record(OP_UPDATE_BUDGET, name, values, icol=icol, level=level)
 
     def finalize_budget(
@@ -235,6 +267,7 @@ class JaxStats:
         icol: int | None = None,
         l_count_sample: bool = True,
     ):
+        """Record a future ``stats_finalize_budget`` call."""
         return self._record(
             OP_FINALIZE_BUDGET,
             name,
@@ -351,6 +384,7 @@ class JaxStats:
         )
 
     def to_api(self):
+        """Replay recorded events to the existing CLUBB stats API."""
         if bool(np.asarray(self.overflow)):
             raise RuntimeError(
                 f"JaxStats event log overflowed max_events={self.max_events}."

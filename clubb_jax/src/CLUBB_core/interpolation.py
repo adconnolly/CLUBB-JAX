@@ -1,10 +1,17 @@
-"""JAX port of interpolation.F90 — CLUBB's vertical interpolation primitives.
+"""JAX port of ``interpolation.F90``.
 
-lin_interpolate_two_points — straight linear interpolation between two known (height, value) points.
-mono_cubic_interp — Steffen (1990) monotone cubic interpolation (with the optional non-monotone quintic
-variant), used to interpolate a field to an arbitrary altitude between grid levels. Both pure-jnp in their
-float arguments → differentiable; the integer k-level arguments select interpolate-vs-extrapolate / boundary
-branches and are treated as static Python control flow (they are concrete grid indices, not differentiated).
+Porting deviations:
+  * Fortran exposes ``binary_search`` and ``lin_interpolate_on_grid_api``.
+    JAX does not keep them as public routines because callers use vectorized
+    ``jnp.interp``-based routines instead.
+  * Fortran debug builds stop on invalid linear-interpolation inputs and
+    unsorted grids.  JAX routines assume validated monotone grids so they can
+    remain jit-friendly.
+  * Fortran ``l_quintic_poly_interp`` is a module flag; JAX passes
+    ``l_quintic_poly_interp`` as an explicit argument.
+  * ``zlinterp_fnc`` and ``lin_interp_between_grids`` replace explicit Fortran
+    searches with vectorized JAX interpolation while preserving zero-fill or
+    clamp semantics.
 """
 import jax
 import jax.numpy as jnp
@@ -15,20 +22,60 @@ _EPS = 1.0e-10   # constants_clubb.F90 eps
 
 
 def lin_interpolate_two_points(height_int, height_high, height_low, var_high, var_low):
-    """Linear interpolation of a variable to height_int, given its values at height_high and height_low
-    (interpolation.F90:lin_interpolate_two_points):
-      var = (height_int - height_low)/(height_high - height_low) * (var_high - var_low) + var_low.
+    """This function computes a linear interpolation of the value of variable.
+
+    Given two known values of a variable at two height values, the value
+    of that variable at a height between those two height levels (rather
+    than a height outside of those two height levels) is computed.
+
+    Here is a diagram:
+
+     ################################ Height high, know variable value
+
+
+
+     -------------------------------- Height to be interpolated to; linear interpolation
+
+
+
+
+
+     ################################ Height low, know variable value
+
+
+    FORMULA:
+
+    variable(@ Height interpolation) =
+
+    [ (variable(@ Height high) - variable(@ Height low)) / (Height high - Height low) ]
+    * (Height interpolation - Height low)  +  variable(@ Height low)
+
+    Comments from WRF-HOC, Brian Griffin.
+
+    References:
+    None
     """
+    # Compute linear interpolation
     return ((height_int - height_low) / (height_high - height_low)) * (var_high - var_low) + var_low
 
 
 def mono_cubic_interp(z_in, km1, k00, kp1, kp2, zm1, z00, zp1, zp2, fm1, f00, fp1, fp2,
                       l_quintic_poly_interp=False):
-    """Steffen (1990) monotone cubic interpolation to altitude z_in between z00 and zp1
-    (interpolation.F90:mono_cubic_interp). km1/k00/kp1/kp2 are integer grid indices selecting the branch:
-    when km1 <= k00 a cubic (or quintic) is fit using the slopes at the surrounding levels with Steffen's
-    monotonicity limiter; otherwise a linear extrapolation is used. Returns the interpolated field value.
-    Differentiable in z_in and the field/height values."""
+    """Steffen's monotone cubic interpolation method.
+
+    Returns monotone cubic interpolated value between x00 and xp1
+
+    Original Author:
+      Takanobu Yamaguchi
+      tak.yamaguchi@noaa.gov
+
+      This version has been modified slightly for CLUBB's coding standards and
+      adds the 3/2 from eqn 21. -dschanen 26 Oct 2011
+      We have also added a quintic polynomial option.
+
+    References:
+      M. Steffen, Astron. Astrophys. 239, 443-450 (1990)
+    """
     coef1 = 1.0
     coef2 = 1.0
 
@@ -36,6 +83,8 @@ def mono_cubic_interp(z_in, km1, k00, kp1, kp2, zm1, z00, zp1, zp2, fm1, f00, fp
         # Steffen's limited derivative: (sign(sa)+sign(sb)) * min(|sa|, |sb|, |p|/2 * coef2).
         return (coef1 * (jnp.sign(sa) + jnp.sign(sb))
                 * jnp.minimum(jnp.minimum(jnp.abs(sa), jnp.abs(sb)), coef2 * 0.5 * jnp.abs(p)))
+
+    # ---- Begin Code ----
 
     if km1 <= k00:
         hm1 = z00 - zm1
@@ -64,15 +113,21 @@ def mono_cubic_interp(z_in, km1, k00, kp1, kp2, zm1, z00, zp1, zp2, fm1, f00, fp
             dfdxp1 = _lim(s00, sp1, pp1)
 
         if not l_quintic_poly_interp:
+            # Old formula
+            # f_out = c1 * ( (z_in - z00)**3 ) + c2 * ( (z_in - z00)**2 ) + c3 * (z_in - z00) + c4
             c1 = (dfdx00 + dfdxp1 - 2.0 * s00) / (h00 ** 2)
             c2 = (3.0 * s00 - 2.0 * dfdx00 - dfdxp1) / h00
             c3 = dfdx00
             c4 = f00
+            # Faster nested multiplication
             zprime = z_in - z00
             return c4 + zprime * (c3 + zprime * (c2 + zprime * c1))
         else:
+            # Use a quintic polynomial interpolation instead instead of the Steffen formula.
+            # Unlike the formula above, this formula does not guarantee monotonicity.
             beta = 120.0 * ((fp1 - f00) - 0.5 * h00 * (dfdx00 + dfdxp1))
-            # Linear-interpolation fallback when beta underflows, else the quintic.
+
+            # Prevent an underflow by using a linear interpolation
             alpha = (6.0 / jnp.where(jnp.abs(beta) < _EPS, 1.0, beta)) * h00 * (dfdxp1 - dfdx00) + 0.5
             zn = (z_in - z00) / h00
             quintic = (((beta / 20.0) * zn - (beta * (1.0 + alpha) / 12.0)) * zn
@@ -87,43 +142,63 @@ def mono_cubic_interp(z_in, km1, k00, kp1, kp2, zm1, z00, zp1, zp2, fm1, f00, fp
 
 
 def linear_interp_factor(factor, var_high, var_low):
-    """Linear-interpolation coefficient applied to two values (interpolation.F90:linear_interp_factor):
-      result = factor * (var_high - var_low) + var_low.
+    """Determines the coefficient for a linear interpolation.
+
+    References:
+      None
     """
     return factor * (var_high - var_low) + var_low
 
 
 def lin_interp_between_grids(interpolate_altitudes, current_altitudes, current_values):
-    """Interpolate current_values (defined on the sorted current_altitudes grid) onto the
-    interpolate_altitudes grid (interpolation.F90:lin_interp_between_grids).
+    """Interpolates from the values (gr_current_values) on the current grid (gr_current) to the gr_interpolate grid."""
+    interpolate_altitudes = jnp.asarray(interpolate_altitudes, dtype=jnp.float64)
+    current_altitudes = jnp.asarray(current_altitudes, dtype=jnp.float64)
+    current_values = jnp.asarray(current_values, dtype=jnp.float64)
 
-    Linear interpolation between the two bracketing source levels, with end-point clamping for targets
-    outside the source range (below the lowest → current_values[0]; above the highest → current_values[-1]).
-    That is exactly `np.interp` on a sorted source grid: the Fortran's per-point search + lin_interpolate_two_points
-    + low/high clamp reproduces np.interp's behavior level-for-level. Used by the Fortran host-model (dycore) regrid
-    path; the standalone JAX sounding/forcing interpolations call jnp.interp directly. Pure-jnp → differentiable."""
-    return jnp.interp(jnp.asarray(interpolate_altitudes, dtype=jnp.float64),
-                      jnp.asarray(current_altitudes, dtype=jnp.float64),
-                      jnp.asarray(current_values, dtype=jnp.float64))
+    # --------------------- Begin Code ---------------------
+    tol = 1.0e-6
+
+    interp = jnp.interp(interpolate_altitudes, current_altitudes, current_values)
+
+    # find nearest zt level of gr_current for zt(i) of gr_interpolate grid
+    # if there is no gr_current zt level above or below the gr_interpolate grid level,
+    # then the gr_current value of the closest level is taken
+    abs_delta = jnp.abs(interpolate_altitudes[:, None] - current_altitudes[None, :])
+    nearest = jnp.argmin(abs_delta, axis=1)
+    exact = jnp.min(abs_delta, axis=1) < tol
+    return jnp.where(exact, current_values[nearest], interp)
 
 
 def zlinterp_fnc(grid_out, grid_src, var_src):
-    """Vertical linear interpolation of var_src (on grid_src) onto grid_out
-    (interpolation.F90:zlinterp_fnc, "LIN_INT" from WRF-HOC). Values below the lowest / above the highest source
-    level are set to zero, and altitude is assumed to increase monotonically — i.e. this is exactly a linear
-    interpolation with zero-fill outside the source range. Pure-jnp → differentiable in var_src (and grids)."""
+    """Do a linear interpolation in the vertical.
+
+    Assumes values that
+    are less than lowest source point are zero and above the highest
+    source point are zero. Also assumes altitude increases linearly.
+
+    References:
+      function LIN_INT from WRF-HOC
+    """
     grid_out = jnp.asarray(grid_out, dtype=jnp.float64)
     grid_src = jnp.asarray(grid_src, dtype=jnp.float64)
     var_src = jnp.asarray(var_src, dtype=jnp.float64)
+    # ---- Begin Code ----
     return jnp.interp(grid_out, grid_src, var_src, left=0.0, right=0.0)
 
 
 def plinterp_fnc(grid_out, grid_src, var_src):
-    """Vertical linear interpolation in PRESSURE coordinates (interpolation.F90:plinterp_fnc).
+    """Do a linear interpolation in the vertical with pressures.
 
-    Identical to zlinterp_fnc but for grids that decrease monotonically (pressure falls with
-    height): it just negates both grids and defers to zlinterp_fnc, so the source grid becomes
-    increasing and the zero-fill-outside-range semantics carry over. Pure-jnp → differentiable."""
+    Assumes
+    values that are less than lowest source point are zero and above the
+    highest source point are zero. Also assumes altitude increases linearly.
+    This function just calls zlinterp_fnc, but negates grid_out and grid_src.
+
+    References:
+      function LIN_INT from WRF-HOC
+    """
     grid_out = jnp.asarray(grid_out, dtype=jnp.float64)
     grid_src = jnp.asarray(grid_src, dtype=jnp.float64)
+    # ---- Begin Code ----
     return zlinterp_fnc(-grid_out, -grid_src, var_src)

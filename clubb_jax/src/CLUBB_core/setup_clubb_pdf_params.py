@@ -1,4 +1,20 @@
-"""JAX port of setup_clubb_pdf_params.F90 — hydrometeor PDF component moments.
+"""JAX port of setup_clubb_pdf_params.F90.
+
+Porting deviations:
+- Fortran output and inout arguments are returned as values so the routines can
+  be used in functional/JIT-friendly call graphs.
+- Fortran derived types are represented by JAX-friendly Python dataclasses and
+  pytrees; optional ``hydromet_pdf_params`` is represented with ``None`` when
+  absent.
+- Fortran loops over grid columns, levels, hydrometeors, and PDF variables are
+  vectorized with JAX arrays and small Python loops over static dimensions.
+- Fortran debug printing and immediate returns after fatal errors are replaced
+  by functional updates to ``err_info``; the caller handles the fatal state
+  after leaving the JAX region.
+- Stats calls are recorded through the JAX stats bridge instead of calling the
+  Fortran netCDF stats API directly.
+
+Hydrometeor PDF component moments:
 
 calc_comp_mu_sigma_hm — the in-precip component means/stdevs (mu_hm_1/2,
 sigma_hm_1/2) of a precipitating hydrometeor, which are the rate-function inputs
@@ -109,8 +125,10 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
     corr_array_n_below = jnp.asarray(corr_array_n_below, dtype=jnp.float64)
     clubb_params = jnp.asarray(clubb_params, dtype=jnp.float64)
 
+    # ---- Begin Code ----
+
     # Assertion check
-    # Check that all hydrometeors are positive otherwise exit the program.
+    # Check that all hydrometeors are positive otherwise exit the program
     if clubb_at_least_debug_level(0):
         negative_hydromet = jnp.any(hydromet < zero_threshold, axis=(1, 2))
         err_info = err_info.set_fatal(mask=negative_hydromet)
@@ -129,6 +147,17 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
         pdf_params.rc_2,
         pdf_params.mixt_frac,
     )
+
+    # Note on hydrometeor PDF shape:
+    # To use a single lognormal over the entire grid level, turn off the
+    # l_use_precip_frac flag and set omicron to 1 and zeta_vrnce_rat to 0 in
+    # tunable_parameters.in.
+    # To use a single delta-lognormal (single lognormal in-precip.), enable the
+    # l_use_precip_frac flag and set omicron to 1 and zeta_vrnce_rat to 0 in
+    # tunable_parameters.in.
+    # Otherwise, with l_use_precip_frac enabled and omicron and zeta_vrnce_rat
+    # values that are not 1 and 0, respectively, the PDF shape is a double
+    # delta-lognormal (two independent lognormals in-precip.).
 
     # Calculate precipitation fraction.
     if l_use_precip_frac:
@@ -179,12 +208,14 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
     # based on a prescribed value, and whether the value is constant or varying
     # over the grid level.
     if not l_const_Nc_in_cloud:
+        # Ncn varies at each vertical level.
         const_Ncnp2_on_Ncnm2 = jnp.full_like(
             Nc_in_cloud,
             hm_metadata.Ncnp2_on_Ncnm2,
         )
         stdev_const_Ncnp2_on_Ncnm2 = stdev_L2N(const_Ncnp2_on_Ncnm2)
     else:
+        # Ncn is constant at each vertical level.
         const_Ncnp2_on_Ncnm2 = jnp.zeros_like(Nc_in_cloud)
         stdev_const_Ncnp2_on_Ncnm2 = jnp.zeros_like(Nc_in_cloud)
 
@@ -388,6 +419,11 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
     )
 
     # Calculate the normal space correlations.
+    # The normal space correlations are the same as the true correlations
+    # except when at least one of the variables involved is a precipitating
+    # hydrometeor or Ncn.  In these cases, the normal space correlation
+    # involves the natural logarithm of the precipitating hydrometeors, ln hm
+    # (for example, ln r_r and ln N_r), and ln N_cn for each PDF component.
     if l_diagnose_correlations:
         from clubb_jax.src.CLUBB_core.diagnose_correlations_module import (
             calc_cholesky_corr_mtx_approx,
@@ -396,13 +432,13 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
 
         corr_cloud = diagnose_correlations(
             pdf_dim,
-            hm_metadata.iiPDF_w,
+            hm_metadata.iiPDF_w + 1,
             corr_array_n_cloud,
             l_calc_w_corr,
         )
         corr_below = diagnose_correlations(
             pdf_dim,
-            hm_metadata.iiPDF_w,
+            hm_metadata.iiPDF_w + 1,
             corr_array_n_below,
             l_calc_w_corr,
         )
@@ -416,7 +452,7 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
         def _diag_cholesky(corr_array_n):
             corr_cholesky_mtx, corr_array_n = calc_cholesky_corr_mtx_approx(
                 pdf_dim,
-                hm_metadata.iiPDF_w,
+                hm_metadata.iiPDF_w + 1,
                 corr_array_n,
             )
             return corr_cholesky_mtx, corr_array_n
@@ -433,7 +469,13 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
         if l_fix_w_chi_eta_correlations and not l_calc_w_corr:
             # When the flags are set this way, the correlation matrices do not
             # vary with any vertical values, and instead are determined entirely
-            # by prescribed values.
+            # by prescribed values. This results in there
+            # being only two unique correlation matrices, one for when the grid box is in cloud
+            # and one for when it is not. So instead of setting up correlation matrices for all
+            # grid boxes then calculating their Cholesky decomps, we can simply set up two correlation
+            # matrices, one for in cloud and one for out cloud, calculate the corresponding
+            # Cholesky decompositions, then use the value of rc at each grid box to determine whether
+            # we assign the in cloud or out of cloud matrices to that grid box.
             (
                 corr_array_1_n,
                 corr_array_2_n,
@@ -452,6 +494,9 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
                 True,
             )
         else:
+            # The correlation matrices can vary with vertical values. So we need to set the
+            # correlation matrices up for each grid box, then find the Cholesky decomp for each
+            # grid box individually. This is very computationally expensive.
             pdf2hydromet = tuple(
                 pdf2hydromet_idx(j, hm_metadata) for j in range(pdf_dim)
             )
@@ -500,10 +545,12 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
                 )
                 return jnp.tril(corr_cholesky_mtx)
 
+            # Compute choleksy factorization for the correlation matrix of 1st PDF component
             corr_cholesky_mtx_1 = jax.vmap(
                 jax.vmap(_cholesky, in_axes=0),
                 in_axes=0,
             )(corr_array_1_n)
+            # Compute choleksy factorization for the correlation matrix of 2nd PDF component
             corr_cholesky_mtx_2 = jax.vmap(
                 jax.vmap(_cholesky, in_axes=0),
                 in_axes=0,
@@ -512,6 +559,7 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
     # hydromet_pdf_params is optional, so if it is not present we simply skip
     # the steps to compute it.
     if hydromet_pdf_params is not None:
+        # Calculate the true correlations for each PDF component.
         corr_array_1, corr_array_2 = denorm_transform_corr(
             sigma_x_1_n,
             sigma_x_2_n,
@@ -524,6 +572,7 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
             hm_metadata.iiPDF_w,
             hm_metadata.iiPDF_Ncn,
         )
+        # Pack the PDF parameters
         hydromet_pdf_params = pack_hydromet_pdf_params(
             nzt,
             ngrdcol,
@@ -568,6 +617,7 @@ def setup_pdf_parameters_api(gr, nzm, nzt, ngrdcol, pdf_dim,
                 stats,
             )
 
+        # Statistics for normal space PDF parameters involving hydrometeors.
         stats = pdf_param_ln_hm_stats(
             nzt,
             ngrdcol,
@@ -644,7 +694,434 @@ def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
                           precip_frac, precip_frac_1, precip_frac_2,
                           hm_tol, precip_frac_tol, mu_thl_1, mu_thl_2,
                           omicron, zeta_vrnce_rat_in):
-    """In-precip component means/stdevs of a precipitating hydrometeor.
+    """Calculates the in-precipitation mean and in-precipitation standard
+    deviation in both PDF components for a precipitating hydrometeor.
+
+    When precipitation is found in both PDF components (precip_frac_1 > 0 and
+    precip_frac_2 > 0), the method that solves for in-precip. mean and
+    in-precip. standard deviation in each PDF component, preserving overall
+    mean and overall variance, is used.  When precipitation fraction is found
+    in one PDF component but not the other one (precip_frac_1 > 0 and
+    precip_frac_2 = 0, or precip_frac_1 = 0 and precip_frac_2 > 0), the
+    calculation of component in-precip. mean and in-precip. standard deviation
+    is simple.  When precipitation is not found in either component
+    (precip_frac_1 = 0 and precip_frac_2 = 0), there isn't any precipitation
+    found overall (at that grid level).
+
+    DESCRIPTION OF THE METHOD THAT SOLVES FOR TWO IN-PRECIPITATION COMPONENTS
+    =========================================================================
+
+    OVERVIEW
+
+    The goal is to calculate the in-precip. mean of the hydrometeor field in
+    each PDF component (mu_hm_1 and mu_hm_2) in a scenario when there is
+    precipitation found in both PDF components.  The fields provided are the
+    overall mean of the hydrometeor, <hm>, the overall variance of the
+    hydrometeor, <hm’^2>, the mixture fraction, a, the overall precipitation
+    fraction, f_p, and the precipitation fraction in each PDF component
+    (f_p_1 and f_p_2).
+
+    The PDF equation for <hm> is:
+
+    <hm> = a * f_p_1 * mu_hm_1 + ( 1- a ) * f_p_2 * mu_hm_2.
+
+    Likewise, the PDF equation for <hm’^2> is:
+
+    <hm’^2> = a * f_p_1 * ( mu_hm_1^2 + sigma_hm_1^2 )
+              + ( 1 - a ) * f_p_2 * ( mu_hm_2^2 + sigma_hm_2^2 )
+              - <hm>^2;
+
+    where sigma_hm_1 and sigma_hm_2 are the in-precip. standard deviations of
+    the hydrometeor field in each PDF component.  This can be rewritten as:
+
+    <hm’^2>
+    = a * f_p_1 * ( 1 + sigma_hm_1^2 / mu_hm_1^2 ) * mu_hm_1^2
+      + ( 1 - a ) * f_p_2 * ( 1 + sigma_hm_2^2 / mu_hm_2^2 ) * mu_hm_2^2
+      - <hm>^2.
+
+    The ratio of sigma_hm_2^2 to mu_hm_2^2 is denoted R:
+
+    R = sigma_hm_2^2 / mu_hm_2^2.
+
+    In order to allow sigma_hm_1^2 / mu_hm_1^2 to have a different ratio, the
+    parameter zeta is introduced, such that:
+
+    R * ( 1 + zeta ) = sigma_hm_1^2 / mu_hm_1^2;
+
+    where zeta > -1.  When -1 < zeta < 0, the ratio sigma_hm_2^2 / mu_hm_2^2
+    grows at the expense of sigma_hm_1^2 / mu_hm_1^2, which narrows.  When
+    zeta = 0, the ratio sigma_hm_1^2 / mu_hm_1^2 is the same as
+    sigma_hm_2^2 / mu_hm_2^2.  When zeta > 0, sigma_hm_1^2 / mu_hm_1^2 grows
+    at the expense of sigma_hm_2^2 / mu_hm_2^2, which narrows.  The component
+    variances are written as:
+
+    sigma_hm_1^2 = R * ( 1 + zeta ) * mu_hm_1^2; and
+    sigma_hm_2^2 = R * mu_hm_2^2,
+
+    and the component standard deviations are simply:
+
+    sigma_hm_1 = sqrt( R * ( 1 + zeta ) ) * mu_hm_1; and
+    sigma_hm_2 = sqrt( R ) * mu_hm_2.
+
+    The equation for <hm’^2> can be rewritten as:
+
+    <hm’^2> = a * f_p_1 * ( 1 + R * ( 1 + zeta ) ) * mu_hm_1^2
+              + ( 1 - a ) * f_p_2 * ( 1 + R ) * mu_hm_2^2
+              - <hm>^2.
+
+    HYDROMETEOR IN-PRECIP. VARIANCE:
+    THE SPREAD OF THE MEANS VS. THE STANDARD DEVIATIONS
+
+    Part I:  Minimum and Maximum Values for R
+
+    The in-precip. variance of the hydrometeor is accounted for through a
+    combination of the variance of each PDF component and the spread between
+    the means of each PDF component.  At one extreme, the standard deviation
+    of each component could be set to 0 and the in-prccip. variance could be
+    accounted for by spreading the PDF component (in-precip.) means far apart.
+    The value of R in this scenario would be its minimum possible value, which
+    is 0.  At the other extreme, the means of each component could be set
+    equal to each other and the in-precip. variance could be accounted for
+    entirely by the PDF component (in-precip.) standard deviations.  The value
+    of R in this scenario would be its maximum possible value, which is Rmax.
+
+    In order to calculate the value of Rmax, use the equation set but set
+    mu_hm_1 = mu_hm_2 and R = Rmax.  When this happens:
+
+    <hm> = ( a * f_p_1 + ( 1- a ) * f_p_2 ) * mu_hm_i;
+
+    and since f_p = a * f_p_1 + ( 1 - a ) * f_p_2:
+
+    mu_hm_i = <hm> / f_p = <hm|_ip>;
+
+    where <hm|_ip> is the in-precip. mean of the hydrometeor.  The equation
+    for hydrometeor variance in this scenario becomes:
+
+    <hm’^2> = <hm|_ip>^2 * ( a * f_p_1 * ( 1 + Rmax * ( 1 + zeta ) )
+                             + ( 1 - a ) * f_p_2 * ( 1 + Rmax ) )
+              - <hm>^2.
+
+    The general equation for the in-precip. variance of a hydrometeor,
+    <hm|_ip’^2>, is given by:
+
+    <hm|_ip’^2> = ( <hm’^2> + <hm>^2 - f_p * <hm|_ip>^2 ) / f_p;
+
+    which can be rewritten as:
+
+    <hm’^2> + <hm>^2 = f_p * ( <hm|_ip’^2> + <hm|_ip>^2 ).
+
+    When the above equation is substituted into the modified PDF equation for
+    <hm’^2>, Rmax is solved for and the equation is:
+
+    Rmax = ( f_p / ( a * f_p_1 * ( 1 + zeta ) + ( 1 - a ) * f_p_2 ) )
+           * ( <hm|_ip’^2> / <hm|_ip>^2 ).
+
+    Here, in the scenario that zeta = 0, both PDF components have the same
+    mean and same variance, which reduces the in-precip. distribution to an
+    assumed single lognormal, and the above equation reduces to:
+
+    Rmax = <hm|_ip’^2> / <hm|_ip>^2;
+
+    which is what is expected in that case.
+
+    Part II:  Enter omicron
+
+    A parameter is used to prescribe the ratio of R to its maximum value,
+    Rmax.  The prescribed parameter is called omicron, where:
+
+    R = omicron * Rmax;
+
+    where 0 <= omicron <= 1.  When omicron = 0, the standard deviation of each
+    PDF component is 0, and mu_hm_1 is spread as far away from mu_hm_2 as it
+    needs to be to account for the in-precip. variance.  When omicron = 1,
+    mu_hm_1 is equal to mu_hm_2, and the standard deviations of the PDF
+    components account for all of the in-precip. variance (and when zeta = 0,
+    the PDF shape is a single lognormal in-precip.).  At intermediate values
+    of omicron, the means of each PDF component are somewhat spread and each
+    PDF component has some width.  The modified parameters are listed below.
+
+    The ratio of sigma_hm_2^2 to mu_hm_2^2 is:
+
+    sigma_hm_2^2 / mu_hm_2^2 = omicron * Rmax;
+
+    and the ratio of sigma_hm_1^2 / mu_hm_1^2 is:
+
+    sigma_hm_1^2 / mu_hm_1^2 = omicron * Rmax * ( 1 + zeta ).
+
+    The component variances are written as:
+
+    sigma_hm_1^2 = omicron * Rmax * ( 1 + zeta ) * mu_hm_1^2; and
+    sigma_hm_2^2 = omicron * Rmax * mu_hm_2^2,
+
+    and the component standard deviations are simply:
+
+    sigma_hm_1 = sqrt( omicron * Rmax * ( 1 + zeta ) ) * mu_hm_1; and
+    sigma_hm_2 = sqrt( omicron * Rmax ) * mu_hm_2.
+
+    The equation set becomes:
+
+    [1] <hm> = a * f_p_1 * mu_hm_1 + ( 1- a ) * f_p_2 * mu_hm_2; and
+
+    [2] <hm’^2>
+        = a * f_p_1 * ( 1 + omicron * Rmax * ( 1 + zeta ) ) * mu_hm_1^2
+          + ( 1 - a ) * f_p_2 * ( 1 + omicron * Rmax ) * mu_hm_2^2
+          - <hm>^2.
+
+    SOLVING THE EQUATION SET FOR MU_HM_1 AND MU_HM_2.
+
+    The above system of two equations can be solved for mu_hm_1 and mu_hm_2.
+    All other quantities in the equation set are known quantities.  The
+    equation for <hm> is rewritten to isolate mu_hm_2:
+
+    mu_hm_2 = ( <hm> - a * f_p_1 * mu_hm_1 ) / ( ( 1 - a ) * f_p_2 ).
+
+    The above equation is substituted into the equation for <hm’^2>.  The
+    equation for <hm’^2> is rewritten, resulting in:
+
+    [ a * f_p_1 * ( 1 + omicron * Rmax * ( 1 + zeta ) )
+      + a^2 * f_p_1^2 * ( 1 + omicron * Rmax ) / ( ( 1 - a ) * f_p_2 ) ]
+    * mu_hm_1^2
+    + [ - 2 * <hm> * a * f_p_1 * ( 1 + omicron * Rmax )
+        / ( ( 1 - a ) * f_p_2 ) ] * mu_hm_1
+    + [ - ( <hm’^2>
+            + ( 1 - ( 1 + omicron * Rmax ) / ( ( 1 - a ) * f_p_2 ) )
+              * <hm>^2 ) ]
+    = 0.
+
+    This equation is of the form:
+
+    A * mu_hm_1^2 + B * mu_hm_1 + C = 0;
+
+    so the solution for mu_hm_1 is:
+
+    mu_hm_1 = ( -B +/- sqrt( B^2 - 4*A*C ) ) / (2*A);
+
+    where:
+
+    A = a * f_p_1 * ( 1 + omicron * Rmax * ( 1 + zeta ) )
+        + a^2 * f_p_1^2 * ( 1 + omicron * Rmax ) / ( ( 1 - a ) * f_p_2 );
+
+    B = - 2 * <hm> * a * f_p_1 * ( 1 + omicron * Rmax )
+        / ( ( 1 - a ) * f_p_2 );
+
+    and
+
+    C = - ( <hm’^2>
+            + ( 1 - ( 1 + omicron * Rmax ) / ( ( 1 - a ) * f_p_2 ) )
+              * <hm>^2 ).
+
+    The signs of the coefficients:
+
+    1) coefficient A is always positive,
+    2) coefficient B is always negative (this means that -B is always
+       positive), and
+    3) coefficient C can be positive, negative, or zero.
+
+    Since ( 1 - ( 1 + omicron * Rmax ) / ( ( 1 - a ) * f_p_2 ) ) * <hm>^2 is
+    always negative and <hm’^2> is always positive, the sign of coefficient C
+    depends on which term is greater in magnitude.
+
+    When <hm’^2> is greater, the sign of coefficient C is negative.  This
+    means that -4*A*C is positive, which in turn means that
+    sqrt( B^2 - 4*A*C ) is greater in magnitude than -B.  If the subtraction
+    option of the +/- were to be chosen, the value of mu_hm_1 would be
+    negative in this scenerio.  So the natural thing to do would be to always
+    choose the addition option.  However, this method requires that mu_hm_1
+    equals mu_hm_2 when omicron = 1.  When zeta >= 0, this happens when the
+    addition option is chosen, but not when the subtraction option is chosen.
+    However, when zeta < 0, this happens when the subtraction option is
+    chosen, but not when the addition option is chosen.  So, the equation for
+    mu_hm_1 becomes:
+
+    mu_hm_1 = ( -B + sqrt( B^2 - 4*A*C ) ) / (2*A); when zeta >= 0; and
+    mu_hm_1 = ( -B - sqrt( B^2 - 4*A*C ) ) / (2*A); when zeta < 0.
+
+    Once this is set, of course:
+
+    mu_hm_2 = ( <hm> - a * f_p_1 * mu_hm_1 ) / ( ( 1 - a ) * f_p_2 ).
+
+    The system has been solved and the in-precip. PDF component means have
+    been found!
+
+    NOTES
+
+    Note 1:
+
+    The term B^2 - 4*A*C has been analyzed, and mathematically:
+
+    B^2 - 4*A*C >= 0
+
+    always holds true.  Additionally, the minimum value:
+
+    B^2 - 4*A*C = 0,
+
+    can only occur when omicron = 1 and zeta = 0 (or alternatively to
+    zeta = 0, Rmax = 0, but this only occurs when <hm|_ip'^2> / <hm|_ip>^2 has
+    a value of 0).
+
+    Numerically, when omicron = 1 and zeta = 0, B^2 - 4*A*C can produce very
+    small (on the order of epsilon) negative values.  This is due to numerical
+    round off error.  When this happens, the erroneous small, negative value
+    of B^2 - 4*A*C is simply reset to the value it's supposed to have, which
+    is 0.
+
+    Note 2:
+
+    As the value of <hm|_ip'^2> / <hm|_ip>^2 increases and as the value of
+    omicron decreases (narrowing the in-precip standard deviations and
+    increasing the spread between the in-precip means), a situtation arises
+    where the value of one of the component means will become negative.  This
+    is because there is a limit to the amount of in-precip variance that can
+    be represented by this kind of distribution.  In order to prevent
+    out-of-bounds values of mu_hm_1 or mu_hm_2, lower limits will be
+    declared, called mu_hm_1_min and mu_hm_2_min.  The value of the
+    hydrometeor in-precip. component mean will be limited from going any
+    smaller (or negative) at this value.  From there, the value of the other
+    hydrometeor in-precip. component mean is easy to calculate.  Then, both
+    values will be entered into the calculation of hydrometeor variance, which
+    will be rewritten to solve for R.  Then, both the hydrometeor mean and
+    hydrometeor variance will be preserved with a valid distribution.
+
+    In this emergency scenario, the value of R is:
+
+    R = ( <hm'^2> + <hm>^2 - a * f_p_1 * mu_hm_1^2
+          - ( 1 - a ) * f_p_2 * mu_hm_2^2 )
+        / ( a * f_p_1 * ( 1 + zeta ) * mu_hm_1^2
+            + ( 1 - a ) * f_p_2 * mu_hm_2^2 ).
+
+    The minimum values of the in-precip. component means are bounded by:
+
+    mu_hm_1_min >= hm_tol / f_p_1; and
+    mu_hm_2_min >= hm_tol / f_p_2.
+
+    These are set this way because hm_1 ( = mu_hm_1 * f_p_1 ) and
+    hm_2 ( = mu_hm_2 * f_p_2 ) need to have values of at least hm_tol when
+    precipitation is found in both PDF components.
+
+    However, an in-precip. component mean value of hm_tol / f_p_1 or
+    hm_tol / f_p_2 often produces a distribution where one component centers
+    around values that are too small to be a good match with data taken from
+    Large Eddy Simulations (LES).  It is desirable to increase the minimum
+    threshold of mu_hm_1 and mu_hm_2.
+
+    As the minimum threshold increases, the value of the in-precip. component
+    mean that is from the component that is not being set to the minimum
+    threshold decreases.  If the minimum threshold were to be boosted as high
+    as <hm> / f_p (in most cases, <hm> / f_p >> hm_tol / f_p_i), both
+    components would have a value of <hm> / f_p.  The minimum threshold should
+    not be set this high.
+
+    Additionally, the minimum threshold for one in-precip. component mean
+    cannot be set so high as to drive the other in-precip. component mean
+    below hm_tol / f_p_i.  (This doesn't come into play unless <hm> is close
+    to hm_tol.)  The upper limit for the in-precip. mean values are:
+
+    mu_hm_1|_(upper. lim.) = ( <hm> - ( 1 - a ) * f_p_2 * ( hm_tol / f_p_2 ) )
+                             / ( a * f_p_1 ); and
+
+    mu_hm_2|_(upper. lim.) = ( <hm> - a * f_p_1 * ( hm_tol / f_p_1 ) )
+                             / ( ( 1 - a ) * f_p_2 );
+
+    which reduces to:
+
+    mu_hm_1|_(upper. lim.) = ( <hm> - ( 1 - a ) * hm_tol ) / ( a * f_p_1 );
+    and
+    mu_hm_2|_(upper. lim.) = ( <hm> - a * hm_tol ) / ( ( 1 - a ) * f_p_2 ).
+
+    An appropriate minimum value for mu_hm_1 can be set by:
+
+    mu_hm_1_min = | min( hm_tol / f_p_1
+                  |      + mu_hm_min_coef * ( <hm> / f_p - hm_tol / f_p_1 ),
+                  |      ( <hm> - ( 1 - a ) * hm_tol ) / ( a * f_p_1 ) );
+                  |    where <hm> / f_p > hm_tol / f_p_1;
+                  | hm_tol / f_p_1;
+                  |    where <hm> / f_p <= hm_tol / f_p_1;
+
+    and similarly for mu_hm_2:
+
+    mu_hm_2_min = | min( hm_tol / f_p_2
+                  |      + mu_hm_min_coef * ( <hm> / f_p - hm_tol / f_p_2 ),
+                  |      ( <hm> - a * hm_tol ) / ( ( 1 - a ) * f_p_2 ) );
+                  |    where <hm> / f_p > hm_tol / f_p_2;
+                  | hm_tol / f_p_2;
+                  |    where <hm> / f_p <= hm_tol / f_p_2;
+
+    where mu_hm_min_coef is a coefficient that has a value
+    0 <= mu_hm_min_coef < 1.  When the value of mu_hm_min_coef is 0,
+    mu_hm_1_min reverts to hm_tol / f_p_1 and mu_hm_2_min reverts to
+    hm_tol / f_p_2.  An appropriate value for mu_hm_min_coef should be small,
+    such as 0.01 - 0.05.
+
+    Note 3:
+
+    When the value of zeta >= 0, the value of mu_hm_1 tends to be larger than
+    the value of mu_hm_2.  Likewise when the value of zeta < 0, the value of
+    mu_hm_2 tends to be larger than the value of mu_hm_1.  Since most cloud
+    water and cloud fraction tends to be found in PDF component 1, it is
+    advantageous to have the larger in-precip. component mean of the
+    hydrometeor also found in PDF component 1.  The recommended value of zeta
+    is a value greater than or equal to 0.
+
+    Update:
+
+    In order to better represent the increase in <th_l'^2> near the ground
+    from the evaporation of rain, the code is modified to tend towards a
+    negative correlation of th_l and hm.  When mu_thl_1 <= mu_thl_2,
+    mu_hm_1 >= mu_hm_2; otherwise, when mu_thl_1 > mu_thl_2,
+    mu_hm_1 <= mu_hm_2.
+
+    In the original derivation, mu_hm_1 >= mu_hm_2 when zeta >= 0, and
+    mu_hm_1 < mu_hm_2 when zeta < 0, where zeta is a tunable or adjustable
+    parameter.  In order to allow the relationship of mu_hm_1 to mu_hm_2 to
+    depend on the relationship of mu_thl_1 to mu_thl_2, the value of zeta must
+    also depend on the relationship of mu_thl_1 to mu_thl_2.
+
+    When mu_thl_1 <= mu_thl_2:
+
+    The relationship of mu_hm_1 to mu_hm_2 is mu_hm_1 >= mu_hm_2, so
+    zeta >= 0.  The tunable value of zeta is referred to as zeta_in.  When
+    zeta_in is already greater than 0 (meaning sigma_hm_1^2 / mu_hm_1^2 is
+    greater than sigma_hm_2^2 / mu_hm_2^2), zeta is simply set to zeta_in.  In
+    other words, the component with the greater mean value of the hydrometeor
+    also has the greater value of component variance to the square of the
+    component mean.  However, when zeta_in is less than 0, zeta must be
+    adjusted to be greater than 0.  The following equation is used to set the
+    value of zeta:
+
+           | zeta_in; when zeta_in >= 0
+    zeta = |
+           | ( 1 / ( 1 + zeta_in ) ) - 1; when zeta_in < 0.
+
+    Previously, when zeta_in < 0, mu_hm_1 < mu_hm_2, and
+    sigma_hm_1^2 / mu_hm_1^2 < sigma_hm_2^2 / mu_hm_2^2.  Now that zeta has to
+    be greater than 0, sigma_hm_1^2 / mu_hm_1^2 > sigma_hm_2^2 / mu_hm_2^2.
+    The ratio of the greater variance-over-mean-squared to the smaller
+    variance-over-mean-squared remains the same when using the equation for
+    zeta listed above.
+
+    When mu_thl_1 > mu_thl_2:
+
+    The relationship of mu_hm_1 to mu_hm_2 is mu_hm_1 <= mu_hm_2, so
+    zeta <= 0.  When zeta_in is already less than 0 (meaning
+    sigma_hm_1^2 / mu_hm_1^2 is less than sigma_hm_2^2 / mu_hm_2^2), zeta is
+    simply set to zeta_in.  In other words, the component with the greater
+    mean value of the hydrometeor also has the greater value of component
+    variance to the square of the component mean.  However, when zeta_in is
+    greater than 0, zeta must be adjusted to be less than 0.  The following
+    equation is used to set the value of zeta:
+
+           | zeta_in; when zeta_in <= 0
+    zeta = |
+           | ( 1 / ( 1 + zeta_in ) ) - 1; when zeta_in > 0.
+
+    Previously, when zeta_in > 0, mu_hm_1 > mu_hm_2, and
+    sigma_hm_1^2 / mu_hm_1^2 > sigma_hm_2^2 / mu_hm_2^2.  Now that zeta has to
+    be less than 0, sigma_hm_1^2 / mu_hm_1^2 < sigma_hm_2^2 / mu_hm_2^2.
+    The ratio of the greater variance-over-mean-squared to the smaller
+    variance-over-mean-squared remains the same when using the equation for
+    zeta listed above.
+
+    Brian Griffin; February 2015.
 
     All array args are (ngrdcol, nzt) except precip_frac_tol (ngrdcol,). omicron and
     zeta_vrnce_rat_in are scalars. Returns
@@ -673,8 +1150,8 @@ def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
     a_s = jnp.where(a > 0.0, a, 1.0)
     oma_s = jnp.where(oma > 0.0, oma, 1.0)
 
-    # ----- Branch: precipitation in BOTH PDF components (the quadratic solve) -----
-    # zeta sign depends on mu_thl_1 vs mu_thl_2 (so the cloudier comp has the larger mean).
+    # Adjust the value of zeta based on the relationship of mu_thl_1 to
+    # mu_thl_2.
     thl_le = mu_thl_1 <= mu_thl_2
     zeta_flip = (1.0 / (1.0 + zeta_vrnce_rat_in)) - 1.0
     zeta = jnp.where(
@@ -683,43 +1160,70 @@ def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
         jnp.where(thl_le, zeta_flip, zeta_vrnce_rat_in),
     )
 
+    # Calculate the value of Rmax.
+    # Rmax = ( f_p / ( a * f_p_1 * ( 1 + zeta ) + ( 1 - a ) * f_p_2 ) )
+    #        * ( <hm|_ip’^2> / <hm|_ip>^2 ).
+    # The parameter zeta is written in the code as zeta_vrnce_rat.
     # Guard the Rmax denominator: at no-precip points fp1=fp2=0 -> 0/0 = nan (forward and grad),
     # which poisons even though the both-precip branch is unselected there.
     den_R = a * fp1 * (1.0 + zeta) + oma * fp2
     Rmax = (fp / jnp.where(den_R > 0.0, den_R, 1.0)) * ratio
     oR = omicron * Rmax
+    # Calculate the value of coefficient A.
+    # A = a * f_p_1 * ( 1 + omicron * Rmax * ( 1 + zeta ) )
+    #     + a^2 * f_p_1^2 * ( 1 + omicron * Rmax ) / ( ( 1 - a ) * f_p_2 ).
     coef_A = (a * fp1 * (1.0 + oR * (1.0 + zeta))
               + a ** 2 * fp1 ** 2 * (1.0 + oR) / (oma_s * fp2_s))
+    # Calculate the value of coefficient B.
+    # B = - 2 * <hm> * a * f_p_1 * ( 1 + omicron * Rmax )
+    #     / ( ( 1 - a ) * f_p_2 ).
     coef_B = -2.0 * hmm * a * fp1 * (1.0 + oR) / (oma_s * fp2_s)
+    # Calculate the value of coefficient C.
+    # C = - ( <hm’^2>
+    #         + ( 1 - ( 1 + omicron * Rmax ) / ( ( 1 - a ) * f_p_2 ) )
+    #           * <hm>^2 ).
     coef_C = -(hmp2 + (1.0 - (1.0 + oR) / (oma_s * fp2_s)) * hmm ** 2)
+    # Calculate value of B^2 - 4*A*C.
     disc = jnp.maximum(coef_B ** 2 - 4.0 * coef_A * coef_C, 0.0)
     coef_A_s = jnp.where(coef_A != 0.0, coef_A, 1.0)
+    # Calculate the mean (in-precip.) of the hydrometeor in the 1st PDF
+    # component.
     mu1 = jnp.where(thl_le, (-coef_B + _safe_sqrt(disc)) / (2.0 * coef_A_s),
                     (-coef_B - _safe_sqrt(disc)) / (2.0 * coef_A_s))
+    # Calculate the mean (in-precip.) of the hydrometeor in the 2nd PDF
+    # component.
     mu2 = (hmm - a * fp1 * mu1) / (oma_s * fp2_s)
     R = oR
 
-    # Minimum allowable component means.
+    # Calculate the minimum allowable value of the mean (in-precip.) of a
+    # hydrometeor in the 1st PDF component.
     hm_ip = hmm / jnp.where(fp > 0.0, fp, 1.0)
     mu1_min = jnp.where(hm_ip > hm_tol / fp1_s,
                         jnp.minimum(hm_tol / fp1_s + _MU_HM_MIN_COEF * (hm_ip - hm_tol / fp1_s),
                                     (hmm - oma * hm_tol) / (a_s * fp1_s)),
                         hm_tol / fp1_s)
+    # Calculate the minimum allowable value of the mean (in-precip.) of a
+    # hydrometeor in the 2nd PDF component.
     mu2_min = jnp.where(hm_ip > hm_tol / fp2_s,
                         jnp.minimum(hm_tol / fp2_s + _MU_HM_MIN_COEF * (hm_ip - hm_tol / fp2_s),
                                     (hmm - a * hm_tol) / (oma_s * fp2_s)),
                         hm_tol / fp2_s)
 
     def _emergency_R(m1, m2):
+        # Calculate new R.
         num = (hmp2 + hmm ** 2 - a * fp1 * m1 ** 2 - oma * fp2 * m2 ** 2)
         den = (a * fp1 * (1.0 + zeta) * m1 ** 2 + oma * fp2 * m2 ** 2)
         return jnp.maximum(num / jnp.where(den != 0.0, den, 1.0), 0.0)
 
-    # Emergency: mu1 < mu1_min -> set mu1=mu1_min, recompute mu2 and R.
+    # If mu_hm_1 is less than mu_hm_1_min, then set mu_hm_1 equal to
+    # mu_hm_1_min.  Calculate mu_hm_2 to preserve overall mean, and calculate
+    # a new value of R to preserve overall variance.
     mu1_e1 = mu1_min
     mu2_e1 = (hmm - a * fp1 * mu1_e1) / (oma_s * fp2_s)
     R_e1 = _emergency_R(mu1_e1, mu2_e1)
-    # Emergency: mu2 < mu2_min -> set mu2=mu2_min, recompute mu1 and R.
+    # If mu_hm_2 is less than mu_hm_2_min, then set mu_hm_2 equal to
+    # mu_hm_2_min.  Calculate mu_hm_1 to preserve overall mean, and calculate
+    # a new value of R to preserve overall variance.
     mu2_e2 = mu2_min
     mu1_e2 = (hmm - oma * fp2 * mu2_e2) / (a_s * fp1_s)
     R_e2 = _emergency_R(mu1_e2, mu2_e2)
@@ -730,22 +1234,37 @@ def calc_comp_mu_sigma_hm(hmm, hmp2, hmp2_ip_on_hmm2_ip, mixt_frac,
     mu2_b = jnp.where(use_e1, mu2_e1, jnp.where(use_e2, mu2_e2, mu2))
     R_b = jnp.where(use_e1, R_e1, jnp.where(use_e2, R_e2, R))
 
+    # Calculate the in-precip. standard deviation of the hydrometeor in the 1st
+    # and 2nd PDF components.
     sig1_b = _safe_sqrt(R_b * (1.0 + zeta)) * mu1_b
     sig2_b = _safe_sqrt(R_b) * mu2_b
+    # Calculate the mean of the hydrometeor in the 1st and 2nd PDF components.
     hm1_b = jnp.maximum(mu1_b * fp1, hm_tol)
     hm2_b = jnp.maximum(mu2_b * fp2, hm_tol)
 
-    # ----- Branch: precip in comp 1 only (precip_frac_2 = 0) -----
+    # Else if there is precipitation found in the 1st PDF component but not
+    # the 2nd PDF component.
+    # Calculate the mean (in-precip.) of the hydrometeor in the 1st PDF
+    # component.
     mu1_c1 = hmm / (a_s * fp1_s)
+    # Calculate the in-precip. standard deviation of the hydrometeor in the 1st
+    # PDF component.
     sig1_c1 = _safe_sqrt((hmp2 + hmm ** 2 - a * fp1 * mu1_c1 ** 2) / (a_s * fp1_s))
+    # Calculate the mean of the hydrometeor in the 1st PDF component.
     hm1_c1 = mu1_c1 * fp1
 
-    # ----- Branch: precip in comp 2 only (precip_frac_1 = 0) -----
+    # Else if there is precipitation found in the 2nd PDF component but not
+    # the 1st PDF component.
+    # Calculate the mean (in-precip.) of the hydrometeor in the 2nd PDF
+    # component.
     mu2_c2 = hmm / (oma_s * fp2_s)
+    # Calculate the in-precip. standard deviation of the hydrometeor in the 2nd
+    # PDF component.
     sig2_c2 = _safe_sqrt((hmp2 + hmm ** 2 - oma * fp2 * mu2_c2 ** 2) / (oma_s * fp2_s))
+    # Calculate the mean of the hydrometeor in the 2nd PDF component.
     hm2_c2 = mu2_c2 * fp2
 
-    # ----- Select branch -----
+    # Else there is no precipitation.
     z = jnp.zeros_like(hmm)
     mu_hm_1 = jnp.where(both, mu1_b, jnp.where(comp1, mu1_c1, z))
     mu_hm_2 = jnp.where(both, mu2_b, jnp.where(comp2, mu2_c2, z))
@@ -776,9 +1295,10 @@ def compute_mean_stdev(chi_1, chi_2, stdev_chi_1, stdev_chi_2,
                        precip_frac, precip_frac_1, precip_frac_2, precip_frac_tol,
                        omicron, zeta_vrnce_rat,
                        w_1=None, w_2=None, stdev_w_1=None, stdev_w_2=None):
-    """Means and stdevs (per PDF component) of chi, eta, w, Ncn, and the precipitating
-    hydrometeors, stacked into (ngrdcol, nzt, pdf_dim) arrays. Oracle compute_mean_stdev
-    (setup_clubb_pdf_params.F90:818).
+    """Calculates the means and standard deviations (for each PDF component) of
+    chi, eta, w, Ncn, and the precipitating hydrometeors.  For the
+    precipitating hydrometeors, the component means and standard deviations
+    are in-precip.
 
     `hydromets` is a list of (hmm, hmp2_zt, ratio, hm_tol) tuples in pdf order after Ncn
     (rr, Nr for KK); each is processed by calc_comp_mu_sigma_hm. The hydrometeor in-precip
@@ -801,15 +1321,29 @@ def compute_mean_stdev(chi_1, chi_2, stdev_chi_1, stdev_chi_2,
     stdev_w_2 = z if stdev_w_2 is None else jnp.asarray(stdev_w_2, dtype=jnp.float64)
     Ncnm = jnp.asarray(Ncnm, dtype=jnp.float64)
 
-    # Ncn standard deviation and sigma^2/mu^2 ratio (single lognormal over the box).
+    # Initialize output variables.
+
+    # Enter the PDF parameters.
+
+    # Vertical velocity, w.
+    # Extended liquid water mixing ratio, chi.
+    # Coordinate orthogonal to chi, eta.
+    # Simplified cloud nuclei concentration, Ncn.
+    # Standard deviation of simplified cloud nuclei concentration, Ncn,
+    # in PDF component 1.
     if l_const_Nc_in_cloud:
+        # Ncn is constant in both PDF components.
         sig_Ncn = z
         s2m2_Ncn = z
     else:
+        # Ncn varies in both PDF components.
         sig_Ncn = jnp.sqrt(Ncnp2_on_Ncnm2) * Ncnm
         s2m2_Ncn = jnp.broadcast_to(jnp.asarray(Ncnp2_on_Ncnm2, dtype=jnp.float64), chi_1.shape)
 
-    # Columns in iiPDF order: chi, eta, w, Ncn, <hydrometeors>.
+    # Note:  This code assumes to be these arrays in the same order as the
+    # correlation arrays, etc., which is determined by the iiPDF indices.
+    # The order should be as follows:  chi, eta, w, Ncn, <precip. hydrometeors>
+    # (indices increasing from left to right).
     mu1_cols = [chi_1, jnp.broadcast_to(z, chi_1.shape), w_1, Ncnm]
     mu2_cols = [jnp.asarray(chi_2, dtype=jnp.float64), jnp.broadcast_to(z, chi_1.shape), w_2, Ncnm]
     sig1_cols = [jnp.asarray(stdev_chi_1, dtype=jnp.float64),
@@ -887,8 +1421,8 @@ def norm_transform_mean_stdev(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2,
 def calc_corr_w_hm_n(wm, wphydrometp, mu_w_1, mu_w_2, mu_hm_1, mu_hm_2,
                      sigma_w_1, sigma_w_2, sigma_hm_1, sigma_hm_2, sigma_hm_1_n, sigma_hm_2_n,
                      mixt_frac, precip_frac_1, precip_frac_2, hm_tol):
-    """PDF-component correlation of w and ln(hm) in-precip, diagnosed from the overall w-hm flux
-    (setup_clubb_pdf_params.F90:calc_corr_w_hm_n) — the inverse of the flux assembly.
+    """Calculates the PDF component correlation (in-precip) between vertical
+    velocity, w, and the natural logarithm of a hydrometeor, ln hm.
 
     corr = (wphydrometp - Σ_i mixt_i precip_frac_i (μ_w_i - <w>) μ_hm_i) / (Σ_i mixt_i precip_frac_i σ_w_i σ_hm_i_n μ_hm_i),
     clamped to ±max_mag_correlation, with a 4-way branch on whether w and hm vary (σ > tol) in each component:
@@ -999,7 +1533,7 @@ def comp_corr_norm(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2, sigma_x_1_n, sigma_x_2_
                    iiPDF_chi, iiPDF_eta, iiPDF_w, iiPDF_Ncn, pdf2hydromet, hydromet_tol, Ncn_tol_val,
                    iiPDF_type, l_calc_w_corr, l_fix_w_chi_eta_correlations,
                    pdf_params_corr=None):
-    """Assemble the normal-space PDF correlation arrays (setup_clubb_pdf_params.F90:comp_corr_norm).
+    """Assemble the normal-space PDF correlation arrays.
 
     Builds the lower-triangular (then symmetrized) (ngrdcol, nzt, pdf_dim, pdf_dim) correlation arrays for the
     two PDF components from the component_corr_* routines plus calc_corr_w_hm_n (for the w-correlations when
@@ -1034,15 +1568,29 @@ def comp_corr_norm(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2, sigma_x_1_n, sigma_x_2_
     idx = jnp.arange(pdf_dim)
     A1 = A1.at[:, :, idx, idx].set(1.0)
     A2 = A2.at[:, :, idx, idx].set(1.0)
+    # Normal space correlations
+    # Initialize corr_w_hm_1_n and corr_w_hm_2_n arrays to 0.
+    # Set ones_vector to a vector of 1s.
+    # Initialize the normal space correlation arrays
+    # The corr_arrays are assumed to be lower triangular matrices
+    # Set diagonal elements to 1
+    # This code assumes the following order in the prescribed correlation
+    # arrays (iiPDF indices):
+    # chi, eta, w, Ncn, <hydrometeors> (indices increasing from left to right)
 
     def _set(A, r, c, val):
         return A.at[:, :, r, c].set(val)
 
-    # ---- w-correlations (down-gradient diagnosis) when l_calc_w_corr ----
+    # Calculate normal space correlations involving w by first calculating total
+    # covariances involving w (<w'Ncn'>, etc.) using the down-gradient
+    # approximation.
     corr_w_Ncn_1 = jnp.zeros((ng, nzt)); corr_w_Ncn_2 = jnp.zeros((ng, nzt))
     corr_w_hm_1 = {j: jnp.zeros((ng, nzt)) for j in hm_indices}
     corr_w_hm_2 = {j: jnp.zeros((ng, nzt)) for j in hm_indices}
     if l_calc_w_corr:
+        # Calculate the correlation of w and ln Ncn in each PDF component.
+        # The subroutine calc_corr_w_hm_n can be used to do this as long as a
+        # value of 1 is sent in for precip_frac_1 and precip_frac_2.
         corr_w_Ncn_1, corr_w_Ncn_2 = calc_corr_w_hm_n(
             wm_zt, wpNcnp_zt, mu_x_1[:, :, iiPDF_w], mu_x_2[:, :, iiPDF_w],
             mu_x_1[:, :, iiPDF_Ncn], mu_x_2[:, :, iiPDF_Ncn],
@@ -1051,6 +1599,8 @@ def comp_corr_norm(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2, sigma_x_1_n, sigma_x_2_
             sigma_x_1_n[:, :, iiPDF_Ncn], sigma_x_2_n[:, :, iiPDF_Ncn],
             mixt_frac, ones, ones, Ncn_tol_val)
         for j in hm_indices:
+            # Calculate the correlation of w and the natural logarithm of the
+            # hydrometeor for each PDF component and each hydrometeor type.
             hm_idx = int(pdf2hydromet[j])
             corr_w_hm_1[j], corr_w_hm_2[j] = calc_corr_w_hm_n(
                 wm_zt, wphydrometp_zt[:, :, hm_idx], mu_x_1[:, :, iiPDF_w], mu_x_2[:, :, iiPDF_w],
@@ -1058,75 +1608,85 @@ def comp_corr_norm(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2, sigma_x_1_n, sigma_x_2_
                 sigma_x_1[:, :, j], sigma_x_2[:, :, j], sigma_x_1_n[:, :, j], sigma_x_2_n[:, :, j],
                 mixt_frac, precip_frac_1, precip_frac_2, hydromet_tol[hm_idx])
 
-    # ---- (eta, chi) ----
+    # In order to decompose the normal space correlation matrix,
+    # we must not have a perfect correlation of chi and
+    # eta. Thus, we impose a limitation.
     if l_fix_w_chi_eta_correlations:
+        # Correlation of chi (old s) and eta (old t)
         c1, c2 = component_corr_chi_eta(rc_1, rc_2, cc[iiPDF_eta, iiPDF_chi],
                                         cb[iiPDF_eta, iiPDF_chi], True)
     else:
+        # Preferred, more accurate version.
         c1 = jnp.asarray(pdf_params_corr['corr_chi_eta_1'])
         c2 = jnp.asarray(pdf_params_corr['corr_chi_eta_2'])
     A1 = _set(A1, iiPDF_eta, iiPDF_chi, c1); A2 = _set(A2, iiPDF_eta, iiPDF_chi, c2)
 
-    # ---- (w, chi) ----
     if l_fix_w_chi_eta_correlations:
+        # Correlation of chi (old s) and w
         c1, c2 = component_corr_w_x(rc_1, rc_2, cc[iiPDF_w, iiPDF_chi], cb[iiPDF_w, iiPDF_chi],
                                     iiPDF_type, True)
     else:
+        # Preferred, more accurate version.
         c1 = jnp.asarray(pdf_params_corr['corr_w_chi_1']); c2 = jnp.asarray(pdf_params_corr['corr_w_chi_2'])
     A1 = _set(A1, iiPDF_w, iiPDF_chi, c1); A2 = _set(A2, iiPDF_w, iiPDF_chi, c2)
 
-    # ---- (Ncn, chi): cloud value used twice (Ncn is inherently in-cloud) ----
+    # Correlation of chi (old s) and ln Ncn, corr_array_n_cloud used twice because
+    # Ncn is an inherently in-cloud property.
     c1, c2 = component_corr_x_hm_n_ip(rc_1, rc_2, cc[iiPDF_Ncn, iiPDF_chi], cc[iiPDF_Ncn, iiPDF_chi])
     A1 = _set(A1, iiPDF_Ncn, iiPDF_chi, c1); A2 = _set(A2, iiPDF_Ncn, iiPDF_chi, c2)
 
-    # ---- (hm, chi) ----
+    # Correlation of chi (old s) and the natural logarithm of the hydrometeors
     for j in hm_indices:
         c1, c2 = component_corr_x_hm_n_ip(rc_1, rc_2, cc[j, iiPDF_chi], cb[j, iiPDF_chi])
         A1 = _set(A1, j, iiPDF_chi, c1); A2 = _set(A2, j, iiPDF_chi, c2)
 
-    # ---- (w, eta) ----
+    # Correlation of eta (old t) and w
     if l_fix_w_chi_eta_correlations:
+        # Correlation of chi (old s) and w
         c1, c2 = component_corr_w_x(rc_1, rc_2, cc[iiPDF_w, iiPDF_eta], cb[iiPDF_w, iiPDF_eta],
                                     iiPDF_type, True)
         A1 = _set(A1, iiPDF_w, iiPDF_eta, c1); A2 = _set(A2, iiPDF_w, iiPDF_eta, c2)
     else:
         # Faithful to F90:1560 quirk: re-writes (w, chi), leaving (w, eta) at 0.
+        # Preferred, more accurate version.
         c1 = jnp.asarray(pdf_params_corr['corr_w_chi_1']); c2 = jnp.asarray(pdf_params_corr['corr_w_chi_2'])
         A1 = _set(A1, iiPDF_w, iiPDF_chi, c1); A2 = _set(A2, iiPDF_w, iiPDF_chi, c2)
 
-    # ---- (Ncn, eta): cloud value used twice ----
+    # Correlation of eta (old t) and ln Ncn, corr_array_n_cloud used twice because
+    # Ncn is an inherently in-cloud property.
     c1, c2 = component_corr_x_hm_n_ip(rc_1, rc_2, cc[iiPDF_Ncn, iiPDF_eta], cc[iiPDF_Ncn, iiPDF_eta])
     A1 = _set(A1, iiPDF_Ncn, iiPDF_eta, c1); A2 = _set(A2, iiPDF_Ncn, iiPDF_eta, c2)
 
-    # ---- (hm, eta): estimated from (eta, chi) and (hm, chi) ----
+    # Correlation of eta (old t) and the natural logarithm of the hydrometeors
     for j in hm_indices:
         c1, c2 = component_corr_eta_hm_n_ip(A1[:, :, iiPDF_eta, iiPDF_chi], A1[:, :, j, iiPDF_chi],
                                             A2[:, :, iiPDF_eta, iiPDF_chi], A2[:, :, j, iiPDF_chi])
         A1 = _set(A1, j, iiPDF_eta, c1); A2 = _set(A2, j, iiPDF_eta, c2)
 
-    # ---- (Ncn, w) ----
+    # Correlation of w and ln Ncn
     c1, c2 = component_corr_w_hm_n_ip(corr_w_Ncn_1, rc_1, corr_w_Ncn_2, rc_2,
                                       cc[iiPDF_Ncn, iiPDF_w], cb[iiPDF_Ncn, iiPDF_w], l_calc_w_corr)
     A1 = _set(A1, iiPDF_Ncn, iiPDF_w, c1); A2 = _set(A2, iiPDF_Ncn, iiPDF_w, c2)
 
-    # ---- (hm, w) ----
+    # Correlation of w and the natural logarithm of the hydrometeors
     for j in hm_indices:
         c1, c2 = component_corr_w_hm_n_ip(corr_w_hm_1[j], rc_1, corr_w_hm_2[j], rc_2,
                                           cc[j, iiPDF_w], cb[j, iiPDF_w], l_calc_w_corr)
         A1 = _set(A1, j, iiPDF_w, c1); A2 = _set(A2, j, iiPDF_w, c2)
 
-    # ---- (hm, Ncn) ----
+    # Correlation of ln Ncn and the natural logarithm of the hydrometeors
     for j in hm_indices:
         c1, c2 = component_corr_hmx_hmy_n_ip(rc_1, rc_2, cc[j, iiPDF_Ncn], cb[j, iiPDF_Ncn])
         A1 = _set(A1, j, iiPDF_Ncn, c1); A2 = _set(A2, j, iiPDF_Ncn, c2)
 
-    # ---- (hmy, hmx) for hydrometeor pairs ----
+    # Correlation of the natural logarithm of two hydrometeors
     for ii in range(iiPDF_Ncn + 1, pdf_dim - 1):
         for jj in range(ii + 1, pdf_dim):
             c1, c2 = component_corr_hmx_hmy_n_ip(rc_1, rc_2, cc[jj, ii], cb[jj, ii])
             A1 = _set(A1, jj, ii, c1); A2 = _set(A2, jj, ii, c2)
 
-    # ---- Symmetrize (mirror lower triangle): full = L + L^T - I ----
+    # For ease of use later in the code, we make the correlation arrays
+    # symmetrical
     eye = jnp.zeros((ng, nzt, pdf_dim, pdf_dim)).at[:, :, idx, idx].set(1.0)
     A1 = A1 + jnp.swapaxes(A1, -1, -2) - eye
     A2 = A2 + jnp.swapaxes(A2, -1, -2) - eye
@@ -1136,8 +1696,10 @@ def comp_corr_norm(mu_x_1, mu_x_2, sigma_x_1, sigma_x_2, sigma_x_1_n, sigma_x_2_
 def denorm_transform_corr(sigma_x_1_n, sigma_x_2_n, sigma2_on_mu2_ip_1, sigma2_on_mu2_ip_2,
                           corr_array_1_n, corr_array_2_n,
                           iiPDF_chi, iiPDF_eta, iiPDF_w, iiPDF_Ncn):
-    """Transform the normal-space PDF correlation arrays to real ("standard") space
-    (setup_clubb_pdf_params.F90:denorm_transform_corr).
+    """Calculates the true or "real-space" correlations between PDF variables,
+    where at least one of the variables that is part of a correlation has an
+    assumed lognormal distribution -- which are the precipitating hydrometeors
+    (in precipitation) and N_cn.
 
     Correlations among the normal variables (chi, eta, w) are unchanged. Correlations between a normal variable
     and a lognormal one (Ncn or a precipitating hydrometeor) use corr_NN2NL; correlations between two lognormal
@@ -1161,33 +1723,64 @@ def denorm_transform_corr(sigma_x_1_n, sigma_x_2_n, sigma2_on_mu2_ip_1, sigma2_o
     def _s(A, r, c, val):
         return A.at[:, :, r, c].set(val)
 
-    # Normal-normal pairs (chi/eta/w): correlations carry over unchanged.
+    # Initialize diagonal elements to one
+    # The correlations in each PDF component between two of w, chi (old s), and
+    # eta (old t) do not need to be transformed to standard space, since w, chi,
+    # and eta follow assumed normal distributions in each PDF component.  The
+    # normal space correlations between any two of these variables are the same
+    # as the actual correlations.
     for (rr, cc_) in ((iiPDF_eta, iiPDF_chi), (iiPDF_w, iiPDF_chi), (iiPDF_w, iiPDF_eta)):
         A1 = _s(A1, rr, cc_, Cn1[:, :, rr, cc_]); A2 = _s(A2, rr, cc_, Cn2[:, :, rr, cc_])
 
-    # chi/eta/w  x  Ncn (normal-lognormal). Component 2 reuses r1[Ncn].
+    # Calculate the true correlation of variables that have an assumed normal
+    # distribution and variables that have an assumed lognormal distribution
+    # for the ith PDF component, given their normal space correlation and the
+    # normal space standard deviation of the variable with the assumed
+    # lognormal distribution.
+    # Transform the correlations between chi/eta/w and N_cn to standard space.
     for x in (iiPDF_chi, iiPDF_eta, iiPDF_w):
         A1 = _s(A1, iiPDF_Ncn, x, corr_NN2NL(Cn1[:, :, iiPDF_Ncn, x], s1n[:, :, iiPDF_Ncn], r1[:, :, iiPDF_Ncn]))
         A2 = _s(A2, iiPDF_Ncn, x, corr_NN2NL(Cn2[:, :, iiPDF_Ncn, x], s2n[:, :, iiPDF_Ncn], r1[:, :, iiPDF_Ncn]))
 
-    # chi/eta/w  x  hydrometeors (normal-lognormal).
+    # Transform the correlations (in-precip) between chi/eta/w and the
+    # precipitating hydrometeors to standard space.
     for x in (iiPDF_chi, iiPDF_eta, iiPDF_w):
         for j in hm_indices:
+            # Transform the correlation (in-precip) between w, chi, or eta and a
+            # precipitating hydrometeor, hm, to standard space in PDF component 1.
             A1 = _s(A1, j, x, corr_NN2NL(Cn1[:, :, j, x], s1n[:, :, j], r1[:, :, j]))
+            # Transform the correlation (in-precip) between w, chi, or eta and a
+            # precipitating hydrometeor, hm, to standard space in PDF component 2.
             A2 = _s(A2, j, x, corr_NN2NL(Cn2[:, :, j, x], s2n[:, :, j], r2[:, :, j]))
 
-    # Ncn  x  hydrometeors (lognormal-lognormal). Component 2 reuses r1[Ncn].
+    # Calculate the true correlation of two variables that both have an
+    # assumed lognormal distribution for the ith PDF component, given their
+    # normal space correlation and both of their normal space standard
+    # deviations.
+    # Transform the correlations (in-precip) between N_cn and the precipitating
+    # hydrometeors to standard space.
     for j in hm_indices:
+        # Transform the correlation (in-precip) between N_cn and a precipitating
+        # hydrometeor, hm, to standard space in PDF component 1.
         A1 = _s(A1, j, iiPDF_Ncn, corr_NN2LL(Cn1[:, :, j, iiPDF_Ncn], s1n[:, :, iiPDF_Ncn], s1n[:, :, j],
                                              r1[:, :, iiPDF_Ncn], r1[:, :, j]))
+        # Transform the correlation (in-precip) between N_cn and a precipitating
+        # hydrometeor, hm, to standard space in PDF component 2.
         A2 = _s(A2, j, iiPDF_Ncn, corr_NN2LL(Cn2[:, :, j, iiPDF_Ncn], s2n[:, :, iiPDF_Ncn], s2n[:, :, j],
                                              r1[:, :, iiPDF_Ncn], r2[:, :, j]))
 
-    # hydrometeor x hydrometeor pairs (lognormal-lognormal).
+    # Transform the correlations (in-precip) between two precipitating
+    # hydrometeors to standard space.
     for ii in range(iiPDF_Ncn + 1, pdf_dim - 1):
         for jj in range(ii + 1, pdf_dim):
+            # Transform the correlation (in-precip) between two precipitating
+            # hydrometeors (for example, r_r and N_r) to standard space in PDF
+            # component 1.
             A1 = _s(A1, jj, ii, corr_NN2LL(Cn1[:, :, jj, ii], s1n[:, :, ii], s1n[:, :, jj],
                                            r1[:, :, ii], r1[:, :, jj]))
+            # Transform the correlation (in-precip) between two precipitating
+            # hydrometeors (for example, r_r and N_r) to standard space in PDF
+            # component 2.
             A2 = _s(A2, jj, ii, corr_NN2LL(Cn2[:, :, jj, ii], s2n[:, :, ii], s2n[:, :, jj],
                                            r2[:, :, ii], r2[:, :, jj]))
 
@@ -1200,8 +1793,13 @@ def denorm_transform_corr(sigma_x_1_n, sigma_x_2_n, sigma2_on_mu2_ip_1, sigma2_o
 def calc_corr_norm_and_cholesky_factor(corr_array_n_cloud, corr_array_n_below, rc_1, rc_2,
                                        iiPDF_type, iiPDF_chi, iiPDF_eta, iiPDF_w, iiPDF_Ncn,
                                        l_follow_ADG1_PDF_standards):
-    """Compute the normal-space PDF correlation arrays and their Cholesky factors for both PDF components
-    (setup_clubb_pdf_params.F90:calc_corr_norm_and_cholesky_factor).
+    """This subroutine computes the correlation arrays and correlation
+    Cholesky matrices of PDF vars for both components. Here, we assume that
+    there are only two unique correlation arrays, which allows us to compute
+    these two unique arrays and their corresponding Cholesky decompositions,
+    then use rc to determine which one to assign to each grid column and
+    vertical level. If the correlation arrays vary based on vertically varying
+    values, then this subroutine is not appropriate.
 
     Uses the "two unique correlation arrays" optimization: the prescribed in-cloud and below-cloud correlation
     matrices are each adjusted (ADG zeroing of corr(w,chi)/corr(w,eta); Ncn below-cloud values replaced with
@@ -1547,7 +2145,8 @@ def pack_hydromet_pdf_params(nzt, ngrdcol,
                              mu_x_2, sigma_x_1, sigma_x_2,
                              corr_array_1, corr_array_2,
                              hydromet_pdf_params):
-    """Pack hydrometeor PDF parameters.
+    """Pack the standard means and variances involving hydrometeors, as well as a
+    few other variables, into the structure hydromet_pdf_params.
 
     JAX/Python adaptation: Fortran packs an ``(ngrdcol,nzt)`` array of derived
     types; the JAX object stores those per-cell fields as leading array
@@ -1675,13 +2274,16 @@ def pack_hydromet_pdf_params(nzt, ngrdcol,
 def compute_rtp2_from_chi(sigma_chi_1, sigma_chi_2, sigma_eta_1, sigma_eta_2,
                           rt_1, rt_2, crt_1, crt_2, mixt_frac,
                           corr_chi_eta_1, corr_chi_eta_2):
-    """Variance of rt reconstructed from the chi/eta PDF (setup_clubb_pdf_params.F90:compute_rtp2_from_chi).
+    """Compute the variance of rt from the distribution of chi and eta. The
+    resulting variance will be consistent with CLUBB's extended PDF
+    involving chi and eta, including if l_fix_w_chi_eta_correlations = .true..
 
     The per-component rt variance implied by the chi/eta distribution is
     varnce_rt_i = (corr_chi_eta_i sigma_chi_i sigma_eta_i + 1/2 sigma_chi_i^2 + 1/2 sigma_eta_i^2)/(2 crt_i^2),
     and rtp2 is the binormal combine of the two components about the overall mean rtm. Consistent with CLUBB's
     extended chi/eta PDF (incl. l_fix_w_chi_eta_correlations). The Fortran computes this only as the
     `rtp2_from_chi` stats diagnostic; mirrored here as a pure, differentiable function. Pure-jnp."""
+    #----- Begin Code -----
     varnce_rt_1 = (corr_chi_eta_1 * sigma_chi_1 * sigma_eta_1
                    + 0.5 * sigma_chi_1 ** 2 + 0.5 * sigma_eta_1 ** 2) / (2.0 * crt_1 ** 2)
     varnce_rt_2 = (corr_chi_eta_2 * sigma_chi_2 * sigma_eta_2

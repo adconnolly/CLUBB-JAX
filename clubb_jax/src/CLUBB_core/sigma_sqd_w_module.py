@@ -1,4 +1,13 @@
-"""JAX port of ``src/CLUBB_core/sigma_sqd_w_module.F90``."""
+"""JAX port of ``src/CLUBB_core/sigma_sqd_w_module.F90``.
+
+Porting deviations:
+- The Fortran output argument ``sigma_sqd_w`` is returned as the function
+  result, preserving functional/JIT-friendly semantics.
+- Fortran loops over grid columns and levels are vectorized with JAX array
+  operations.
+- OpenACC data-region comments are omitted because JAX tracing handles device
+  placement.
+"""
 
 from functools import partial
 
@@ -49,7 +58,33 @@ def compute_sigma_sqd_w(
     clubb_params,
     l_predict_upwp_vpwp: bool,
 ):
-    """Compute the variable sigma_sqd_w (PDF width parameter)."""
+    """Compute the variable sigma_sqd_w (PDF width parameter).
+
+    The value of sigma_sqd_w is restricted in the ADG1 PDF in order to keep
+    the marginal PDFs of all responder variables (variables that do not set
+    the mixture fraction) valid.  The limits on sigma_sqd_w in order to keep
+    the PDF of a responder variable, x, valid are:
+
+    0 <= sigma_sqd_w <= 1 - <w'x'>^2 / ( <w'^2> * <x'^2> ).
+
+    The overall limits on sigma_sqd_w must be applied based on the most
+    restrictive case so that all Double Gaussian PDF responder variables, x,
+    have realizable PDFs.  The overall limits on sigma_sqd_w are:
+
+    0 <= sigma_sqd_w <= 1 - max( <w'x'>^2 / ( <w'^2> * <x'^2> ), for all x).
+
+    The equation used for sigma_sqd_w is:
+
+    sigma_sqd_w = gamma_Skw_fnc
+                  * ( 1 - max( <w'x'>^2 / ( <w'^2> * <x'^2> ), for all x) );
+
+    where 0 <= gamma_Skw_fnc <= 1.
+
+    References:
+      Eqn 22 in ``Equations for CLUBB''
+    """
+
+    # ---- Begin Code ----
 
     if nzm > 1:
         wp3_zm = zt2zm(nzm, nzt, ngrdcol, gr, wp3)

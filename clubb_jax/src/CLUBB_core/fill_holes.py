@@ -1,19 +1,16 @@
-"""JAX port of exposed routines from `src/CLUBB_core/fill_holes.F90`.
+"""JAX port of exposed routines from ``src/CLUBB_core/fill_holes.F90``.
 
-This module ports the vertical hole-filling wrapper used by the active JAX
-`advance_xm_wpxp` and `advance_xp2_xpyp` paths, plus the wp2/TKE helper exposed
-by the Python API. Python callers pass zero-based `lower_hf_level` and
-`upper_hf_level`, matching `clubb_python.CLUBB_core.fill_holes`.
-
-The source Fortran notes that the lowest level should not be included because
-hole filling should not alter the set surface value for momentum-level fields
-or consider a below-surface thermodynamic level. Momentum-level calls should
-also exclude the upper boundary level.
-
-TODO(JAX port):
-  Only `global_fill` and `sliding_window` are currently implemented. The
-  widening, smart-window, smart-window-smooth, and parallel-fill methods remain
-  unported.
+Porting deviations:
+  * Fortran mutates ``field``, ``wp2``, ``up2``, and ``vp2`` in place.  JAX
+    returns updated arrays.
+  * Python callers pass zero-based ``lower_hf_level`` and ``upper_hf_level``,
+    matching ``clubb_python.CLUBB_core.fill_holes``.
+  * Only ``global_fill`` and ``sliding_window`` are implemented for
+    ``fill_holes_vertical``.  The Fortran ``widening_windows``,
+    ``smart_window``, ``smart_window_smooth``, and ``parallel_fill`` methods
+    remain unported and deliberately raise ``NotImplementedError``.
+  * Fortran diagnostic printing and debug-only conservation warnings are not
+    reproduced in JAX.
 """
 
 from __future__ import annotations
@@ -51,23 +48,29 @@ def fill_holes_global(
     rho_ds,
     field,
 ):
-    """Fill holes using the whole range as the fill window.
+    """This subroutine clips values of 'field' that are below 'threshold' using
+    the whole range [lower_hf_level:upper_hf_level] as the fill window. This
+    maximized effectiveness, but minimized locality.
 
-    This is maximally effective and computationally cheap, but minimally local.
     Mass is conserved by reducing the clipped field everywhere by a constant
-    multiplicative coefficient. This routine does not guarantee that the clipped
-    field will exceed threshold everywhere; blunt clipping is needed for that.
+    multiplicative coefficient.
+
+    This subroutine does not guarantee that the clipped field will exceed
+    threshold everywhere; blunt clipping is needed for that.
     """
     del ngrdcol
+    # --------------------- Begin Code ---------------------
+
     k_idx = jnp.arange(nz)[None, :]
     in_range = (k_idx >= lower_hf_level) & (k_idx <= upper_hf_level)
     rho_ds_dz = rho_ds * dz
 
+    # Compute the numerator and denominator integrals
     numer_integral_global = jnp.sum(jnp.where(in_range, rho_ds_dz * field, 0.0), axis=1, keepdims=True)
     denom_integral_global = jnp.sum(jnp.where(in_range, rho_ds_dz, 0.0), axis=1, keepdims=True)
 
-    # Find the vertical average of field, using the precomputed numerator and
-    # denominator. See the description of vertical_avg in advance_helper_module.
+    # Find the vertical average of field, using the precomputed numerator and denominator,
+    # see description of the vertical_avg function in advance_helper_module
     field_avg_global = numer_integral_global / denom_integral_global
 
     # Clip small or negative values from field.
@@ -77,6 +80,7 @@ def fill_holes_global(
         jnp.minimum(threshold, field),
     )
 
+    # To compute the clipped field's vertical integral we only need to recompute the numerator
     numer_integral_clipped = jnp.sum(
         jnp.where(in_range, rho_ds_dz * field_clipped, 0.0),
         axis=1,
@@ -91,10 +95,11 @@ def fill_holes_global(
     mass_fraction_global = (field_avg_global - threshold) / (
         field_clipped_avg - threshold
     )
+    # Calculate normalized, filled field
     field_filled = threshold + mass_fraction_global * (field_clipped - threshold)
 
-    # Do not update this column if there are no holes in the fill range, or if
-    # field_clipped_avg ~= threshold.
+    # Do not complete calculations or update field values for this
+    # column if there are no holes that need filling
     any_hole = jnp.any(jnp.where(in_range, field < threshold, False), axis=1, keepdims=True)
     apply_fill = in_range & any_hole & safe_to_scale
     return jnp.where(apply_fill, field_filled, field)
@@ -114,17 +119,26 @@ def fill_holes_sliding_window(
     rho_ds,
     field,
 ):
-    """Fill holes with a sliding-window technique and global fallback.
+    """This subroutine clips values of 'field' that are below 'threshold' as much
+    as possible (i.e. "fills holes"), but conserves the total integrated mass
+    of 'field'.  This prevents clipping from acting as a spurious source.
 
-    This modifies consecutive vertical ranges in serial. It is computationally
-    expensive but highly local. The locality has a tradeoff with effectiveness,
-    so this falls back to a global fill if the first pass leaves holes.
+    This performs a sliding window technique, modifying consecutive ranges of
+    vertical levels in serial, this is computationally expensive, but highly local.
+    This high locally has a tradeoff with effectiveness, and can often fail to fill
+    all the holes, especially if there is more than ~5, as a result, this relies on
+    the global fill if the first pass of the sliding window fails to fill all holes
+
+    Mass is conserved by reducing the clipped field everywhere by a constant
+    multiplicative coefficient.
 
     References:
-      "Numerical Methods for Wave Equations in Geophysical Fluid Dynamics",
-      Durran (1999), p. 292.
+      ``Numerical Methods for Wave Equations in Geophysical Fluid
+        Dynamics'', Durran (1999), p. 292.
     """
     del nz
+    # --------------------- Begin Code ---------------------
+
     rho_ds_dz = rho_ds * dz
     window_len = 2 * num_hf_draw_points + 1
     start_indx = lower_hf_level + num_hf_draw_points
@@ -151,16 +165,23 @@ def fill_holes_sliding_window(
             jnp.maximum(threshold, field_window),
             jnp.minimum(threshold, field_window),
         )
+        # Compute the clipped field's vertical integral.
+        # clipped_total_mass >= original_total_mass,
+        # see description of the vertical_avg function in advance_helper_module
         field_clipped_avg = (
             jnp.sum(rho_window * field_clipped, axis=1, keepdims=True)
             * invrs_denom_integral
         )
 
+        # Avoid divide by zero issues by doing nothing if field_clipped_avg ~= threshold
         safe_to_scale = (
             jnp.abs(field_clipped_avg - threshold)
             > jnp.abs(field_clipped_avg + threshold) * eps / 2.0
         )
+        # Compute coefficient that makes the clipped field have the same mass as the
+        # original field.  We should always have mass_fraction > 0.
         mass_fraction = (field_avg - threshold) / (field_clipped_avg - threshold)
+        # Calculate normalized, filled field
         field_window_filled = threshold + mass_fraction * (field_clipped - threshold)
 
         any_hole = jnp.any(field_window < threshold, axis=1, keepdims=True)
@@ -173,7 +194,9 @@ def fill_holes_sliding_window(
 
     field = jax.lax.fori_loop(start_indx, stop_indx, fill_one_window, field)
 
-    # If the first sliding-window pass did not work, fall back to global fill.
+    # Check if all holes were filled.
+
+    # If the first sliding window pass didn't work, fallback to global fill
     return jax.lax.cond(
         jnp.any(field < threshold),
         lambda f: fill_holes_global(
@@ -212,12 +235,17 @@ def fill_holes_vertical(
     fill_holes_type: int,
     field,
 ):
-    """Call a vertical hole-filling method selected by `fill_holes_type`.
+    """This subroutine calls a hole filling method, specified by fill_holes_type.
 
-    The lowest level should not be included because hole filling should not
-    alter the set surface value for momentum-level variables or consider a
-    below-surface thermodynamic level. Momentum-level calls should also exclude
-    the upper boundary level.
+    The lowest level (k=1) should not be included, as the hole-filling scheme
+    should not alter the set value of 'field' at the surface (for momentum
+    level variables), or consider the value of 'field' at a level below the
+    surface (for thermodynamic level variables).
+
+    For momentum level variables only, the hole-filling scheme should not
+    alter the set value of 'field' at the upper boundary level (k=nz).
+    So for momemtum level variables, call with upper_hf_level=nz-1, and
+    for thermodynamic level variables, call with upper_hf_level=nz.
     """
     if grid_dir_indx not in (1, -1):
         raise ValueError(f"Unsupported grid_dir_indx={grid_dir_indx}")
@@ -242,8 +270,10 @@ def fill_holes_vertical(
         )
         return jnp.flip(filled, axis=1)
 
-    # Only bother with a fill call if there are values below threshold.
+    # Only bother will a fill call if there are values below threshold
     if fill_holes_type == global_fill:
+        # This fills holes by modifying the entire range, this is maximally effective
+        # and computationally cheap, but minimally local
         filled = fill_holes_global(
             nz,
             ngrdcol,
@@ -255,6 +285,9 @@ def fill_holes_vertical(
             field,
         )
     elif fill_holes_type == sliding_window:
+        # This performs a sliding window technique, modifying consecutive ranges of
+        # vertical levels in serial, this is computationally expensive, but highly local.
+        # This can also fail to fill, so this falls back to a global fill if neccesary.
         filled = fill_holes_sliding_window(
             nz,
             ngrdcol,
@@ -290,21 +323,39 @@ def fill_holes_wp2_from_horz_tke(
     up2,
     vp2,
 ):
-    """Fill wp2 holes by borrowing TKE from up2 and vp2.
+    """This subroutine clips values of wp2 that are below 'threshold' as much
+    as possible (i.e. "fills holes"), but conserves the turbulent kinetic energy
+    (up2+vp2+wp2). This prevents clipping from acting as a spurious source.
 
-    This clips wp2 values below threshold as much as possible while conserving
-    turbulent kinetic energy up2+vp2+wp2 at each height level. It does not
-    guarantee that wp2 will exceed threshold everywhere; blunt clipping is
-    needed for that.
+    Turbulent kinetic energy at each height level is conserved by reducing up2 and vp2
+    by a multiplicative coefficient.
+
+    This subroutine does not guarantee that the clipped field will exceed
+    threshold everywhere; blunt clipping is needed for that.
+
+    The lowest level (k=1) should not be included, as the hole-filling scheme
+    should not alter the set value of 'field' at the surface (for momentum
+    level variables), or consider the value of 'field' at a level below the
+    surface (for thermodynamic level variables).
+
+    For momentum level variables only, the hole-filling scheme should not
+    alter the set value of 'field' at the upper boundary level (k=nz).
+    So for momemtum level variables, call with upper_hf_level=nz-1, and
+    for thermodynamic level variables, call with upper_hf_level=nz.
     """
     del ngrdcol
+    # --------------------- Begin Code ---------------------
+
     k_idx = jnp.arange(nz)[None, :]
     in_range = (k_idx >= lower_hf_level) & (k_idx <= upper_hf_level)
 
+    # For each height level, fill holes in wp2 by taking tke from up2 and vp2
     missing_wp2 = threshold - wp2
     up2_avail = jnp.maximum(up2 - threshold, zero)
     vp2_avail = jnp.maximum(vp2 - threshold, zero)
     up2_vp2_avail = up2_avail + vp2_avail
+    # Check if we have a hole to fill at level k and
+    # there is buffer TKE in up2 and/or vp2 available
     do_fill = in_range & (wp2 < threshold) & ((up2 > threshold) | (vp2 > threshold))
 
     # Not enough TKE available to fill the hole.
@@ -317,6 +368,7 @@ def fill_holes_wp2_from_horz_tke(
     case_enough = do_fill & (missing_wp2 < up2_vp2_avail)
     no_up2_avail = jnp.abs(up2_avail) < _F64_EPS * 1000.0
     no_vp2_avail = jnp.abs(vp2_avail) < _F64_EPS * 1000.0
+    # Calculate portion of up2/vp2 that we want to take away
     ratio = jnp.where(up2_vp2_avail > zero, missing_wp2 / up2_vp2_avail, zero)
 
     up2_enough = jnp.where(

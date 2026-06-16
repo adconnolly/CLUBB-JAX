@@ -1,18 +1,27 @@
-"""JAX port of CLUBB_core/hydromet_pdf_parameter_module.F90 — hydrometeor-PDF parameter containers.
+"""JAX port of ``CLUBB_core/hydromet_pdf_parameter_module.F90``.
 
-This Fortran module is a pair of derived types plus their zero/allocate initializers (no physics):
-  * `hydromet_pdf_parameter` — per-column means/variances/correlations of the hydrometeor PDF.
-  * `precipitation_fractions` — the (ngrdcol, nzt) precip-fraction fields.
-Ported as frozen dataclasses holding jnp arrays (differentiable-compatible, zeros carry zero gradient), with
-`init_hydromet_pdf_params` / `init_precip_fracs` / `zero_precip_fracs` mirroring the Fortran initializers.
-Validated in `tests/test_hydromet_pdf_parameter.py` (shapes, dims metadata, all-zero, round-trip).
+Description:
+This module defines the derived type hydromet_pdf_parameter.
+
+References:
+  None
+
+Porting deviations:
+  * Fortran derived types are represented as frozen dataclasses that are JAX
+    pytrees.
+  * Fortran allocates and mutates ``precipitation_fractions``.  JAX returns new
+    dataclass instances with fixed-shape arrays.
+  * Fortran ``zero_precip_fracs_api`` mutates its inout argument.  JAX
+    ``zero_precip_fracs`` returns a zeroed copy preserving dimensions.
 """
 from dataclasses import dataclass
 
 import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-MAX_HYDROMET_DIM = 8   # hydromet_pdf_parameter_module.F90:27
+MAX_HYDROMET_DIM = 8
 
 
 _HYDROMET_PDF_PARAMETER_FIELDS = (
@@ -40,25 +49,25 @@ _HYDROMET_PDF_PARAMETER_FIELDS = (
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class HydrometPdfParameter:
-    """Means/variances/correlations of the hydrometeor PDF (hydromet_pdf_parameter type)."""
-    hm_1: jnp.ndarray
-    hm_2: jnp.ndarray
-    mu_hm_1: jnp.ndarray
-    mu_hm_2: jnp.ndarray
-    sigma_hm_1: jnp.ndarray
-    sigma_hm_2: jnp.ndarray
-    corr_w_hm_1: jnp.ndarray
-    corr_w_hm_2: jnp.ndarray
-    corr_chi_hm_1: jnp.ndarray
-    corr_chi_hm_2: jnp.ndarray
-    corr_eta_hm_1: jnp.ndarray
-    corr_eta_hm_2: jnp.ndarray
-    corr_hmx_hmy_1: jnp.ndarray
-    corr_hmx_hmy_2: jnp.ndarray
-    mu_Ncn_1: float
-    mu_Ncn_2: float
-    sigma_Ncn_1: float
-    sigma_Ncn_2: float
+    """JAX representation of Fortran ``type hydromet_pdf_parameter``."""
+    hm_1: jnp.ndarray          # Mean of hydrometeor, hm (1st PDF component)   [un vary]
+    hm_2: jnp.ndarray          # Mean of hydrometeor, hm (2nd PDF component)   [un vary]
+    mu_hm_1: jnp.ndarray       # Mean of hm (1st PDF component) in-precip (ip) [un vary]
+    mu_hm_2: jnp.ndarray       # Mean of hm (2nd PDF component) ip             [un vary]
+    sigma_hm_1: jnp.ndarray    # Standard deviation of hm (1st PDF comp.) ip   [un vary]
+    sigma_hm_2: jnp.ndarray    # Standard deviation of hm (2nd PDF comp.) ip   [un vary]
+    corr_w_hm_1: jnp.ndarray   # Correlation of w and hm (1st PDF component) ip      [-]
+    corr_w_hm_2: jnp.ndarray   # Correlation of w and hm (2nd PDF component) ip      [-]
+    corr_chi_hm_1: jnp.ndarray # Correlation of chi and hm (1st PDF component) ip    [-]
+    corr_chi_hm_2: jnp.ndarray # Correlation of chi and hm (2nd PDF component) ip    [-]
+    corr_eta_hm_1: jnp.ndarray # Correlation of eta and hm (1st PDF component) ip    [-]
+    corr_eta_hm_2: jnp.ndarray # Correlation of eta and hm (2nd PDF component) ip    [-]
+    corr_hmx_hmy_1: jnp.ndarray # Correlation of hmx and hmy (1st PDF component) ip  [-]
+    corr_hmx_hmy_2: jnp.ndarray # Correlation of hmx and hmy (2nd PDF component) ip  [-]
+    mu_Ncn_1: float    # Mean of Ncn (1st PDF component)                  [num/kg]
+    mu_Ncn_2: float    # Mean of Ncn (2nd PDF component)                  [num/kg]
+    sigma_Ncn_1: float # Standard deviation of Ncn (1st PDF component)    [num/kg]
+    sigma_Ncn_2: float # Standard deviation of Ncn (2nd PDF component)    [num/kg]
 
     def tree_flatten(self):
         return tuple(getattr(self, name) for name in _HYDROMET_PDF_PARAMETER_FIELDS), None
@@ -72,12 +81,12 @@ class HydrometPdfParameter:
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class PrecipitationFractions:
-    """Precipitation-fraction fields, shape (ngrdcol, nzt) (precipitation_fractions type)."""
-    ngrdcol: int
+    """JAX representation of Fortran ``type precipitation_fractions``."""
+    ngrdcol: int # Dimensions of variables
     nzt: int
-    precip_frac: jnp.ndarray
-    precip_frac_1: jnp.ndarray
-    precip_frac_2: jnp.ndarray
+    precip_frac: jnp.ndarray   # Precipitation fraction (overall)           [-]
+    precip_frac_1: jnp.ndarray # Precipitation fraction (1st PDF component) [-]
+    precip_frac_2: jnp.ndarray # Precipitation fraction (2nd PDF component) [-]
 
     def tree_flatten(self):
         children = (self.precip_frac, self.precip_frac_1, self.precip_frac_2)
@@ -98,9 +107,10 @@ class PrecipitationFractions:
 
 
 def init_hydromet_pdf_params():
-    """Zero-initialize a HydrometPdfParameter (hydromet_pdf_parameter_module.F90:init_hydromet_pdf_params)."""
-    vec = lambda: jnp.zeros(MAX_HYDROMET_DIM)
-    mat = lambda: jnp.zeros((MAX_HYDROMET_DIM, MAX_HYDROMET_DIM))
+    """Initialize the elements of hydromet_pdf_params."""
+    vec = lambda: jnp.zeros(MAX_HYDROMET_DIM, dtype=jnp.float64)
+    mat = lambda: jnp.zeros((MAX_HYDROMET_DIM, MAX_HYDROMET_DIM), dtype=jnp.float64)
+    # Initialize hydromet_pdf_params.
     return HydrometPdfParameter(
         hm_1=vec(), hm_2=vec(), mu_hm_1=vec(), mu_hm_2=vec(),
         sigma_hm_1=vec(), sigma_hm_2=vec(), corr_w_hm_1=vec(), corr_w_hm_2=vec(),
@@ -110,14 +120,18 @@ def init_hydromet_pdf_params():
 
 
 def init_precip_fracs(nzt, ngrdcol):
-    """Allocate + zero a PrecipitationFractions (hydromet_pdf_parameter_module.F90:init_precip_fracs_api)."""
-    z = jnp.zeros((ngrdcol, nzt))
+    """Initialize the elements of precip_fracs."""
+    # Allocate precip frac arrays
+    z = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    # Set metadata values
+    # Zero precip_fracs
     return PrecipitationFractions(ngrdcol=ngrdcol, nzt=nzt,
                                   precip_frac=z, precip_frac_1=z, precip_frac_2=z)
 
 
 def zero_precip_fracs(precip_fracs):
-    """Zero the precip-fraction fields, preserving dims (hydromet_pdf_parameter_module.F90:zero_precip_fracs_api)."""
-    z = jnp.zeros((precip_fracs.ngrdcol, precip_fracs.nzt))
+    """Initialize the elements of precip_fracs."""
+    # Initialize precip_fracs.
+    z = jnp.zeros((precip_fracs.ngrdcol, precip_fracs.nzt), dtype=jnp.float64)
     return PrecipitationFractions(ngrdcol=precip_fracs.ngrdcol, nzt=precip_fracs.nzt,
                                   precip_frac=z, precip_frac_1=z, precip_frac_2=z)

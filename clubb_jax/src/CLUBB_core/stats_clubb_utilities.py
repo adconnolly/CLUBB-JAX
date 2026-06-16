@@ -1,4 +1,17 @@
-"""JAX port of ``src/CLUBB_core/stats_clubb_utilities.F90``."""
+"""JAX port of ``src/CLUBB_core/stats_clubb_utilities.F90``.
+
+Porting deviations:
+- Only ``stats_accumulate`` is ported here.  The Fortran
+  ``stats_accumulate_hydromet_api`` and ``stats_accumulate_lh_tend`` entry
+  points are not present because the current JAX core does not call them.
+- Fortran ``stats_type`` mutation through ``stats_update`` is represented by
+  functional updates to the JAX stats bridge object.
+- OpenACC host/device synchronization comments are omitted because JAX handles
+  device placement through array tracing rather than explicit ``!$acc update``
+  directives.
+- Small per-column stats reductions remain Python loops over static grid
+  columns; field math is expressed with JAX arrays.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +43,7 @@ def _calculate_spurious_source(
     integral_forcing,
     dt,
 ):
+    """JAX equivalent of ``calculate_spurious_source`` from numerical_check."""
     return (integral_after - integral_before) / dt + flux_top - flux_sfc - integral_forcing
 
 
@@ -102,6 +116,9 @@ def stats_accumulate(
     stats,
 ):
     """Accumulate per-timestep CLUBB statistics into a ``JaxStats`` event log."""
+    # ---- Begin Code ----
+
+    # Sample fields
     if not stats.l_sample:
         return stats
 
@@ -142,6 +159,7 @@ def stats_accumulate(
         stats = stats.update("shear", shear)
 
     for name, value in (
+        # stats_zt variables
         ("thlm", thlm),
         ("thvm", thvm),
         ("rtm", rtm),
@@ -180,6 +198,7 @@ def stats_accumulate(
             )
 
     for name, value in (
+        # stats_zm variables
         ("wm_zm", wm_zm),
         ("ddzt_umvm_sqd", ddzt_umvm_sqd),
         ("wp2", wp2),
@@ -228,6 +247,7 @@ def stats_accumulate(
             edsclr_idx = edsclr + 1
             stats = stats.update(f"wpedsclr{edsclr_idx}p", wpedsclrp[:, :, edsclr])
 
+    # stats_sfc variables
     for i in range(ngrdcol):
         stats = stats.update("cc", jnp.max(cloud_frac[i, :]), icol=i)
 
@@ -347,6 +367,8 @@ def stats_accumulate(
             0.0,
             rho_ds_zm[i, gr.k_lb_zm] * wprtp_sfc[i],
         )
+        # Get the vertical integral of rtm before this function begins
+        # so that spurious source can be calculated.
         rtm_integral_before = vertical_integral(
             nzt, rho_ds_zt[i, :], rtm_before[i, :], dzt[i, :],
         )
@@ -356,6 +378,7 @@ def stats_accumulate(
         rtm_integral_forcing = vertical_integral(
             nzt, rho_ds_zt[i, :], rtm_forcing[i, :], dzt[i, :],
         )
+        # Calculate the spurious source for rtm.
         rtm_spur_src = _calculate_spurious_source(
             rtm_integral_after,
             rtm_integral_before,
@@ -371,6 +394,8 @@ def stats_accumulate(
             0.0,
             rho_ds_zm[i, gr.k_lb_zm] * wpthlp_sfc[i],
         )
+        # Get the vertical integral of thlm before this function begins
+        # so that spurious source can be calculated.
         thlm_integral_before = vertical_integral(
             nzt, rho_ds_zt[i, :], thlm_before[i, :], dzt[i, :],
         )
@@ -380,6 +405,7 @@ def stats_accumulate(
         thlm_integral_forcing = vertical_integral(
             nzt, rho_ds_zt[i, :], thlm_forcing[i, :], dzt[i, :],
         )
+        # Calculate the spurious source for thlm.
         thlm_spur_src = _calculate_spurious_source(
             thlm_integral_after,
             thlm_integral_before,
@@ -392,6 +418,8 @@ def stats_accumulate(
         l_compute_spurious_source = jnp.asarray(l_implemented) | (
             jnp.all(jnp.abs(wm_zt[i, :]) < eps) & jnp.all(jnp.abs(wm_zm[i, :]) < eps)
         )
+        # Spurious source will only be calculated if rtm_ma and thlm_ma are zero.
+        # Therefore, wm must be zero or l_implemented must be true.
         stats = stats.update(
             "rtm_spur_src",
             jnp.where(l_compute_spurious_source, rtm_spur_src, -9999.0),
