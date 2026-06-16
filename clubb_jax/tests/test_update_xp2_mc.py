@@ -28,13 +28,42 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import update_xp2_mc
-from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_frac_double_delta_jax
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import update_xp2_mc as _update_xp2_mc
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.CLUBB_core.constants_clubb import cloud_frac_min, Cp, Lv
 from clubb_jax.src.derived_types.grid_class import setup_grid
+from clubb_jax.src.derived_types.pdf_params import init_pdf_params
 
 _NG, _DZ, _ZTOP = 2, 50.0, 1500.0
+
+
+def _pdf_from_dict(p, nzt, ngrdcol):
+    params = init_pdf_params(nzt, ngrdcol)
+    return params.replace(**{k: jnp.asarray(v) for k, v in p.items()})
+
+
+def update_xp2_mc(gr, dt, cloud_frac, rcm, rvm, thlm, wm, exner, rrm_evap, p):
+    zeros = jnp.zeros((gr.ngrdcol, gr.nzm), dtype=jnp.float64)
+    return _update_xp2_mc(
+        gr,
+        gr.nzm,
+        gr.nzt,
+        gr.ngrdcol,
+        dt,
+        jnp.asarray(cloud_frac),
+        jnp.asarray(rcm),
+        jnp.asarray(rvm),
+        jnp.asarray(thlm),
+        jnp.asarray(wm),
+        jnp.asarray(exner),
+        jnp.asarray(rrm_evap),
+        _pdf_from_dict(p, gr.nzt, gr.ngrdcol),
+        zeros,
+        zeros,
+        zeros,
+        zeros,
+        zeros,
+    )
 
 
 def _pdf_params(nzt, seed):
@@ -79,6 +108,15 @@ def _ref_zt(dt, cloud_frac, rcm, rvm, thlm, wm, exner, rrm_evap, p):
     return rtp2, thlp2, wprtp, wpthlp, rtpthlp, pf
 
 
+def _precip_frac_double_delta_reference(cloud_frac):
+    ng, nzt = cloud_frac.shape
+    pf = np.zeros((ng, nzt))
+    pf[:, nzt - 1] = 0.0
+    for k in range(nzt - 2, -1, -1):
+        pf[:, k] = np.where(cloud_frac[:, k] > cloud_frac_min, cloud_frac[:, k], pf[:, k + 1])
+    return pf
+
+
 def _inputs(nzt, seed):
     rng = np.random.default_rng(seed)
     cloud_frac = rng.choice([0.0, 0.5, 0.9], (_NG, nzt))
@@ -98,11 +136,11 @@ def test_transcription_and_interp():
     rtp2_zt, thlp2_zt, wprtp_zt, wpthlp_zt, rtpthlp_zt, pf = _ref_zt(
         dt, cloud_frac, rcm, rvm, thlm, wm, exner, rrm_evap, p)
     # precip-frac fill matches.
-    assert np.max(np.abs(np.asarray(precip_frac_double_delta_jax(cloud_frac)) - pf)) < 1e-14, "precip_frac fill"
+    assert np.max(np.abs(_precip_frac_double_delta_reference(cloud_frac) - pf)) < 1e-14, "precip_frac fill"
     # The full outputs equal zt2zm of the literal zt tendencies.
     worst = 0.0
     for g, ref_zt in zip(got, (rtp2_zt, thlp2_zt, wprtp_zt, wpthlp_zt, rtpthlp_zt)):
-        ref = np.asarray(zt2zm_jax(ref_zt, jgr))
+        ref = np.asarray(zt2zm(jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr, ref_zt))
         worst = max(worst, np.max(np.abs(g - ref)))
     assert worst < 1e-12, f"update_xp2_mc transcription mismatch {worst:.2e}"
     print(f"  literal transcription + zt2zm (5 moments) + precip_frac fill, worst {worst:.2e}  PASS")

@@ -33,7 +33,7 @@ import jax.numpy as jnp
 
 from clubb_jax.src.derived_types.grid_class import setup_grid
 from clubb_jax.src.CLUBB_core.grid_class import (
-    ddzt_jax, ddzm_jax, zt2zm_jax, zm2zt_jax, zt2zm2zt_jax, zm2zt2zm_jax,
+    ddzt, ddzm, zt2zm, zm2zt, zt2zm2zt, zm2zt2zm,
 )
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
@@ -64,27 +64,33 @@ def test_f2py_oracle():
     rng = np.random.default_rng(0)
     worst = {}
     # zt-input operators: the leading f2py size arg is nzm
-    for nm, jf, ff in (("ddzt", ddzt_jax, clubb_f2py.f2py_ddzt_2d), ("zt2zm", zt2zm_jax, clubb_f2py.f2py_zt2zm_2d)):
+    for nm, jf, ff in (
+        ("ddzt", lambda a: ddzt(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_ddzt_2d),
+        ("zt2zm", lambda a: zt2zm(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_zt2zm_2d),
+    ):
         w = 0.0
         for _ in range(15):
             a = rng.standard_normal((ng, nzt))
-            w = max(w, float(np.max(np.abs(np.asarray(jf(jnp.asarray(a), jgr)) - np.asarray(ff(nzm, a))))))
+            w = max(w, float(np.max(np.abs(np.asarray(jf(jnp.asarray(a))) - np.asarray(ff(nzm, a))))))
         worst[nm] = w
     # zm-input operators: the leading f2py size arg is nzt
-    for nm, jf, ff in (("ddzm", ddzm_jax, clubb_f2py.f2py_ddzm_2d), ("zm2zt", zm2zt_jax, clubb_f2py.f2py_zm2zt_2d)):
+    for nm, jf, ff in (
+        ("ddzm", lambda a: ddzm(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_ddzm_2d),
+        ("zm2zt", lambda a: zm2zt(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_zm2zt_2d),
+    ):
         w = 0.0
         for _ in range(15):
             a = rng.standard_normal((ng, nzm))
-            w = max(w, float(np.max(np.abs(np.asarray(jf(jnp.asarray(a), jgr)) - np.asarray(ff(nzt, a))))))
+            w = max(w, float(np.max(np.abs(np.asarray(jf(jnp.asarray(a))) - np.asarray(ff(nzt, a))))))
         worst[nm] = w
     # round-trip smoothers, with no-clip (-1e30) and a finite lower clip (0.0)
     for zmin in (-1e30, 0.0):
         wt = wm = 0.0
         for _ in range(15):
             at = rng.standard_normal((ng, nzt)); am = rng.standard_normal((ng, nzm))
-            wt = max(wt, float(np.max(np.abs(np.asarray(zt2zm2zt_jax(jnp.asarray(at), jgr, zt_min=zmin))
+            wt = max(wt, float(np.max(np.abs(np.asarray(zt2zm2zt(nzm, nzt, ng, jgr, jnp.asarray(at), zt_min=zmin))
                                              - np.asarray(clubb_f2py.f2py_zt2zm2zt_2d(nzm, at, zmin))))))
-            wm = max(wm, float(np.max(np.abs(np.asarray(zm2zt2zm_jax(jnp.asarray(am), jgr, zm_min=zmin))
+            wm = max(wm, float(np.max(np.abs(np.asarray(zm2zt2zm(nzm, nzt, ng, jgr, jnp.asarray(am), zm_min=zmin))
                                              - np.asarray(clubb_f2py.f2py_zm2zt2zm_2d(nzt, am, zmin))))))
         worst[f"zt2zm2zt(min={zmin:g})"] = wt
         worst[f"zm2zt2zm(min={zmin:g})"] = wm
@@ -126,14 +132,15 @@ def test_stretched_grid_operators():
     assert float(np.max(np.abs(np.asarray(g[0]) - np.asarray(jgr.zm)))) == 0.0, "stretched grid zm mismatch (setup)"
     rng = np.random.default_rng(0)
     worst = 0.0
-    for nm, jf, ff, on_zt in (("ddzt", ddzt_jax, clubb_f2py.f2py_ddzt_2d, True),
-                              ("zt2zm", zt2zm_jax, clubb_f2py.f2py_zt2zm_2d, True),
-                              ("ddzm", ddzm_jax, clubb_f2py.f2py_ddzm_2d, False),
-                              ("zm2zt", zm2zt_jax, clubb_f2py.f2py_zm2zt_2d, False)):
+    for nm, jf, ff, on_zt in (
+            ("ddzt", lambda a: ddzt(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_ddzt_2d, True),
+            ("zt2zm", lambda a: zt2zm(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_zt2zm_2d, True),
+            ("ddzm", lambda a: ddzm(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_ddzm_2d, False),
+            ("zm2zt", lambda a: zm2zt(nzm, nzt, ng, jgr, a), clubb_f2py.f2py_zm2zt_2d, False)):
         for _ in range(8):
             a = rng.standard_normal((ng, nzt if on_zt else nzm))
             worst = max(worst, float(np.max(np.abs(
-                np.asarray(jf(jnp.asarray(a), jgr)) - np.asarray(ff(nzm if on_zt else nzt, a))))))
+                np.asarray(jf(jnp.asarray(a))) - np.asarray(ff(nzm if on_zt else nzt, a))))))
     assert worst < 1e-12, f"stretched-grid operators differ from f2py: worst {worst:.2e}"
     print(f"  f2py ddzt/ddzm/zt2zm/zm2zt on a STRETCHED grid (non-uniform dz): bit-match, worst {worst:.2e}  PASS")
 
@@ -194,8 +201,12 @@ def test_setup_grid_is_sole_grid_constructor():
     Pure source scan — no f2py, never SKIPs. (iter 485)"""
     import re
     src_root = os.path.join(_ROOT, "clubb_jax", "src")
-    # the construction site is allowed only in the grid_class home module
-    home = os.path.normpath(os.path.join(src_root, "derived_types", "grid_class.py"))
+    # Grid construction is allowed in setup_grid and in API converters that
+    # faithfully mirror an already-constructed Fortran/API grid.
+    allowed = {
+        os.path.normpath(os.path.join(src_root, "derived_types", "grid_class.py")),
+        os.path.normpath(os.path.join(src_root, "derived_types", "converters.py")),
+    }
     offenders = []
     for dirpath, _dirs, files in os.walk(src_root):
         for fn in files:
@@ -207,7 +218,7 @@ def test_setup_grid_is_sole_grid_constructor():
                     code = line.split("#", 1)[0]  # strip trailing comments
                     # a Grid(...) construction: `Grid(` preceded by `=`, `return `, `(`, etc. — NOT `class Grid(`
                     if re.search(r"(?<![A-Za-z_.])Grid\s*\(", code) and "class Grid(" not in code:
-                        if os.path.normpath(path) != home:
+                        if os.path.normpath(path) not in allowed:
                             offenders.append(f"{os.path.relpath(path, _ROOT)}:{lineno}: {line.strip()}")
     assert not offenders, (
         "Grid(...) constructed outside setup_grid (derived_types/grid_class.py) — the iter-483 descending-grid guard "
@@ -221,7 +232,12 @@ def test_differentiable():
     rng = np.random.default_rng(2)
     a = jnp.asarray(rng.standard_normal((1, nzt)))
     # a chain through both a derivative and a regrid → finite grad
-    g = jax.grad(lambda v: jnp.sum(ddzt_jax(v, jgr) ** 2) + jnp.sum(zt2zm_jax(v, jgr) ** 2))(a)
+    g = jax.grad(
+        lambda v: (
+            jnp.sum(ddzt(jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr, v) ** 2)
+            + jnp.sum(zt2zm(jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr, v) ** 2)
+        )
+    )(a)
     assert np.all(np.isfinite(np.asarray(g))), "non-finite grad through ddzt/zt2zm"
     print(f"  jax.grad through ddzt + zt2zm: finite ({g.size} entries)  PASS")
 

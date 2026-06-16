@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.clubb_constants import (
+    Cp,
+    Lv,
     T_freeze_K,
     ep,
     saturation_bolton,
@@ -12,6 +15,11 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
     saturation_gfdl,
     saturation_lookup,
 )
+
+SATURATION_FLATAU = saturation_flatau
+SATURATION_BOLTON = saturation_bolton
+SATURATION_GFDL = saturation_gfdl
+SATURATION_LOOKUP = saturation_lookup
 
 _FLATAU_ICE_MIN_T_C = -90.0
 _FLATAU_ICE_A = (
@@ -144,3 +152,34 @@ def sat_mixrat_ice(p_in_Pa, T_in_K):
     safe = denom >= 1.0
     denom_safe = jnp.where(safe, denom, 1.0)
     return jnp.where(safe, ep * esat_ice / denom_safe, ep)
+
+
+def rcm_sat_adj(thlm, rtm, p_in_Pa, exner, saturation_formula: int):
+    """Diagnose liquid water from total water and liquid potential temperature."""
+    thlm = jnp.asarray(thlm, dtype=jnp.float64)
+    rtm = jnp.asarray(rtm, dtype=jnp.float64)
+    p_in_Pa = jnp.asarray(p_in_Pa, dtype=jnp.float64)
+    exner = jnp.asarray(exner, dtype=jnp.float64)
+
+    theta_lo = thlm
+    theta_hi = thlm + Lv / (Cp * exner) * jnp.maximum(rtm, 0.0)
+
+    def residual(theta):
+        rsat = sat_mixrat_liq(p_in_Pa, theta * exner, saturation_formula)
+        rcm = jnp.maximum(rtm - rsat, 0.0)
+        return theta - Lv / (Cp * exner) * rcm - thlm
+
+    def step(bounds, _):
+        lo, hi = bounds
+        mid = 0.5 * (lo + hi)
+        use_upper = residual(mid) < 0.0
+        lo = jnp.where(use_upper, mid, lo)
+        hi = jnp.where(use_upper, hi, mid)
+        return (lo, hi), None
+
+    (theta_lo, theta_hi), _ = jax.lax.scan(
+        step, (theta_lo, theta_hi), None, length=64
+    )
+    theta = 0.5 * (theta_lo + theta_hi)
+    rsat = sat_mixrat_liq(p_in_Pa, theta * exner, saturation_formula)
+    return jnp.maximum(rtm - rsat, 0.0)

@@ -25,10 +25,61 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from clubb_jax.src.derived_types.grid_class import setup_grid
+from clubb_jax.src.derived_types.err_info import ErrInfo
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.CLUBB_core.mono_flux_limiter import (
-    monotonic_turbulent_flux_limit, _monotonic_turbulent_flux_limit_numpy,
-    calc_turb_adv_range, MFL_RTM, MFL_THLM, MFL_UM,
+    monotonic_turbulent_flux_limit,
+    calc_turb_adv_range,
+    mono_flux_rtm as MFL_RTM,
+    mono_flux_thlm as MFL_THLM,
+    mono_flux_um as MFL_UM,
 )
+
+
+def _empty_stats(gr):
+    return JaxStats.empty(
+        l_sample=False,
+        names=(),
+        ncol=gr.ngrdcol,
+        max_nlev=max(gr.nzm, gr.nzt),
+    )
+
+
+def _mfl_call(a):
+    gr = a["gr"]
+    xm, wpxp, _err, _stats = monotonic_turbulent_flux_limit(
+        gr.nzm,
+        gr.nzt,
+        gr.ngrdcol,
+        gr,
+        a["solve_type"],
+        a["dt"],
+        a["xm_old"],
+        a["xp2"],
+        a["wm_zt"],
+        a["xm_forcing"],
+        a["rho_ds_zm"],
+        a["rho_ds_zt"],
+        a["invrs_rho_ds_zm"],
+        a["invrs_rho_ds_zt"],
+        a["xp2_threshold"],
+        a["xm_tol"],
+        False,
+        a["low_lev_effect"],
+        a["high_lev_effect"],
+        2,
+        True,
+        True,
+        _empty_stats(gr),
+        a["xm"],
+        a["wpxp"],
+        ErrInfo.initialized(gr.ngrdcol),
+    )
+    return xm, wpxp
+
+
+def _monotonic_turbulent_flux_limit_numpy(**a):
+    return _mfl_call(a)
 
 
 def _make_inputs(rng, gr, ngrdcol, nzt, solve_type):
@@ -40,7 +91,9 @@ def _make_inputs(rng, gr, ngrdcol, nzt, solve_type):
     vw2 = 0.05 + 0.5 * rng.random((ngrdcol, nzm))
     mf = 0.3 + 0.4 * rng.random((ngrdcol, nzm))
     dt = 60.0
-    lle, hle = calc_turb_adv_range(w1, w2, vw1, vw2, mf, gr, dt)
+    lle, hle, _stats = calc_turb_adv_range(
+        gr.nzm, gr.nzt, gr.ngrdcol, gr, dt, w1, w2, vw1, vw2, mf, _empty_stats(gr)
+    )
 
     if solve_type in (MFL_UM,):
         scale, xp2_thr = 5.0, 1e-3
@@ -75,7 +128,7 @@ def test_bit_exact():
         for st in (MFL_RTM, MFL_THLM, MFL_UM):
             a = _make_inputs(rng, gr, 2, nzt, st)
             xm_np, wpxp_np = _monotonic_turbulent_flux_limit_numpy(**a)
-            xm_jx, wpxp_jx = monotonic_turbulent_flux_limit(**a)
+            xm_jx, wpxp_jx = _mfl_call(a)
             xm_jx = np.asarray(xm_jx); wpxp_jx = np.asarray(wpxp_jx)
             # confirm the limiter actually did something (else the test is vacuous)
             if np.max(np.abs(wpxp_np - a["wpxp"])) > 0:
@@ -87,7 +140,6 @@ def test_bit_exact():
     assert worst < 1e-12, f"JAX flux limiter not bit-exact to NumPy: worst rel {worst:.2e}"
     print(f"  mono flux limiter: JAX (lax.scan) vs NumPy BIT-EXACT (worst rel {worst:.1e}; "
           f"{n_clipped}/18 cases clipped)  PASS")
-    return True
 
 
 def test_differentiable():
@@ -98,13 +150,12 @@ def test_differentiable():
 
     def loss(wpxp):
         b = dict(a); b["wpxp"] = wpxp
-        xm_new, wpxp_new = monotonic_turbulent_flux_limit(**b)
+        xm_new, wpxp_new = _mfl_call(b)
         return jnp.sum(xm_new ** 2) + jnp.sum(wpxp_new ** 2)
 
     g = jax.grad(loss)(jnp.asarray(a["wpxp"]))
     assert np.all(np.isfinite(np.asarray(g))) and float(jnp.sum(jnp.abs(g))) > 0, "grad not finite/nonzero"
     print(f"  mono flux limiter: jax.grad w.r.t. wpxp finite+nonzero (|g|sum={float(jnp.sum(jnp.abs(g))):.2e})  PASS")
-    return True
 
 
 def test_full_limiter_f2py():
@@ -121,7 +172,7 @@ def test_full_limiter_f2py():
         from clubb_python.derived_types.err_info import ErrInfo
     except Exception as e:
         print(f"  f2py monotonic_turbulent_flux_limit oracle: SKIP ({type(e).__name__})")
-        return True
+        return
     gr = setup_grid(ngrdcol=2, deltaz=50.0, zm_init=0.0, zm_top=2000.0, grid_type=1)
     ng, nzm = gr.zm.shape; nzt = nzm - 1
     clubb_api.init_err_info(ng); cf = clubb_api.get_default_config_flags(); clubb_api.init_config_flags(cf)
@@ -136,7 +187,7 @@ def test_full_limiter_f2py():
         rng = np.random.default_rng(seed)
         for st in (MFL_RTM, MFL_THLM, MFL_UM):
             a = _make_inputs(rng, gr, 2, nzt, st)
-            xm_j, wpxp_j = monotonic_turbulent_flux_limit(**a)
+            xm_j, wpxp_j = _mfl_call(a)
             lle = np.asarray(a["low_lev_effect"]); hle = np.asarray(a["high_lev_effect"])
             xm_f, wpxp_f = clubb_f2py.f2py_monotonic_turbulent_flux_limit(
                 code[st], a["dt"], np.asarray(a["xm_old"]), np.asarray(a["xp2"]), np.asarray(a["wm_zt"]),
@@ -149,7 +200,6 @@ def test_full_limiter_f2py():
     assert worst < 1e-12, f"full monotonic_turbulent_flux_limit f2py mismatch: worst rel {worst:.2e}"
     print(f"  f2py monotonic_turbulent_flux_limit (whole routine, rtm/thlm/um × 4 seeds): bit-match, "
           f"worst rel {worst:.2e}  PASS")
-    return True
 
 
 def test_calc_turb_adv_range_f2py():
@@ -163,7 +213,7 @@ def test_calc_turb_adv_range_f2py():
         from clubb_python.derived_types.err_info import ErrInfo
     except Exception as e:
         print(f"  f2py calc_turb_adv_range oracle: SKIP ({type(e).__name__})")
-        return True
+        return
     jgr = setup_grid(ngrdcol=2, deltaz=40.0, zm_init=0.0, zm_top=1200.0, grid_type=1)
     ng, nzm = jgr.zm.shape; nzt = nzm - 1
     clubb_api.init_err_info(ng); cf = clubb_api.get_default_config_flags(); clubb_api.init_config_flags(cf)
@@ -177,8 +227,11 @@ def test_calc_turb_adv_range_f2py():
     for _ in range(15):
         w1 = rng.uniform(-1, 1, (ng, nzm)); w2 = rng.uniform(-1, 1, (ng, nzm))
         v1 = rng.uniform(0.1, 1, (ng, nzm)); v2 = rng.uniform(0.1, 1, (ng, nzm)); mf = rng.uniform(0.3, 0.7, (ng, nzm))
-        jt = calc_turb_adv_range(jnp.asarray(w1), jnp.asarray(w2), jnp.asarray(v1), jnp.asarray(v2),
-                                 jnp.asarray(mf), jgr, 60.0)
+        jt = calc_turb_adv_range(
+            jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr, 60.0,
+            jnp.asarray(w1), jnp.asarray(w2), jnp.asarray(v1), jnp.asarray(v2),
+            jnp.asarray(mf), _empty_stats(jgr),
+        )[:2]
         ft = clubb_f2py.f2py_calc_turb_adv_range(nzt, 60.0, w1, w2, v1, v2, mf)
         # 0-based JAX vs 1-based Fortran level indices: f2py == JAX + 1
         for k in range(2):
@@ -186,14 +239,11 @@ def test_calc_turb_adv_range_f2py():
                 bad += 1
     assert bad == 0, f"calc_turb_adv_range f2py index mismatch (beyond the +1 0/1-based offset) in {bad} cases"
     print("  f2py calc_turb_adv_range: low/high level indices match (modulo 0-based vs 1-based +1), 15 cases  PASS")
-    return True
 
 
 if __name__ == "__main__":
-    ok = True
-    ok &= test_bit_exact()
-    ok &= test_full_limiter_f2py()
-    ok &= test_calc_turb_adv_range_f2py()
-    ok &= test_differentiable()
-    print("\nAll mono_flux_limiter tests PASSED" if ok else "\nFAILED")
-    sys.exit(0 if ok else 1)
+    test_bit_exact()
+    test_full_limiter_f2py()
+    test_calc_turb_adv_range_f2py()
+    test_differentiable()
+    print("\nAll mono_flux_limiter tests PASSED")

@@ -16,7 +16,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.constants_clubb import Cp, Lv, p0, kappa
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 # Tracer-transparency (REFACTOR B5): _asarray/_xp/_iset behave EXACTLY like numpy for concrete arrays
 # (normal runs bit-identical) but route to jnp under a jax.grad trace, so the whole-driver autodiff graph
 # survives the surface-BC interpolation. See CLUBB_core/tracer_numpy.py.
@@ -99,11 +99,11 @@ def read_surface_var_for_bc(state: dict) -> dict:
     rho_zm = _asarray(state['rho_zm'])
     z_bot = _Z_BOT_CNVG
 
-    um_zm    = _asarray(zt2zm_jax(jnp.asarray(state['um']), gr))
-    vm_zm    = _asarray(zt2zm_jax(jnp.asarray(state['vm']), gr))
-    thlm_zm  = _asarray(zt2zm_jax(jnp.asarray(state['thlm']), gr))
-    rtm_zm   = _asarray(zt2zm_jax(jnp.asarray(state['rtm']), gr))
-    exner_zm = _asarray(zt2zm_jax(jnp.asarray(state['exner']), gr))
+    um_zm    = _asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(state['um'])))
+    vm_zm    = _asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(state['vm'])))
+    thlm_zm  = _asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(state['thlm'])))
+    rtm_zm   = _asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(state['rtm'])))
+    exner_zm = _asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(state['exner'])))
     exner_zm = _iset(exner_zm, np.s_[:, 0], (state['p_sfc'] / p0) ** kappa)
 
     cols = {k: [] for k in ('um_bot', 'vm_bot', 'rtm_bot', 'thlm_bot', 'rho_bot', 'exner_bot')}
@@ -337,10 +337,11 @@ def prescribe_forcings_arm(state: dict, time_current: float) -> None:
             state['wm_zt'][:, :] = profile[np.newaxis, :]
             # Compute wm_zm via zt2zm
             import jax.numpy as jnp
-            from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+            from clubb_jax.src.CLUBB_core.grid_class import zt2zm
+            gr = state['gr']
             wm_zt_jax = jnp.asarray(state['wm_zt'])
             state['wm_zm'] = np.asarray(
-                zt2zm_jax(wm_zt_jax, state['gr']), dtype=np.float64
+                zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, wm_zt_jax), dtype=np.float64
             )
         else:
             state[state_key][:, :] = profile[np.newaxis, :]

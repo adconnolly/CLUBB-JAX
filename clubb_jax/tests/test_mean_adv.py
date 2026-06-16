@@ -23,7 +23,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.derived_types.grid_class import setup_grid
-from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax, term_ma_zm_lhs_jax
+from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs, term_ma_zm_lhs
 
 
 def test_f2py_oracle():
@@ -41,10 +41,16 @@ def test_f2py_oracle():
     for _ in range(20):
         wm_zt = rng.uniform(-2.0, 2.0, (ng, nzm - 1)); wm_zm = rng.uniform(-2.0, 2.0, (ng, nzm))
         for lup in (False, True):   # term_ma_zt_lhs centered + upwind branches (the iter-395 merge)
-            j = np.asarray(term_ma_zt_lhs_jax(jnp.asarray(wm_zt), jgr, lup))
+            j = np.asarray(term_ma_zt_lhs(
+                jgr.nzm, jgr.nzt, jgr.ngrdcol, jnp.asarray(wm_zt),
+                jgr.weights_zt2zm, jgr.invrs_dzt, jgr.invrs_dzm, lup, gd,
+            ))
             f = np.asarray(clubb_f2py.f2py_term_ma_zt_lhs(wm_zt, w_zt2zm, idzt, idzm, int(lup), gd))
             wzt = max(wzt, float(np.max(np.abs(j - f))))
-        jm = np.asarray(term_ma_zm_lhs_jax(jnp.asarray(wm_zm), jgr))
+        jm = np.asarray(term_ma_zm_lhs(
+            jgr.nzm, jgr.nzt, jgr.ngrdcol, jnp.asarray(wm_zm),
+            jgr.invrs_dzm, jgr.weights_zm2zt,
+        ))
         fm = np.asarray(clubb_f2py.f2py_term_ma_zm_lhs(wm_zm, idzm, w_zm2zt))
         wzm = max(wzm, float(np.max(np.abs(jm - fm))))
     assert wzt < 1e-12, f"term_ma_zt_lhs f2py mismatch {wzt:.2e}"

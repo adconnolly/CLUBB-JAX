@@ -23,14 +23,40 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.pdf_closure_module import (
-    calc_pdf_skewness_diagnostics_jax, rt_tol, thl_tol, w_tol_sqd)
+from clubb_jax.src.CLUBB_core.constants_clubb import rt_tol, thl_tol, w_tol_sqd
 from clubb_jax.src.CLUBB_core.Skx_module import Skx_func
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.derived_types.grid_class import setup_grid
 from clubb_jax.src.CLUBB_core.parameters_tunable import init_clubb_params
 
 _NG, _NZT = 1, 8
+
+
+def _skx(xp2, xp3, x_tol, clubb_params):
+    return Skx_func(xp2.shape[1], xp2.shape[0], xp2, xp3, x_tol, clubb_params)
+
+
+def calc_pdf_skewness_diagnostics_jax(
+    rtp2_zt,
+    rtp3,
+    thlp2_zt,
+    thlp3,
+    rtp2,
+    thlp2,
+    sigma_sqd_w_zm,
+    wp3_zm,
+    wp2,
+    clubb_params,
+    gr,
+):
+    Skrt_zt = _skx(rtp2_zt, rtp3, rt_tol, clubb_params)
+    Skthl_zt = _skx(thlp2_zt, thlp3, thl_tol, clubb_params)
+    Skrt_zm = _skx(rtp2, zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, rtp3), rt_tol, clubb_params)
+    Skthl_zm = _skx(thlp2, zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, thlp3), thl_tol, clubb_params)
+    Skw_velocity = (1.0 / (1.0 - sigma_sqd_w_zm)) * (
+        wp3_zm / jnp.maximum(wp2, w_tol_sqd)
+    )
+    return Skrt_zt, Skthl_zt, Skrt_zm, Skthl_zm, Skw_velocity
 
 
 def _inputs(rng, gr):
@@ -53,10 +79,10 @@ def test_orchestration_and_skw_velocity():
     Skrt_zt, Skthl_zt, Skrt_zm, Skthl_zm, Skw_vel = calc_pdf_skewness_diagnostics_jax(**k)
     cp = k['clubb_params']
     # independent recomputation via the tested Skx_func + the same regrid
-    r_Skrt_zt = Skx_func(k['rtp2_zt'], k['rtp3'], rt_tol, cp)
-    r_Skthl_zt = Skx_func(k['thlp2_zt'], k['thlp3'], thl_tol, cp)
-    r_Skrt_zm = Skx_func(k['rtp2'], zt2zm_jax(k['rtp3'], gr), rt_tol, cp)
-    r_Skthl_zm = Skx_func(k['thlp2'], zt2zm_jax(k['thlp3'], gr), thl_tol, cp)
+    r_Skrt_zt = _skx(k['rtp2_zt'], k['rtp3'], rt_tol, cp)
+    r_Skthl_zt = _skx(k['thlp2_zt'], k['thlp3'], thl_tol, cp)
+    r_Skrt_zm = _skx(k['rtp2'], zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, k['rtp3']), rt_tol, cp)
+    r_Skthl_zm = _skx(k['thlp2'], zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, k['thlp3']), thl_tol, cp)
     r_Skw = (1.0 / (1.0 - np.asarray(k['sigma_sqd_w_zm']))) * (np.asarray(k['wp3_zm'])
              / np.maximum(np.asarray(k['wp2']), w_tol_sqd))
     for got, ref, nm in ((Skrt_zt, r_Skrt_zt, "Skrt_zt"), (Skthl_zt, r_Skthl_zt, "Skthl_zt"),

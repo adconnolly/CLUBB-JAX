@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from clubb_jax.src.CLUBB_core.constants_clubb import Cp, grav, kappa, p0, Rd
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.CLUBB_core.calc_pressure import init_pressure
 
 _CP_OV_G = Cp / grav
@@ -42,7 +42,7 @@ def hydrostatic(thvm, p_sfc, gr):
     p_in_Pa, exner_zt, p_in_Pa_zm, exner_zm = init_pressure(thvm, p_sfc, gr)
 
     # Interpolate thvm to momentum levels (no floor, as in Fortran hydrostatic)
-    thvm_zm = zt2zm_jax(thvm, gr)
+    thvm_zm = zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, thvm)
 
     rho    = p_in_Pa    / (Rd * thvm    * exner_zt)
     rho_zm = p_in_Pa_zm / (Rd * thvm_zm * exner_zm)

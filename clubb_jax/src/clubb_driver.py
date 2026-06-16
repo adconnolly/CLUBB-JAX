@@ -20,7 +20,7 @@ import numpy as np
 # JAX core
 from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq, rcm_sat_adj
 from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.CLUBB_core.sponge_layer_damping import initialize_tau_sponge_damp
 from clubb_jax.src.Input_fields.hydrostatic_module import hydrostatic
 from clubb_jax.src.CLUBB_core.parameters_tunable import (
@@ -745,9 +745,8 @@ def init_clubb_case(namelist_path: str) -> dict:
     invrs_rho_ds_zt = 1.0 / rho_ds_zt
 
     # Momentum level versions via zt2zm interpolation
-    # zt2zm calls replaced with zt2zm_jax
-    rv_zm = np.maximum(np.asarray(zt2zm_jax(jnp.asarray(rv), gr), dtype=np.float64), 0.0)
-    thm_zm = np.asarray(zt2zm_jax(jnp.asarray(thm), gr), dtype=np.float64)
+    rv_zm = np.maximum(np.asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(rv)), dtype=np.float64), 0.0)
+    thm_zm = np.asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(thm)), dtype=np.float64)
 
     # rtm_sfc: linearly interpolate sounding rt to the zm surface level,
     # matching Fortran read_sounding which interpolates to gr%zm(1).
@@ -780,10 +779,10 @@ def init_clubb_case(namelist_path: str) -> dict:
     if subs_type == 'omega[Pa/s]':
         wm_zt = -wm_zt / (grav * rho)
         wm_zt[:, -1] = 0.0
-        wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr), dtype=np.float64)
+        wm_zm = np.array(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(wm_zt)), dtype=np.float64)
         wm_zm[:, -1] = 0.0
     else:
-        wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr), dtype=np.float64)
+        wm_zm = np.array(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(wm_zt)), dtype=np.float64)
         wm_zm[:, 0] = 0.0
         wm_zm[:, -1] = 0.0
 

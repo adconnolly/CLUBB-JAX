@@ -20,6 +20,7 @@ Requires clubb_release/output/rico_fort/rico_stats.nc; skips if absent.
 import os
 import numpy as np
 import jax
+import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -32,13 +33,70 @@ for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
     if _p not in sys.path:
         sys.path.append(_p)
 
+from clubb_jax.src.CLUBB_core.clubb_constants import iupsilon_precip_frac_rat, nparams
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction, precip_frac_assert_check
+from clubb_jax.src.derived_types.err_info import ErrInfo
+from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _RICO_STATS = os.path.join(os.path.dirname(__file__),
                            "../../clubb_release/output/rico_fort/rico_stats.nc")
 _RR_TOL = 1.0e-10
 _NR_TOL = _RR_TOL / ((4.0 / 3.0) * np.pi * 1000.0 * (5.0e-3) ** 3)   # ~1.9099e-7
 _UPSILON = 0.55   # rico tunable upsilon_precip_frac_rat
+
+
+def _precip_fraction_old_api(
+    hydromet,
+    cloud_frac,
+    cloud_frac_1,
+    cloud_frac_2,
+    ice_supersat_frac,
+    ice_supersat_frac_1,
+    ice_supersat_frac_2,
+    mixt_frac,
+    l_mix_rat_hm,
+    l_frozen_hm,
+    hydromet_tol,
+    upsilon,
+):
+    ngrdcol, nzt, hydromet_dim = np.asarray(hydromet).shape
+    gr = setup_grid(
+        ngrdcol=ngrdcol,
+        deltaz=1.0,
+        zm_init=0.0,
+        zm_top=float(nzt),
+        grid_type=1,
+    )
+    clubb_params = jnp.zeros((ngrdcol, nparams), dtype=jnp.float64)
+    clubb_params = clubb_params.at[:, iupsilon_precip_frac_rat].set(upsilon)
+    stats = JaxStats.empty(
+        l_sample=False,
+        names=(),
+        ncol=ngrdcol,
+        max_nlev=max(nzt, gr.nzm),
+    )
+    _err, pf, pf1, pf2, pftol, _stats = precip_fraction(
+        gr,
+        nzt,
+        ngrdcol,
+        hydromet_dim,
+        hydromet,
+        cloud_frac,
+        cloud_frac_1,
+        l_mix_rat_hm,
+        l_frozen_hm,
+        hydromet_tol,
+        cloud_frac_2,
+        ice_supersat_frac,
+        ice_supersat_frac_1,
+        ice_supersat_frac_2,
+        mixt_frac,
+        clubb_params,
+        ErrInfo.initialized(ngrdcol),
+        stats,
+    )
+    return pf, pf1, pf2, pftol
 
 
 def test_precip_fraction_vs_rico_oracle():
@@ -65,7 +123,7 @@ def test_precip_fraction_vs_rico_oracle():
     l_mix = np.array([1, 0]); l_frozen = np.array([0, 0])
     hm_tol = np.array([_RR_TOL, _NR_TOL])
 
-    pf, pf1, pf2, pftol = (np.asarray(x) for x in precip_fraction(
+    pf, pf1, pf2, pftol = (np.asarray(x) for x in _precip_fraction_old_api(
         hydromet, cf, cf1, cf2, isf, z, z, mf, l_mix, l_frozen, hm_tol, _UPSILON))
 
     # Well-resolved precip region (comfortably above cloud_frac_min=0.005, both agree there
@@ -97,8 +155,9 @@ def test_precip_frac_assert_check():
     hydromet = np.abs(rng.normal(size=(ng, nzt, hd))) * 1e-4
     cf = rng.uniform(0, 1, (ng, nzt)); mf = rng.uniform(0.3, 0.7, (ng, nzt)); isf = np.zeros((ng, nzt))
     hmtol = np.array([1e-10, 1.9e-7])
-    pf, pf1, pf2, pftol = precip_fraction(hydromet, cf, cf, cf, isf, isf, isf, mf,
-                                          np.array([True, False]), np.array([False, False]), hmtol, 1.0)
+    pf, pf1, pf2, pftol = _precip_fraction_old_api(
+        hydromet, cf, cf, cf, isf, isf, isf, mf,
+        np.array([True, False]), np.array([False, False]), hmtol, 1.0)
     args = (hydromet[0], hmtol, mf[0], pf[0], pf1[0], pf2[0], float(pftol[0]))
     assert precip_frac_assert_check(*args) is True, "valid precip_fraction output rejected"
     bad = np.array(pf[0]); bad[5] = 1.5            # precip_frac > 1

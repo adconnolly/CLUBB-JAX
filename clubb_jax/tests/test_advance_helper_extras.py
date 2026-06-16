@@ -25,15 +25,191 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.advance_helper_module import (
-    smooth_min, smooth_max, calc_xpwp, calc_stability_correction, calc_Ri_zm, ilambda0_stability_coef,
-    vertical_avg, vertical_integral, calc_brunt_vaisala_freq_sqd, calculate_thlp2_rad, Lscale_width_vert_avg,
-    wp23_term_splat_lhs, compute_Cx_fnc_Richardson)
+    smooth_min as _smooth_min, smooth_max as _smooth_max,
+    calc_stability_correction as _calc_stability_correction,
+    calc_Ri_zm as _calc_Ri_zm,
+    vertical_avg as _vertical_avg, vertical_integral as _vertical_integral,
+    calc_brunt_vaisala_freq_sqd as _calc_brunt_vaisala_freq_sqd,
+    calculate_thlp2_rad as _calculate_thlp2_rad,
+    Lscale_width_vert_avg as _Lscale_width_vert_avg,
+    wp23_term_splat_lhs as _wp23_term_splat_lhs,
+    compute_Cx_fnc_Richardson as _compute_Cx_fnc_Richardson)
+from clubb_jax.src.CLUBB_core.parameter_indices import ilambda0_stability_coef
 from clubb_jax.src.CLUBB_core.parameters_tunable import init_clubb_params
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _TUNABLE_PARAMS = os.path.join(_ROOT, "clubb_release", "input", "tunable_parameters", "tunable_parameters.in")
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
+
+
+def _smooth_dims(a, b):
+    shape_a = getattr(a, "shape", ())
+    shape_b = getattr(b, "shape", ())
+    shape = shape_a if len(shape_a) > 0 else shape_b
+    if len(shape) >= 2:
+        return shape[1], shape[0]
+    return shape[0] if len(shape) == 1 else 1, 1
+
+
+def smooth_min(a, b, coef):
+    nz, ngrdcol = _smooth_dims(a, b)
+    return _smooth_min(nz, ngrdcol, a, b, coef)
+
+
+def smooth_max(a, b, coef):
+    nz, ngrdcol = _smooth_dims(a, b)
+    return _smooth_max(nz, ngrdcol, a, b, coef)
+
+
+def calc_xpwp(Km_zm, xm, invrs_dzm):
+    Km_zm = jnp.asarray(Km_zm, dtype=jnp.float64)
+    xm = jnp.asarray(xm, dtype=jnp.float64)
+    invrs_dzm = jnp.asarray(invrs_dzm, dtype=jnp.float64)
+    if Km_zm.ndim == 1:
+        out = jnp.zeros_like(Km_zm)
+        interior = Km_zm[1:-1] * invrs_dzm[1:-1] * (xm[1:] - xm[:-1])
+        return out.at[1:-1].set(interior)
+    out = jnp.zeros_like(Km_zm)
+    interior = Km_zm[:, 1:-1] * invrs_dzm[:, 1:-1] * (xm[:, 1:] - xm[:, :-1])
+    return out.at[:, 1:-1].set(interior)
+
+
+def calc_stability_correction(brunt_vaisala_freq_sqd, Lscale_zm, em, clubb_params):
+    ngrdcol, nzm = np.asarray(brunt_vaisala_freq_sqd).shape
+    return _calc_stability_correction(
+        nzm,
+        ngrdcol,
+        brunt_vaisala_freq_sqd,
+        Lscale_zm,
+        em,
+        clubb_params[:, ilambda0_stability_coef],
+    )
+
+
+def calc_Ri_zm(bv_freq_sqd, shear, lim_bv, lim_shear):
+    ngrdcol, nzm = np.asarray(bv_freq_sqd).shape
+    return _calc_Ri_zm(nzm, ngrdcol, bv_freq_sqd, shear, lim_bv, lim_shear)
+
+
+def vertical_avg(rho_ds, field, dz):
+    return _vertical_avg(len(np.asarray(rho_ds)), rho_ds, field, dz)
+
+
+def vertical_integral(rho_ds, field, dz):
+    return _vertical_integral(len(np.asarray(rho_ds)), rho_ds, field, dz)
+
+
+def calc_brunt_vaisala_freq_sqd(
+    thlm,
+    exner,
+    rtm,
+    rcm,
+    p_in_Pa,
+    thvm,
+    ice_supersat_frac,
+    bv_efold,
+    T0,
+    l_use_thvm_in_bv_freq,
+    l_brunt_vaisala_freq_moist,
+    l_modify_limiters_for_cnvg_test,
+    gr,
+):
+    from clubb_jax.src.CLUBB_core.saturation import SATURATION_FLATAU
+    return _calc_brunt_vaisala_freq_sqd(
+        gr.nzm,
+        gr.nzt,
+        gr.ngrdcol,
+        gr,
+        thlm,
+        exner,
+        rtm,
+        rcm,
+        p_in_Pa,
+        thvm,
+        ice_supersat_frac,
+        SATURATION_FLATAU,
+        l_brunt_vaisala_freq_moist,
+        l_use_thvm_in_bv_freq,
+        l_modify_limiters_for_cnvg_test,
+        bv_efold,
+        T0,
+    )
+
+
+def calculate_thlp2_rad(rcm, thlprcp, radht, clubb_params, gr):
+    return _calculate_thlp2_rad(
+        gr.ngrdcol,
+        gr.nzm,
+        gr.nzt,
+        gr,
+        rcm,
+        thlprcp,
+        radht,
+        clubb_params,
+        jnp.zeros((gr.ngrdcol, gr.nzm), dtype=jnp.float64),
+    )
+
+
+def Lscale_width_vert_avg(var_profile, rho_ds_zm, var_below_ground_value, gr):
+    return _Lscale_width_vert_avg(
+        gr.nzm,
+        gr.ngrdcol,
+        gr,
+        2,
+        var_profile,
+        jnp.zeros((gr.ngrdcol, gr.nzm), dtype=jnp.float64),
+        rho_ds_zm,
+        var_below_ground_value,
+    )
+
+
+def wp23_term_splat_lhs(
+    brunt_vaisala_freq_sqd_mixed,
+    Lscale_zm,
+    rho_ds_zm,
+    C_wp2_splat,
+    below_grnd_val,
+    gr,
+):
+    del below_grnd_val
+    return _wp23_term_splat_lhs(
+        gr.nzm,
+        gr.nzt,
+        gr.ngrdcol,
+        gr,
+        C_wp2_splat,
+        brunt_vaisala_freq_sqd_mixed,
+        Lscale_zm,
+        rho_ds_zm,
+    )
+
+
+def compute_Cx_fnc_Richardson(
+    brunt_vaisala_freq_sqd,
+    brunt_vaisala_freq_sqd_mixed,
+    ddzt_umvm_sqd,
+    clubb_params,
+    l_use_shear_Richardson,
+    l_modify_limiters_for_cnvg_test,
+):
+    ngrdcol, nzm = np.asarray(brunt_vaisala_freq_sqd).shape
+    nzt = nzm - 1
+    gr = setup_grid(ngrdcol, _DZ, 0.0, _DZ * (nzm - 1), grid_type=1)
+    return _compute_Cx_fnc_Richardson(
+        nzm,
+        nzt,
+        ngrdcol,
+        gr,
+        jnp.zeros((ngrdcol, nzm), dtype=jnp.float64),
+        ddzt_umvm_sqd,
+        jnp.ones((ngrdcol, nzm), dtype=jnp.float64),
+        brunt_vaisala_freq_sqd,
+        brunt_vaisala_freq_sqd_mixed,
+        clubb_params,
+        l_use_shear_Richardson,
+        l_modify_limiters_for_cnvg_test,
+    )
 
 
 def test_smooth_min_closed_form():
@@ -195,13 +371,13 @@ def test_stability_and_Ri_f2py():
         print(f"  f2py stability/Ri oracle: SKIP ({type(e).__name__})")
         return
     rng = np.random.default_rng(6)
-    npar = max(ilambda0_stability_coef, 80)
+    npar = max(ilambda0_stability_coef + 1, 80)
     sworst = rworst = 0.0
     for _ in range(40):
         ng, nzm = 2, 10
         bv = rng.uniform(-1e-3, 1e-2, (ng, nzm)); ls = rng.uniform(10.0, 500.0, (ng, nzm))
         em = rng.uniform(1e-3, 1.0, (ng, nzm)); lam0 = rng.uniform(0.5, 3.0, (ng,))
-        cp = np.zeros((ng, npar)); cp[:, ilambda0_stability_coef - 1] = lam0
+        cp = np.zeros((ng, npar)); cp[:, ilambda0_stability_coef] = lam0
         sj = np.asarray(calc_stability_correction(jnp.asarray(bv), jnp.asarray(ls), jnp.asarray(em), jnp.asarray(cp)))
         sf = np.asarray(clubb_f2py.f2py_calc_stability_correction(bv, ls, em, lam0))
         sworst = max(sworst, float(np.max(np.abs(sj - sf))))

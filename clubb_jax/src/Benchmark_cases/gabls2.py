@@ -16,7 +16,7 @@ import math
 import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
 from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg
 from clubb_jax.src.Benchmark_cases.sfc_flux import compute_wpthlp_sfc, compute_wprtp_sfc
@@ -37,7 +37,7 @@ def gabls2_tndcy(state: dict, time_current: float) -> None:
     else:
         wm_zt = np.zeros_like(zt)
     state['wm_zt'][:] = wm_zt
-    wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr), dtype=np.float64)   # np.array → writable copy
+    wm_zm = np.array(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(wm_zt)), dtype=np.float64)   # np.array -> writable copy
     wm_zm[:, 0] = 0.0
     wm_zm[:, -1] = 0.0
     state['wm_zm'][:] = wm_zm

@@ -109,7 +109,7 @@ def test_kk_hm_metadata():
     pdf_dim=6 (0-based, matching setup_clubb_pdf_params IIPDF_NCN+1)."""
     m = kk_hm_metadata()
     assert m.hydromet_dim == 2 and m.iirr == 0 and m.iiNr == 1
-    assert m.hydromet_list == ["rrm", "Nrm"]
+    assert list(m.hydromet_list) == ["rrm", "Nrm"]
     assert list(m.l_mix_rat_hm) == [True, False]
     assert list(m.l_frozen_hm) == [False, False]
     np.testing.assert_allclose(m.hydromet_tol[0], 1.0e-10)

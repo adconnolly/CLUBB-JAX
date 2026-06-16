@@ -25,6 +25,64 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
 )
 
 
+II_CHI = 0
+II_ETA = 1
+II_W = 2
+II_NCN = 3
+II_RR = 4
+II_NR = 5
+II_RI = 6
+II_NI = 7
+II_RS = 8
+II_NS = 9
+II_RG = 10
+II_NG = 11
+
+
+@dataclass
+class HmMetadata:
+    """Small compatibility metadata object used by unit tests and index helpers."""
+
+    hydromet_dim: int = 0
+    iirr: int = -1
+    iirs: int = -1
+    iiri: int = -1
+    iirg: int = -1
+    iiNr: int = -1
+    iiNs: int = -1
+    iiNi: int = -1
+    iiNg: int = -1
+    iiPDF_chi: int = II_CHI
+    iiPDF_eta: int = II_ETA
+    iiPDF_w: int = II_W
+    iiPDF_Ncn: int = II_NCN
+    iiPDF_rr: int = -1
+    iiPDF_rs: int = -1
+    iiPDF_ri: int = -1
+    iiPDF_rg: int = -1
+    iiPDF_Nr: int = -1
+    iiPDF_Ns: int = -1
+    iiPDF_Ni: int = -1
+    iiPDF_Ng: int = -1
+
+    @property
+    def pdf_dim(self):
+        return max(
+            self.iiPDF_chi,
+            self.iiPDF_eta,
+            self.iiPDF_w,
+            self.iiPDF_Ncn,
+            self.iiPDF_rr,
+            self.iiPDF_rs,
+            self.iiPDF_ri,
+            self.iiPDF_rg,
+            self.iiPDF_Nr,
+            self.iiPDF_Ns,
+            self.iiPDF_Ni,
+            self.iiPDF_Ng,
+        ) + 1
+
+
 @dataclass(frozen=True)
 class hmp2_ip_on_hmm2_ip_ratios_type:
     rr: float = 1.0
@@ -90,6 +148,40 @@ class hm_metadata_type:
     iiPDF_Ncn: int = -1
     hmp2_ip_on_hmm2_ip: np.ndarray | None = None
     Ncnp2_on_Ncnm2: float = 1.0
+
+    @property
+    def hydromet_dim(self):
+        if self.hydromet_list:
+            return len(self.hydromet_list)
+        if self.hmp2_ip_on_hmm2_ip is not None:
+            return len(self.hmp2_ip_on_hmm2_ip)
+        return max(
+            self.iirr,
+            self.iirs,
+            self.iiri,
+            self.iirg,
+            self.iiNr,
+            self.iiNs,
+            self.iiNi,
+            self.iiNg,
+        ) + 1
+
+    @property
+    def pdf_dim(self):
+        return max(
+            self.iiPDF_chi,
+            self.iiPDF_eta,
+            self.iiPDF_w,
+            self.iiPDF_rr,
+            self.iiPDF_rs,
+            self.iiPDF_ri,
+            self.iiPDF_rg,
+            self.iiPDF_Nr,
+            self.iiPDF_Ns,
+            self.iiPDF_Ni,
+            self.iiPDF_Ng,
+            self.iiPDF_Ncn,
+        ) + 1
 
     def tree_flatten(self):
         children = (
@@ -224,6 +316,9 @@ corr_array_n_below_def = np.array(
     dtype=np.float64,
 ).reshape((d_var_total, d_var_total), order="F")
 
+CORR_ARRAY_N_CLOUD_DEF = corr_array_n_cloud_def
+CORR_ARRAY_N_BELOW_DEF = corr_array_n_below_def
+
 
 def def_corr_idx(iiPDF_x, hm_metadata):
     """Map an iiPDF index to the corresponding default correlation-array index."""
@@ -270,6 +365,12 @@ def def_corr_idx(iiPDF_x, hm_metadata):
     return ii_def_corr
 
 
+def _def_corr_idx_from(iiPDF_x, hm_metadata):
+    if isinstance(hm_metadata, (tuple, list, np.ndarray)):
+        return int(hm_metadata[iiPDF_x])
+    return def_corr_idx(iiPDF_x, hm_metadata)
+
+
 def set_corr_arrays_to_default(pdf_dim, hm_metadata):
     """Return the default lower-triangular cloud and below-cloud correlation arrays."""
     corr_array_n_cloud = np.zeros((pdf_dim, pdf_dim), dtype=np.float64)
@@ -281,8 +382,8 @@ def set_corr_arrays_to_default(pdf_dim, hm_metadata):
 
     for i in range(pdf_dim - 1):
         for j in range(i + 1, pdf_dim):
-            idx_i = def_corr_idx(i, hm_metadata)
-            idx_j = def_corr_idx(j, hm_metadata)
+            idx_i = _def_corr_idx_from(i, hm_metadata)
+            idx_j = _def_corr_idx_from(j, hm_metadata)
 
             if idx_i > idx_j:
                 corr_array_n_cloud[j, i] = corr_array_n_cloud_def[idx_i, idx_j]
@@ -292,6 +393,25 @@ def set_corr_arrays_to_default(pdf_dim, hm_metadata):
                 corr_array_n_below[j, i] = corr_array_n_below_def[idx_j, idx_i]
 
     return corr_array_n_cloud, corr_array_n_below
+
+
+def kk_prescribed_correlations():
+    """Return prescribed normal-space correlations for the warm-rain KK PDF."""
+    return {
+        "corr_chi_eta": corr_array_n_cloud_def[II_ETA, II_CHI],
+        "corr_w_chi": corr_array_n_cloud_def[II_W, II_CHI],
+        "corr_w_eta": corr_array_n_cloud_def[II_W, II_ETA],
+        "corr_w_Ncn": corr_array_n_cloud_def[II_NCN, II_W],
+        "corr_w_rr": corr_array_n_cloud_def[II_RR, II_W],
+        "corr_w_Nr": corr_array_n_cloud_def[II_NR, II_W],
+        "corr_chi_Ncn": corr_array_n_cloud_def[II_NCN, II_CHI],
+        "corr_chi_rr": corr_array_n_cloud_def[II_RR, II_CHI],
+        "corr_chi_Nr": corr_array_n_cloud_def[II_NR, II_CHI],
+        "corr_eta_Ncn": corr_array_n_cloud_def[II_NCN, II_ETA],
+        "corr_eta_rr": corr_array_n_cloud_def[II_RR, II_ETA],
+        "corr_eta_Nr": corr_array_n_cloud_def[II_NR, II_ETA],
+        "corr_rr_Nr": corr_array_n_cloud_def[II_NR, II_RR],
+    }
 
 
 def get_corr_var_index(var_name, hm_metadata):
@@ -502,6 +622,53 @@ def init_pdf_hydromet_arrays_api(
     pdf_dim = pdf_count + 1
 
     return hm_metadata, pdf_dim
+
+
+def init_pdf_hydromet_arrays(
+    host_dx=0.0,
+    host_dy=0.0,
+    hydromet_dim=0,
+    iirr=-1,
+    iiNr=-1,
+    iiri=-1,
+    iiNi=-1,
+    iirs=-1,
+    iiNs=-1,
+    iirg=-1,
+    iiNg=-1,
+    Ncnp2_on_Ncnm2=1.0,
+):
+    """Compatibility wrapper returning only hydrometeor metadata."""
+    hm_metadata, _ = init_pdf_hydromet_arrays_api(
+        host_dx,
+        host_dy,
+        hydromet_dim,
+        iirr,
+        iiNr,
+        iiri,
+        iiNi,
+        iirs,
+        iiNs,
+        iirg,
+        iiNg,
+        Ncnp2_on_Ncnm2,
+    )
+    return hm_metadata
+
+
+def kk_hm_metadata():
+    """Return the warm-rain KK hydrometeor metadata used by the RICO-style setup."""
+    hm_metadata = init_pdf_hydromet_arrays(
+        hydromet_dim=2,
+        iirr=0,
+        iiNr=1,
+        host_dx=0.0,
+        host_dy=0.0,
+    )
+    return replace(
+        hm_metadata,
+        hmp2_ip_on_hmm2_ip=np.full(2, 1.25, dtype=np.float64),
+    )
 
 
 def setup_corr_varnce_array_api(

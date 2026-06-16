@@ -4,7 +4,9 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import numpy as np
 
+from clubb_jax.src.CLUBB_core.error_code import CLUBB_FATAL_ERROR
 from clubb_jax.src.derived_types import ErrInfo
 
 
@@ -189,12 +191,141 @@ def parameterization_check(
 def check_negative(var, varname, operation, err_info: ErrInfo):
     """Checks for negative values in the var array."""
     del varname, operation
+    if not hasattr(err_info, "set_fatal"):
+        if np.any(np.asarray(var) < 0.0):
+            err_info[...] = CLUBB_FATAL_ERROR
+        return err_info
     return err_info.set_fatal(mask=jnp.any(jnp.asarray(var) < 0.0))
 
 
 def check_nan(var, varname, operation, err_info: ErrInfo):
     """Checks for a non-finite value in var."""
     del varname, operation
+    if not hasattr(err_info, "set_fatal"):
+        if np.any(~np.isfinite(np.asarray(var))):
+            err_info[...] = CLUBB_FATAL_ERROR
+        return err_info
     return err_info.set_fatal(
         mask=jnp.any(jnp.logical_not(jnp.isfinite(jnp.asarray(var))))
     )
+
+
+def calculate_spurious_source(
+    integral_after,
+    integral_before,
+    flux_top,
+    flux_sfc,
+    integral_forcing,
+    dt,
+):
+    """Return the column-conservation imbalance diagnostic."""
+    return (
+        (jnp.asarray(integral_after) - jnp.asarray(integral_before))
+        / jnp.asarray(dt)
+        + jnp.asarray(flux_top)
+        - jnp.asarray(flux_sfc)
+        - jnp.asarray(integral_forcing)
+    )
+
+
+def _all_finite(*values):
+    for value in values:
+        if value is None:
+            continue
+        if not np.all(np.isfinite(np.asarray(value))):
+            return False
+    return True
+
+
+def sfc_varnce_check(
+    sclr_dim,
+    wp2_sfc,
+    up2_sfc,
+    vp2_sfc,
+    thlp2_sfc,
+    rtp2_sfc,
+    rtpthlp_sfc,
+    sclrp2_sfc=None,
+    sclrprtp_sfc=None,
+    sclrpthlp_sfc=None,
+):
+    """Return True when all surface variance/covariance inputs are finite."""
+    values = [wp2_sfc, up2_sfc, vp2_sfc, thlp2_sfc, rtp2_sfc, rtpthlp_sfc]
+    if int(sclr_dim) > 0:
+        values.extend([sclrp2_sfc, sclrprtp_sfc, sclrpthlp_sfc])
+    return _all_finite(*values)
+
+
+def length_check(Lscale, Lscale_up, Lscale_down):
+    """Return True when all mixing-length arrays are finite."""
+    return _all_finite(Lscale, Lscale_up, Lscale_down)
+
+
+def pdf_closure_check(closure_fields, pdf_params, sclr_dim=0, sclr_fields=None):
+    """Return True when PDF closure outputs and PDF parameters are finite."""
+    values = []
+    if isinstance(closure_fields, dict):
+        values.extend(closure_fields.values())
+    else:
+        values.append(closure_fields)
+
+    if hasattr(pdf_params, "_fields"):
+        values.extend(getattr(pdf_params, field) for field in pdf_params._fields)
+    else:
+        values.append(pdf_params)
+
+    if int(sclr_dim) > 0 and sclr_fields:
+        values.extend(sclr_fields.values())
+    return _all_finite(*values)
+
+
+def rad_check(thlm, rcm, rtm, rim, cloud_frac, p_in_Pa, exner, rho_zm):
+    """Return True when radiation inputs are finite and non-negative."""
+    values = [thlm, rcm, rtm, rim, cloud_frac, p_in_Pa, exner, rho_zm]
+    if not _all_finite(*values):
+        return False
+    if any(np.any(np.asarray(value) < 0.0) for value in values):
+        return False
+    return bool(np.all(np.asarray(rtm) - np.asarray(rcm) >= 0.0))
+
+
+def invalid_model_arrays(**arrays):
+    """Return True if any numeric model array contains a non-finite value."""
+    for value in arrays.values():
+        if value is None:
+            continue
+        try:
+            arr = np.asarray(value)
+        except (TypeError, ValueError):
+            continue
+        if arr.dtype.kind not in "biufc":
+            continue
+        if not np.all(np.isfinite(arr)):
+            return True
+    return False
+
+
+def check_clubb_settings(*, err_info, **kwargs):
+    """Compatibility wrapper for driver setup validation.
+
+    The full Fortran routine primarily reports configuration errors and warnings.  The
+    JAX driver handles unsupported options separately, so this wrapper preserves the
+    runtime contract by returning the provided ErrInfo unchanged.
+    """
+    del kwargs
+    return err_info
+
+
+__all__ = [
+    "CLUBB_FATAL_ERROR",
+    "parameterization_check",
+    "check_negative",
+    "check_nan",
+    "calculate_spurious_source",
+    "sfc_varnce_check",
+    "length_check",
+    "pdf_closure_check",
+    "rad_check",
+    "invalid_model_arrays",
+    "check_clubb_settings",
+]

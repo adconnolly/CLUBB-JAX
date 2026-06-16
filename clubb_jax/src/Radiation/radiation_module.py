@@ -182,7 +182,7 @@ def _advance_bugsrad_radiation(state: dict, time_current: float, l_sample: bool 
     from clubb_jax.src.Input_fields.sounding import load_extended_std_atm
     from clubb_jax.src.Radiation.bugsrad_driver import (
         build_rad_grid_setup, compute_bugsrad_radiation)
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+    from clubb_jax.src.CLUBB_core.grid_class import zt2zm
     from clubb_jax.src.CLUBB_core.constants_clubb import Lv as _LV
 
     cfg = state['cfg']; gr = state['gr']; ngrdcol = state['ngrdcol']
@@ -198,7 +198,7 @@ def _advance_bugsrad_radiation(state: dict, time_current: float, l_sample: bool 
         return
 
     p_in_Pa = np.asarray(state['p_in_Pa'], dtype=np.float64)
-    p_in_Pam = np.asarray(zt2zm_jax(jnp.asarray(p_in_Pa), gr), dtype=np.float64)
+    p_in_Pam = np.asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(p_in_Pa)), dtype=np.float64)
 
     # build + cache the static radiation-grid layout (std-atm extension + buffer) on first call
     setup = state.get('_bugsrad_setup')

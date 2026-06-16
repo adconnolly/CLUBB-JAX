@@ -27,11 +27,35 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.advance_clubb_core_module import compute_diagnostic_cache
 from clubb_jax.src.CLUBB_core.constants_clubb import em_min
+from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
+from clubb_jax.src.CLUBB_core.grid_class import ddzt, zm2zt
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
+
+
+def compute_diagnostic_cache(
+    thlm,
+    rtm,
+    rcm,
+    exner,
+    thv_ds_zt,
+    wp2,
+    up2,
+    vp2,
+    um,
+    vm,
+    l_tke_aniso,
+    gr,
+):
+    thvm = calculate_thvm(gr.nzt, gr.ngrdcol, thlm, rtm, rcm, exner, thv_ds_zt)
+    em = 0.5 * (wp2 + up2 + vp2) if l_tke_aniso else 1.5 * wp2
+    sqrt_em_zt = jnp.sqrt(zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, em, em_min))
+    ddzt_um = ddzt(gr.nzm, gr.nzt, gr.ngrdcol, gr, um)
+    ddzt_vm = ddzt(gr.nzm, gr.nzt, gr.ngrdcol, gr, vm)
+    ddzt_umvm_sqd = ddzt_um ** 2 + ddzt_vm ** 2
+    return thvm, em, sqrt_em_zt, ddzt_umvm_sqd
 
 
 def _setup_f2py_grid():

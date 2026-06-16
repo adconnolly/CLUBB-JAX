@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.Benchmark_cases.sfc_flux import compute_wpthlp_sfc, compute_wprtp_sfc
 
 
@@ -49,7 +49,7 @@ def atex_long_tndcy(state: dict, time_current: float) -> None:
     state['thlm_forcing'][:] = thlm_forcing
     state['rtm_forcing'][:] = rtm_forcing
     state['wm_zt'][:] = wm_zt
-    wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr), dtype=np.float64)
+    wm_zm = np.array(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(wm_zt)), dtype=np.float64)
     wm_zm[:, 0] = 0.0
     wm_zm[:, -1] = 0.0
     state['wm_zm'][:] = wm_zm

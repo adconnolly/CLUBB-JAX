@@ -215,3 +215,59 @@ def init_pdf_implicit_coefs_terms_api(nz: int, ngrdcol: int, sclr_dim: int) -> i
         coef_wpthlpsclrp_implicit=coef_wpthlpsclrp_implicit,
         term_wpthlpsclrp_explicit=term_wpthlpsclrp_explicit,
     )
+
+
+def zero_pdf_implicit_coefs_terms_api(coefs: implicit_coefs_terms) -> implicit_coefs_terms:
+    """Return a zeroed implicit-coefficient container with the same dimensions."""
+    return init_pdf_implicit_coefs_terms_api(coefs.nz, coefs.ngrdcol, coefs.sclr_dim)
+
+
+def init_pdf_params(nz: int, ngrdcol: int) -> pdf_parameter:
+    """JAX equivalent of pdf_parameter_module.F90:init_pdf_params."""
+    zero_2d = jnp.zeros((ngrdcol, nz), dtype=jnp.float64)
+    values = {
+        field: zero_2d
+        for field in pdf_parameter._fields
+        if field not in ("ngrdcol", "nz")
+    }
+    return pdf_parameter(ngrdcol=ngrdcol, nz=nz, **values)
+
+
+def zero_pdf_params_api(params: pdf_parameter) -> pdf_parameter:
+    """Return a zeroed PDF-parameter container with the same dimensions."""
+    return init_pdf_params(params.nz, params.ngrdcol)
+
+
+def pack_pdf_params_api(params: pdf_parameter, nz: int):
+    """Pack the first column of a pdf_parameter into a ``(nz, 47)`` array."""
+    slots = []
+    for field in pdf_parameter._fields[2:]:
+        value = jnp.asarray(getattr(params, field), dtype=jnp.float64)
+        if value.ndim == 1:
+            slots.append(value[:nz])
+        else:
+            slots.append(value[0, :nz])
+    return jnp.stack(slots, axis=1)
+
+
+def unpack_pdf_params_api(r_param_array, nz: int, template: pdf_parameter) -> pdf_parameter:
+    """Unpack a ``(nz, 47)`` array into the first column of a pdf_parameter."""
+    r_param_array = jnp.asarray(r_param_array, dtype=jnp.float64)
+    values = {}
+    for idx, field in enumerate(pdf_parameter._fields[2:]):
+        arr = jnp.zeros((template.ngrdcol, nz), dtype=jnp.float64)
+        arr = arr.at[0, :].set(r_param_array[:nz, idx])
+        values[field] = arr
+    return pdf_parameter(ngrdcol=template.ngrdcol, nz=nz, **values)
+
+
+__all__ = [
+    "implicit_coefs_terms",
+    "pdf_parameter",
+    "init_pdf_implicit_coefs_terms_api",
+    "zero_pdf_implicit_coefs_terms_api",
+    "init_pdf_params",
+    "zero_pdf_params_api",
+    "pack_pdf_params_api",
+    "unpack_pdf_params_api",
+]
