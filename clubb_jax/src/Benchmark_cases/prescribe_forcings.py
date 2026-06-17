@@ -134,18 +134,30 @@ def read_surface_var_for_bc(state: dict) -> dict:
 def _stats_surface_update(state: dict, wpthlp_sfc, wprtp_sfc, upwp_sfc,
                           vpwp_sfc, ustar, T_sfc, l_sample: bool) -> None:
     """Mirrors Fortran stats_update calls in the surface section."""
-    sw = state.get('stats_writer')
-    if not l_sample or sw is None:
+    if not l_sample:
         return
+
+    sw = state.get('stats_writer')
     rho_zm_sfc = state['rho_zm'][:, 0]
-    sw.update("sh", wpthlp_sfc * rho_zm_sfc * Cp)
-    sw.update("lh", wprtp_sfc * rho_zm_sfc * Lv)
-    sw.update("wpthlp_sfc", wpthlp_sfc)
-    sw.update("wprtp_sfc", wprtp_sfc)
-    sw.update("upwp_sfc", upwp_sfc)
-    sw.update("vpwp_sfc", vpwp_sfc)
-    sw.update("ustar", ustar)
-    sw.update("T_sfc", T_sfc)
+    updates = (
+        ("sh", wpthlp_sfc * rho_zm_sfc * Cp),
+        ("lh", wprtp_sfc * rho_zm_sfc * Lv),
+        ("wpthlp_sfc", wpthlp_sfc),
+        ("wprtp_sfc", wprtp_sfc),
+        ("upwp_sfc", upwp_sfc),
+        ("vpwp_sfc", vpwp_sfc),
+        ("ustar", ustar),
+        ("T_sfc", T_sfc),
+    )
+
+    if sw is not None:
+        for name, value in updates:
+            sw.update(name, value)
+        return
+
+    from clubb_python import clubb_api
+    for name, value in updates:
+        clubb_api.stats_update(name, value)
 
 
 # ── _time_interp + apply_time_dependent_forcings now live in their Fortran-home module
@@ -343,7 +355,8 @@ def _is_dummy_profile(profile: np.ndarray) -> bool:
     ))
 
 
-def prescribe_forcings_arm(state: dict, time_current: float) -> None:
+def prescribe_forcings_arm(state: dict, time_current: float,
+                           l_sample: bool = False) -> None:
     """Update state forcing fields for the ARM case — pure Python port.
 
     Mirrors the ARM branch of prescribe_forcings.F90 when l_t_dependent=True.
@@ -406,6 +419,16 @@ def prescribe_forcings_arm(state: dict, time_current: float) -> None:
 
     # ── arm_sfclyr ───────────────────────────────────────────────────────────
     arm_sfclyr(state, time_current, ngrdcol, fd, z_bot)
+    _stats_surface_update(
+        state,
+        state['wpthlp_sfc'],
+        state['wprtp_sfc'],
+        state['upwp_sfc'],
+        state['vpwp_sfc'],
+        state['ustar'],
+        state['T_sfc'],
+        l_sample,
+    )
 
 
 # ── Main dispatcher ─────────────────────────────────────────────────────────

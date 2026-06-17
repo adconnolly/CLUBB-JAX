@@ -523,8 +523,7 @@ def _prescribe_forcings(state: dict, itime: int, l_sample: bool = False):
     """Set forcings for the current timestep using the JAX prescribe_forcings port."""
     time_current = float(state['time_initial'] + (itime - 1) * state['dt_main'])
     if str(state['runtype']).strip() == "arm":
-        del l_sample
-        prescribe_forcings_arm(state, time_current)
+        prescribe_forcings_arm(state, time_current, l_sample=l_sample)
     else:
         prescribe_forcings_generic(state, time_current, l_sample=l_sample)
 
