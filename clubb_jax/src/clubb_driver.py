@@ -33,12 +33,12 @@ from clubb_jax.src.CLUBB_core.parameters_tunable import (
 from clubb_jax.src.CLUBB_core.model_flags import get_default_config_flags
 from clubb_jax.src.CLUBB_core.numerical_check import check_clubb_settings
 from clubb_jax.src.CLUBB_core.error_code import set_debug_level as set_jax_debug_level
-from clubb_jax.src.derived_types.config_flags import ConfigFlags
-from clubb_jax.src.derived_types.grid_class import setup_grid
-from clubb_jax.src.derived_types.sclr_idx import SclrIdx
-from clubb_jax.src.derived_types.err_info import ErrInfo
+from clubb_jax.src.CLUBB_core.config_flags import ConfigFlags
+from clubb_jax.src.CLUBB_core.grid_class import setup_grid
+from clubb_jax.src.CLUBB_core.sclr_idx import SclrIdx
+from clubb_jax.src.CLUBB_core.err_info import ErrInfo
 from clubb_jax.src.derived_types.converters import err_info_from_api, err_info_to_api
-from clubb_jax.src.derived_types.pdf_params import (
+from clubb_jax.src.CLUBB_core.pdf_params import (
     init_pdf_implicit_coefs_terms_api,
     init_pdf_params,
 )

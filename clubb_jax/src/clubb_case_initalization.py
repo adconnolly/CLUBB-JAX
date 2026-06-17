@@ -4,18 +4,30 @@ from pathlib import Path
 
 import numpy as np
 
-# Python API
+# Stats API
 from clubb_python import clubb_api
-from clubb_python.derived_types.config_flags import ConfigFlags
-from clubb_python.derived_types.grid_class import setup_grid as py_setup_grid
-from clubb_python.derived_types.sclr_idx import SclrIdx
-from clubb_python.derived_types.pdf_params import (
+from clubb_jax.src.CLUBB_core.config_flags import ConfigFlags
+from clubb_jax.src.CLUBB_core.grid_class import setup_grid as py_setup_grid
+from clubb_jax.src.CLUBB_core.sclr_idx import SclrIdx
+from clubb_jax.src.CLUBB_core.pdf_params import (
     init_pdf_implicit_coefs_terms_api,
     init_pdf_params as init_pdf_params_py,
 )
-from clubb_jax.src.derived_types.err_info import ErrInfo
+from clubb_jax.src.CLUBB_core.err_info import ErrInfo
 from clubb_jax.src.derived_types.converters import err_info_from_api, err_info_to_api
+from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
 from clubb_jax.src.CLUBB_core.error_code import set_debug_level as set_jax_debug_level
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
+from clubb_jax.src.CLUBB_core.model_flags import get_default_config_flags
+from clubb_jax.src.CLUBB_core.numerical_check import check_clubb_settings
+from clubb_jax.src.CLUBB_core.parameters_tunable import (
+    calc_derrived_params,
+    check_parameters,
+    get_param_names,
+    init_clubb_params,
+)
+from clubb_jax.src.CLUBB_core.saturation import rcm_sat_adj, sat_mixrat_liq
+from clubb_jax.src.Input_fields.hydrostatic_module import hydrostatic
 
 # I/O
 from clubb_jax.src.io.grid_file import read_grid_file
@@ -395,12 +407,11 @@ def init_clubb_case(namelist_path: str) -> dict:
     edsclr_dim = cfg['edsclr_dim']
 
     # ── 1. Initialize error handling ────────────────────────────────────
-    clubb_api.init_err_info(ngrdcol)
-    clubb_api.set_debug_level(cfg['debug_level'])
     set_jax_debug_level(cfg['debug_level'])
+    err_info = ErrInfo.initialized(ngrdcol=ngrdcol)
 
     # ── 2. Get config flags ─────────────────────────────────────────────
-    flags = clubb_api.get_default_config_flags()
+    flags = get_default_config_flags()
     # Override from namelist (configurable_clubb_flags_nl)
     flag_overrides = {}
     for name in ConfigFlags._fields:
@@ -410,7 +421,6 @@ def init_clubb_case(namelist_path: str) -> dict:
         d = flags._asdict()
         d.update(flag_overrides)
         flags = ConfigFlags(**d)
-    clubb_api.init_config_flags(flags)
 
     saturation_formula = flags.saturation_formula
     microphys_scheme = str(cfg.get('microphys_scheme', 'none')).strip().strip("'\"").lower()
@@ -420,23 +430,6 @@ def init_clubb_case(namelist_path: str) -> dict:
     l_calc_thlp2_rad = bool(cfg.get('l_calc_thlp2_rad', flags.l_calc_thlp2_rad))
 
     _check_unsupported_features(cfg, flags, microphys_scheme, rad_scheme, l_calc_thlp2_rad)
-
-    # Initialize Fortran radiation-module state used by sunray_sw.
-    clubb_api.set_simplified_radiation_params(
-        f0=float(cfg.get('f0', 0.0)),
-        f1=float(cfg.get('f1', 0.0)),
-        kappa=float(cfg.get('kappa', 0.0)),
-        eff_drop_radius=float(cfg.get('eff_drop_radius', 1.0e-5)),
-        alvdr=float(cfg.get('alvdr', 0.1)),
-        gc=float(cfg.get('gc', 0.85)),
-        omega=float(cfg.get('omega', 0.992)),
-        l_rad_above_cloud=bool(cfg.get('l_rad_above_cloud', False)),
-        l_sw_radiation=bool(cfg.get('l_sw_radiation', False)),
-        l_fix_cos_solar_zen=bool(cfg.get('l_fix_cos_solar_zen', False)),
-        fs_values=cfg.get('fs_values', [0.0]),
-        cos_solar_zen_values=cfg.get('cos_solar_zen_values', [-999.0]),
-        cos_solar_zen_times=cfg.get('cos_solar_zen_times', [-999.0]),
-    )
 
     # ── 3. Read sounding ────────────────────────────────────────────────
     snd_path = _resolve_case_input_path(namelist_dir, runtype, "_sounding.in")
@@ -543,10 +536,14 @@ def init_clubb_case(namelist_path: str) -> dict:
     thvm = thlm * (1.0 + ep1 * (rtm / (1.0 + rtm)))
 
     # Hydrostatic pressure
-    result = clubb_api.hydrostatic(
-        gr=gr, ngrdcol=ngrdcol, nzt=nzt, nzm=nzm, thvm=thvm, p_sfc=p_sfc,
-    )
+    result = hydrostatic(thvm=thvm, p_sfc=p_sfc, gr=gr)
     p_in_Pa, p_in_Pa_zm, exner, exner_zm, rho, rho_zm = result
+    p_in_Pa = np.array(p_in_Pa, copy=True)
+    p_in_Pa_zm = np.array(p_in_Pa_zm, copy=True)
+    exner = np.array(exner, copy=True)
+    exner_zm = np.array(exner_zm, copy=True)
+    rho = np.array(rho, copy=True)
+    rho_zm = np.array(rho_zm, copy=True)
 
     # Convert temperature type
     if theta_type in ('thm[K]', 'T[K]'):
@@ -554,34 +551,34 @@ def init_clubb_case(namelist_path: str) -> dict:
         thm = thlm.copy()
         # rcm = max(rtm - rsat(p, T), 0)
         T_in_K = thm * exner
-        rsat = clubb_api.sat_mixrat_liq(
-            gr=gr, nz=nzt, ngrdcol=ngrdcol, p_in_Pa=p_in_Pa, T_in_K=T_in_K,
-            saturation_formula=saturation_formula
-        )
+        rsat = np.array(sat_mixrat_liq(
+            p_in_Pa=p_in_Pa,
+            T_in_K=T_in_K,
+            saturation_formula=saturation_formula,
+        ), copy=True)
         rcm = np.maximum(rtm - rsat, 0.0)
         thlm = thm - Lv / (Cp * exner) * rcm
     elif theta_type == 'thlm[K]':
         # Already liquid potential temperature
-        rcm = np.zeros_like(thlm)
-        for k in range(nzt):
-            for i in range(ngrdcol):
-                rcm[i, k] = clubb_api.rcm_sat_adj(
-                    thlm[i, k], rtm[i, k], p_in_Pa[i, k], exner[i, k],
-                    saturation_formula)
+        rcm = np.array(rcm_sat_adj(thlm, rtm, p_in_Pa, exner, saturation_formula), copy=True)
         thm = thlm + Lv / (Cp * exner) * rcm
     else:
         raise ValueError(f"Unknown theta_type: {theta_type}")
 
     # Recompute thvm and hydrostatic with corrected thlm
     # NOTE: Fortran passes thm (not thlm) as the 5th arg to calculate_thvm
-    thvm = clubb_api.calculate_thvm(
+    thvm = np.array(calculate_thvm(
         nzt=nzt, ngrdcol=ngrdcol, thlm=thlm, rtm=rtm, rcm=rcm, exner=exner,
         thv_ds_zt=thm * (1.0 + ep2 * (rtm - rcm))**kappa,
-    )
-    result = clubb_api.hydrostatic(
-        gr=gr, ngrdcol=ngrdcol, nzt=nzt, nzm=nzm, thvm=thvm, p_sfc=p_sfc,
-    )
+    ), copy=True)
+    result = hydrostatic(thvm=thvm, p_sfc=p_sfc, gr=gr)
     p_in_Pa, p_in_Pa_zm, exner, exner_zm, rho, rho_zm = result
+    p_in_Pa = np.array(p_in_Pa, copy=True)
+    p_in_Pa_zm = np.array(p_in_Pa_zm, copy=True)
+    exner = np.array(exner, copy=True)
+    exner_zm = np.array(exner_zm, copy=True)
+    rho = np.array(rho, copy=True)
+    rho_zm = np.array(rho_zm, copy=True)
 
     # Compute dry static density (anelastic base state)
     # NOTE: thm was already computed before the 2nd hydrostatic call
@@ -599,9 +596,9 @@ def init_clubb_case(namelist_path: str) -> dict:
     invrs_rho_ds_zt = 1.0 / rho_ds_zt
 
     # Momentum level versions via zt2zm interpolation
-    rv_zm = clubb_api.zt2zm(gr=gr, nzm=nzm, nzt=nzt, ngrdcol=ngrdcol, azt=rv)
+    rv_zm = np.array(zt2zm(nzm=nzm, nzt=nzt, ngrdcol=ngrdcol, gr=gr, azt=rv), copy=True)
     rv_zm = np.maximum(rv_zm, 0.0)
-    thm_zm = clubb_api.zt2zm(gr=gr, nzm=nzm, nzt=nzt, ngrdcol=ngrdcol, azt=thm)
+    thm_zm = np.array(zt2zm(nzm=nzm, nzt=nzt, ngrdcol=ngrdcol, gr=gr, azt=thm), copy=True)
 
     # rtm_sfc: linearly interpolate sounding rt to the zm surface level,
     # matching Fortran read_sounding which interpolates to gr%zm(1).
@@ -630,12 +627,12 @@ def init_clubb_case(namelist_path: str) -> dict:
         wm_zt = -wm_zt / (grav * rho)
         wm_zt[:, -1] = 0.0
 
-    wm_zm = clubb_api.zt2zm(gr=gr, nzm=nzm, nzt=nzt, ngrdcol=ngrdcol, azt=wm_zt)
+    wm_zm = np.array(zt2zm(nzm=nzm, nzt=nzt, ngrdcol=ngrdcol, gr=gr, azt=wm_zt), copy=True)
     wm_zm[:, 0] = 0.0
     wm_zm[:, -1] = 0.0
 
     # ── 8. Initialize PDF and tunable parameters ────────────────────────
-    clubb_params = clubb_api.init_clubb_params(ngrdcol, iunit=10, filename=namelist_path)
+    clubb_params = init_clubb_params(ngrdcol, filename=namelist_path)
     pdf_params = init_pdf_params_py(nzt, ngrdcol)
     pdf_params_zm = init_pdf_params_py(nzm, ngrdcol)   # NB: Fortran uses nzm for pdf_params_zm
     pdf_implicit_coefs_terms = init_pdf_implicit_coefs_terms_api(nzt, ngrdcol, sclr_dim)
@@ -655,43 +652,31 @@ def init_clubb_case(namelist_path: str) -> dict:
         iiedsclr_thl=iiedsclr_thl,
         iiedsclr_CO2=iiedsclr_co2,
     )
-    clubb_api.set_sclr_idx(
-        iisclr_rt, iisclr_thl, iisclr_co2,
-        iiedsclr_rt, iiedsclr_thl, iiedsclr_co2,
-    )
-
-    nu_vert_res_dep, lmin, mixt_frac_max_mag = clubb_api.calc_derrived_params(
+    nu_vert_res_dep, lmin, mixt_frac_max_mag = calc_derrived_params(
         gr=gr,
         ngrdcol=ngrdcol,
         grid_type=grid_type,
         deltaz=deltaz,
         clubb_params=clubb_params,
-        nu_vert_res_dep=None,
         l_prescribed_avg_deltaz=False,
     )
-    err_info = ErrInfo.initialized(ngrdcol=ngrdcol)
 
-    err_info = err_info_from_api(
-        clubb_api.check_clubb_settings(
-            ngrdcol=ngrdcol,
-            params=clubb_params,
-            config_flags=flags,
-            err_info=err_info_to_api(err_info),
-            l_implemented=False,
-            l_input_fields=False,
-        )
+    err_info = check_clubb_settings(
+        ngrdcol=ngrdcol,
+        params=clubb_params,
+        config_flags=flags,
+        err_info=err_info,
+        l_implemented=False,
+        l_input_fields=False,
     )
-    err_info = err_info_from_api(
-        clubb_api.check_parameters(
-            ngrdcol=ngrdcol,
-            clubb_params=clubb_params,
-            lmin=lmin,
-            err_info=err_info_to_api(err_info),
-        )
+    err_info = check_parameters(
+        ngrdcol=ngrdcol,
+        clubb_params=clubb_params,
+        lmin=lmin,
+        err_info=err_info,
     )
     # Reset error codes set by check_clubb_settings warnings
     # (they are non-fatal but would cause advance_clubb_core to bail out)
-    clubb_api.reset_err_code()
     err_info = err_info.reset_code()
 
     # ── 9. Initialize TKE / variances (case-specific, Fortran-like) ────
@@ -829,13 +814,13 @@ def init_clubb_case(namelist_path: str) -> dict:
                 nzm=nzm,
                 zm=gr.zm[0, :],
                 clubb_params=clubb_params,
-                param_names=clubb_api.get_param_names(),
+                param_names=get_param_names(),
                 err_info=err_info_to_api(err_info),
                 sclr_dim=sclr_dim,
                 edsclr_dim=edsclr_dim,
             )
         )
-        err = clubb_api.get_err_code(ngrdcol)
+        err = np.asarray(err_info.err_code_or_default())
         if np.any(err != 0):
             raise RuntimeError(f"stats_init failed with err_code={err}")
         stats_enabled = bool(clubb_api.get_stats_config()[0])
@@ -847,7 +832,6 @@ def init_clubb_case(namelist_path: str) -> dict:
     pdf_params_zm = init_pdf_params_py(nzm, ngrdcol)
 
     # ── 15. Clear any accumulated error codes from init ──────────────
-    clubb_api.reset_err_code()
     err_info = err_info.reset_code()
 
     # ── Build state dict ────────────────────────────────────────────────
@@ -987,11 +971,9 @@ def init_clubb_case(namelist_path: str) -> dict:
     return state
 
 def clean_up_clubb(state: dict):
-    """Clean up Fortran state."""
+    """Clean up stats state."""
     if state['l_stats']:
         state['err_info'] = err_info_from_api(
             clubb_api.finalize_stats(err_info=err_info_to_api(state['err_info']))
         )
-    clubb_api.cleanup_grid(gr=state['gr'])
-    clubb_api.cleanup_err_info(err_info=err_info_to_api(state['err_info']))
     print("CLUBB cleanup complete.")

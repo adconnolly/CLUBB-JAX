@@ -28,7 +28,7 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
     zero_threshold,
 )
 from clubb_jax.src.CLUBB_core.grid_class import zm2zt2zm, zt2zm
-from clubb_jax.src.derived_types import Grid
+from clubb_jax.src.CLUBB_core import Grid
 
 
 @partial(

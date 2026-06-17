@@ -12,6 +12,7 @@ import numpy as np
 from clubb_python import clubb_api
 from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
+from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.Benchmark_cases.prescribe_forcings import (
     prescribe_forcings_arm,
@@ -21,11 +22,6 @@ from clubb_jax.src.Microphys.microphys_driver import calc_microphys_scheme_tendc
 from clubb_jax.src.derived_types.converters import (
     err_info_from_api,
     err_info_to_api,
-    grid_from_api,
-    implicit_coefs_terms_from_api,
-    nu_vert_res_dep_from_api,
-    pdf_parameter_from_api,
-    sclr_idx_from_api,
 )
 
 
@@ -235,7 +231,7 @@ def _update_driver_stats(state: dict, time_current: float) -> None:
 
 def _calculate_thvm(state: dict):
     """Update virtual potential temperature diagnostic."""
-    state['thvm'] = clubb_api.calculate_thvm(
+    state['thvm'] = calculate_thvm(
         nzt=state['nzt'],
         ngrdcol=state['ngrdcol'],
         thlm=state['thlm'],
@@ -255,7 +251,7 @@ def _calculate_thlp2_rad(state: dict):
         state['ngrdcol'],
         state['nzm'],
         state['nzt'],
-        grid_from_api(state['gr']),
+        state['gr'],
         state['rcm'],
         state['thlprcp'],
         state['radht'],
@@ -293,7 +289,7 @@ def _cloud_drop_sed(state: dict, l_sample: bool = False):
 def _advance_clubb_core(state: dict):
     """Advance the CLUBB core using the JAX translated core."""
     result = advance_clubb_core_module.advance_clubb_core(
-        gr=grid_from_api(state['gr']),
+        gr=state['gr'],
         nzm=state['nzm'],
         nzt=state['nzt'],
         ngrdcol=state['ngrdcol'],
@@ -306,7 +302,7 @@ def _advance_clubb_core(state: dict):
         sclr_dim=state['sclr_dim'],
         sclr_tol=state['sclr_tol'],
         edsclr_dim=state['edsclr_dim'],
-        sclr_idx=sclr_idx_from_api(state['sclr_idx']),
+        sclr_idx=state['sclr_idx'],
         thlm_forcing=state['thlm_forcing'],
         rtm_forcing=state['rtm_forcing'],
         um_forcing=state['um_forcing'],
@@ -354,7 +350,7 @@ def _advance_clubb_core(state: dict):
         host_dx=state['host_dx'],
         host_dy=state['host_dy'],
         clubb_params=state['clubb_params'],
-        nu_vert_res_dep=nu_vert_res_dep_from_api(state['nu_vert_res_dep']),
+        nu_vert_res_dep=state['nu_vert_res_dep'],
         lmin=state['lmin'],
         mixt_frac_max_mag=state['mixt_frac_max_mag'],
         t0=state['T0'],
@@ -412,10 +408,10 @@ def _advance_clubb_core(state: dict):
         vm_pert=state['vm_pert'],
         upwp_pert=state['upwp_pert'],
         vpwp_pert=state['vpwp_pert'],
-        pdf_params=pdf_parameter_from_api(state['pdf_params']),
-        pdf_params_zm=pdf_parameter_from_api(state['pdf_params_zm']),
-        pdf_implicit_coefs_terms=implicit_coefs_terms_from_api(state['pdf_implicit_coefs_terms']),
-        err_info=err_info_from_api(state['err_info']),
+        pdf_params=state['pdf_params'],
+        pdf_params_zm=state['pdf_params_zm'],
+        pdf_implicit_coefs_terms=state['pdf_implicit_coefs_terms'],
+        err_info=state['err_info'],
     )
     if result is None:
         raise RuntimeError(
@@ -514,7 +510,7 @@ def _advance_clubb_core(state: dict):
         state['_wpsclrpthlp'],
         state['_jax_stats'],
     ) = result
-    if err_info_from_api(state['err_info']).is_fatal():
+    if state['err_info'].is_fatal():
         message = (
             "advance_clubb_core returned fatal err_info; "
             f"{_err_code_summary(state['err_info'])}"

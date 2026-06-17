@@ -110,7 +110,7 @@ from clubb_jax.src.CLUBB_core.grid_class import (
     zt2zm,
     zt2zm2zt,
 )
-from clubb_jax.src.derived_types import (
+from clubb_jax.src.CLUBB_core import (
     ErrInfo,
     Grid,
     NuVertResDep,

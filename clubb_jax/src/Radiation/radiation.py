@@ -9,9 +9,16 @@ The BUGSrad and LBA branches from Fortran radiation_module are intentionally
 excluded; those schemes are handled by the Fortran driver.
 """
 
+import math
 import numpy as np
 
 from clubb_python import clubb_api
+from clubb_jax.src.CLUBB_core.calendar import (
+    compute_current_date,
+    gregorian2julian_day,
+    leap_year,
+)
+from clubb_jax.src.Radiation.rad_lwsw_module import sunray_sw
 
 
 _CP = 1004.67
@@ -69,15 +76,21 @@ def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bo
     if l_sw_radiation and amu0 > 0.0:
         fs0 = _compute_fs0(cfg, amu0)
 
-        # Call sunray_sw to get Frad_SW on momentum levels (ngrdcol, nzm).
-        frad_sw = clubb_api.sunray_sw(
-            gr=gr,
-            nzt=nzt,
-            fs0=fs0,
-            amu0=amu0,
-            rho=state['rho'],
-            rcm=state['rcm'],
+        frad_sw = sunray_sw(
             ngrdcol=ngrdcol,
+            nzt=nzt,
+            rcm=state['rcm'],
+            rho=state['rho'],
+            xi_abs=amu0,
+            dzt=np.asarray(gr.dzt),
+            zm=np.asarray(gr.zm),
+            zt=np.asarray(gr.zt),
+            radius=float(cfg.get('eff_drop_radius', cfg.get('radius', 10.0e-6))),
+            A=float(cfg.get('alvdr', cfg.get('A_surface_albedo', 0.0))),
+            gc=float(cfg.get('gc', 0.85)),
+            Fs0=fs0,
+            omega=float(cfg.get('omega', cfg.get('omega_sw', 0.999))),
+            l_center=bool(cfg.get('l_center_rad', True)),
         )
 
         # Compute radht_SW from Frad_SW: ddzm(Frad_SW) / (rho * Cp)
@@ -227,13 +240,64 @@ def _compute_amu0(state: dict, time_current: float) -> float:
             raise ValueError("time_current exceeds provided cos_solar_zen_times range.")
         return float(cos_vals[idx])
 
-    return clubb_api.cos_solar_zen(
+    return _cos_solar_zen(
         int(cfg.get('day', 1)),
         int(cfg.get('month', 1)),
         int(cfg.get('year', 2000)),
         float(time_current),
         float(cfg.get('lat_vals', 0.0)),
         float(cfg.get('lon_vals', 0.0)),
+    )
+
+
+def _cos_solar_zen(
+    day: int,
+    month: int,
+    year: int,
+    current_time: float,
+    lat_in_degrees: float,
+    lon_in_degrees: float,
+) -> float:
+    """Port of Radiation/cos_solar_zen_module.F90:cos_solar_zen."""
+    c0 = 0.006918
+    c1 = -0.399912
+    c2 = -0.006758
+    c3 = -0.002697
+    d1 = 0.070257
+    d2 = 0.000907
+    d3 = 0.000148
+
+    present_day, present_month, present_year, present_time = compute_current_date(
+        day, month, year, current_time
+    )
+    jul_day = gregorian2julian_day(present_day, present_month, present_year)
+    days_in_year = 366 if leap_year(present_year) else 365
+    hour = present_time / 3600.0
+    t = 2.0 * math.pi * float(jul_day - 1) / float(days_in_year)
+
+    delta = (
+        c0
+        + c1 * math.cos(t)
+        + d1 * math.sin(t)
+        + c2 * math.cos(2.0 * t)
+        + d2 * math.sin(2.0 * t)
+        + c3 * math.cos(3.0 * t)
+        + d3 * math.sin(3.0 * t)
+    )
+
+    hour_int = int(hour)
+    if 0 <= hour_int <= 11:
+        zln = 180.0 - hour * 15.0
+    elif 12 <= hour_int <= 23:
+        zln = 540.0 - hour * 15.0
+    else:
+        raise ValueError(f"Hour={hour}; > 24 hours in cosine solar zenith code")
+
+    longang = abs(float(lon_in_degrees) - zln) * math.pi / 180.0
+    latang = float(lat_in_degrees) * math.pi / 180.0
+    return (
+        math.sin(latang) * math.sin(delta)
+        + math.cos(latang) * math.cos(delta) * math.cos(longang)
     )
 
 

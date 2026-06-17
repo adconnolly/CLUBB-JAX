@@ -193,7 +193,7 @@ def test_descending_grid_rejected():
 
 def test_setup_grid_is_sole_grid_constructor():
     """Source-grounded guardrail for the iter-483 descending-grid guard's COVERAGE. That guard lives in `setup_grid`
-    (derived_types/grid_class.py) — it only protects the downstream ascending-only assumptions (zt2zm boundaries,
+    (CLUBB_core/grid_class.py) — it only protects the downstream ascending-only assumptions (zt2zm boundaries,
     pos_definite_adj, sponge_layer_damping, precipitation_fraction, fill_holes, advance_xm_wpxp/xp2_xpyp, diffusion,
     remapping) IF `setup_grid` is the SINGLE place a `Grid` is constructed. Verified iter 485 by grepping src: the only
     `Grid(...)` construction is the `return Grid(...)` inside `setup_grid`. This test pins that invariant so a future
@@ -204,7 +204,7 @@ def test_setup_grid_is_sole_grid_constructor():
     # Grid construction is allowed in setup_grid and in API converters that
     # faithfully mirror an already-constructed Fortran/API grid.
     allowed = {
-        os.path.normpath(os.path.join(src_root, "derived_types", "grid_class.py")),
+        os.path.normpath(os.path.join(src_root, "CLUBB_core", "grid_class.py")),
         os.path.normpath(os.path.join(src_root, "derived_types", "converters.py")),
     }
     offenders = []
@@ -221,7 +221,7 @@ def test_setup_grid_is_sole_grid_constructor():
                         if os.path.normpath(path) not in allowed:
                             offenders.append(f"{os.path.relpath(path, _ROOT)}:{lineno}: {line.strip()}")
     assert not offenders, (
-        "Grid(...) constructed outside setup_grid (derived_types/grid_class.py) — the iter-483 descending-grid guard "
+        "Grid(...) constructed outside setup_grid (CLUBB_core/grid_class.py) — the iter-483 descending-grid guard "
         "no longer covers all construction sites:\n  " + "\n  ".join(offenders))
     print("  setup_grid (grid_class.py) is the sole Grid constructor in src — iter-483 guard coverage intact  PASS")
 

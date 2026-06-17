@@ -27,26 +27,11 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import NamedTuple
 
 import numpy as np
 
 from clubb_jax.src.Input_fields.namelist import read_namelist
-
-# ---------------------------------------------------------------------------
-# NuVertResDep: mirrors clubb_python.derived_types.nu_vert_res_dep.NuVertResDep
-# ---------------------------------------------------------------------------
-
-class NuVertResDep(NamedTuple):
-    """Vertical-resolution-dependent nu coefficient arrays (one value per column)."""
-    nzm: int          # stored as ngrdcol to match the Fortran Python-API convention
-    nu1:   np.ndarray  # Background Coefficient of Eddy Diffusion: wp2      [m^2/s]
-    nu2:   np.ndarray  # Background Coefficient of Eddy Diffusion: xp2      [m^2/s]
-    nu6:   np.ndarray  # Background Coefficient of Eddy Diffusion: wpxp     [m^2/s]
-    nu8:   np.ndarray  # Background Coefficient of Eddy Diffusion: wp3      [m^2/s]
-    nu9:   np.ndarray  # Background Coefficient of Eddy Diffusion: up2/vp2  [m^2/s]
-    nu10:  np.ndarray  # Background Coefficient of Eddy Diffusion: edsclrm  [m^2/s]
-    nu_hm: np.ndarray  # Background Coefficient of Eddy Diffusion: hydromet [m^2/s]
+from clubb_jax.src.CLUBB_core.nu_vert_res_dep import NuVertResDep
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +176,10 @@ def init_clubb_params(ngrdcol: int, filename: str) -> np.ndarray:
     nparams = 102
 
     # Set the default tunable parameter values
-    values = np.array([_DEFAULTS[n] for n in PARAM_NAMES], dtype=np.float64)
+    values = np.tile(
+        np.array([_DEFAULTS[n] for n in PARAM_NAMES], dtype=np.float64),
+        (ngrdcol, 1),
+    )
 
     # If the filename is empty, assume we're using a `working' set of
     # parameters that are set statically here (handy for host models).
@@ -200,11 +188,23 @@ def init_clubb_params(ngrdcol: int, filename: str) -> np.ndarray:
     for raw_name, val in nml.items():
         key = raw_name.lower().strip()
         if key in _NAME_TO_IDX:
-            values[_NAME_TO_IDX[key]] = float(val)
+            idx = _NAME_TO_IDX[key]
+            arr = np.asarray(val, dtype=np.float64)
+            if arr.ndim == 0:
+                values[:, idx] = float(arr)
+            else:
+                arr = arr.ravel()
+                if arr.size == 1:
+                    values[:, idx] = float(arr[0])
+                elif arr.size == ngrdcol:
+                    values[:, idx] = arr
+                else:
+                    raise ValueError(
+                        f"{raw_name} must be scalar or have ngrdcol={ngrdcol} values; "
+                        f"got {arr.size}."
+                    )
 
-    # Put the variables in the output array
-    clubb_params = np.tile(values, (ngrdcol, 1))
-    return clubb_params
+    return values
 
 
 def calc_derrived_params(
@@ -309,7 +309,7 @@ def calc_derrived_params(
     nu_hm = clubb_params[:, 51] * mult_factor   # zt-level
 
     nu_vert_res_dep = NuVertResDep(
-        nzm=ngrdcol,
+        nzm=int(gr.nzm),
         nu1=nu1.copy(),
         nu2=nu2.copy(),
         nu6=nu6.copy(),

@@ -101,7 +101,7 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
     zero,
     zero_threshold,
 )
-from clubb_jax.src.derived_types import (
+from clubb_jax.src.CLUBB_core import (
     ErrInfo,
     Grid,
     NuVertResDep,

@@ -23,7 +23,7 @@ from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5:
 from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
-from clubb_jax.src.derived_types.err_info import ErrInfo
+from clubb_jax.src.CLUBB_core.err_info import ErrInfo
 from clubb_jax.src.Microphys.KK_microphys.kk_microphys_driver import compute_kk_microphysics
 
 _UPSILON_IDX = 64   # clubb_params index of upsilon_precip_frac_rat (numerical_check._PNAME_IDX)

@@ -30,7 +30,7 @@ import numpy as np
 
 from clubb_jax.src.CLUBB_core.error_code import CLUBB_FATAL_ERROR
 from clubb_jax.src.CLUBB_core import model_flags as _model_flags
-from clubb_jax.src.derived_types import ErrInfo
+from clubb_jax.src.CLUBB_core import ErrInfo
 
 _iiPDF_ADG1 = _model_flags.iiPDF_ADG1
 _iiPDF_ADG2 = _model_flags.iiPDF_ADG2

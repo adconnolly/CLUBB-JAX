@@ -256,26 +256,47 @@ def rcm_sat_adj(thlm, rtm, p_in_Pa, exner, saturation_formula: int):
     p_in_Pa = jnp.asarray(p_in_Pa, dtype=jnp.float64)
     exner = jnp.asarray(exner, dtype=jnp.float64)
 
-    # Default initialization
-    theta_lo = thlm
-    theta_hi = thlm + Lv / (Cp * exner) * jnp.maximum(rtm, 0.0)
+    tolerance = 0.001
+    zero_threshold = 0.0
 
-    def residual(theta):
+    theta = thlm
+    too_low = jnp.zeros_like(theta)
+    too_high = jnp.zeros_like(theta)
+    done = jnp.zeros_like(theta, dtype=bool)
+
+    def step(carry, iteration):
+        theta, too_low, too_high, done = carry
         rsat = sat_mixrat_liq(p_in_Pa, theta * exner, saturation_formula)
-        rcm = jnp.maximum(rtm - rsat, 0.0)
-        return theta - Lv / (Cp * exner) * rcm - thlm
+        answer = theta - (Lv / (Cp * exner)) * jnp.maximum(
+            rtm - rsat,
+            zero_threshold,
+        )
+        diff = answer - thlm
+        converged = jnp.abs(diff) <= tolerance
+        active = ~done
 
-    def step(bounds, _):
-        lo, hi = bounds
-        mid = 0.5 * (lo + hi)
-        use_upper = residual(mid) < 0.0
-        lo = jnp.where(use_upper, mid, lo)
-        hi = jnp.where(use_upper, hi, mid)
-        return (lo, hi), None
+        set_high = active & (~converged) & (diff > tolerance)
+        set_low = active & (~converged) & ((-diff) > tolerance)
+        too_high_new = jnp.where(set_high, theta, too_high)
+        too_low_new = jnp.where(set_low, theta, too_low)
 
-    (theta_lo, theta_hi), _ = jax.lax.scan(
-        step, (theta_lo, theta_hi), None, length=64
+        too_high_new = jnp.where(
+            active & (~converged) & (iteration == 0),
+            theta + 20.0,
+            too_high_new,
+        )
+        theta_new = 0.5 * (too_low_new + too_high_new)
+
+        done_new = done | (active & converged)
+        theta = jnp.where(active & (~converged), theta_new, theta)
+        too_low = jnp.where(active, too_low_new, too_low)
+        too_high = jnp.where(active, too_high_new, too_high)
+        return (theta, too_low, too_high, done_new), None
+
+    (theta, _too_low, _too_high, _done), _ = jax.lax.scan(
+        step,
+        (theta, too_low, too_high, done),
+        jnp.arange(64),
     )
-    theta = 0.5 * (theta_lo + theta_hi)
     rsat = sat_mixrat_liq(p_in_Pa, theta * exner, saturation_formula)
-    return jnp.maximum(rtm - rsat, 0.0)
+    return jnp.maximum(rtm - rsat, zero_threshold)

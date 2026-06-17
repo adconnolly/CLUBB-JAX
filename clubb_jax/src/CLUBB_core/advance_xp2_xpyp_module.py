@@ -84,7 +84,7 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
     zero_threshold,
 )
 from clubb_jax.src.CLUBB_core.error_code import clubb_at_least_debug_level
-from clubb_jax.src.derived_types import (
+from clubb_jax.src.CLUBB_core import (
     ErrInfo,
     Grid,
     NuVertResDep,
@@ -92,7 +92,7 @@ from clubb_jax.src.derived_types import (
     implicit_coefs_terms,
     pdf_parameter,
 )
-from clubb_jax.src.derived_types.err_info_codes import (
+from clubb_jax.src.CLUBB_core.err_info_codes import (
     ERR_XP2_XPYP_INVALID_C_UU,
     ERR_XP2_XPYP_MULTIPLE_LHS_REQUIRED,
 )

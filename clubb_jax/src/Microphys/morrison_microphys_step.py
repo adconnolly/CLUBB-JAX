@@ -98,7 +98,7 @@ def advance_morrison_microphysics(state: dict):
     from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction
     from clubb_jax.src.CLUBB_core.setup_clubb_pdf_params import hydrometp2_zt
     from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
-    from clubb_jax.src.derived_types.err_info import ErrInfo
+    from clubb_jax.src.CLUBB_core.err_info import ErrInfo
     pdf = state['pdf_params']
     ga = lambda a: np.asarray(getattr(pdf, a), np.float64)
     stats = JaxStats.empty(

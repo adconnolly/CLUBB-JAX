@@ -54,7 +54,7 @@ from clubb_jax.src.CLUBB_core.grid_class import zm2zt
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import tridiag_solve
 from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs
-from clubb_jax.src.derived_types import ErrInfo, Grid, NuVertResDep
+from clubb_jax.src.CLUBB_core import ErrInfo, Grid, NuVertResDep
 
 
 windm_edsclrm_um = 1

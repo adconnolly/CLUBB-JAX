@@ -37,7 +37,7 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
 )
 from clubb_jax.src.CLUBB_core.grid_class import ddzm, zm2zt, zt2zm
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
-from clubb_jax.src.derived_types import Grid
+from clubb_jax.src.CLUBB_core import Grid
 
 
 xp3_rtp3 = 1  # Named constant for solving rtp3

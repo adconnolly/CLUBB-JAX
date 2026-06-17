@@ -8,7 +8,7 @@ References:
 
 Porting deviations:
 - The Fortran `clubb_config_flags_type` declaration is represented by
-  `clubb_jax.src.derived_types.config_flags.ConfigFlags`; this module constructs
+  `clubb_jax.src.CLUBB_core.config_flags.ConfigFlags`; this module constructs
   that type directly instead of using Fortran out-arguments.
 - `set_default_clubb_config_flags_api` is exposed as `get_default_config_flags`
   because Python callers expect a returned value.
@@ -19,7 +19,7 @@ Porting deviations:
 """
 from __future__ import annotations
 
-from clubb_jax.src.derived_types.config_flags import ConfigFlags
+from clubb_jax.src.CLUBB_core.config_flags import ConfigFlags
 
 
 # Advance subroutine ordering variables

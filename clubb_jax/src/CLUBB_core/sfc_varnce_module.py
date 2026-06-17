@@ -41,7 +41,7 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
 )
 from clubb_jax.src.CLUBB_core.error_code import clubb_at_least_debug_level
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
-from clubb_jax.src.derived_types import ErrInfo, Grid, SclrIdx
+from clubb_jax.src.CLUBB_core import ErrInfo, Grid, SclrIdx
 
 
 @partial(
