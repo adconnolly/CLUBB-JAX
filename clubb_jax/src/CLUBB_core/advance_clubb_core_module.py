@@ -25,6 +25,31 @@ Porting deviations:
 import jax
 
 jax.config.update("jax_enable_x64", True)
+
+# ── Persistent JIT compilation cache ────────────────────────────────────────
+# The closure advance compiles ~244 XLA kernels on the first timestep (≈130 s
+# for a 4-column ARM run); steps 2..N hit the in-process cache, but every fresh
+# *process* (each case of a comparison sweep, every short run/grad/unit-test
+# invocation) re-pays that cost — a one-time price a 3-30-step run never recoups.
+# Persisting the compiled executables to disk turns that into a cross-process
+# cache hit, roughly halving the wall time of a cold run (measured 132.9 s →
+# 70.7 s on ARM/30 steps) with ZERO numerical effect: the cached executable is
+# byte-identical to the freshly-compiled one, so faithfulness/grad are preserved
+# by construction. The cache is content-addressed on the lowered HLO, so a code
+# change transparently invalidates stale entries. Opt out with
+# CLUBB_JAX_NO_JIT_CACHE=1; override the directory with JAX_COMPILATION_CACHE_DIR.
+import os as _os
+
+if not _os.environ.get("CLUBB_JAX_NO_JIT_CACHE"):
+    _cache_dir = _os.environ.get("JAX_COMPILATION_CACHE_DIR") or _os.path.expanduser(
+        "~/.cache/clubb_jax_jit"
+    )
+    jax.config.update("jax_compilation_cache_dir", _cache_dir)
+    # Persist every kernel, not just those above the 1 s default threshold, so the
+    # many sub-second kernels also survive across processes.
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.clubb_constants import (

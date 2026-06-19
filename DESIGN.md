@@ -344,6 +344,18 @@ usage *except for stats*) is **WIP**. Verified state and the queue:
   the whole timestep (`advance_clubb_core` end-to-end), ideally drive the loop with `lax.scan`, and stabilize the
   static-arg keys to stop the re-traces — the same whole-step compilation efficient whole-driver `jax.grad` needs.
 
+  **Applied (2026-06-19), step 1 — persistent JIT cache.** `advance_clubb_core_module.py` now enables JAX's
+  on-disk compilation cache at import (default `~/.cache/clubb_jax_jit`; opt out `CLUBB_JAX_NO_JIT_CACHE=1`,
+  relocate via `JAX_COMPILATION_CACHE_DIR`). This makes the first-step compile a **cross-process** cache hit, so
+  every fresh process (each case of a comparison sweep, every short run/grad/unit-test) reuses the prior compile.
+  Measured on a 4-column ARM/30-step run against the rebuilt intel oracle: **Fortran 2.0 s**; JAX **cold 133–147 s
+  (244 XLA compiles, 237 cache entries / 16 MB)** → **warm 70–78 s** (~47% faster). Numerically transparent — the
+  cached executable is byte-identical, so ARM stays **bit-faithful** (`run_bindiff_all.py` PASS, 0 vars over
+  threshold) and `jax.grad` is unaffected. **The cache halves only the XLA-backend half; the residual ~70 s is JAX
+  tracing + MLIR lowering of the 244 separate jitted leaves, which only the whole-step-jit / `lax.scan`
+  restructuring above removes.** That structural fix remains the open lever (the module's monolithic outer jit was
+  found "impractically large" — it needs decomposition, not a single `@jit`).
+
 - **Unit-test status (165 files; 118 passing at branch start).** A signature-drift pass updated **35** stale
   tests to the refactor's new JIT-friendly signatures (leading `nzm/nzt/ngrdcol/gr`, reordered args,
   `static_argnums` → arrays in static slots raised `unhashable type`). Two surfaced small **src** fixes (applied):
