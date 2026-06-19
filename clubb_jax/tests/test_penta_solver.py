@@ -34,7 +34,11 @@ try:
 except Exception:
     HAS_FORTRAN = False
 
-from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve_jax
+from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve
+
+
+def penta_lu_solve_jax(lhs, rhs):
+    return penta_lu_solve(rhs.shape[-1], lhs.shape[1], lhs, rhs)
 
 
 def _dense_penta(s2, s1, d, sb1, sb2):

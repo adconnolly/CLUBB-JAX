@@ -52,7 +52,6 @@ def test_f2py_oracle():
                          thermodynamic_heights=np.asfortranarray(np.asarray(jgr.zt)),
                          err_info=ErrInfo(ngrdcol=ng))
     rng = np.random.default_rng(4)
-    zt = np.asarray(jgr.zt)
     sfc_elevation = np.zeros(ng)
     skw_max = np.full(ng, _SKW_MAX)
     wp2_zt = rng.uniform(0.05, 2.0, (ng, nzt))
@@ -62,7 +61,7 @@ def test_f2py_oracle():
     for l_smth in (True, False):
         ref = np.asarray(clubb_f2py.f2py_clip_skewness(
             60.0, sfc_elevation, skw_max, np.asfortranarray(wp2_zt), l_smth, np.asfortranarray(wp3.copy())))
-        got = np.asarray(clip_skewness_core(wp3, wp2_zt, zt, sfc_elevation, skw_max, l_smth))
+        got = np.asarray(clip_skewness_core(nzt, ng, jgr, sfc_elevation, skw_max, wp2_zt, l_smth, wp3))
         worst = max(worst, np.max(np.abs(got - ref)))
     # The sharp-threshold branch is bit-exact; the ~1e-10 residual is the smooth-Heaviside (Peskin) transition-
     # zone FP-order difference propagated through the wp3 limit, not a transcription error (closed-form faithful).
@@ -72,12 +71,13 @@ def test_f2py_oracle():
 
 def test_skewness_limit():
     jgr = setup_grid(ngrdcol=_NG, deltaz=_DZ, zm_init=0.0, zm_top=_ZTOP, grid_type=1)
-    nzt = jgr.zm.shape[1] - 1
-    zt = np.asarray(jgr.zt)
+    nzm = jgr.zm.shape[1]
+    nzt = nzm - 1
     rng = np.random.default_rng(6)
     wp2_zt = rng.uniform(0.1, 2.0, (_NG, nzt))
     wp3 = rng.uniform(-8.0, 8.0, (_NG, nzt)) * wp2_zt ** 1.5
-    got = np.asarray(clip_skewness_core(wp3, wp2_zt, zt, np.zeros(_NG), np.full(_NG, _SKW_MAX), True))
+    got = np.asarray(clip_skewness_core(nzt, _NG, jgr, np.zeros(_NG), np.full(_NG, _SKW_MAX), wp2_zt, True, wp3))
+    zt = np.asarray(jgr.zt)
     skw = got / wp2_zt ** 1.5
     # Above the near-surface reduction zone (>200 m AGL) |Skw| must not exceed Skw_max_mag.
     high = zt > 200.0
@@ -87,11 +87,11 @@ def test_skewness_limit():
 
 def test_differentiable():
     jgr = setup_grid(ngrdcol=1, deltaz=_DZ, zm_init=0.0, zm_top=_ZTOP, grid_type=1)
-    nzt = jgr.zm.shape[1] - 1
-    zt = np.asarray(jgr.zt)[:1]
+    nzm = jgr.zm.shape[1]
+    nzt = nzm - 1
     wp2_zt = np.random.default_rng(1).uniform(0.1, 2.0, (1, nzt))
     def loss(wp3):
-        return jnp.sum(clip_skewness_core(wp3, wp2_zt, zt, np.zeros(1), np.full(1, _SKW_MAX), True) ** 2)
+        return jnp.sum(clip_skewness_core(nzt, 1, jgr, np.zeros(1), np.full(1, _SKW_MAX), wp2_zt, True, wp3) ** 2)
     g = np.asarray(jax.grad(loss)(jnp.asarray(np.random.default_rng(2).uniform(-5, 5, (1, nzt)))))
     assert np.isfinite(g).all(), "non-finite grad through clip_skewness_core"
     print(f"  jax.grad through clip_skewness_core: finite ({g.size} entries)  PASS")

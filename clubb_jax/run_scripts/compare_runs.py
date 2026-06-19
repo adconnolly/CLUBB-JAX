@@ -25,6 +25,8 @@ JAX_ROOT    = os.path.normpath(os.path.join(RUN_SCRIPTS, "../.."))   # CLUBB-JAX
 CLUBB_ROOT  = os.path.normpath(os.path.join(JAX_ROOT, "clubb_release"))
 PYTHONPATH  = os.pathsep.join([JAX_ROOT, CLUBB_ROOT,
                                 os.path.join(CLUBB_ROOT, "clubb_python_api")])
+DEFAULT_FORTRAN_COMPARE_ROOT = os.path.join(JAX_ROOT, "output_fortran")
+DEFAULT_JAX_COMPARE_ROOT = os.path.join(JAX_ROOT, "clubb_jax", "output")
 
 REL_TOL = 1e-6   # flag variables whose max|Δ|/max|ref| exceeds this
 # Absolute floor (numpy.allclose convention: |Δ| <= ABS_TOL + REL_TOL*|ref|).
@@ -42,6 +44,20 @@ PROGNOSTIC = {
     "wpthlp", "wprtp", "upwp", "vpwp", "up2", "vp2", "em",
     "sclrm",
 }
+
+
+def compare_output_dirs(
+    case: str,
+    fortran_root: str | None = None,
+    jax_root: str | None = None,
+) -> tuple[str, str]:
+    """Return the Fortran and JAX output dirs used by this compare script."""
+    fort_root = os.path.abspath(fortran_root or DEFAULT_FORTRAN_COMPARE_ROOT)
+    jax_root = os.path.abspath(jax_root or DEFAULT_JAX_COMPARE_ROOT)
+    return (
+        os.path.join(fort_root, f"{case}_compare_fort"),
+        os.path.join(jax_root, f"{case}_compare_jax"),
+    )
 
 
 def _read_dt_main(case: str) -> int:
@@ -157,15 +173,23 @@ def main():
                         help="Correctness standard for the verdict (REFACTOR.md §2). "
                              "'bit' = legacy machine-precision gate (default; for debugging a real "
                              "regression). 'physical' = Tier-C field-class tolerances.")
+    parser.add_argument("--fortran-exe", default=os.environ.get("FORTRAN_EXE"),
+                        help="Compiled CLUBB standalone executable for the Fortran run. "
+                             "Default: FORTRAN_EXE if set, otherwise "
+                             "clubb_release/install/latest/clubb_standalone.")
+    parser.add_argument("--fortran-out-root", default=os.environ.get("FORTRAN_OUT_ROOT"),
+                        help="Root directory for transient Fortran comparison output. "
+                             "Default: output_fortran under the repo root.")
+    parser.add_argument("--jax-out-root", default=os.environ.get("JAX_OUT_ROOT"),
+                        help="Root directory for transient JAX comparison output. "
+                             "Default: clubb_jax/output.")
     args = parser.parse_args()
 
     case   = args.case
     niters = args.max_iters
-    # Output convention (see DESIGN.md): Fortran stats live under clubb_release/output/,
-    # JAX stats under clubb_jax/output/. Each run also gets its own *_compare_* subdir
-    # so neither clobbers a stored oracle.
-    outdir_f = os.path.join(CLUBB_ROOT, f"output/{case}_compare_fort")
-    outdir_j = os.path.join(JAX_ROOT, "clubb_jax", f"output/{case}_compare_jax")
+    # Keep transient comparison output out of the symlinked clubb_release tree.
+    # Each side gets its own *_compare_* subdir so neither clobbers a stored oracle.
+    outdir_f, outdir_j = compare_output_dirs(case, args.fortran_out_root, args.jax_out_root)
     # Force per-step output (stats_tsamp = stats_tout = interval) so JAX/Fortran records
     # are instantaneous and time-aligned. Default interval = the case's dt_main.
     interval = args.tout if args.tout is not None else _read_dt_main(case)
@@ -178,10 +202,15 @@ def main():
     env_jax["PYTHONPATH"] = PYTHONPATH
 
     scm = [sys.executable, os.path.join(RUN_SCRIPTS, "run_scm.py")]
+    fortran_exe = os.path.abspath(
+        args.fortran_exe or os.path.join(CLUBB_ROOT, "install/latest/clubb_standalone")
+    )
+    if not os.path.isfile(fortran_exe):
+        sys.exit(f"Fortran executable not found: {fortran_exe}")
 
     print(f"=== Step 1: Pure Fortran run ({niters} iters) ===")
     t0 = time.time()
-    rc = run(scm + [case, "-legacy",
+    rc = run(scm + [case, "-exe", fortran_exe,
                     "-max_iters", str(niters),
                     "-out_dir", outdir_f] + tout_args)
     print(f"  Fortran: {time.time()-t0:.1f}s  (rc={rc})")

@@ -1,263 +1,404 @@
-"""JAX implementation of fill_holes.F90:fill_holes_vertical_api.
+"""JAX port of exposed routines from ``src/CLUBB_core/fill_holes.F90``.
 
-ARM uses fill_holes_type=2 (sliding_window with global fallback).
-num_hf_draw_points=2 (from constants_clubb.F90).
+Porting deviations:
+  * Fortran mutates ``field``, ``wp2``, ``up2``, and ``vp2`` in place.  JAX
+    returns updated arrays.
+  * Python callers pass zero-based ``lower_hf_level`` and ``upper_hf_level``,
+    matching ``clubb_python.CLUBB_core.fill_holes``.
+  * Only ``global_fill`` and ``sliding_window`` are implemented for
+    ``fill_holes_vertical``.  The Fortran ``widening_windows``,
+    ``smart_window``, ``smart_window_smooth``, and ``parallel_fill`` methods
+    remain unported and deliberately raise ``NotImplementedError``.
+  * Fortran diagnostic printing and debug-only conservation warnings are not
+    reproduced in JAX.
 """
 
+from __future__ import annotations
+
+from functools import partial
+
 import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-import numpy as np
 
-from clubb_jax.src.CLUBB_core.constants_clubb import eps, Lv, Cp
-
-_NUM_HF_DRAW = 2   # num_hf_draw_points=2 — window half-width for sliding fill
-
-
-def fill_holes_global(field, rho_dz, threshold, lower_k, upper_k):
-    """fill_holes_global: mass-conserving global fill over [lower_k, upper_k].
-
-    Args:
-        field:    (ngrdcol, nz) — field to fill (modified in-place-style)
-        rho_dz:   (ngrdcol, nz) — rho_ds * dz (precomputed)
-        threshold: scalar
-        lower_k, upper_k: Python int — 0-based inclusive index range
-
-    Returns:
-        field: (ngrdcol, nz) with holes filled
-    """
-    nz = field.shape[1]
-    k_idx = jnp.arange(nz)[None, :]   # (1, nz)
-    mask = (k_idx >= lower_k) & (k_idx <= upper_k)
-
-    rho_dz_m = jnp.where(mask, rho_dz, 0.0)
-    denom = jnp.sum(rho_dz_m, axis=1, keepdims=True)          # (ngrdcol, 1)
-    field_avg = jnp.sum(rho_dz_m * field, axis=1, keepdims=True) / denom  # (ngrdcol, 1)
-
-    # Clip field
-    field_clipped = jnp.where(
-        field_avg >= threshold,
-        jnp.maximum(threshold, field),
-        jnp.minimum(threshold, field),
-    )
-    field_clipped_avg = jnp.sum(rho_dz_m * field_clipped, axis=1, keepdims=True) / denom
-
-    # Mass-conservation coefficient
-    safe = (jnp.abs(field_clipped_avg - threshold)
-            > jnp.abs(field_clipped_avg + threshold) * eps / 2.0)
-    mass_frac = jnp.where(
-        safe,
-        (field_avg - threshold) / (field_clipped_avg - threshold),
-        1.0,
-    )
-    field_new = jnp.where(mask,
-                          threshold + mass_frac * (field_clipped - threshold),
-                          field)
-
-    # Only apply if any hole exists in this column
-    any_hole = jnp.any(jnp.where(mask, field < threshold, False),
-                       axis=1, keepdims=True)  # (ngrdcol, 1)
-    return jnp.where(any_hole, field_new, field)
-
-
-def fill_holes_sliding_window(field, rho_dz, threshold, lower_k, upper_k,
-                                   num_draw=_NUM_HF_DRAW):
-    """fill_holes_sliding_window + global fallback (fill_holes_type=2).
-
-    Args:
-        field:    (ngrdcol, nz)
-        rho_dz:   (ngrdcol, nz) — rho_ds * dz
-        threshold: scalar
-        lower_k, upper_k: Python int — 0-based inclusive bounds
-        num_draw: half-window size (default 2)
-
-    Returns:
-        field: (ngrdcol, nz) with holes filled
-    """
-    # Fast path: no holes — skip all work
-    # (Fortran checks this first; in JAX we always run the loop but it's a noop)
-    wlen = 2 * num_draw + 1  # static window length = 5
-
-    def body(k, field_carry):
-        """Process one level k of the sliding window."""
-        # Dynamic slice window of width wlen centered at k
-        start = k - num_draw   # dynamic integer
-        field_win = jax.lax.dynamic_slice(
-            field_carry, (0, start), (field_carry.shape[0], wlen))   # (ngrdcol, wlen)
-        rho_dz_win = jax.lax.dynamic_slice(
-            rho_dz, (0, start), (rho_dz.shape[0], wlen))             # (ngrdcol, wlen)
-
-        denom = jnp.sum(rho_dz_win, axis=1, keepdims=True)           # (ngrdcol, 1)
-        field_avg = jnp.sum(rho_dz_win * field_win, axis=1, keepdims=True) / denom
-
-        # Only modify if any value in window is below threshold
-        any_hole = jnp.any(field_win < threshold, axis=1, keepdims=True)  # (ngrdcol,1)
-
-        # Clip
-        field_clipped = jnp.where(
-            field_avg >= threshold,
-            jnp.maximum(threshold, field_win),
-            jnp.minimum(threshold, field_win),
-        )
-        field_clipped_avg = jnp.sum(rho_dz_win * field_clipped, axis=1, keepdims=True) / denom
-
-        # Mass-conservation coefficient (avoid divide-by-zero)
-        safe = (jnp.abs(field_clipped_avg - threshold)
-                > jnp.abs(field_clipped_avg + threshold) * eps / 2.0)
-        mass_frac = jnp.where(
-            safe,
-            (field_avg - threshold) / (field_clipped_avg - threshold),
-            1.0,
-        )
-        field_win_new = threshold + mass_frac * (field_clipped - threshold)
-        # Only write back if any hole existed in window
-        field_win_out = jnp.where(any_hole, field_win_new, field_win)
-
-        field_out = jax.lax.dynamic_update_slice(field_carry, field_win_out, (0, start))
-        return field_out
-
-    # Serial loop: k from lower_k+num_draw to upper_k-num_draw (inclusive)
-    start_k = lower_k + num_draw
-    end_k = upper_k - num_draw + 1   # exclusive for fori_loop
-
-    field_sw = jax.lax.fori_loop(start_k, end_k, body, field)
-
-    # Global fallback if holes remain
-    field_out = jax.lax.cond(
-        jnp.any(field_sw < threshold),
-        lambda f: fill_holes_global(f, rho_dz, threshold, lower_k, upper_k),
-        lambda f: f,
-        field_sw,
-    )
-    return field_out
-
-
-def fill_holes_vertical(field, rho_ds, dz, threshold, lower_k, upper_k,
-                             fill_holes_type, grid_dir_indx=1):
-    """fill_holes_vertical_api in JAX.
-
-    Args:
-        field:           (ngrdcol, nz) — field to fill (NOT mutated)
-        rho_ds:          (ngrdcol, nz)
-        dz:              (ngrdcol, nz)
-        threshold:       scalar (e.g. w_tol_sqd)
-        lower_k, upper_k: Python int — 0-based inclusive index range
-        fill_holes_type: Python int — 1=global, 2=sliding_window+global_fallback
-        grid_dir_indx:   Python int — +1 (standard ascending grid)
-
-    Returns:
-        field: (ngrdcol, nz) with holes filled (copy, not in-place)
-    """
-    rho_dz = rho_ds * dz   # precomputed for both fill methods
-
-    # Skip entirely if no values below threshold (fast path, no JIT-traced branch)
-    # In JIT, we always trace both paths but only apply the relevant one.
-    if fill_holes_type == 1:
-        return fill_holes_global(field, rho_dz, threshold, lower_k, upper_k)
-    elif fill_holes_type == 2:
-        return fill_holes_sliding_window(field, rho_dz, threshold, lower_k, upper_k)
-    else:
-        raise NotImplementedError(f"fill_holes_type={fill_holes_type} not implemented")
-
-
-# Called eagerly ~7-9× per timestep (rtm, thlm, rtp2, thlp2, up2, vp2, wp2), the inner sliding-window
-# `fori_loop` / global-fill bodies CLOSE OVER `rho_dz`/`threshold`, so eager use bakes those values into
-# the loop jaxpr → XLA recompiles every step → unbounded compile-cache growth (the Iter290 residual ~9
-# scan-recompiles/step; Iter291). Jitting the entry makes the arrays tracers (hoisted to operands), so
-# each (grid-size, fill_type) variant compiles ONCE and cache-hits. The int control args
-# (lower_k/upper_k/fill_holes_type/grid_dir_indx) drive Python branching/shaping → static; `threshold`
-# is only used arithmetically → traced. Value-preserving + differentiable; all callers import this name.
-fill_holes_vertical = jax.jit(
-    fill_holes_vertical,
-    static_argnames=("lower_k", "upper_k", "fill_holes_type", "grid_dir_indx"),
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    eps,
+    global_fill,
+    num_hf_draw_points,
+    one,
+    sliding_window,
+    zero,
 )
-
 
 _F64_EPS = jnp.finfo(jnp.float64).eps
 
 
-def fill_holes_wp2_from_horz_tke(wp2, up2, vp2, threshold, lower_k, upper_k):
-    """fill_holes.F90:fill_holes_wp2_from_horz_tke — TKE-conserving wp2 hole-fill.
+@partial(
+    jax.jit,
+    static_argnames=("nz", "ngrdcol"),
+)
+def fill_holes_global(
+    nz: int,
+    ngrdcol: int,
+    threshold: float,
+    lower_hf_level: int,
+    upper_hf_level: int,
+    dz,
+    rho_ds,
+    field,
+):
+    """This subroutine clips values of 'field' that are below 'threshold' using
+    the whole range [lower_hf_level:upper_hf_level] as the fill window. This
+    maximized effectiveness, but minimized locality.
 
-    Where wp2 < threshold AND (up2 > threshold OR vp2 > threshold), borrows TKE
-    from up2 and vp2 proportionally to fill holes in wp2.
+    Mass is conserved by reducing the clipped field everywhere by a constant
+    multiplicative coefficient.
 
-    ARM call: lower_hf_level=1 (Fortran 1-based), upper_hf_level=nzm-2 (Fortran 1-based)
-              → Python lower_k=0..1? Let's accept 0-based Python range.
-
-    Args:
-        wp2, up2, vp2: (ngrdcol, nzm)
-        threshold:     scalar
-        lower_k, upper_k: Python 0-based inclusive index range
-
-    Returns:
-        wp2, up2, vp2: (ngrdcol, nzm) modified within [lower_k, upper_k]
+    This subroutine does not guarantee that the clipped field will exceed
+    threshold everywhere; blunt clipping is needed for that.
     """
-    nzm = wp2.shape[1]
-    k_idx = jnp.arange(nzm)[None, :]   # (1, nzm)
-    in_range = (k_idx >= lower_k) & (k_idx <= upper_k)
+    del ngrdcol
+    # --------------------- Begin Code ---------------------
 
-    # Operate only where a hole exists AND there is available TKE
-    has_hole    = wp2 < threshold
-    has_tke_up  = up2 > threshold
-    has_tke_vp  = vp2 > threshold
-    do_fill     = in_range & has_hole & (has_tke_up | has_tke_vp)
+    k_idx = jnp.arange(nz)[None, :]
+    in_range = (k_idx >= lower_hf_level) & (k_idx <= upper_hf_level)
+    rho_ds_dz = rho_ds * dz
 
-    missing     = threshold - wp2            # > 0 where has_hole
-    up2_avail   = jnp.maximum(up2 - threshold, 0.0)
-    vp2_avail   = jnp.maximum(vp2 - threshold, 0.0)
-    total_avail = up2_avail + vp2_avail      # > 0 where (has_tke_up | has_tke_vp)
+    # Compute the numerator and denominator integrals
+    numer_integral_global = jnp.sum(jnp.where(in_range, rho_ds_dz * field, 0.0), axis=1, keepdims=True)
+    denom_integral_global = jnp.sum(jnp.where(in_range, rho_ds_dz, 0.0), axis=1, keepdims=True)
 
-    # --- Case 1: not enough TKE ---
-    case1 = do_fill & (missing >= total_avail)
-    wp2_c1  = wp2 + total_avail
-    up2_c1  = jnp.minimum(up2, threshold)
-    vp2_c1  = jnp.minimum(vp2, threshold)
+    # Find the vertical average of field, using the precomputed numerator and denominator,
+    # see description of the vertical_avg function in advance_helper_module
+    field_avg_global = numer_integral_global / denom_integral_global
 
-    # --- Case 2: enough TKE (missing < total_avail) ---
-    case2 = do_fill & (missing < total_avail)
+    # Clip small or negative values from field.
+    field_clipped = jnp.where(
+        field_avg_global >= threshold,
+        jnp.maximum(threshold, field),
+        jnp.minimum(threshold, field),
+    )
 
-    # Fortran epsilon threshold for deciding if a component is "zero"
-    eps_thr = _F64_EPS * 1000.0
+    # To compute the clipped field's vertical integral we only need to recompute the numerator
+    numer_integral_clipped = jnp.sum(
+        jnp.where(in_range, rho_ds_dz * field_clipped, 0.0),
+        axis=1,
+        keepdims=True,
+    )
+    field_clipped_avg = numer_integral_clipped / denom_integral_global
 
-    case2a = case2 & (jnp.abs(up2_avail) < eps_thr)   # no up2 avail → take all from vp2
-    case2b = case2 & (~case2a) & (jnp.abs(vp2_avail) < eps_thr)  # no vp2 avail → take all from up2
-    case2c = case2 & (~case2a) & (~case2b)              # both available → proportional
+    safe_to_scale = (
+        jnp.abs(field_clipped_avg - threshold)
+        > jnp.abs(field_clipped_avg + threshold) * eps / 2.0
+    )
+    mass_fraction_global = (field_avg_global - threshold) / (
+        field_clipped_avg - threshold
+    )
+    # Calculate normalized, filled field
+    field_filled = threshold + mass_fraction_global * (field_clipped - threshold)
 
-    ratio  = jnp.where(total_avail > 0.0, missing / total_avail, 0.0)
-
-    # case2a: up2 unchanged, vp2 -= missing
-    up2_2a = up2
-    vp2_2a = vp2 - missing
-
-    # case2b: up2 -= missing, vp2 unchanged
-    up2_2b = up2 - missing
-    vp2_2b = vp2
-
-    # case2c: proportional
-    up2_2c = threshold + up2_avail * (1.0 - ratio)
-    vp2_2c = threshold + vp2_avail * (1.0 - ratio)
-
-    up2_c2 = jnp.where(case2a, up2_2a, jnp.where(case2b, up2_2b, up2_2c))
-    vp2_c2 = jnp.where(case2a, vp2_2a, jnp.where(case2b, vp2_2b, vp2_2c))
-
-    # --- Assemble ---
-    wp2_new = jnp.where(case1, wp2_c1, jnp.where(case2, threshold, wp2))
-    up2_new = jnp.where(case1, up2_c1, jnp.where(case2, up2_c2, up2))
-    vp2_new = jnp.where(case1, vp2_c1, jnp.where(case2, vp2_c2, vp2))
-
-    return wp2_new, up2_new, vp2_new
+    # Do not complete calculations or update field values for this
+    # column if there are no holes that need filling
+    any_hole = jnp.any(jnp.where(in_range, field < threshold, False), axis=1, keepdims=True)
+    apply_fill = in_range & any_hole & safe_to_scale
+    return jnp.where(apply_fill, field_filled, field)
 
 
-def fill_holes_hydromet_clip_jax(hm, num, hm_tol, rvm_mc, thlm_mc, exner, dt):
-    """Clip a non-frozen (rain) precipitating hydrometeor mass `hm` <= `hm_tol` to 0, returning the removed mass
-    to vapor (rvm_mc) with a latent cooling on thlm (mirrors fill_holes.F90:fill_holes_driver_api, lines
-    2444-2476); the partner number `num` is zeroed (clip_hydromet_conc_mvr, <rx>=0). Concrete-numpy path
-    (the KK step runs concrete). Returns (hm, num, rvm_mc, thlm_mc)."""
-    below = hm <= hm_tol
-    removed = np.where(below, hm, 0.0)                      # removed rr mass [kg/kg]
-    hm = np.where(below, 0.0, hm)
-    num = np.where(below, 0.0, num)
-    exner = np.asarray(exner, np.float64)
-    rvm_mc = np.asarray(rvm_mc, np.float64) + removed / dt
-    thlm_mc = np.asarray(thlm_mc, np.float64) - (Lv / Cp) * removed / (exner * dt)
-    return hm, num, rvm_mc, thlm_mc
+@partial(
+    jax.jit,
+    static_argnames=("nz", "ngrdcol"),
+)
+def fill_holes_sliding_window(
+    nz: int,
+    ngrdcol: int,
+    threshold: float,
+    lower_hf_level: int,
+    upper_hf_level: int,
+    dz,
+    rho_ds,
+    field,
+):
+    """This subroutine clips values of 'field' that are below 'threshold' as much
+    as possible (i.e. "fills holes"), but conserves the total integrated mass
+    of 'field'.  This prevents clipping from acting as a spurious source.
+
+    This performs a sliding window technique, modifying consecutive ranges of
+    vertical levels in serial, this is computationally expensive, but highly local.
+    This high locally has a tradeoff with effectiveness, and can often fail to fill
+    all the holes, especially if there is more than ~5, as a result, this relies on
+    the global fill if the first pass of the sliding window fails to fill all holes
+
+    Mass is conserved by reducing the clipped field everywhere by a constant
+    multiplicative coefficient.
+
+    References:
+      ``Numerical Methods for Wave Equations in Geophysical Fluid
+        Dynamics'', Durran (1999), p. 292.
+    """
+    del nz
+    # --------------------- Begin Code ---------------------
+
+    rho_ds_dz = rho_ds * dz
+    window_len = 2 * num_hf_draw_points + 1
+    start_indx = lower_hf_level + num_hf_draw_points
+    stop_indx = upper_hf_level - num_hf_draw_points + 1
+
+    def fill_one_window(k, field_carry):
+        k_start = k - num_hf_draw_points
+        field_window = jax.lax.dynamic_slice(
+            field_carry,
+            (0, k_start),
+            (ngrdcol, window_len),
+        )
+        rho_window = jax.lax.dynamic_slice(
+            rho_ds_dz,
+            (0, k_start),
+            (ngrdcol, window_len),
+        )
+
+        invrs_denom_integral = one / jnp.sum(rho_window, axis=1, keepdims=True)
+        field_avg = jnp.sum(rho_window * field_window, axis=1, keepdims=True) * invrs_denom_integral
+
+        field_clipped = jnp.where(
+            field_avg >= threshold,
+            jnp.maximum(threshold, field_window),
+            jnp.minimum(threshold, field_window),
+        )
+        # Compute the clipped field's vertical integral.
+        # clipped_total_mass >= original_total_mass,
+        # see description of the vertical_avg function in advance_helper_module
+        field_clipped_avg = (
+            jnp.sum(rho_window * field_clipped, axis=1, keepdims=True)
+            * invrs_denom_integral
+        )
+
+        # Avoid divide by zero issues by doing nothing if field_clipped_avg ~= threshold
+        safe_to_scale = (
+            jnp.abs(field_clipped_avg - threshold)
+            > jnp.abs(field_clipped_avg + threshold) * eps / 2.0
+        )
+        # Compute coefficient that makes the clipped field have the same mass as the
+        # original field.  We should always have mass_fraction > 0.
+        mass_fraction = (field_avg - threshold) / (field_clipped_avg - threshold)
+        # Calculate normalized, filled field
+        field_window_filled = threshold + mass_fraction * (field_clipped - threshold)
+
+        any_hole = jnp.any(field_window < threshold, axis=1, keepdims=True)
+        field_window_out = jnp.where(
+            any_hole & safe_to_scale,
+            field_window_filled,
+            field_window,
+        )
+        return jax.lax.dynamic_update_slice(field_carry, field_window_out, (0, k_start))
+
+    field = jax.lax.fori_loop(start_indx, stop_indx, fill_one_window, field)
+
+    # Check if all holes were filled.
+
+    # If the first sliding window pass didn't work, fallback to global fill
+    return jax.lax.cond(
+        jnp.any(field < threshold),
+        lambda f: fill_holes_global(
+            nz=field.shape[1],
+            ngrdcol=ngrdcol,
+            threshold=threshold,
+            lower_hf_level=lower_hf_level,
+            upper_hf_level=upper_hf_level,
+            dz=dz,
+            rho_ds=rho_ds,
+            field=f,
+        ),
+        lambda f: f,
+        field,
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "nz",
+        "ngrdcol",
+        "grid_dir_indx",
+        "fill_holes_type",
+    ),
+)
+def fill_holes_vertical(
+    nz: int,
+    ngrdcol: int,
+    threshold: float,
+    lower_hf_level: int,
+    upper_hf_level: int,
+    dz,
+    rho_ds,
+    grid_dir_indx: int,
+    fill_holes_type: int,
+    field,
+):
+    """This subroutine calls a hole filling method, specified by fill_holes_type.
+
+    The lowest level (k=1) should not be included, as the hole-filling scheme
+    should not alter the set value of 'field' at the surface (for momentum
+    level variables), or consider the value of 'field' at a level below the
+    surface (for thermodynamic level variables).
+
+    For momentum level variables only, the hole-filling scheme should not
+    alter the set value of 'field' at the upper boundary level (k=nz).
+    So for momemtum level variables, call with upper_hf_level=nz-1, and
+    for thermodynamic level variables, call with upper_hf_level=nz.
+    """
+    if grid_dir_indx not in (1, -1):
+        raise ValueError(f"Unsupported grid_dir_indx={grid_dir_indx}")
+
+    if grid_dir_indx == -1:
+        field_reversed = jnp.flip(field, axis=1)
+        dz_reversed = jnp.flip(dz, axis=1)
+        rho_ds_reversed = jnp.flip(rho_ds, axis=1)
+        lower_reversed = nz - 1 - lower_hf_level
+        upper_reversed = nz - 1 - upper_hf_level
+        filled = fill_holes_vertical(
+            nz,
+            ngrdcol,
+            threshold,
+            lower_reversed,
+            upper_reversed,
+            dz_reversed,
+            rho_ds_reversed,
+            1,
+            fill_holes_type,
+            field_reversed,
+        )
+        return jnp.flip(filled, axis=1)
+
+    # Only bother will a fill call if there are values below threshold
+    if fill_holes_type == global_fill:
+        # This fills holes by modifying the entire range, this is maximally effective
+        # and computationally cheap, but minimally local
+        filled = fill_holes_global(
+            nz,
+            ngrdcol,
+            threshold,
+            lower_hf_level,
+            upper_hf_level,
+            dz,
+            rho_ds,
+            field,
+        )
+    elif fill_holes_type == sliding_window:
+        # This performs a sliding window technique, modifying consecutive ranges of
+        # vertical levels in serial, this is computationally expensive, but highly local.
+        # This can also fail to fill, so this falls back to a global fill if neccesary.
+        filled = fill_holes_sliding_window(
+            nz,
+            ngrdcol,
+            threshold,
+            lower_hf_level,
+            upper_hf_level,
+            dz,
+            rho_ds,
+            field,
+        )
+    else:
+        # TODO(JAX port): port the remaining Fortran fill_holes_type options
+        # rather than routing them through a Python/API fallback.
+        raise NotImplementedError(
+            "JAX fill_holes_vertical currently supports global_fill and "
+            f"sliding_window; got fill_holes_type={fill_holes_type}."
+        )
+
+    return jnp.where(jnp.any(field < threshold), filled, field)
+
+
+@partial(
+    jax.jit,
+    static_argnames=("nz", "ngrdcol"),
+)
+def fill_holes_wp2_from_horz_tke(
+    nz: int,
+    ngrdcol: int,
+    threshold: float,
+    lower_hf_level: int,
+    upper_hf_level: int,
+    wp2,
+    up2,
+    vp2,
+):
+    """This subroutine clips values of wp2 that are below 'threshold' as much
+    as possible (i.e. "fills holes"), but conserves the turbulent kinetic energy
+    (up2+vp2+wp2). This prevents clipping from acting as a spurious source.
+
+    Turbulent kinetic energy at each height level is conserved by reducing up2 and vp2
+    by a multiplicative coefficient.
+
+    This subroutine does not guarantee that the clipped field will exceed
+    threshold everywhere; blunt clipping is needed for that.
+
+    The lowest level (k=1) should not be included, as the hole-filling scheme
+    should not alter the set value of 'field' at the surface (for momentum
+    level variables), or consider the value of 'field' at a level below the
+    surface (for thermodynamic level variables).
+
+    For momentum level variables only, the hole-filling scheme should not
+    alter the set value of 'field' at the upper boundary level (k=nz).
+    So for momemtum level variables, call with upper_hf_level=nz-1, and
+    for thermodynamic level variables, call with upper_hf_level=nz.
+    """
+    del ngrdcol
+    # --------------------- Begin Code ---------------------
+
+    k_idx = jnp.arange(nz)[None, :]
+    in_range = (k_idx >= lower_hf_level) & (k_idx <= upper_hf_level)
+
+    # For each height level, fill holes in wp2 by taking tke from up2 and vp2
+    missing_wp2 = threshold - wp2
+    up2_avail = jnp.maximum(up2 - threshold, zero)
+    vp2_avail = jnp.maximum(vp2 - threshold, zero)
+    up2_vp2_avail = up2_avail + vp2_avail
+    # Check if we have a hole to fill at level k and
+    # there is buffer TKE in up2 and/or vp2 available
+    do_fill = in_range & (wp2 < threshold) & ((up2 > threshold) | (vp2 > threshold))
+
+    # Not enough TKE available to fill the hole.
+    case_not_enough = do_fill & (missing_wp2 >= up2_vp2_avail)
+    wp2_not_enough = wp2 + up2_vp2_avail
+    up2_not_enough = jnp.minimum(up2, threshold)
+    vp2_not_enough = jnp.minimum(vp2, threshold)
+
+    # Enough TKE is available to fill the hole.
+    case_enough = do_fill & (missing_wp2 < up2_vp2_avail)
+    no_up2_avail = jnp.abs(up2_avail) < _F64_EPS * 1000.0
+    no_vp2_avail = jnp.abs(vp2_avail) < _F64_EPS * 1000.0
+    # Calculate portion of up2/vp2 that we want to take away
+    ratio = jnp.where(up2_vp2_avail > zero, missing_wp2 / up2_vp2_avail, zero)
+
+    up2_enough = jnp.where(
+        no_up2_avail,
+        up2,
+        jnp.where(
+            no_vp2_avail,
+            up2 - missing_wp2,
+            threshold + up2_avail * (one - ratio),
+        ),
+    )
+    vp2_enough = jnp.where(
+        no_up2_avail,
+        vp2 - missing_wp2,
+        jnp.where(
+            no_vp2_avail,
+            vp2,
+            threshold + vp2_avail * (one - ratio),
+        ),
+    )
+
+    wp2_out = jnp.where(case_not_enough, wp2_not_enough, jnp.where(case_enough, threshold, wp2))
+    up2_out = jnp.where(case_not_enough, up2_not_enough, jnp.where(case_enough, up2_enough, up2))
+    vp2_out = jnp.where(case_not_enough, vp2_not_enough, jnp.where(case_enough, vp2_enough, vp2))
+    return wp2_out, up2_out, vp2_out
+
+
+__all__ = [
+    "fill_holes_global",
+    "fill_holes_sliding_window",
+    "fill_holes_vertical",
+    "fill_holes_wp2_from_horz_tke",
+]

@@ -1,146 +1,332 @@
-"""Tridiagonal LU solver — JAX port of tridiag_lu_solver.F90.
+"""JAX implementation of ``tridiag_lu_solver.F90``.
 
-Faithful port of CLUBB_core/tridiag_lu_solver.F90
-  tridiag_lu_solve_single_rhs_multiple_lhs  (the common path).
+Description:
+  These routines solve lhs*soln=rhs using LU decomp.
 
-Algorithm: Thomas / LU decomposition:
-  1. LU decomposition  — forward sweep (sequential, uses lax.scan)
-  2. Forward substitution  (sequential, lax.scan)
-  3. Backward substitution (reverse sequential, lax.scan)
+  LHS is stored in band diagonal form.
+    lhs = | lhs(0,1)  lhs(-1,1)      0          0          0          0      0
+          | lhs(1,2)  lhs( 0,2)  lhs(-1,2)      0          0          0      0
+          |     0     lhs( 1,3)  lhs( 0,3)  lhs(-1,3)      0          0      0
+          |     0         0      lhs( 1,4)  lhs( 0,4)  lhs(-1,4)      0      0
+          |     0         0          0      lhs( 1,5)  lhs( 0,5)  lhs(-1,5)  0 ...
+          |    ...
 
-LHS band storage (matching diffusion.py output):
-  lhs[0, :, k] = superdiagonal  (Fortran lhs(-1, i, k))
-  lhs[1, :, k] = main diagonal  (Fortran lhs( 0, i, k))
-  lhs[2, :, k] = subdiagonal    (Fortran lhs( 1, i, k))
+   U is stored in band diagonal form
+    U = |   1    upper(1)  0       0       0       0       0
+        |   0      1     upper(2)  0       0       0       0
+        |   0      0       1     upper(3)  0       0       0
+        |   0      0       0       1     upper(4)  0       0
+        |   0      0       0       0       1     upper(5)  0  ...
+        |  ...
 
-Array layout: levels on last axis, columns on middle axis.
+  L is also stored in band diagonal form, but the lowest most band is equivalent to the
+  lowermost band of LHS, thus we don't need to store it
+    L = | l_diag(1)       0           0            0          0        0
+        |  lower(2)      l_diag(2)    0            0          0        0
+        |    0           lower(3)   l_diag(3)      0          0        0
+        |    0            0         lower(4)    l_diag(4)     0        0
+        |    0            0           0         lower(5)    l_diag(5)   0   ...
+        |  ...
+
+  To perform the LU decomposition, we go element by element.
+  First we start by noting that we want lhs=LU, so the first step of calculating
+  L*U, by multiplying the first row of L by the columns of U, gives us
+
+    l_diag(1)*1        = lhs( 0,1)  =>  l_diag(1)   = lhs( 0,1)
+    l_diag(1)*upper(1) = lhs(-1,1)  =>  upper(1)    = lhs(-1,1) / l_diag(1)
+
+  Now that we're passed the k=1 step, each following step uses all the bands,
+  allowing us to write the general step
+
+    lower(k)*1 = lhs(1,k)                         =>  lower(k)    = lhs( 1,k)
+    lower(k)*upper(k-1)+l_diag(k)*1  = lhs( 0,k)  =>  l_diag(k) = lhs( 0,k)
+                                                                  - lower(k)*upper(k-1)
+    l_diag(k)*upper(k)               = lhs(-1,k)  =>  upper(k)  = lhs(-1,k) / l_diag(k)
+
+  This general step is done for k from 2 to ndim-1 (do k = 2, ndim-), and the last
+  step is tweaked similarly to the first one, where we disclude the upper band
+  since it becomes no longer relevant. Note from this general step that the lower band
+  is always equivalent to first subdiagonal band of lhs, thus we do not need to
+  calculate or store lower. Also note that we only ever need l_diag so that we can divide
+  by it, so instead we compute lower_diag_invrs to reduce divide operations.
+
+  After L and U are computed, normally we do forward substitution using L,
+  then backward substitution using U to find the solution. This is replicated
+  for every right hand side we want to solve for.
+
+References:
+  none
+
+Porting deviations:
+The Fortran generic interface is implemented as a Python rank-dispatch wrapper.
+The explicit Fortran loops are represented by ``jax.lax.scan`` sweeps.  Fortran
+mutates ``soln`` output arrays; the JAX routines return the solution arrays.
+The band dimension uses Python indices ``0, 1, 2`` for Fortran bands
+``-1, 0, 1``.
 """
 
 from __future__ import annotations
 
+from functools import partial
+
+import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from jax import jit, lax
 
 
-def tridiag_lu_solve_jax(
-    lhs: jnp.ndarray,
-    rhs: jnp.ndarray,
-) -> jnp.ndarray:
-    """Solve a tridiagonal system lhs * soln = rhs via LU decomposition.
+@partial(jax.jit, static_argnames=("ndim",))
+def tridiag_lu_solve_single_rhs_lhs(ndim: int, lhs, rhs):
+    """Solve one tridiagonal system with one right-hand side.
 
-    Faithful port of Fortran tridiag_lu_solve_single_rhs_multiple_lhs.
-
-    Fortran band index map:
-      lhs(-1, i, k) = lhs[0, i-1, k-1]  superdiagonal
-      lhs( 0, i, k) = lhs[1, i-1, k-1]  main diagonal
-      lhs( 1, i, k) = lhs[2, i-1, k-1]  subdiagonal
-
-    Args:
-        lhs: shape (3, ngrdcol, ndim).
-        rhs: shape (ngrdcol, ndim).
-
-    Returns:
-        soln: shape (ngrdcol, ndim).
+    Description:
+      Written for single RHS and single LHS.
     """
-    sup = lhs[0]   # (ngrdcol, ndim)  superdiagonal
-    mid = lhs[1]   # (ngrdcol, ndim)  main diagonal
-    sub = lhs[2]   # (ngrdcol, ndim)  subdiagonal
+    del ndim
 
-    # Transpose to (ndim, ngrdcol) so the scan axis is the level axis.
-    sup_t = sup.T   # (ndim, ngrdcol)
-    mid_t = mid.T
-    sub_t = sub.T
-    rhs_t = rhs.T   # (ndim, ngrdcol)
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
+    upper_band = lhs[0]
+    diag_band = lhs[1]
+    lower_band = lhs[2]
 
-    # ---- LU decomposition ----
-    # k = 0
-    l_inv_0 = 1.0 / mid_t[0]         # (ngrdcol,)
-    upper_0 = l_inv_0 * sup_t[0]      # (ngrdcol,)
+    # ----------------------- Begin Code -----------------------
 
-    # k = 1 .. ndim-2  (sequential scan)
-    def lu_step(carry, x):
-        upper_prev = carry             # (ngrdcol,)
-        mid_k, sub_k, sup_k = x
-        l_inv_k = 1.0 / (mid_k - sub_k * upper_prev)
-        upper_k = l_inv_k * sup_k
-        return upper_k, (l_inv_k, upper_k)
+    # Inverse of the diagonal of L
+    lower_diag_invrs_0 = 1.0 / diag_band[0]
 
-    final_upper, (l_inv_int, upper_int) = lax.scan(
-        lu_step, upper_0,
-        (mid_t[1:-1], sub_t[1:-1], sup_t[1:-1]),
+    # First U band
+    upper_0 = lower_diag_invrs_0 * upper_band[0]
+
+    def lu_step(upper_prev, x):
+        diag_k, lower_k, upper_k_lhs = x
+        lower_diag_invrs_k = 1.0 / (diag_k - lower_k * upper_prev)
+        upper_k = lower_diag_invrs_k * upper_k_lhs
+        return upper_k, (lower_diag_invrs_k, upper_k)
+
+    upper_last, (lower_diag_invrs_mid, upper_mid) = jax.lax.scan(
+        lu_step,
+        upper_0,
+        (diag_band[1:-1], lower_band[1:-1], upper_band[1:-1]),
     )
-    # l_inv_int: (ndim-2, ngrdcol), upper_int: (ndim-2, ngrdcol)
 
-    # k = ndim-1
-    l_inv_last = 1.0 / (mid_t[-1] - sub_t[-1] * final_upper)   # (ngrdcol,)
-
-    # Assemble
-    l_inv_t = jnp.concatenate(
-        [l_inv_0[None], l_inv_int, l_inv_last[None]], axis=0
-    )   # (ndim, ngrdcol)
-    upper_t = jnp.concatenate(
-        [upper_0[None], upper_int], axis=0
-    )   # (ndim-1, ngrdcol)
-
-    # ---- Forward substitution: L * y = rhs  (store in soln_t) ----
-    soln_0 = l_inv_t[0] * rhs_t[0]   # (ngrdcol,)
-
-    def fwd_step(carry, x):
-        soln_prev = carry
-        l_inv_k, sub_k, rhs_k = x
-        return l_inv_k * (rhs_k - sub_k * soln_prev), None
-
-    soln_t_end, _ = lax.scan(
-        fwd_step, soln_0,
-        (l_inv_t[1:], sub_t[1:], rhs_t[1:]),
+    lower_diag_invrs_last = 1.0 / (
+        diag_band[-1] - lower_band[-1] * upper_last
     )
-    # Need all intermediate values, not just the last.
-    # Re-scan storing outputs:
-    def fwd_step_store(carry, x):
-        soln_prev = carry
-        l_inv_k, sub_k, rhs_k = x
-        soln_k = l_inv_k * (rhs_k - sub_k * soln_prev)
+    lower_diag_invrs = jnp.concatenate(
+        [
+            lower_diag_invrs_0[None],
+            lower_diag_invrs_mid,
+            lower_diag_invrs_last[None],
+        ],
+        axis=0,
+    )
+    upper = jnp.concatenate([upper_0[None], upper_mid], axis=0)
+
+    soln_0 = lower_diag_invrs[0] * rhs[0]
+
+    def forward_substitution(soln_prev, x):
+        lower_diag_invrs_k, lower_k, rhs_k = x
+        soln_k = lower_diag_invrs_k * (rhs_k - lower_k * soln_prev)
         return soln_k, soln_k
 
-    _, soln_int_t = lax.scan(
-        fwd_step_store, soln_0,
-        (l_inv_t[1:], sub_t[1:], rhs_t[1:]),
+    _, soln_rest = jax.lax.scan(
+        forward_substitution,
+        soln_0,
+        (lower_diag_invrs[1:], lower_band[1:], rhs[1:]),
     )
-    # soln_int_t: (ndim-1, ngrdcol)
+    soln = jnp.concatenate([soln_0[None], soln_rest], axis=0)
 
-    soln_t = jnp.concatenate([soln_0[None], soln_int_t], axis=0)   # (ndim, ngrdcol)
+    def backward_substitution(soln_next, x):
+        soln_k_old, upper_k = x
+        soln_k = soln_k_old - upper_k * soln_next
+        return soln_k, soln_k
 
-    # ---- Backward substitution: U * x = y ----
-    def bwd_step(carry, x):
-        soln_next = carry
-        soln_k, upper_k = x
-        soln_k_new = soln_k - upper_k * soln_next
-        return soln_k_new, soln_k_new
-
-    # Scan from k = ndim-2 down to k = 0
-    _, soln_updated_rev = lax.scan(
-        bwd_step, soln_t[-1],
-        (soln_t[:-1][::-1], upper_t[::-1]),
+    _, soln_reversed = jax.lax.scan(
+        backward_substitution,
+        soln[-1],
+        (soln[:-1][::-1], upper[::-1]),
     )
-    # soln_updated_rev: (ndim-1, ngrdcol) in order [k=ndim-2, k=ndim-3, ..., k=0]
-
-    soln_final_t = jnp.concatenate(
-        [soln_updated_rev[::-1], soln_t[-1:]], axis=0
-    )   # (ndim, ngrdcol)
-
-    return soln_final_t.T   # (ngrdcol, ndim)
+    return jnp.concatenate([soln_reversed[::-1], soln[-1:]], axis=0)
 
 
-# JIT-compiled production version.
-# Called eagerly (per prognostic variable, per timestep), the solver redefines its nested scan bodies
-# (lu_step/fwd_step/bwd_step) on every call, so JAX's scan compile-cache misses and XLA recompiles each
-# step → unbounded compile-cache growth (a co-cause of the rico OOM, Iter290). Jitting the pure
-# (lhs, rhs) -> soln entry point makes every call hit the jit cache by input aval (one compile per distinct
-# grid size, then reused), bounding memory and removing the per-step recompiles. jit is value-preserving and
-# composes with grad, so the solve stays bit-identical and differentiable. Both names are jitted so callers
-# importing either hit the cache.
-tridiag_lu_solve_jax = jit(tridiag_lu_solve_jax)
-tridiag_lu_solve = tridiag_lu_solve_jax
+@partial(jax.jit, static_argnames=("ndim", "ngrdcol"))
+def tridiag_lu_solve_single_rhs_multiple_lhs(ndim: int, ngrdcol: int, lhs, rhs):
+    """Solve multiple tridiagonal systems with one right-hand side each.
+
+    Description:
+      Written for single RHS and multiple LHS.
+    """
+    del ndim, ngrdcol
+
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
+    upper_band = lhs[0].T
+    diag_band = lhs[1].T
+    lower_band = lhs[2].T
+    rhs_t = rhs.T
+
+    # ----------------------- Begin Code -----------------------
+
+    # Inverse of the diagonal of L
+    lower_diag_invrs_0 = 1.0 / diag_band[0]
+
+    # First U band
+    upper_0 = lower_diag_invrs_0 * upper_band[0]
+
+    def lu_step(upper_prev, x):
+        diag_k, lower_k, upper_k_lhs = x
+        lower_diag_invrs_k = 1.0 / (diag_k - lower_k * upper_prev)
+        upper_k = lower_diag_invrs_k * upper_k_lhs
+        return upper_k, (lower_diag_invrs_k, upper_k)
+
+    upper_last, (lower_diag_invrs_mid, upper_mid) = jax.lax.scan(
+        lu_step,
+        upper_0,
+        (diag_band[1:-1], lower_band[1:-1], upper_band[1:-1]),
+    )
+
+    lower_diag_invrs_last = 1.0 / (
+        diag_band[-1] - lower_band[-1] * upper_last
+    )
+    lower_diag_invrs = jnp.concatenate(
+        [
+            lower_diag_invrs_0[None],
+            lower_diag_invrs_mid,
+            lower_diag_invrs_last[None],
+        ],
+        axis=0,
+    )
+    upper = jnp.concatenate([upper_0[None], upper_mid], axis=0)
+
+    soln_0 = lower_diag_invrs[0] * rhs_t[0]
+
+    def forward_substitution(soln_prev, x):
+        lower_diag_invrs_k, lower_k, rhs_k = x
+        soln_k = lower_diag_invrs_k * (rhs_k - lower_k * soln_prev)
+        return soln_k, soln_k
+
+    _, soln_rest = jax.lax.scan(
+        forward_substitution,
+        soln_0,
+        (lower_diag_invrs[1:], lower_band[1:], rhs_t[1:]),
+    )
+    soln = jnp.concatenate([soln_0[None], soln_rest], axis=0)
+
+    def backward_substitution(soln_next, x):
+        soln_k_old, upper_k = x
+        soln_k = soln_k_old - upper_k * soln_next
+        return soln_k, soln_k
+
+    _, soln_reversed = jax.lax.scan(
+        backward_substitution,
+        soln[-1],
+        (soln[:-1][::-1], upper[::-1]),
+    )
+    return jnp.concatenate([soln_reversed[::-1], soln[-1:]], axis=0).T
 
 
-__all__ = ["tridiag_lu_solve_jax", "tridiag_lu_solve"]
+@partial(jax.jit, static_argnames=("ndim", "nrhs", "ngrdcol"))
+def tridiag_lu_solve_multiple_rhs_lhs(
+    ndim: int, nrhs: int, ngrdcol: int, lhs, rhs
+):
+    """Solve multiple tridiagonal systems with multiple right-hand sides.
+
+    Description:
+      Written for multiple RHS and multiple LHS.
+    """
+    del ndim, nrhs, ngrdcol
+
+    # Matrices to solve, stored using band diagonal vectors
+    # -2 is the uppermost band, 2 is the lower most band, 0 is diagonal
+    upper_band = lhs[0].T
+    diag_band = lhs[1].T
+    lower_band = lhs[2].T
+    rhs_t = jnp.transpose(rhs, (1, 0, 2))
+
+    # ----------------------- Begin Code -----------------------
+
+    # Inverse of the diagonal of L
+    lower_diag_invrs_0 = 1.0 / diag_band[0]
+
+    # First U band
+    upper_0 = lower_diag_invrs_0 * upper_band[0]
+
+    def lu_step(upper_prev, x):
+        diag_k, lower_k, upper_k_lhs = x
+        lower_diag_invrs_k = 1.0 / (diag_k - lower_k * upper_prev)
+        upper_k = lower_diag_invrs_k * upper_k_lhs
+        return upper_k, (lower_diag_invrs_k, upper_k)
+
+    upper_last, (lower_diag_invrs_mid, upper_mid) = jax.lax.scan(
+        lu_step,
+        upper_0,
+        (diag_band[1:-1], lower_band[1:-1], upper_band[1:-1]),
+    )
+
+    lower_diag_invrs_last = 1.0 / (
+        diag_band[-1] - lower_band[-1] * upper_last
+    )
+    lower_diag_invrs = jnp.concatenate(
+        [
+            lower_diag_invrs_0[None],
+            lower_diag_invrs_mid,
+            lower_diag_invrs_last[None],
+        ],
+        axis=0,
+    )
+    upper = jnp.concatenate([upper_0[None], upper_mid], axis=0)
+
+    soln_0 = lower_diag_invrs[0, :, None] * rhs_t[0]
+
+    def forward_substitution(soln_prev, x):
+        lower_diag_invrs_k, lower_k, rhs_k = x
+        soln_k = lower_diag_invrs_k[:, None] * (
+            rhs_k - lower_k[:, None] * soln_prev
+        )
+        return soln_k, soln_k
+
+    _, soln_rest = jax.lax.scan(
+        forward_substitution,
+        soln_0,
+        (lower_diag_invrs[1:], lower_band[1:], rhs_t[1:]),
+    )
+    soln = jnp.concatenate([soln_0[None], soln_rest], axis=0)
+
+    def backward_substitution(soln_next, x):
+        soln_k_old, upper_k = x
+        soln_k = soln_k_old - upper_k[:, None] * soln_next
+        return soln_k, soln_k
+
+    _, soln_reversed = jax.lax.scan(
+        backward_substitution,
+        soln[-1],
+        (soln[:-1][::-1], upper[::-1]),
+    )
+    return jnp.transpose(
+        jnp.concatenate([soln_reversed[::-1], soln[-1:]], axis=0),
+        (1, 0, 2),
+    )
+
+
+def tridiag_lu_solve(ndim: int, lhs, rhs):
+    """Generic tridiagonal LU solve interface."""
+    if lhs.ndim == 2 and rhs.ndim == 1:
+        return tridiag_lu_solve_single_rhs_lhs(ndim, lhs, rhs)
+    if lhs.ndim == 3 and rhs.ndim == 2:
+        return tridiag_lu_solve_single_rhs_multiple_lhs(
+            ndim, lhs.shape[1], lhs, rhs
+        )
+    if lhs.ndim == 3 and rhs.ndim == 3:
+        return tridiag_lu_solve_multiple_rhs_lhs(
+            ndim, rhs.shape[2], lhs.shape[1], lhs, rhs
+        )
+    raise ValueError("Unsupported lhs/rhs ranks for tridiag_lu_solve")
+
+
+__all__ = [
+    "tridiag_lu_solve",
+    "tridiag_lu_solve_single_rhs_lhs",
+    "tridiag_lu_solve_single_rhs_multiple_lhs",
+    "tridiag_lu_solve_multiple_rhs_lhs",
+]

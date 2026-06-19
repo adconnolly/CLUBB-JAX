@@ -82,6 +82,24 @@ def run_case(run_cmd, run_cwd, case_name, namelist_file, output_dir, run_env=Non
     return 0
 
 
+def prepare_fortran_run_cwd(output_dir: str) -> str:
+    """Create a local Fortran cwd whose ../input resolves to clubb_release/input."""
+    work_root = os.path.join(output_dir, "_clubb_run")
+    run_scripts_dir = os.path.join(work_root, "run_scripts")
+    os.makedirs(run_scripts_dir, exist_ok=True)
+
+    input_link = os.path.join(work_root, "input")
+    target = os.path.join(CLUBB_ROOT, "input")
+    if os.path.lexists(input_link):
+        if os.path.islink(input_link) and os.readlink(input_link) == target:
+            return run_scripts_dir
+        if os.path.isdir(input_link) and not os.path.islink(input_link):
+            sys.exit(f"Cannot prepare Fortran run cwd; path exists and is not a symlink: {input_link}")
+        os.unlink(input_link)
+    os.symlink(target, input_link)
+    return run_scripts_dir
+
+
 def read_model_times(model_file):
     """Read time_initial, time_final, dt_main from a model file if present."""
     values = {}
@@ -233,10 +251,13 @@ def setup_files_and_aggregate(args, output_dir):
     stats_file = (None if disable_stats
                     else (args.stats or os.path.join(CLUBB_ROOT, "input/stats/standard_stats.in")))
 
-    # Fortran binary resolves "../input/..." relative to its CWD, so it must run
-    # from clubb_release/run_scripts/ where ../input/ points to clubb_release/input/.
-    run_cwd = os.path.join(CLUBB_ROOT, "run_scripts")
-    run_env = None
+    # The Fortran binary resolves "../input/..." relative to its CWD and writes
+    # scratch files such as fort.10 there. Use a local generated cwd so a
+    # symlinked clubb_release checkout remains read-only.
+    run_cwd = prepare_fortran_run_cwd(output_dir)
+    run_env = os.environ.copy()
+    run_env["GIT_DIR"] = os.path.join(CLUBB_ROOT, ".git")
+    run_env["GIT_WORK_TREE"] = CLUBB_ROOT
     run_cmd = None
 
     if args.exe:
@@ -276,7 +297,9 @@ def setup_files_and_aggregate(args, output_dir):
         clubb_python_api_dir = os.path.join(CLUBB_ROOT, "clubb_python_api")
         if not os.path.isdir(clubb_python_api_dir):
             sys.exit(f"Python API directory not found: {clubb_python_api_dir}")
-        run_cwd = RUN_SCRIPTS
+        # The JAX driver still calls Fortran-backed prescribe_forcings, which
+        # resolves ../input relative to CWD.
+        run_cwd = prepare_fortran_run_cwd(output_dir)
         executable = f"{sys.executable} -m clubb_jax.src.clubb_standalone"
         run_cmd = [sys.executable, "-m", "clubb_jax.src.clubb_standalone"]
         run_env = os.environ.copy()
@@ -477,7 +500,7 @@ def main():
     # compiler in the environment but inputting a specific executable will
     # override that with the specified one
     parser.add_argument("-exe", metavar="[EXECUTABLE]",
-        help="CLUBB executable to use.\nDefault: install/clubb_standalone")
+        help="CLUBB executable to use.\nDefault: clubb_release/install/latest/clubb_standalone")
 
     parser.add_argument("-driver_test", action="store_true",
         help="Runs the clubb_driver_test executable instead of clubb_standalone"

@@ -56,8 +56,8 @@ def test_f2py_oracle():
                (True, _params(0.25, 0.25, 1.0))]     # degenerate coefs -> constant gamma_coef
     for l_gamma, params in configs:
         f_zm, f_zt = clubb_f2py.f2py_compute_gamma_skw(l_gamma, skw_zm, params, skw_zt)
-        g_zm = np.asarray(compute_gamma_Skw(skw_zm, params, l_gamma))
-        g_zt = np.asarray(compute_gamma_Skw(skw_zt, params, l_gamma))
+        g_zm = np.asarray(compute_gamma_Skw(NZM, NG, skw_zm, params, l_gamma))
+        g_zt = np.asarray(compute_gamma_Skw(NZT, NG, skw_zt, params, l_gamma))
         worst = max(worst, np.max(np.abs(g_zm - np.asarray(f_zm))), np.max(np.abs(g_zt - np.asarray(f_zt))))
     assert worst < 1e-12, f"compute_gamma_skw f2py mismatch {worst:.2e}"
     print(f"  f2py compute_gamma_skw: bit-match (zm+zt, varying/constant/degenerate), worst {worst:.2e}  PASS")
@@ -67,7 +67,7 @@ def test_closed_form():
     gc, gb, gcf = 0.32, 0.08, 1.2
     params = _params(gc, gb, gcf)[:1]                 # single column to match skw's ngrdcol=1
     skw = np.array([[0.0, 1.0, -2.0]])
-    got = np.asarray(compute_gamma_Skw(skw, params, True))
+    got = np.asarray(compute_gamma_Skw(3, 1, skw, params, True))
     ref = gb + (gc - gb) * np.exp(-0.5 * (skw / gcf) ** 2)
     assert np.max(np.abs(got - ref)) < 1e-13, "closed-form mismatch"
     # At Skw=0 the Gaussian is 1 -> gamma = gamma_coef.
@@ -78,7 +78,7 @@ def test_closed_form():
 def test_differentiable():
     params = _params(0.32, 0.08, 1.2)
     def loss(skw):
-        return jnp.sum(compute_gamma_Skw(skw, params, True) ** 2)
+        return jnp.sum(compute_gamma_Skw(NZM, NG, skw, params, True) ** 2)
     g = np.asarray(jax.grad(loss)(jnp.asarray(np.random.default_rng(1).uniform(-3, 3, (NG, NZM)))))
     assert np.isfinite(g).all(), "non-finite grad through compute_gamma_Skw"
     print(f"  jax.grad through compute_gamma_Skw: finite ({g.size} entries)  PASS")

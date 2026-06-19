@@ -1,204 +1,501 @@
-"""Pure JAX implementations of grid interpolation and derivative operators.
+"""JAX implementations of selected ``grid_class.F90`` helpers.
 
-Faithful port of CLUBB_core/grid_class.F90 routines:
-  - zm2zt_jax:   momentum-level field → thermodynamic-level field
-  - zt2zm_jax:   thermodynamic-level field → momentum-level field
-  - ddzm_jax:    d/dz of momentum-level field evaluated at thermo levels
-  - ddzt_jax:    d/dz of thermo-level field evaluated at momentum levels
-  - zm2zt2zm_jax: zm→zt→zm smoother
-  - zt2zm2zt_jax: zt→zm→zt smoother
+Description:
 
-Array layout: (ngrdcol, nz), ascending grid (index 0 = lowest level).
+Definition of a grid class and associated functions
+
+The grid specification is as follows for an ASCENDING grid:
+
+    +                ================== zm(nzm) =================== top
+    |
+    |
+1/dzt(nzt)   +       ------------------ zt(nzt) -------------------
+    |        |
+    |        |
+    +  1/dzm(nzm-1)  ================== zm(nzm-1) =================
+             |
+             |
+             +       ------------------ zt(nzt-1) -----------------
+
+                                          .
+                                          .
+                                          .
+                                          .
+
+                     ================== zm(k+1) ===================
+
+
+                     ------------------ zt(k+1) -------------------
+
+
+    +                ================== zm(k+1) ===================
+    |
+    |
+1/dzt(k)     +       ------------------ zt(k) ---------------------
+    |        |
+    |        |
+    +    1/dzm(k)    ================== zm(k) =====================
+             |
+             |
+             +       ------------------ zt(k-1) -------------------
+
+
+                     ================== zm(k-1) ===================
+
+
+                     ------------------ zt(k-2) -------------------
+
+                                          .
+                                          .
+                                          .
+                                          .
+
+             +       ------------------ zt(2) ---------------------
+             |
+             |
+    +    1/dzm(2)    ================== zm(2) =====================
+    |        |
+    |        |
+1/dzt(1)     +       ------------------ zt(1) ---------------------
+    |
+    |
+    +                ================== zm(1) =====================  zm_init
+                     //////////////////////////////////////////////  surface
+
+
+The variable zm(k) stands for the momentum level altitude at momentum
+level k; the variable zt(k) stands for the thermodynamic level altitude at
+thermodynamic level k; the variable invrs_dzt(k) is the inverse distance
+between momentum levels (over a central thermodynamic level k); and the
+variable invrs_dzm(k) is the inverse distance between thermodynamic levels
+(over a central momentum level k).  Please note that in the above diagram,
+"invrs_dzt" is denoted "dzt", and "invrs_dzm" is denoted "dzm", such that
+1/dzt is the distance between successive momentum levels k and k+1 (over a
+central thermodynamic level k), and 1/dzm is the distance between successive
+thermodynamic levels k-1 and k (over a central momentum level k).
+
+The grid setup is compatible with a stretched (unevely-spaced) grid.  Thus,
+the distance between successive grid levels may not always be constant.
+
+NOTE:  Any future code written for use in the CLUBB parameterization should
+       use interpolation formulas consistent with a stretched grid.  The
+       simplest way to do so is to call the appropriate interpolation
+       function from this module.  Interpolations should *not* be handled in
+       the form of:  ( var_zm(k+1) + var_zm(k) ) / 2; *nor* in the form of:
+       0.5*( var_zt(k) + var_zt(k-1) ).
 
 References:
-  Golaz et al. (2002) JAS 59:3540–3551, Section 3c.
-  src/CLUBB_core/grid_class.F90, linear_interpolated_azt_2D,
-  linear_interpolated_azm_2D, gradzm_2D, gradzt_2D.
+
+https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:clubb_grid
+
+Section 3c, p. 3548 /Numerical discretization/ of:
+ ``A PDF-Based Model for Boundary Layer Clouds. Part I:
+   Method and Model Description'' Golaz, et al. (2002)
+   JAS, Vol. 59, pp. 3540--3551.
+
+Porting deviations:
+  * Fortran generic interfaces include scalar/1D/2D overloads and optional
+    cubic interpolation through ``l_cubic_interp``.  JAX implements the active
+    2D linear operator path used by the core.
+  * Fortran band selector constants are 1-based; JAX uses Python 0-based
+    ``T_ABOVE``, ``T_BELOW``, ``M_ABOVE``, and ``M_BELOW``.
+  * Fortran mutates output arrays.  JAX returns arrays.
 """
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
+import jax
 import jax.numpy as jnp
-from jax import jit
+import numpy as np
+
+core_rknd = np.float64
+
+T_ABOVE = 0
+T_BELOW = 1
+M_ABOVE = 0
+M_BELOW = 1
+
+GRID_TYPE_EVEN = 1
+GRID_TYPE_STRETCHED_ZT = 2
+GRID_TYPE_STRETCHED_ZM = 3
 
 
-def zm2zt_jax(azm: jnp.ndarray, gr) -> jnp.ndarray:
-    """Interpolate a field from momentum (zm) levels to thermodynamic (zt) levels.
+_GRID_ARRAY_FIELDS = (
+    "zm",
+    "zt",
+    "dzm",
+    "dzt",
+    "invrs_dzm",
+    "invrs_dzt",
+    "weights_zt2zm",
+    "weights_zm2zt",
+)
 
-    Faithfully implements Fortran linear_interpolated_azt_2D.
+_GRID_STATIC_FIELDS = (
+    "nzm",
+    "nzt",
+    "ngrdcol",
+    "k_lb_zm",
+    "k_ub_zm",
+    "k_lb_zt",
+    "k_ub_zt",
+    "grid_dir_indx",
+    "grid_dir",
+)
 
-    Formula for each thermo level k=0..nzt-1 (ascending grid):
-        azt[k] = w_above * azm[k+1] + w_below * azm[k]
-    where:
-        w_above = (zt[k] - zm[k]) / (zm[k+1] - zm[k])   [weight for upper zm]
-        w_below = (zm[k+1] - zt[k]) / (zm[k+1] - zm[k]) [weight for lower zm]
 
-    Args:
-        azm: Field on momentum levels, shape (ngrdcol, nzm).
-        gr:  Grid object with .zm shape (ngrdcol, nzm) and .zt (ngrdcol, nzt).
+@jax.tree_util.register_pytree_node_class
+class Grid(NamedTuple):
+    """Grid structure for CLUBB vertical discretization."""
 
-    Returns:
-        azt: Field on thermodynamic levels, shape (ngrdcol, nzt).
-    """
-    zm = gr.zm      # (ngrdcol, nzm)
-    zt = gr.zt      # (ngrdcol, nzt)
+    nzm: int
+    nzt: int
+    ngrdcol: int
 
-    # dzt[k] = zm[k+1] - zm[k], shape (ngrdcol, nzt)
+    zm: jnp.ndarray
+    zt: jnp.ndarray
+
+    dzm: jnp.ndarray
+    dzt: jnp.ndarray
+
+    invrs_dzm: jnp.ndarray
+    invrs_dzt: jnp.ndarray
+
+    weights_zt2zm: jnp.ndarray
+    weights_zm2zt: jnp.ndarray
+
+    k_lb_zm: int
+    k_ub_zm: int
+    k_lb_zt: int
+    k_ub_zt: int
+
+    grid_dir_indx: int
+    grid_dir: float
+
+    def replace(self, **kwargs):
+        return self._replace(**kwargs)
+
+    def tree_flatten(self):
+        children = tuple(getattr(self, name) for name in _GRID_ARRAY_FIELDS)
+        aux_data = tuple(getattr(self, name) for name in _GRID_STATIC_FIELDS)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        data = dict(zip(_GRID_STATIC_FIELDS, aux_data))
+        data.update(dict(zip(_GRID_ARRAY_FIELDS, children)))
+        return cls(**data)
+
+
+def setup_grid(
+    ngrdcol: int,
+    deltaz,
+    zm_init,
+    zm_top,
+    l_ascending_grid: bool = True,
+    grid_type: int = GRID_TYPE_EVEN,
+    momentum_heights=None,
+    thermodynamic_heights=None,
+) -> Grid:
+    """Construct a JAX `Grid` with CLUBB-style heights, spacings, and weights."""
+    deltaz_arr = _as_column_input(deltaz, ngrdcol, "deltaz")
+    zm_init_arr = _as_column_input(zm_init, ngrdcol, "zm_init")
+    zm_top_arr = _as_column_input(zm_top, ngrdcol, "zm_top")
+
+    if grid_type not in (
+        GRID_TYPE_EVEN,
+        GRID_TYPE_STRETCHED_ZT,
+        GRID_TYPE_STRETCHED_ZM,
+    ):
+        raise ValueError(f"Unsupported grid_type={grid_type}.")
+    if not l_ascending_grid:
+        raise ValueError(
+            "l_ascending_grid=False is not supported by the JAX grid operators."
+        )
+
+    if grid_type == GRID_TYPE_EVEN:
+        nzm = int(
+            np.floor(
+                (zm_top_arr[0] - zm_init_arr[0] + deltaz_arr[0])
+                / deltaz_arr[0]
+            )
+        )
+        nzt = nzm - 1
+        if nzm < 2 or nzt < 1:
+            raise ValueError(
+                f"Invalid derived grid dimensions: nzm={nzm}, nzt={nzt}."
+            )
+        zm, zt = _setup_even_grid(nzm, ngrdcol, deltaz_arr, zm_init_arr)
+    elif grid_type == GRID_TYPE_STRETCHED_ZT:
+        zt_in = _prepare_height_array(
+            "thermodynamic_heights", thermodynamic_heights, ngrdcol
+        )
+        _validate_monotonic_increasing("thermodynamic_heights", zt_in)
+        if np.any(zt_in[:, 0] <= zm_init_arr):
+            raise ValueError(
+                "Stretched zt grid lowest thermodynamic level must be above zm_init."
+            )
+        end_idx = int(np.searchsorted(zt_in[0], zm_top_arr[0], side="right") - 1)
+        if end_idx < 0:
+            raise ValueError("Stretched zt grid cannot fulfill zm_top requirement.")
+        zt = zt_in[:, : end_idx + 1]
+        nzt = zt.shape[1]
+        nzm = nzt + 1
+        zm = _calc_zm_from_zt(nzm, nzt, ngrdcol, zt, zm_init_arr)
+    else:
+        zm_in = _prepare_height_array("momentum_heights", momentum_heights, ngrdcol)
+        _validate_monotonic_increasing("momentum_heights", zm_in)
+        begin_idx = int(np.searchsorted(zm_in[0], zm_init_arr[0], side="left"))
+        end_idx = int(np.searchsorted(zm_in[0], zm_top_arr[0], side="right") - 1)
+        if begin_idx >= zm_in.shape[1]:
+            raise ValueError("Stretched zm grid cannot fulfill zm_init requirement.")
+        if end_idx < begin_idx:
+            raise ValueError("Stretched zm grid cannot fulfill zm_top requirement.")
+        zm = zm_in[:, begin_idx : end_idx + 1]
+        nzm = zm.shape[1]
+        nzt = nzm - 1
+        if nzm < 2 or nzt < 1:
+            raise ValueError(
+                f"Stretched zm grid produced invalid dimensions: nzm={nzm}, nzt={nzt}."
+            )
+        zt = 0.5 * (zm[:, :-1] + zm[:, 1:])
+
+    dzm, dzt, invrs_dzm, invrs_dzt = _calc_grid_spacings(
+        nzm, ngrdcol, zm, zt
+    )
+    weights_zt2zm = _calc_zt2zm_weights(nzm, nzt, ngrdcol, zm, zt)
+    weights_zm2zt = _calc_zm2zt_weights(nzt, ngrdcol, zm, zt, dzt)
+
+    return Grid(
+        nzm=nzm,
+        nzt=nzt,
+        ngrdcol=ngrdcol,
+        zm=jnp.asarray(zm),
+        zt=jnp.asarray(zt),
+        dzm=jnp.asarray(dzm),
+        dzt=jnp.asarray(dzt),
+        invrs_dzm=jnp.asarray(invrs_dzm),
+        invrs_dzt=jnp.asarray(invrs_dzt),
+        weights_zt2zm=jnp.asarray(weights_zt2zm),
+        weights_zm2zt=jnp.asarray(weights_zm2zt),
+        k_lb_zm=0,
+        k_ub_zm=nzm - 1,
+        k_lb_zt=0,
+        k_ub_zt=nzt - 1,
+        grid_dir_indx=1,
+        grid_dir=1.0,
+    )
+
+
+def _as_column_input(value, ngrdcol: int, name: str):
+    if isinstance(value, (int, float)):
+        return np.full(ngrdcol, value, dtype=core_rknd)
+    arr = np.asarray(value, dtype=core_rknd)
+    if arr.shape != (ngrdcol,):
+        raise ValueError(f"{name} must have shape ({ngrdcol},), got {arr.shape}.")
+    return arr
+
+
+def _prepare_height_array(name: str, heights, ngrdcol: int):
+    if heights is None:
+        raise ValueError(f"{name} must be provided for stretched grid setup.")
+    arr = np.asarray(heights, dtype=core_rknd)
+    if arr.ndim == 1:
+        arr = np.tile(arr[None, :], (ngrdcol, 1))
+    if arr.ndim != 2:
+        raise ValueError(f"{name} must be 1D or 2D, got shape {arr.shape}.")
+    if arr.shape[0] != ngrdcol:
+        raise ValueError(
+            f"{name} first dimension must match ngrdcol={ngrdcol}, got {arr.shape[0]}."
+        )
+    return arr
+
+
+def _validate_monotonic_increasing(name: str, arr) -> None:
+    if arr.shape[1] < 1:
+        raise ValueError(f"{name} must contain at least one level.")
+    if np.any(np.diff(arr, axis=1) <= 0.0):
+        raise ValueError(f"{name} must be strictly increasing with level index.")
+
+
+def _setup_even_grid(nzm: int, ngrdcol: int, deltaz, zm_init):
+    k_indices = np.arange(nzm, dtype=core_rknd)
+    zm = zm_init[:, None] + deltaz[:, None] * k_indices[None, :]
+    zt = 0.5 * (zm[:, :-1] + zm[:, 1:])
+    return zm, zt
+
+
+def _calc_zm_from_zt(nzm: int, nzt: int, ngrdcol: int, zt, zm_init):
+    zm = np.zeros((ngrdcol, nzm), dtype=core_rknd)
+    zm[:, 1:-1] = 0.5 * (zt[:, :-1] + zt[:, 1:])
+    zm[:, 0] = np.asarray(zm_init, dtype=core_rknd)
+    if nzt > 1:
+        zm[:, -1] = zt[:, -1] + 0.5 * (zt[:, -1] - zt[:, -2])
+    else:
+        zm[:, -1] = zt[:, -1] + (zt[:, -1] - zm[:, 0])
+    return zm
+
+
+def _calc_grid_spacings(nzm: int, ngrdcol: int, zm, zt):
+    dzm = np.zeros((ngrdcol, nzm), dtype=core_rknd)
     dzt = zm[:, 1:] - zm[:, :-1]
 
-    # Both weights computed DIRECTLY, matching Fortran calc_zm2zt_weights
-    # (grid_class.F90:2621/2625) — NOT w_below = 1 - w_above. The two are
-    # identical (0.5) on an evenly-spaced grid but differ by ~1 ULP on a
-    # stretched grid (grid_type=2, e.g. rico), so the direct form is the
-    # faithful one. azt[k] = w_above*azm[k+1] + w_below*azm[k].
-    w_above = (zt - zm[:, :-1]) / dzt          # weights_zm2zt(m_above)
-    w_below = (zm[:, 1:] - zt) / dzt           # weights_zm2zt(m_below)
-    return w_above * azm[:, 1:] + w_below * azm[:, :-1]
+    dzm[:, 1:-1] = zt[:, 1:] - zt[:, :-1]
+    dzm[:, 0] = 2.0 * (zt[:, 0] - zm[:, 0])
+    dzm[:, -1] = dzm[:, -2]
+
+    invrs_dzm = np.where(np.abs(dzm) > 1e-30, 1.0 / dzm, 0.0)
+    invrs_dzt = np.where(np.abs(dzt) > 1e-30, 1.0 / dzt, 0.0)
+    return dzm, dzt, invrs_dzm, invrs_dzt
 
 
-def zt2zm_jax(azt: jnp.ndarray, gr, zm_min: float | None = None) -> jnp.ndarray:
-    """Interpolate a field from thermodynamic (zt) levels to momentum (zm) levels.
+def _calc_zt2zm_weights(nzm: int, nzt: int, ngrdcol: int, zm, zt):
+    weights = np.zeros((ngrdcol, nzm, 2), dtype=core_rknd)
 
-    Faithfully implements Fortran linear_interpolated_azm_2D (ascending grid).
+    for k in range(1, nzm - 1):
+        denom = zt[:, k] - zt[:, k - 1]
+        weights[:, k, T_ABOVE] = (zm[:, k] - zt[:, k - 1]) / (denom + 1e-30)
+        weights[:, k, T_BELOW] = (zt[:, k] - zm[:, k]) / (denom + 1e-30)
 
-    Boundary conditions (ascending grid):
-      k=0 (lower): linear extension using zt[0], zt[1] -- NOT a simple copy,
-                   matches Fortran weights_zt2zm(1,*) which uses linear extension.
-      k=nzm-1 (upper): linear extension using zt[nzt-2], zt[nzt-1].
+    if nzt >= 2:
+        denom0 = zt[:, 1] - zt[:, 0]
+        weights[:, 0, T_ABOVE] = (zm[:, 0] - zt[:, 0]) / (denom0 + 1e-30)
+        weights[:, 0, T_BELOW] = (zt[:, 1] - zm[:, 0]) / (denom0 + 1e-30)
 
-    Interior k=1..nzm-2:
-      azm[k] = w_above * azt[k] + (1-w_above) * azt[k-1]
-    where w_above = (zm[k] - zt[k-1]) / (zt[k] - zt[k-1]).
+        denomn = zt[:, -1] - zt[:, -2]
+        weights[:, -1, T_ABOVE] = (zm[:, -1] - zt[:, -2]) / (denomn + 1e-30)
+        weights[:, -1, T_BELOW] = (zt[:, -1] - zm[:, -1]) / (denomn + 1e-30)
+    else:
+        weights[:, 0, T_ABOVE] = 1.0
+        weights[:, -1, T_ABOVE] = 1.0
 
-    Args:
-        azt: Field on thermodynamic levels, shape (ngrdcol, nzt).
-        gr:  Grid with .zm (ngrdcol, nzm) and .zt (ngrdcol, nzt).
-        zm_min: Optional lower clamp applied after interpolation.
+    return weights
 
-    Returns:
-        azm: Field on momentum levels, shape (ngrdcol, nzm).
+
+def _calc_zm2zt_weights(nzt: int, ngrdcol: int, zm, zt, dzt):
+    weights = np.zeros((ngrdcol, nzt, 2), dtype=core_rknd)
+    for k in range(nzt):
+        total_dist = dzt[:, k] + 1e-30
+        weights[:, k, M_ABOVE] = (zt[:, k] - zm[:, k]) / total_dist
+        weights[:, k, M_BELOW] = (zm[:, k + 1] - zt[:, k]) / total_dist
+    return weights
+
+
+def zt2zm(nzm: int, nzt: int, ngrdcol: int, gr, azt, zm_min=None):
+    """Function to interpolate a variable located on the thermodynamic grid
+    levels (azt) to the momentum grid levels (azm).  This function inputs the
+    entire azt array and outputs the results as an azm array.  The
+    formulation used is compatible with a stretched (unevenly-spaced) grid.
     """
-    zm = gr.zm   # (ngrdcol, nzm)
-    zt = gr.zt   # (ngrdcol, nzt)
-    nzm = zm.shape[1]
+    azt = jnp.asarray(azt, dtype=jnp.float64)
 
-    # --- Interior levels k=1..nzm-2 ---
-    # zt[k-1] < zm[k] < zt[k] for ascending grids
-    # denom = zt[k] - zt[k-1], shape (ngrdcol, nzm-2)
-    denom_int = zt[:, 1:] - zt[:, :-1]          # (ngrdcol, nzt-1) = (ngrdcol, nzm-2)
-    zm_int = zm[:, 1:-1]                          # (ngrdcol, nzm-2)
-    # Both weights DIRECT, matching Fortran calc_zt2zm_weights (grid_class.F90:
-    # 2265/2269) — NOT w_below = 1 - w_above (identical on uniform grids, ~1 ULP
-    # apart on stretched grids like rico). azm[k] = w_above*azt[k] + w_below*azt[k-1].
-    w_above_int = (zm_int - zt[:, :-1]) / denom_int      # weights_zt2zm(t_above)
-    w_below_int = (zt[:, 1:] - zm_int) / denom_int       # weights_zt2zm(t_below)
-    azm_int = w_above_int * azt[:, 1:] + w_below_int * azt[:, :-1]
+    # Interpolate the value of a thermodynamic-level variable to the central
+    # momentum level, k, between two successive thermodynamic levels using
+    # linear interpolation.
+    interior = (
+        gr.weights_zt2zm[:, 1:nzm - 1, T_ABOVE] * azt[:, 1:nzt]
+        + gr.weights_zt2zm[:, 1:nzm - 1, T_BELOW] * azt[:, :nzt - 1]
+    )
 
-    # --- Lower boundary k=0 (ascending grid): linear extension below zt[0] ---
-    # Fortran: azm(1) = azt(1) for ascending grid
-    # The Fortran code sets azm(1) = azt(1) directly (not using weights).
-    # Python 0-indexed: azm[0] = azt[0]
-    azm_bot = azt[:, :1]   # shape (ngrdcol, 1)
+    # Set the value of the thermodynamic-level variable, azt, at momentum
+    # level 1.  The name of the variable when interpolated/extended to momentum
+    # levels is azm.  This is the lower boundary for an ascending grid and the
+    # upper boundary for a descending grid.
+    lower_ascending = azt[:, :1]
+    upper_ascending = (
+        gr.weights_zt2zm[:, nzm - 1:nzm, T_ABOVE] * azt[:, nzt - 1:nzt]
+        + gr.weights_zt2zm[:, nzm - 1:nzm, T_BELOW] * azt[:, nzt - 2:nzt - 1]
+    )
+    # Use a linear extension based on the values of azt at levels 1 and 2 to
+    # find the value of azm at level 1.
+    lower_descending = (
+        gr.weights_zt2zm[:, :1, T_ABOVE] * azt[:, 1:2]
+        + gr.weights_zt2zm[:, :1, T_BELOW] * azt[:, :1]
+    )
+    upper_descending = azt[:, nzt - 1:nzt]
 
-    # --- Upper boundary k=nzm-1: linear extension above zt[nzt-1] ---
-    # Fortran: azm(nzm) = w_zt2zm(nzm,t_above)*azt(nzt) + w_zt2zm(nzm,t_below)*azt(nzt-1)
-    # where t_above weight = (zm(nzm) - zt(nzt-1)) / (zt(nzt) - zt(nzt-1))
-    # Python 0-indexed:
-    denom_top = zt[:, -1:] - zt[:, -2:-1]        # (ngrdcol, 1)
-    w_above_top = (zm[:, -1:] - zt[:, -2:-1]) / denom_top   # weights_zt2zm(nzm,t_above)
-    w_below_top = (zt[:, -1:] - zm[:, -1:]) / denom_top     # weights_zt2zm(nzm,t_below), direct
-    azm_top = w_above_top * azt[:, -1:] + w_below_top * azt[:, -2:-1]
+    is_ascending = gr.grid_dir_indx == 1
+    lower = jnp.where(is_ascending, lower_ascending, lower_descending)
+    upper = jnp.where(is_ascending, upper_ascending, upper_descending)
 
-    azm = jnp.concatenate([azm_bot, azm_int, azm_top], axis=1)
-
+    azm = jnp.concatenate([lower, interior, upper], axis=1)
     if zm_min is not None:
         azm = jnp.maximum(azm, zm_min)
-
     return azm
 
 
-def ddzm_jax(azm: jnp.ndarray, gr) -> jnp.ndarray:
-    """Vertical derivative of a momentum-level field, evaluated at thermo levels.
-
-    Implements Fortran gradzm_2D:
-        dazm_dz[k] = (azm[k+1] - azm[k]) * invrs_dzt[k]  for k=0..nzt-1
-
-    Args:
-        azm: Field on momentum levels, shape (ngrdcol, nzm).
-        gr:  Grid with .invrs_dzt (ngrdcol, nzt).
-
-    Returns:
-        Result on thermodynamic levels, shape (ngrdcol, nzt).
+def zm2zt(nzm: int, nzt: int, ngrdcol: int, gr, azm, zt_min=None):
+    """Function to interpolate a variable located on the momentum grid levels
+    (azm) to the thermodynamic grid levels (azt).  This function inputs the
+    entire azm array and outputs the results as an azt array.  The formulation
+    used is compatible with a stretched (unevenly-spaced) grid.
     """
-    return (azm[:, 1:] - azm[:, :-1]) * gr.invrs_dzt
-
-
-def ddzt_jax(azt: jnp.ndarray, gr) -> jnp.ndarray:
-    """Vertical derivative of a thermo-level field, evaluated at momentum levels.
-
-    Implements Fortran gradzt_2D:
-        Interior k=1..nzm-2: dazt_dz[k] = (azt[k] - azt[k-1]) * invrs_dzm[k]
-        Boundary: dazt_dz[0] = dazt_dz[1]  (Fortran boundary condition)
-                  dazt_dz[nzm-1] = dazt_dz[nzm-2]
-
-    Args:
-        azt: Field on thermodynamic levels, shape (ngrdcol, nzt).
-        gr:  Grid with .invrs_dzm (ngrdcol, nzm).
-
-    Returns:
-        Result on momentum levels, shape (ngrdcol, nzm).
-    """
-    # Interior: (azt[k] - azt[k-1]) * invrs_dzm[k] for k=1..nzm-2
-    interior = (azt[:, 1:] - azt[:, :-1]) * gr.invrs_dzm[:, 1:-1]  # (ngrdcol, nzm-2)
-
-    # Boundary: replicate adjacent interior value
-    bottom = interior[:, :1]   # same as k=1
-    top = interior[:, -1:]     # same as k=nzm-2
-
-    return jnp.concatenate([bottom, interior, top], axis=1)
-
-
-def zm2zt2zm_jax(azm: jnp.ndarray, gr, zm_min: float | None = None) -> jnp.ndarray:
-    """Smooth azm by mapping zm→zt→zm.
-
-    Implements Fortran zm2zt2zm.
-    """
-    azt = zm2zt_jax(azm, gr)
-    return zt2zm_jax(azt, gr, zm_min=zm_min)
-
-
-def zt2zm2zt_jax(azt: jnp.ndarray, gr, zt_min: float | None = None) -> jnp.ndarray:
-    """Smooth azt by mapping zt→zm→zt.
-
-    Implements Fortran zt2zm2zt.
-    """
-    azm = zt2zm_jax(azt, gr)
-    result = zm2zt_jax(azm, gr)
+    azm = jnp.asarray(azm, dtype=jnp.float64)
+    # Interpolate the value of a momentum-level variable to the central
+    # thermodynamic level, k, between two successive momentum levels using
+    # linear interpolation.
+    azt = (
+        gr.weights_zm2zt[:, :, M_ABOVE] * azm[:, 1:nzm]
+        + gr.weights_zm2zt[:, :, M_BELOW] * azm[:, :nzt]
+    )
     if zt_min is not None:
-        result = jnp.maximum(result, zt_min)
-    return result
+        azt = jnp.maximum(azt, zt_min)
+    return azt
 
 
-# JIT-compiled versions for production use
-zm2zt = jit(zm2zt_jax)
-zt2zm = jit(zt2zm_jax)
-ddzm = jit(ddzm_jax)
-ddzt = jit(ddzt_jax)
-zm2zt2zm = jit(zm2zt2zm_jax)
-zt2zm2zt = jit(zt2zm2zt_jax)
+def zt2zm2zt(nzm: int, nzt: int, ngrdcol: int, gr, azt, zt_min=None):
+    """Function to interpolate a variable located on the thermodynamic grid
+    levels (azt) to the momentum grid levels (azm), then interpolate back
+    to thermodynamic grid levels (azt).
+
+    Note:
+      This is intended for smoothing variables.
+    """
+    # Interpolate azt to momentum levels
+    # Interpolate back to thermodynamic levels
+    return zm2zt(nzm, nzt, ngrdcol, gr, zt2zm(nzm, nzt, ngrdcol, gr, azt), zt_min)
+
+
+def zm2zt2zm(nzm: int, nzt: int, ngrdcol: int, gr, azm, zm_min=None):
+    """Function to interpolate a variable located on the momentum grid
+    levels(azm) to thermodynamic grid levels (azt), then interpolate
+    back to momentum grid levels (azm).
+
+    Note:
+      This is intended for smoothing variables.
+    """
+    # Interpolate azt to termodynamic levels
+    # Interpolate back to momentum levels
+    return zt2zm(nzm, nzt, ngrdcol, gr, zm2zt(nzm, nzt, ngrdcol, gr, azm), zm_min)
+
+
+def ddzm(nzm: int, nzt: int, ngrdcol: int, gr, azm):
+    """2D version of gradzm."""
+    azm = jnp.asarray(azm, dtype=jnp.float64)
+    # Vertical derivative of azm (thermo. levs.) [units vary / m]
+    return (azm[:, 1:nzm] - azm[:, :nzt]) * gr.invrs_dzt
+
+
+def ddzt(nzm: int, nzt: int, ngrdcol: int, gr, azt):
+    """2D version of gradzt."""
+    azt = jnp.asarray(azt, dtype=jnp.float64)
+    # Vertical derivative of azt (mom.levs.) [units vary / m]
+    interior = (azt[:, 1:nzt] - azt[:, :nzt - 1]) * gr.invrs_dzm[:, 1:nzm - 1]
+    return jnp.concatenate([interior[:, :1], interior, interior[:, -1:]], axis=1)
 
 
 __all__ = [
-    "zm2zt_jax",
-    "zt2zm_jax",
-    "ddzm_jax",
-    "ddzt_jax",
-    "zm2zt2zm_jax",
-    "zt2zm2zt_jax",
-    "zm2zt",
+    "Grid",
+    "setup_grid",
+    "GRID_TYPE_EVEN",
+    "GRID_TYPE_STRETCHED_ZT",
+    "GRID_TYPE_STRETCHED_ZM",
     "zt2zm",
+    "zm2zt",
+    "zt2zm2zt",
+    "zm2zt2zm",
     "ddzm",
     "ddzt",
-    "zm2zt2zm",
-    "zt2zm2zt",
 ]

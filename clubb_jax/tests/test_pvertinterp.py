@@ -61,7 +61,7 @@ def test_f2py_oracle():
     # An interior pressure, plus targets outside both ends (exercise the clamp branches).
     for p_out in (95000.0, 88000.0, 101000.0, 80000.0):
         ref = np.asarray(clubb_f2py.f2py_pvertinterp(p_mid.copy(), float(p_out), input_var.copy()))
-        got = np.asarray(pvertinterp(p_mid, p_out, input_var))
+        got = np.asarray(pvertinterp(nzt, ng, jgr, p_mid, p_out, input_var))
         worst = max(worst, np.max(np.abs(got - ref)))
     assert worst < 1e-11, f"pvertinterp f2py mismatch {worst:.2e}"
     print(f"  f2py pvertinterp: match (interior + both clamps), worst {worst:.2e}  PASS")
@@ -74,7 +74,7 @@ def test_pressure_weighted_identity():
     p_mid = np.linspace(100000.0, 80000.0, nzt)[None, :]
     input_var = np.random.default_rng(2).standard_normal((1, nzt))
     p_out = 91234.0
-    got = float(np.asarray(pvertinterp(p_mid, p_out, input_var))[0])
+    got = float(np.asarray(pvertinterp(nzt, 1, None, p_mid, p_out, input_var))[0])
     # Find the bracket (p_mid descending) and apply the Fortran pressure-weighted formula.
     k = next(i for i in range(nzt - 1) if p_mid[0, i] > p_out >= p_mid[0, i + 1])
     dpu = p_mid[0, k] - p_out
@@ -88,7 +88,7 @@ def test_differentiable():
     nzt = 12
     p_mid = jnp.asarray(np.linspace(100000.0, 80000.0, nzt)[None, :])
     def loss(v):
-        return jnp.sum(pvertinterp(p_mid, 90000.0, v) ** 2)
+        return jnp.sum(pvertinterp(nzt, 1, None, p_mid, 90000.0, v) ** 2)
     g = np.asarray(jax.grad(loss)(jnp.asarray(np.random.default_rng(1).standard_normal((1, nzt)))))
     assert np.isfinite(g).all(), "non-finite grad through pvertinterp"
     print(f"  jax.grad through pvertinterp: finite ({g.size} entries)  PASS")

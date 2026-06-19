@@ -21,10 +21,40 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.adg1_adg2_3d_luhar_pdf import ADG2_pdf_driver
+from clubb_jax.src.CLUBB_core.adg1_adg2_3d_luhar_pdf import ADG2_pdf_driver as _ADG2_pdf_driver
 
 NG, NZ = 2, 8
 _BETA = 1.75
+
+
+def ADG2_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, wprtp, wpthlp, sqrt_wp2, beta):
+    ng, nz = np.asarray(wm).shape
+    sclr_dim = 1
+    sclr_tol = jnp.full((sclr_dim,), 1e-8)
+    sclrm = jnp.zeros((ng, nz, sclr_dim), dtype=jnp.float64)
+    sclrp2 = jnp.ones((ng, nz, sclr_dim), dtype=jnp.float64) * 1e-6
+    wpsclrp = jnp.zeros((ng, nz, sclr_dim), dtype=jnp.float64)
+    return _ADG2_pdf_driver(
+        nz,
+        ng,
+        sclr_dim,
+        sclr_tol,
+        wm,
+        rtm,
+        thlm,
+        wp2,
+        rtp2,
+        thlp2,
+        Skw,
+        wprtp,
+        wpthlp,
+        sqrt_wp2,
+        beta,
+        sclrm,
+        sclrp2,
+        wpsclrp,
+        False,
+    )
 
 
 def _inputs(rng):

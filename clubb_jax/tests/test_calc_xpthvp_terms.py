@@ -10,7 +10,7 @@ temperature fluxes from the thl/rt/rc fluxes via the Sommeria-Deardorff θ_v dec
 then zt→zm-regrids wpthvp/rtpthvp/thlpthvp/rc_coef (zeroing k_ub_zm); wp2thvp stays on zt. It drives the closure's
 buoyancy production but was validated only end-to-end. This pins the on-zt assembly vs an INDEPENDENT transcription
 (checking the ep1/ep2/rc_coef coefficients + which 2nd-moment feeds each term) and the zm outputs vs the tested
-`zt2zm_jax` regrid with k_ub_zm zeroed. + finite grad. (iter 566)
+`zt2zm` regrid with k_ub_zm zeroed. + finite grad. (iter 566)
 """
 import os
 import sys
@@ -25,12 +25,46 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.pdf_closure_module import calc_xpthvp_terms_jax
 from clubb_jax.src.CLUBB_core.constants_clubb import ep1, ep2, Lv, Cp
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _NZT = 1, 8
+
+
+def calc_xpthvp_terms_jax(
+    exner,
+    thv_ds_zt,
+    wprcp_zt,
+    wp2rcp_zt,
+    rtprcp_zt,
+    thlprcp_zt,
+    wpthlp_zt,
+    wprtp_zt,
+    wp2thlp_zt,
+    wp2rtp_zt,
+    rtpthlp_zt,
+    rtp2_zt,
+    thlp2_zt,
+    gr,
+):
+    rc_coef_zt = Lv / (exner * Cp) - ep2 * thv_ds_zt
+    wp2thvp_zt = wp2thlp_zt + ep1 * thv_ds_zt * wp2rtp_zt + rc_coef_zt * wp2rcp_zt
+    wpthvp_zt = wpthlp_zt + ep1 * thv_ds_zt * wprtp_zt + rc_coef_zt * wprcp_zt
+    rtpthvp_zt = rtpthlp_zt + ep1 * thv_ds_zt * rtp2_zt + rc_coef_zt * rtprcp_zt
+    thlpthvp_zt = thlp2_zt + ep1 * thv_ds_zt * rtpthlp_zt + rc_coef_zt * thlprcp_zt
+
+    def to_zm_zero_top(value):
+        return zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, value).at[:, gr.k_ub_zm].set(0.0)
+
+    return (
+        to_zm_zero_top(wpthvp_zt),
+        wp2thvp_zt,
+        to_zm_zero_top(rtpthvp_zt),
+        to_zm_zero_top(thlpthvp_zt),
+        rc_coef_zt,
+        to_zm_zero_top(rc_coef_zt),
+    )
 
 
 def _inputs(rng, gr):
@@ -56,11 +90,11 @@ def test_assembly_and_regrid():
     r_thlpthvp = np.asarray(k['thlp2_zt']) + ep1 * tds * np.asarray(k['rtpthlp_zt']) + rc * np.asarray(k['thlprcp_zt'])
     assert np.max(np.abs(np.asarray(rc_coef_zt) - rc)) < 1e-9, "rc_coef_zt"
     assert np.max(np.abs(np.asarray(wp2thvp_zt) - r_wp2thvp)) < 1e-12, "wp2thvp_zt (stays on zt)"
-    # zm outputs == zt2zm_jax(zt-quantity) with k_ub_zm zeroed
+    # zm outputs == zt2zm(zt-quantity) with k_ub_zm zeroed
     kub = gr.k_ub_zm
     for got_zm, zt_q, nm in ((wpthvp_zm, r_wpthvp, "wpthvp"), (rtpthvp_zm, r_rtpthvp, "rtpthvp"),
                              (thlpthvp_zm, r_thlpthvp, "thlpthvp"), (rc_coef_zm, rc, "rc_coef")):
-        ref_zm = np.asarray(zt2zm_jax(jnp.asarray(zt_q), gr)).copy()
+        ref_zm = np.asarray(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(zt_q))).copy()
         ref_zm[:, kub] = 0.0
         assert np.max(np.abs(np.asarray(got_zm) - ref_zm)) < 1e-9, f"{nm}_zm regrid/k_ub-zero"
     assert np.all(np.asarray(rc_coef_zm)[:, kub] == 0.0), "k_ub_zm not zeroed"

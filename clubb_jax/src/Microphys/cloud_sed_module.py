@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax, ddzm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm, ddzm
 from clubb_jax.src.CLUBB_core.constants_clubb import rho_lw, Cp, Lv
 from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray  # REFACTOR B5: tracer-transparent np.asarray
 
@@ -45,8 +45,8 @@ def cloud_drop_sed(rcm, Ncm, rho_zm, rho, exner, sigma_g, gr):
     exner_j  = jnp.asarray(exner)
 
     # Interpolate rcm, Ncm to momentum (zm) levels.
-    rcm_zm = zt2zm_jax(rcm_j, gr)
-    Ncm_zm = zt2zm_jax(Ncm_j, gr)
+    rcm_zm = zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, rcm_j)
+    Ncm_zm = zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, Ncm_j)
 
     # Sedimentation flux Fcsed on zm levels (positive downwards), only where there
     # is cloud (rcm>0 and Ncm>0). Use safe values inside the powers, then mask.
@@ -62,7 +62,7 @@ def cloud_drop_sed(rcm, Ncm, rho_zm, rho, exner, sigma_g, gr):
     Fcsed = Fcsed.at[:, 0].set(0.0).at[:, -1].set(0.0)
 
     # d(rcm)/dt due to the sedimentation flux divergence (on zt levels).
-    sed_rcm = (1.0 / rho_j) * ddzm_jax(Fcsed, gr)
+    sed_rcm = (1.0 / rho_j) * ddzm(gr.nzm, gr.nzt, gr.ngrdcol, gr, Fcsed)
 
     rcm_mc  = sed_rcm
     thlm_mc = -(Lv / (Cp * exner_j)) * sed_rcm

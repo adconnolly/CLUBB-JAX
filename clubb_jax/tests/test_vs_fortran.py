@@ -36,9 +36,14 @@ try:
 except ImportError:
     HAS_JAX = False
 
-from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zt2zm_jax
-from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs_jax, diffusion_zm_lhs_jax
-from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve_jax
+from clubb_jax.src.CLUBB_core.grid_class import zm2zt, zt2zm
+from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs, diffusion_zm_lhs
+from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve
+from clubb_jax.src.derived_types.grid_class import setup_grid
+
+
+def call_tridiag_lu_solve(lhs, rhs):
+    return tridiag_lu_solve(rhs.shape[-1], lhs, rhs)
 
 ORACLE_EXE = os.path.join(
     os.path.dirname(__file__), '..', 'fortran_oracle', 'build_exe', 'oracle_driver.exe'
@@ -87,39 +92,17 @@ def call_oracle(nzm, ngrdcol, deltaz, zm_init, K_zm, K_zt, nu, rho_zm, rho_zt):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def make_even_grid(nzm, deltaz, zm_init, ngrdcol):
-    zm_1d = np.array([zm_init + k * deltaz for k in range(nzm)], dtype=np.float64)
-    zt_1d = 0.5 * (zm_1d[:-1] + zm_1d[1:])
-    nzt = nzm - 1
-
-    zm = np.tile(zm_1d, (ngrdcol, 1))
-    zt = np.tile(zt_1d, (ngrdcol, 1))
-    invrs_dzt = 1.0 / (zm[:, 1:] - zm[:, :-1])
-
-    dzm_int = zt[:, 1:] - zt[:, :-1]
-    invrs_dzm_int = 1.0 / dzm_int
-    invrs_dzm = np.concatenate([
-        invrs_dzm_int[:, :1], invrs_dzm_int, invrs_dzm_int[:, -1:]
-    ], axis=1)
-
-    class Grid:
-        pass
-    gr = Grid()
-    gr.nzm, gr.nzt, gr.ngrdcol = nzm, nzt, ngrdcol
-    gr.zm, gr.zt = zm, zt
-    gr.invrs_dzt = invrs_dzt
-    gr.invrs_dzm = invrs_dzm
-    return gr
+    return setup_grid(
+        ngrdcol=ngrdcol,
+        deltaz=deltaz,
+        zm_init=zm_init,
+        zm_top=zm_init + (nzm - 1) * deltaz,
+        grid_type=1,
+    )
 
 
 def _to_jax(gr):
-    class JG:
-        pass
-    jgr = JG()
-    for a in ('nzm', 'nzt', 'ngrdcol'):
-        setattr(jgr, a, getattr(gr, a))
-    for a in ('zm', 'zt', 'invrs_dzt', 'invrs_dzm'):
-        setattr(jgr, a, jnp.array(getattr(gr, a), dtype=jnp.float64))
-    return jgr
+    return gr
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -137,7 +120,7 @@ def test_zm2zt_vs_fortran():
     # Linear profile f = 2 + 0.5*z  (matches oracle_driver)
     azm = (2.0 + 0.5 * gr.zm).astype(np.float64)
     jgr = _to_jax(gr)
-    azt_jax = np.asarray(zm2zt_jax(jnp.array(azm), jgr))
+    azt_jax = np.asarray(zm2zt(jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr, jnp.array(azm)))
 
     # Oracle: ZM2ZT shape (nzt, ngrdcol); JAX: (ngrdcol, nzt) — transpose oracle
     azt_fortran = oracle['ZM2ZT'].T           # → (ngrdcol, nzt)
@@ -156,7 +139,7 @@ def test_zt2zm_vs_fortran():
     gr = make_even_grid(nzm, deltaz, zm_init, ngrdcol)
     azt = (2.0 + 0.5 * gr.zt).astype(np.float64)
     jgr = _to_jax(gr)
-    azm_jax = np.asarray(zt2zm_jax(jnp.array(azt), jgr))
+    azm_jax = np.asarray(zt2zm(jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr, jnp.array(azt)))
 
     azm_fortran = oracle['ZT2ZM'].T           # → (ngrdcol, nzm)
     err = np.max(np.abs(azm_jax - azm_fortran))
@@ -175,7 +158,11 @@ def _run_diffusion_zt_comparison(nzm, ngrdcol, deltaz, zm_init, K_zm_val, nu_val
     nu = nu_val * jnp.ones(ngrdcol)
     invrs_rho_ds_zt = (1.0 / rho_val) * jnp.ones((ngrdcol, nzt))
     rho_ds_zm = rho_val * jnp.ones((ngrdcol, nzm))
-    lhs_jax = np.asarray(diffusion_zt_lhs_jax(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, jgr))
+    K_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    lhs_jax = np.asarray(diffusion_zt_lhs(
+        jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr,
+        K_zm, K_zt, nu, invrs_rho_ds_zt, rho_ds_zm,
+    ))
 
     # Oracle DIFF_ZT_LHS: shape (nzt, ngrdcol, 3) — k, col, [super,main,sub]
     # JAX lhs: shape (3, ngrdcol, nzt) — [super,main,sub], col, k
@@ -221,7 +208,11 @@ def _run_diffusion_zm_comparison(nzm, ngrdcol, deltaz, zm_init, K_zt_val, nu_val
     nu = nu_val * jnp.ones(ngrdcol)
     invrs_rho_ds_zm = (1.0 / rho_val) * jnp.ones((ngrdcol, nzm))
     rho_ds_zt = rho_val * jnp.ones((ngrdcol, nzt))
-    lhs_jax = np.asarray(diffusion_zm_lhs_jax(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, jgr))
+    K_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    lhs_jax = np.asarray(diffusion_zm_lhs(
+        jgr.nzm, jgr.nzt, jgr.ngrdcol, jgr,
+        K_zt, K_zm, nu, invrs_rho_ds_zm, rho_ds_zt,
+    ))
 
     lhs_fort = oracle['DIFF_ZM_LHS']          # (nzm, ngrdcol, 3)
     lhs_fort_t = lhs_fort.transpose(2, 1, 0)  # → (3, ngrdcol, nzm)
@@ -286,7 +277,7 @@ def test_solver_zt_vs_fortran():
     oracle = call_oracle(nzm, ngrdcol, deltaz, zm_init, 5.0, 1.0, 0.0, 1.0, 1.0)
 
     lhs_jax, rhs_jax = _make_artificial_lhs(nzt, ngrdcol)
-    soln_jax = np.asarray(tridiag_lu_solve_jax(lhs_jax, rhs_jax))  # (ngrdcol, nzt)
+    soln_jax = np.asarray(call_tridiag_lu_solve(lhs_jax, rhs_jax))  # (ngrdcol, nzt)
 
     # Oracle SOLVER_ZT_SOLN: shape (nzt, ngrdcol) → transpose to (ngrdcol, nzt)
     soln_fort = oracle['SOLVER_ZT_SOLN'].T
@@ -303,7 +294,7 @@ def test_solver_zm_vs_fortran():
     oracle = call_oracle(nzm, ngrdcol, deltaz, zm_init, 5.0, 1.0, 0.0, 1.0, 1.0)
 
     lhs_jax, rhs_jax = _make_artificial_lhs(nzm, ngrdcol)
-    soln_jax = np.asarray(tridiag_lu_solve_jax(lhs_jax, rhs_jax))  # (ngrdcol, nzm)
+    soln_jax = np.asarray(call_tridiag_lu_solve(lhs_jax, rhs_jax))  # (ngrdcol, nzm)
 
     soln_fort = oracle['SOLVER_ZM_SOLN'].T   # (ngrdcol, nzm)
     err = np.max(np.abs(soln_jax - soln_fort))
@@ -325,7 +316,7 @@ def test_solver_vs_fortran_varied():
         oracle = call_oracle(nzm, ngrdcol, dz, z0, 5.0, 1.0, 0.0, 1.0, 1.0)
 
         lhs_jax, rhs_jax = _make_artificial_lhs(nzt, ngrdcol)
-        soln_jax = np.asarray(tridiag_lu_solve_jax(lhs_jax, rhs_jax))
+        soln_jax = np.asarray(call_tridiag_lu_solve(lhs_jax, rhs_jax))
         soln_fort = oracle['SOLVER_ZT_SOLN'].T
         err = np.max(np.abs(soln_jax - soln_fort))
         print(f"  nzm={nzm} ngrdcol={ngrdcol}: err={err:.3e}",

@@ -41,7 +41,9 @@ def test_mass_conservation_and_no_holes():
     field, rho_dz = _setup(rng)
     thr = 0.1
     lo, hi = 1, 8
-    out = np.asarray(fill_holes_global(jnp.asarray(field), jnp.asarray(rho_dz), thr, lo, hi))
+    nz = field.shape[1]; ngrdcol = field.shape[0]
+    rho_dz_j = jnp.asarray(rho_dz)
+    out = np.asarray(fill_holes_global(nz, ngrdcol, thr, lo, hi, rho_dz_j, jnp.ones_like(rho_dz_j), jnp.asarray(field)))
     # (1) ρ·dz-weighted mass conserved over [lo, hi]
     m_in = np.sum(field[0, lo:hi + 1] * rho_dz[0, lo:hi + 1])
     m_out = np.sum(out[0, lo:hi + 1] * rho_dz[0, lo:hi + 1])
@@ -56,7 +58,9 @@ def test_mass_conservation_and_no_holes():
 def test_grad_finite():
     rng = np.random.default_rng(7)
     field, rho_dz = _setup(rng)
-    g = jax.grad(lambda f: jnp.sum(fill_holes_global(f, jnp.asarray(rho_dz), 0.1, 1, 8) ** 2))(jnp.asarray(field))
+    nz = field.shape[1]; ngrdcol = field.shape[0]
+    rho_dz_j = jnp.asarray(rho_dz)
+    g = jax.grad(lambda f: jnp.sum(fill_holes_global(nz, ngrdcol, 0.1, 1, 8, rho_dz_j, jnp.ones_like(rho_dz_j), f) ** 2))(jnp.asarray(field))
     assert np.all(np.isfinite(np.asarray(g))), "non-finite grad"
     print("  jax.grad through fill_holes_global finite  PASS")
 

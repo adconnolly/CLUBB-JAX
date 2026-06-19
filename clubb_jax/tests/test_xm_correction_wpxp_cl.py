@@ -22,8 +22,9 @@ for _p in (_ROOT + "/clubb_release", _ROOT + "/clubb_release/clubb_python_api"):
     if _p not in sys.path:
         sys.path.append(_p)
 
-from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import xm_correction_wpxp_cl
+from clubb_jax.src.CLUBB_core.advance_xm_wpxp_module import xm_correction_wpxp_cl, xm_wpxp_rtm
 from clubb_jax.src.CLUBB_core.constants_clubb import eps
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 
 
 def _ref(xm, wpxp_chnge, invrs_dzt, dt):
@@ -50,8 +51,11 @@ def test_xm_correction_wpxp_cl_matches_reference():
     wpxp_chnge[1] = 0.0                                  # col 1: no clipping → no-op
     wpxp_chnge[2] = 0.5 * eps                            # col 2: sub-eps → gated off (no-op)
 
-    got = np.asarray(xm_correction_wpxp_cl(
-        jnp.asarray(xm), jnp.asarray(wpxp_chnge), jnp.asarray(invrs_dzt), dt))
+    _stats = JaxStats.empty(l_sample=False, names=(), ncol=ng, max_nlev=nzm)
+    got, _ = xm_correction_wpxp_cl(
+        nzm, nzt, ng, xm_wpxp_rtm, dt,
+        jnp.asarray(wpxp_chnge), jnp.asarray(invrs_dzt), _stats, jnp.asarray(xm))
+    got = np.asarray(got)
     ref = _ref(xm, wpxp_chnge, invrs_dzt, dt)
 
     assert np.allclose(got, ref, atol=1e-14), f"max |Δ| = {np.abs(got - ref).max():.3e}"
@@ -65,10 +69,14 @@ def test_xm_correction_wpxp_cl_matches_reference():
 def test_xm_correction_wpxp_cl_all_zero_is_noop():
     rng = np.random.default_rng(1)
     ng, nzt = 2, 8
+    nzm = nzt + 1
     xm = rng.normal(size=(ng, nzt))
     invrs_dzt = rng.uniform(0.5, 2.0, size=(ng, nzt))
-    got = np.asarray(xm_correction_wpxp_cl(
-        jnp.asarray(xm), jnp.zeros((ng, nzt + 1)), jnp.asarray(invrs_dzt), 60.0))
+    _stats = JaxStats.empty(l_sample=False, names=(), ncol=ng, max_nlev=nzm)
+    got, _ = xm_correction_wpxp_cl(
+        nzm, nzt, ng, xm_wpxp_rtm, 60.0,
+        jnp.zeros((ng, nzm)), jnp.asarray(invrs_dzt), _stats, jnp.asarray(xm))
+    got = np.asarray(got)
     assert np.array_equal(got, xm), "zero wpxp_chnge should be an exact no-op"
 
 

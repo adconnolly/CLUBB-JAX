@@ -43,9 +43,9 @@ def test_scalar_lhs_terms():
     C8 = rng.uniform(3.0, 6.0, _NG); C8b = rng.uniform(0.1, 0.5, _NG)
     itau3 = rng.uniform(1e-3, 1e-2, (_NG, nzt)); Skw = rng.uniform(-3.0, 3.0, (_NG, nzt))
 
-    jd = np.asarray(wp2_term_dp1_lhs(jnp.asarray(C1), jnp.asarray(itau1)))
-    jp = np.asarray(wp2_term_pr1_lhs(jnp.asarray(C4), jnp.asarray(itau4)))
-    j3 = np.asarray(wp3_term_pr1_lhs(jnp.asarray(C8), jnp.asarray(C8b), jnp.asarray(itau3), jnp.asarray(Skw)))
+    jd = np.asarray(wp2_term_dp1_lhs(nzm, _NG, gr, jnp.asarray(C1), jnp.asarray(itau1)))
+    jp = np.asarray(wp2_term_pr1_lhs(nzm, _NG, gr, jnp.asarray(C4), jnp.asarray(itau4)))
+    j3 = np.asarray(wp3_term_pr1_lhs(nzt, _NG, gr, jnp.asarray(C8), jnp.asarray(C8b), jnp.asarray(itau3), jnp.asarray(Skw), True))
     rd = np.zeros((_NG, nzm)); rp = np.zeros((_NG, nzm)); r3 = np.zeros((_NG, nzt))
     for k in range(1, nzm - 1):
         rd[:, k] = C1[:, k] * itau1[:, k]
@@ -64,7 +64,7 @@ def test_wp2_term_ta_lhs():
     rng = np.random.default_rng(42)
     invrs_rho_ds_zm = rng.uniform(0.8, 2.0, (_NG, nzm))
     rho_ds_zt = rng.uniform(0.5, 1.2, (_NG, nzt))
-    j = np.asarray(wp2_term_ta_lhs(jnp.asarray(invrs_rho_ds_zm), jnp.asarray(rho_ds_zt), gr))
+    j = np.asarray(wp2_term_ta_lhs(nzm, nzt, _NG, gr, jnp.asarray(rho_ds_zt), jnp.asarray(invrs_rho_ds_zm)))
     # (2, ngrdcol, nzm): band 0 = super (coeff of wp3[k]); band 1 = sub (coeff of wp3[k-1])
     ref = np.zeros((2, _NG, nzm))
     for k in range(1, nzm - 1):
@@ -84,8 +84,8 @@ def test_wp3_term_tp_lhs():
     coef = rng.uniform(0.5, 2.0, _NG)
     wp2 = rng.uniform(1e-3, 2.0, (_NG, nzm)); rho_zm = rng.uniform(0.5, 1.2, (_NG, nzm))
     inv_rho_zt = rng.uniform(0.8, 2.0, (_NG, nzt))
-    j = np.asarray(wp3_term_tp_lhs(jnp.asarray(coef), jnp.asarray(wp2), jnp.asarray(rho_zm),
-                                   jnp.asarray(inv_rho_zt), gr))
+    j = np.asarray(wp3_term_tp_lhs(nzm, nzt, _NG, gr, jnp.asarray(coef), jnp.asarray(wp2),
+                                   jnp.asarray(rho_zm), jnp.asarray(inv_rho_zt)))
     ref = np.zeros((2, _NG, nzt))
     for k in range(1, nzt - 1):
         ref[0, :, k] = coef * (-3.0 * inv_rho_zt[:, k] * invrs_dzt[:, k] * rho_zm[:, k + 1] * wp2[:, k + 1]
@@ -104,8 +104,8 @@ def test_ac_pr2_lhs():
     rng = np.random.default_rng(44)
     C11 = rng.uniform(0.3, 0.8, (_NG, nzt)); wm_zm = rng.uniform(-0.1, 0.1, (_NG, nzm))
     C_uu_shr = rng.uniform(0.1, 0.5, _NG); wm_zt = rng.uniform(-0.1, 0.1, (_NG, nzt))
-    j3 = np.asarray(wp3_terms_ac_pr2_lhs(jnp.asarray(C11), jnp.asarray(wm_zm), gr))
-    j2 = np.asarray(wp2_terms_ac_pr2_lhs(jnp.asarray(C_uu_shr), jnp.asarray(wm_zt), gr))
+    j3 = np.asarray(wp3_terms_ac_pr2_lhs(nzm, nzt, _NG, gr, jnp.asarray(C11), jnp.asarray(wm_zm)))
+    j2 = np.asarray(wp2_terms_ac_pr2_lhs(nzm, nzt, _NG, gr, jnp.asarray(C_uu_shr), jnp.asarray(wm_zt)))
     r3 = np.zeros((_NG, nzt)); r2 = np.zeros((_NG, nzm))
     for k in range(1, nzt - 1):
         r3[:, k] = (1.0 - C11[:, k]) * 3.0 * idzt[:, k] * (wm_zm[:, k + 1] - wm_zm[:, k])

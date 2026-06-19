@@ -25,6 +25,7 @@ RUN_SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, RUN_SCRIPTS)
 import golden as G        # noqa: E402
 import invariants as INV  # noqa: E402
+from compare_runs import compare_output_dirs  # noqa: E402
 
 JAX_ROOT = G.JAX_ROOT
 CLUBB_ROOT = os.path.join(JAX_ROOT, "clubb_release")
@@ -48,7 +49,8 @@ def _run_compare(case: str, niters: int):
     cmd = [sys.executable, os.path.join(RUN_SCRIPTS, "compare_runs.py"),
            "--case", case, "--max-iters", str(niters), "--tier", "physical"]
     rc = subprocess.run(cmd).returncode
-    jax_nc = os.path.join(JAX_ROOT, "clubb_jax", "output", f"{case}_compare_jax", f"{case}_stats.nc")
+    _, jax_dir = compare_output_dirs(case)
+    jax_nc = os.path.join(jax_dir, f"{case}_stats.nc")
     return (rc == 0), (jax_nc if os.path.isfile(jax_nc) else None)
 
 

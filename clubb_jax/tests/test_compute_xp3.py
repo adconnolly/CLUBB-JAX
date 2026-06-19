@@ -32,7 +32,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.advance_xp3_module import compute_xp3
+from clubb_jax.src.CLUBB_core.Skx_module import Skx_func, xp3_LG_2005_ansatz
+from clubb_jax.src.CLUBB_core.grid_class import zm2zt
 from clubb_jax.src.CLUBB_core.parameters_tunable import init_clubb_params
 from clubb_jax.src.CLUBB_core.constants_clubb import (
     iSkw_denom_coef, w_tol, w_tol_sqd, thl_tol, rt_tol, zero_threshold,
@@ -40,6 +41,63 @@ from clubb_jax.src.CLUBB_core.constants_clubb import (
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
+
+
+def compute_xp3(
+    wp2,
+    wp3,
+    wprtp,
+    wpthlp,
+    rtp2,
+    thlp2,
+    upwp,
+    vpwp,
+    up2,
+    vp2,
+    sigma_sqd_w,
+    clubb_params,
+    gr,
+):
+    wp2_zt = zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, wp2, w_tol_sqd)
+    Skw_zt = Skx_func(gr.nzt, gr.ngrdcol, wp2_zt, wp3, w_tol, clubb_params)
+    sigma_sqd_w_zt = zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, sigma_sqd_w, zero_threshold)
+    rtp3 = xp3_LG_2005_ansatz(
+        gr.nzt, gr.ngrdcol, Skw_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, wprtp),
+        wp2_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, rtp2, rt_tol ** 2),
+        sigma_sqd_w_zt,
+        clubb_params,
+        rt_tol,
+    )
+    thlp3 = xp3_LG_2005_ansatz(
+        gr.nzt, gr.ngrdcol, Skw_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, wpthlp),
+        wp2_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, thlp2, thl_tol ** 2),
+        sigma_sqd_w_zt,
+        clubb_params,
+        thl_tol,
+    )
+    up3 = xp3_LG_2005_ansatz(
+        gr.nzt, gr.ngrdcol, Skw_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, upwp),
+        wp2_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, up2, w_tol_sqd),
+        sigma_sqd_w_zt,
+        clubb_params,
+        w_tol,
+    )
+    vp3 = xp3_LG_2005_ansatz(
+        gr.nzt, gr.ngrdcol, Skw_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, vpwp),
+        wp2_zt,
+        zm2zt(gr.nzm, gr.nzt, gr.ngrdcol, gr, vp2, w_tol_sqd),
+        sigma_sqd_w_zt,
+        clubb_params,
+        w_tol,
+    )
+    return rtp3, thlp3, up3, vp3
 
 
 def _setup_f2py_grid():
@@ -69,7 +127,7 @@ def test_f2py_oracle_adg1():
         return
     nzt = nzm - 1
     cp = np.asarray(init_clubb_params(ng, filename=fn))            # (ng, nparams), matches Fortran exactly
-    skw_denom = cp[:, iSkw_denom_coef - 1:iSkw_denom_coef]
+    skw_denom = cp[:, iSkw_denom_coef:iSkw_denom_coef + 1]
     zm2zt = lambda a: np.asarray(clubb_f2py.f2py_zm2zt_2d(nzt, a))  # the bit-shadowed Fortran regrid
     ansatz = clubb_f2py.f2py_xp3_lg_2005_ansatz                     # the bit-shadowed Fortran LG-2005 ansatz
     rng = np.random.default_rng(5)

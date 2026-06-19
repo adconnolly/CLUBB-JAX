@@ -1,22 +1,19 @@
-"""Mass-conserving vertical grid remapping — port of remapping_module.F90 (Ullrich-linear path).
+"""JAX port of remapping_module.F90.
 
-Remaps a field from a source vertical grid to a target grid while conserving column-integrated mass. The
-density is given as a piecewise-linear spline (rho_lin_spline_vals at rho_lin_spline_levels); the exact mass
-over each grid cell is integrated, converted to a hydrostatic pressure coordinate, and the Ullrich et al.
-(2016, "Arbitrary-Order Conservative and Consistent Remapping … Part II", eq. 30) first-order conservative
-linear map R_ij is built from the overlap of source/target pressure cells. The remapped field is R · source.
-
-Ported here: `calc_mass_over_grid_intervals`, `remapping_matrix`, `matrix_vector_mult`, `remap_vals_to_target`,
-`remap_vals_to_target_same_grid` (the f2py-exposed driver, source grid == target grid == stored grid), AND the
-E3SM Piecewise-Parabolic Method (method 2): `remap_vals_ppm` → `map1_ppm` → `ppm2m`/`steepz`/`kmppm` (the
-kord=4 path; the kord≥7 Huynh branch is omitted). The debug-only conservation/monotonicity/consistency checks
-(active only at debug level ≥ 2) do not affect the output and are omitted.
-
-All functions are pure-jnp and differentiable. `calc_mass_over_grid_intervals` integrates the spline exactly via a
-cumulative-mass M(z) (piecewise-quadratic, continuous) so that mass[k] = M(grid[k+1]) − M(grid[k]); this is
-mathematically identical to the Fortran's sequential per-cell accumulation (agreeing to FP summation order).
-
-Reference: clubb_release/src/CLUBB_core/remapping_module.F90
+Porting deviations:
+- The Fortran public ``remap_iv_from_var_name`` helper is not ported here; JAX
+  callers currently pass ``iv`` directly.
+- Debug-only conservation, monotonicity, consistency, and remap-matrix checks
+  that only print/stop at debug level >= 2 are omitted from the jitted path.
+- ``calc_mass_over_grid_intervals`` is vectorized over columns and integrates a
+  cumulative piecewise-quadratic mass function rather than reproducing the
+  Fortran sequential loop state.  It computes the same exact integral for the
+  linear density spline, up to floating-point summation order.
+- The Fortran optional ``R_ij`` reuse path is not exposed; JAX computes the
+  remapping matrix functionally when the Ullrich method is selected.
+- The PPM port implements the active ``kord = 4`` vertical remapping path.  The
+  Fortran ``kord >= 7`` Huynh branch is not implemented because the CLUBB call
+  site fixes ``kord`` to 4.
 """
 from __future__ import annotations
 
@@ -30,10 +27,19 @@ from clubb_jax.src.CLUBB_core.constants_clubb import grav
 _CONS_ULLRICH_REMAP = 1    # model_flags.F90 cons_ullrich_remap
 _PPM_REMAP = 2             # model_flags.F90 ppm_remap
 
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#
+#
+#                GENERAL REMAPPING FUNCTIONS AND SUBROUTINES
+#
+#
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
 
 def _calc_mass_1col(rho_vals, rho_levels, grid_levels):
-    """Single-column mass over each [grid_levels[k], grid_levels[k+1]] interval, from the piecewise-linear
-    rho spline (rho_vals at rho_levels, ascending). Returns mass_per_interval, shape (len(grid_levels)-1,)."""
+    """Single-column helper for ``calc_mass_over_grid_intervals``."""
     seg_mass = (rho_levels[1:] - rho_levels[:-1]) * (rho_vals[:-1] + rho_vals[1:]) * 0.5
     Mcum = jnp.concatenate([jnp.zeros((1,), dtype=rho_vals.dtype), jnp.cumsum(seg_mass)])  # mass node0→node j
 
@@ -49,7 +55,16 @@ def _calc_mass_1col(rho_vals, rho_levels, grid_levels):
 
 
 def calc_mass_over_grid_intervals(rho_lin_spline_vals, rho_lin_spline_levels, grid_levels):
-    """Mass over each grid interval from a piecewise-linear density spline (remapping_module.F90).
+    """Calculate the mass over every interval (grid_levels(k) to grid_levels(k+1))
+    of the grid levels (grid_levels).
+    This function assumes a linear spline for rho, defined by the values of
+    rho (lin_spline_rho_vals) given at the altitudes (lin_spline_rho_levels).
+    So with the assumption that the linear spline is the exact rho function, this function
+    computes the exact mass over each interval, such that any target grid with the same lowest
+    and highest level would give the same total mass, if the linear spline is the same.
+
+    Returns an array with the dimension grid_levels_idx-1 where at each index the mass of that
+    interval is stored, starting at the bottom level.
 
     Args:
         rho_lin_spline_vals:   (ngrdcol, total_idx) density values [kg/m^3], ascending in altitude.
@@ -62,11 +77,31 @@ def calc_mass_over_grid_intervals(rho_lin_spline_vals, rho_lin_spline_levels, gr
     rv = jnp.asarray(rho_lin_spline_vals, dtype=jnp.float64)
     rl = jnp.asarray(rho_lin_spline_levels, dtype=jnp.float64)
     gl = jnp.asarray(grid_levels, dtype=jnp.float64)
+    # Note:  The lin_spline_rho_levels and lin_spline_rho_vals need to be arranged from
+    #        lowest to highest in altitude
+    #--------------------- Begin Code ---------------------
+    # check if highest value of lin spline is higher or equal to highest level of target grid
+    # find first level and set initial val_below and level_below
+    # find all spline connection points between the level_below and the next grid level
+    # in grid_levels and add up their masses, finally the rho value on the next grid level is
+    # interpolated and the last part of mass added to the total mass of that interval
     return jax.vmap(_calc_mass_1col)(rv, rl, gl)
 
 
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#
+#                LINEAR REMAPPING METHOD BY ULLRICH ET AL.
+#        formula (30) in 'Arbitrary-Order Conservative and Consistent
+#                         Remapping and a Theory of Linear Maps: Part II'
+#
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
 def remapping_matrix(levels_source, levels_target):
-    """Ullrich first-order conservative linear remapping matrix R_ij (remapping_module.F90:remapping_matrix).
+    """implements the remapping scheme proposed by Ullrich et al. in
+    'Arbitrary-Order Conservative and Consistent Remapping and a Theory of Linear Maps: Part II'
+    in formula (30)
 
     Built from source/target *pressure* levels (eq. 30): for target cell k and source cell l, the overlap of
     the pressure intervals normalized by the target cell thickness:
@@ -85,6 +120,7 @@ def remapping_matrix(levels_source, levels_target):
     lt = jnp.asarray(levels_target, dtype=jnp.float64)
 
     def _one(ls_i, lt_i):
+        #--------------------- Begin Code ---------------------
         tgt_lo = lt_i[:-1][:, None]; tgt_hi = lt_i[1:][:, None]      # (nt-1, 1)
         src_lo = ls_i[:-1][None, :]; src_hi = ls_i[1:][None, :]      # (1, ns-1)
         omega_upper = jnp.maximum(tgt_hi, src_hi)
@@ -96,7 +132,9 @@ def remapping_matrix(levels_source, levels_target):
 
 
 def matrix_vector_mult(x_vectors, A_matrices):
-    """Batched matrix-vector product y[i] = A[i] @ x[i] (remapping_module.F90:matrix_vector_mult).
+    """Calculates the matrix-vector product y = Ax, where A is a matrix with dim_output x dim_input
+    and y,x are vectors with x having dim_input many entries and y having dim_output many entries.
+    The result y is calculated for every ngrdcol
 
     Args:
         x_vectors:  (ngrdcol, dim_input).
@@ -107,23 +145,45 @@ def matrix_vector_mult(x_vectors, A_matrices):
     """
     x = jnp.asarray(x_vectors, dtype=jnp.float64)
     A = jnp.asarray(A_matrices, dtype=jnp.float64)
+    #--------------------- Begin Code ---------------------
+    # matrix vector multiplication
     return jnp.einsum('ikj,ij->ik', A, x)
 
 
 def _pressure_levels(mass_on_cells, p_sfc):
     """Hydrostatic pressure at each grid level: p[0]=p_sfc; p[k]=p[k-1] − mass[k-1]·grav. Vectorized over cols."""
     p_sfc = jnp.asarray(p_sfc, dtype=jnp.float64)
+    # Calculate pressure levels from altitudes and densities
     dp = mass_on_cells * grav                                        # (ngrdcol, ncell)
     return p_sfc[:, None] - jnp.concatenate(
         [jnp.zeros((mass_on_cells.shape[0], 1), dtype=mass_on_cells.dtype), jnp.cumsum(dp, axis=1)], axis=1)
 
 
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#
+#                PIECEWISE PARABOLIC METHOD BY ULLRICH AND WOODWARD
+#        in 'The Piecewise Parabolic Method (PPM) for gas-dynamical simulations'
+#
+# The implementation of the PPM was obtained from the Energy Exascale Earth
+# System Model project, sponsored by the U.S.Department of Energy, Office of
+# Science, Office of Biological and Environmental Research Earth Systems Model
+# Development Program area of Earth and Environmental System Modeling.
+#
+# https://github.com/E3SM-Project/E3SM/blob/master/components/eam/src/dynamics/fv/mapz_module.F90
+#
+# The subroutines kmppm, steepz, ppm2m and map1_ppm were obtained
+# from the E3SM code.
+#
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
 def kmppm(dm, AA, AL, AR, A6, lmt):
-    """PPM monotonicity limiter (remapping_module.F90:kmppm), vectorized + elementwise over (ncol, km).
-    lmt: 0 standard PPM, 1 Lin full-monotone, 2 positive-definite, 3 no-op. Returns (AL, AR, A6)."""
+    """the monotonicity constrained defined in the PPM paper."""
     if lmt == 3:
         return AL, AR, A6
     if lmt == 0:
+        # Standard PPM constraint
         da1 = AR - AL
         da2 = da1 ** 2
         a6da = A6 * da1
@@ -135,12 +195,14 @@ def kmppm(dm, AA, AL, AR, A6, lmt):
         ALn = jnp.where(dm0, AA, jnp.where(hi, AR - 3.0 * (AR - AA), AL))   # AL = AR - A6 (hi branch)
         return ALn, ARn, A6n
     if lmt == 1:
+        # Improved full monotonicity constraint (Lin)
+        # Note: no need to provide first guess of A6 <-- a4(4,i)
         qmp = 2.0 * dm
         ALn = AA - jnp.sign(qmp) * jnp.minimum(jnp.abs(qmp), jnp.abs(AL - AA))
         ARn = AA + jnp.sign(qmp) * jnp.minimum(jnp.abs(qmp), jnp.abs(AR - AA))
         A6n = 3.0 * (2.0 * AA - (ALn + ARn))
         return ALn, ARn, A6n
-    # lmt == 2: positive-definite constraint
+    # Positive definite constraint
     cond = jnp.abs(AR - AL) < -A6
     a6_safe = jnp.where(A6 != 0.0, A6, 1.0)
     fmin = AA + 0.25 * (AR - AL) ** 2 / a6_safe + A6 / 12.0
@@ -160,6 +222,8 @@ def ppm2m(AA, delp, iv, kord):
     kord=4 path (the only one map1_ppm uses); the kord>=7 Huynh branch is omitted."""
     ncol, km = AA.shape
     z = jnp.zeros((ncol, 1), dtype=AA.dtype)
+    # Developer: S.-J. Lin, NASA-GSFC
+    # Developer: A. Gettelman, Feb 2013, convert to column physics
     delq = AA[:, 1:] - AA[:, :-1]                      # (km-1): delq[j]=AA[j+1]-AA[j]
     d4 = delp[:, :-1] + delp[:, 1:]                    # (km-1): d4f[j]=delp[j]+delp[j+1] = Fortran d4(j+2)
     # Pad to align with Fortran d4(k)=delp(k-1)+delp(k): D4[k]=delp[k-1]+delp[k], k=1..km-1
@@ -254,10 +318,11 @@ def ppm2m(AA, delp, iv, kord):
 
 
 def steepz(AA, AL, df2, dm, dq, dp, d4):
-    """PPM discontinuity steepening (remapping_module.F90:steepz). Modifies AL in k=4..km-2 (Fortran). All
-    arrays (ncol, km); dq=DQ (km), d4=D4 (km). Returns the steepened AL."""
+    """the discontinuity adjustment defined in the PPM paper."""
     ncol, km = AA.shape
     z = jnp.zeros((ncol, 1), dtype=AA.dtype)
+    #--------------------- Begin Code ---------------------
+    # Compute ratio of dq/dp
     # rat(k) = dq(k-1)/d4(k) for k=2..km (Fortran) → 0-based k=1..km-1: rat[k]=DQ[k-1]/D4[k]
     d4_safe = jnp.where(d4 != 0.0, d4, 1.0)
     rat = jnp.concatenate([z, dq[:, :-1] / d4_safe[:, 1:]], axis=1)   # rat[0]=0, rat[k]=DQ[k-1]/D4[k]
@@ -314,17 +379,20 @@ def map1_ppm(pe1, q1, pe2, iv, kord):
         kk = k0r[:-1]                                           # (kn) source cell of pe2(k)
         kk2 = k0r[1:]                                           # (kn) source cell of pe2(k+1)
         dpkk = dp1r[kk]
+        # Consider contribution between pe1(i,kk) and pe2(i,k)
         pl = (pe2r[:-1] - pe1r[kk]) / dpkk
-        # same-cell branch
+        # Check to see if pe2(i,k+1) and pe2(i,k) are in same pe1 interval
         pr = (pe2r[1:] - pe1r[kk]) / dpkk
         q_same = ALr[kk] + 0.5 * (A6r[kk] + ARr[kk] - ALr[kk]) * (pr + pl) - A6r[kk] * r3 * (pr * (pr + pl) + pl ** 2)
-        # multi-cell branch
+        # Consider contribution between pe2(i,k) and pe1(i,kk+1)
         qsum1 = (pe1r[kk + 1] - pe2r[:-1]) * (
             ALr[kk] + 0.5 * (A6r[kk] + ARr[kk] - ALr[kk]) * (1.0 + pl) - A6r[kk] * (r3 * (1.0 + pl * (1.0 + pl))))
+        # Next consider contribution between pe1(i,kk+1) and pe1(i,k0(i,k+1))
         qsum_mid = cumr[jnp.maximum(kk2, 0)] - cumr[jnp.minimum(kk + 1, km)]   # sum dp1*AA over (kk+1 .. kk2-1)
         klb = kk2
         delp = pe2r[1:] - pe1r[klb]
         esl = delp / dp1r[klb]
+        # Now consider contribution between pe1(i,k0(i,k+1)) and pe2(i,k+1)
         qsum3 = delp * (ALr[klb] + 0.5 * esl * (ARr[klb] - ALr[klb] + A6r[klb] * (1.0 - r23 * esl)))
         q_multi = (qsum1 + qsum_mid + qsum3) / (pe2r[1:] - pe2r[:-1])
         return jnp.where(kk2 == kk, q_same, q_multi)
@@ -333,16 +401,20 @@ def map1_ppm(pe1, q1, pe2, iv, kord):
 
 
 def remap_vals_ppm(levels_source, levels_target, source_values, iv, kord=4):
-    """E3SM PPM remap wrapper (remapping_module.F90:remap_vals_ppm): flip CLUBB surface→top pressure levels to
-    top→surface for map1_ppm, remap, flip back. levels_* are (ncol, n) pressure [Pa] surface→top; source_values
-    (ncol, ns-1). Returns (ncol, nt-1)."""
+    """This is a wrapper function for E3SM's subroutine implementing the
+    Piecewise Parabolic Method (PPM) that takes in the pressure levels from surface to top
+    """
     ls = jnp.asarray(levels_source, dtype=jnp.float64)
     lt = jnp.asarray(levels_target, dtype=jnp.float64)
     sv = jnp.asarray(source_values, dtype=jnp.float64)
+    # the pressure levels and values are flipped, since map1_ppm takes in the grids
+    # from top to surface instead of surface to top, like CLUBB does
     pe1 = ls[:, ::-1]                                           # top→surface (increasing pressure)
     pe2 = lt[:, ::-1]
     q1 = sv[:, ::-1]
+    # remap values using E3SM's PPM implementation
     q2 = map1_ppm(pe1, q1, pe2, iv, kord)
+    # flip output values back so they correspond to the surface to top ordering in CLUBB's grid
     return q2[:, ::-1]                                          # back to surface→top
 
 
@@ -365,12 +437,16 @@ def remap_vals_to_target(levels_source, levels_target, rho_lin_spline_vals, rho_
     if grid_remap_method not in (_CONS_ULLRICH_REMAP, _PPM_REMAP):
         raise ValueError(f"no remapping method for grid_remap_method={grid_remap_method}")
 
+    # Calculate pressure levels from altitudes and densities
     mass_src = calc_mass_over_grid_intervals(rho_lin_spline_vals, rho_lin_spline_levels, levels_source)
     mass_tgt = calc_mass_over_grid_intervals(rho_lin_spline_vals, rho_lin_spline_levels, levels_target)
     p_src = _pressure_levels(mass_src, p_sfc)
     p_tgt = _pressure_levels(mass_tgt, p_sfc)
+    # Remap values with the selected remapping method
     if grid_remap_method == _PPM_REMAP:
         return remap_vals_ppm(p_src, p_tgt, source_values, iv)
+    # Construct remapping matrix for cons_ullrich_remap method, if not
+    # already given as an optional parameter
     R = remapping_matrix(p_src, p_tgt)
     return matrix_vector_mult(source_values, R)
 
@@ -398,8 +474,13 @@ def remap_vals_to_target_same_grid(source_values, zm, zt, rho_lin_spline_vals, r
     zm = jnp.asarray(zm, dtype=jnp.float64)
     zt = jnp.asarray(zt, dtype=jnp.float64)
     if l_zt_variable:
+        # if variable is given on the zt levels, just take the surrounding zm levels to build
+        # the corresponding grid cell
         levels = zm
     else:
+        # construct surrounding grid levels for values given on the zm levels
+        # for inner levels take the surrounding zt levels, for the outer levels,
+        # take the zt level and the zm level
         levels = jnp.concatenate([zm[:, :1], zt, zm[:, -1:]], axis=1)
     return remap_vals_to_target(levels, levels, rho_lin_spline_vals, rho_lin_spline_levels,
                                 source_values, p_sfc, grid_remap_method, iv=iv)

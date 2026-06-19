@@ -53,9 +53,9 @@ def test_wp2_bp_pr2_dp1_pr1():
     up2 = rng.uniform(1e-3, 2.0, (_NG, nzm)); vp2 = rng.uniform(1e-3, 2.0, (_NG, nzm))
     C4 = rng.uniform(3.0, 6.0, _NG); itau4 = rng.uniform(1e-3, 1e-2, (_NG, nzm))
 
-    jb = np.asarray(wp2_terms_bp_pr2_rhs(jnp.asarray(C_uu_buoy), jnp.asarray(thv), jnp.asarray(wpthvp)))
-    jd = np.asarray(wp2_term_dp1_rhs(jnp.asarray(C1), jnp.asarray(itau1), jnp.asarray(up2), jnp.asarray(vp2)))
-    jp = np.asarray(wp2_term_pr1_rhs(jnp.asarray(C4), jnp.asarray(up2), jnp.asarray(vp2), jnp.asarray(itau4)))
+    jb = np.asarray(wp2_terms_bp_pr2_rhs(nzm, _NG, gr, jnp.asarray(C_uu_buoy), jnp.asarray(thv), jnp.asarray(wpthvp)))
+    jd = np.asarray(wp2_term_dp1_rhs(nzm, _NG, gr, jnp.asarray(C1), jnp.asarray(itau1), 0.0, jnp.asarray(up2), jnp.asarray(vp2), True))
+    jp = np.asarray(wp2_term_pr1_rhs(nzm, _NG, gr, jnp.asarray(C4), jnp.asarray(up2), jnp.asarray(vp2), jnp.asarray(itau4)))
     rb = np.zeros((_NG, nzm)); rd = np.zeros((_NG, nzm)); rp = np.zeros((_NG, nzm))
     for k in range(1, nzm - 1):
         rb[:, k] = (1.0 - C_uu_buoy) * 2.0 * (grav / thv[:, k]) * wpthvp[:, k]
@@ -75,9 +75,9 @@ def test_wp2_pr3():
     thv = rng.uniform(290.0, 320.0, (_NG, nzm)); wpthvp = rng.uniform(-0.05, 0.2, (_NG, nzm))
     upwp = rng.uniform(-0.5, 0.5, (_NG, nzm)); vpwp = rng.uniform(-0.5, 0.5, (_NG, nzm))
     um = rng.uniform(-15.0, 15.0, (_NG, nzt)); vm = rng.uniform(-15.0, 15.0, (_NG, nzt))
-    j = np.asarray(wp2_term_pr3_rhs(jnp.asarray(C_uu_shr), jnp.asarray(C_uu_buoy), jnp.asarray(thv),
+    j = np.asarray(wp2_term_pr3_rhs(nzm, nzt, _NG, gr, jnp.asarray(C_uu_shr), jnp.asarray(C_uu_buoy), jnp.asarray(thv),
                                     jnp.asarray(wpthvp), jnp.asarray(upwp), jnp.asarray(um),
-                                    jnp.asarray(vpwp), jnp.asarray(vm), gr))
+                                    jnp.asarray(vpwp), jnp.asarray(vm)))
     r = np.zeros((_NG, nzm))
     for k in range(1, nzm - 1):
         du = invrs_dzm[:, k] * (um[:, k] - um[:, k - 1])
@@ -100,9 +100,9 @@ def test_wp3_bp1_pr2_pr1():
     C8 = rng.uniform(3.0, 6.0, _NG); C8b = rng.uniform(0.1, 0.5, _NG)
     itau3 = rng.uniform(1e-3, 1e-2, (_NG, nzt)); Skw = rng.uniform(-3.0, 3.0, (_NG, nzt))
     wp3 = rng.standard_normal((_NG, nzt))
-    jb = np.asarray(wp3_terms_bp1_pr2_rhs(jnp.asarray(C11), jnp.asarray(thv_zt), jnp.asarray(wp2thvp)))
-    jp = np.asarray(wp3_term_pr1_rhs(jnp.asarray(C8), jnp.asarray(C8b), jnp.asarray(itau3),
-                                     jnp.asarray(Skw), jnp.asarray(wp3)))
+    jb = np.asarray(wp3_terms_bp1_pr2_rhs(nzt, _NG, gr, jnp.asarray(C11), jnp.asarray(thv_zt), jnp.asarray(wp2thvp)))
+    jp = np.asarray(wp3_term_pr1_rhs(nzt, _NG, gr, jnp.asarray(C8), jnp.asarray(C8b), jnp.asarray(itau3),
+                                     jnp.asarray(Skw), jnp.asarray(wp3), True))
     rb = np.zeros((_NG, nzt)); rp = np.zeros((_NG, nzt))
     for k in range(1, nzt - 1):
         rb[:, k] = (1.0 - C11[:, k]) * 3.0 * (grav / thv_zt[:, k]) * wp2thvp[:, k]
@@ -124,8 +124,8 @@ def test_pr_dfsn_turb():
     # wp2_term_pr_dfsn_rhs
     Cw2 = rng.uniform(0.1, 0.5, _NG); rho_zt = rng.uniform(0.5, 1.2, (_NG, nzt)); irho_zm = rng.uniform(0.8, 2.0, (_NG, nzm))
     wpup2 = rng.standard_normal((_NG, nzt)); wpvp2 = rng.standard_normal((_NG, nzt)); wp3 = rng.standard_normal((_NG, nzt))
-    j2 = np.asarray(wp2_term_pr_dfsn_rhs(jnp.asarray(Cw2), jnp.asarray(rho_zt), jnp.asarray(irho_zm),
-                                         jnp.asarray(wpup2), jnp.asarray(wpvp2), jnp.asarray(wp3), gr))
+    j2 = np.asarray(wp2_term_pr_dfsn_rhs(nzm, nzt, _NG, gr, jnp.asarray(Cw2), jnp.asarray(rho_zt), jnp.asarray(irho_zm),
+                                         jnp.asarray(wpup2), jnp.asarray(wpvp2), jnp.asarray(wp3)))
     wpuip2 = wpup2 + wpvp2 + wp3
     r2 = np.zeros((_NG, nzm))
     for m in range(1, nzm - 1):
@@ -134,8 +134,13 @@ def test_pr_dfsn_turb():
     # wp3_term_pr_turb_rhs (TKE branch)
     Cw3t = rng.uniform(0.1, 0.5, _NG); rho_zm = rng.uniform(0.5, 1.2, (_NG, nzm)); irho_zt = rng.uniform(0.8, 2.0, (_NG, nzt))
     wp2s = rng.uniform(1e-3, 2.0, (_NG, nzm)); ems = rng.uniform(1e-3, 2.0, (_NG, nzm))
-    jt = np.asarray(wp3_term_pr_turb_rhs(jnp.asarray(Cw3t), jnp.asarray(rho_zm), jnp.asarray(irho_zt),
-                                         jnp.asarray(wp2s), jnp.asarray(ems), gr))
+    _zeros_zt = jnp.zeros((2, nzt))
+    _zeros_zm = jnp.zeros((2, nzm))
+    jt = np.asarray(wp3_term_pr_turb_rhs(nzm, nzt, _NG, gr, jnp.asarray(Cw3t),
+                                         _zeros_zt, _zeros_zt, _zeros_zt, _zeros_zt,
+                                         _zeros_zm, _zeros_zm, _zeros_zt,
+                                         jnp.asarray(rho_zm), jnp.asarray(irho_zt),
+                                         jnp.asarray(ems), jnp.asarray(wp2s), True))
     rt = np.zeros((_NG, nzt))
     for k in range(1, nzt - 1):
         rt[:, k] = -Cw3t * irho_zt[:, k] * idzt[:, k] * (rho_zm[:, k + 1] * wp2s[:, k + 1] * ems[:, k + 1]
@@ -144,9 +149,9 @@ def test_pr_dfsn_turb():
     Cw3d = rng.uniform(0.1, 0.5, _NG)
     wp2up2 = rng.standard_normal((_NG, nzm)); wp2vp2 = rng.standard_normal((_NG, nzm)); wp4 = rng.uniform(0, 2, (_NG, nzm))
     up2 = rng.uniform(1e-3, 2, (_NG, nzm)); vp2 = rng.uniform(1e-3, 2, (_NG, nzm)); wp2 = rng.uniform(1e-3, 2, (_NG, nzm))
-    jd = np.asarray(wp3_term_pr_dfsn_rhs(jnp.asarray(Cw3d), jnp.asarray(rho_zm), jnp.asarray(irho_zt),
+    jd = np.asarray(wp3_term_pr_dfsn_rhs(nzm, nzt, _NG, gr, jnp.asarray(Cw3d), jnp.asarray(rho_zm), jnp.asarray(irho_zt),
                                          jnp.asarray(wp2up2), jnp.asarray(wp2vp2), jnp.asarray(wp4),
-                                         jnp.asarray(up2), jnp.asarray(vp2), jnp.asarray(wp2), gr))
+                                         jnp.asarray(up2), jnp.asarray(vp2), jnp.asarray(wp2)))
     net = (wp2up2 + wp2vp2 + wp4) - wp2 * (up2 + vp2 + wp2)
     rd = np.zeros((_NG, nzt))
     for k in range(1, nzt - 1):

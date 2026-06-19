@@ -1,36 +1,50 @@
-"""Pure-Python port of CLUBB_core/parameters_tunable.F90.
+"""Pure-Python implementation of selected ``parameters_tunable.F90`` APIs.
 
-Provides init_clubb_params and calc_derrived_params to replace the
-corresponding Fortran API calls in clubb_standalone.py.
+Description:
+  This module contains tunable model parameters.  The purpose of the module is to make it
+  easier for the clubb_tuner code to use the clubb_params vector without "knowing" any
+  information about the individual parameters contained in the vector itself.
+  It makes it easier to add
+  new parameters to be tuned for, but does not make the CLUBB_core code itself any simpler.
+  The parameters within the vector do not need to be the same variables used in the rest of
+  CLUBB_core (see for e.g. nu1_vert_res_dep or lmin_coef).
+  The parameters in the clubb_params vector only need to be those parameters for which we're not
+  sure the correct value and we'd like to tune for.
+
+References:
+  None
+
+Porting deviations:
+The JAX driver needs ``get_param_names``, ``init_clubb_params``,
+``calc_derrived_params``, and ``check_parameters``.  The Fortran tuner-only
+``read_param_minmax`` and ``read_param_constraints`` routines are omitted.
+Fortran ``pack_parameters`` and ``unpack_parameters`` are represented by
+``PARAM_NAMES``/``PNAME_IDX`` plus a Python dictionary of defaults.  Fortran
+mutates derived-type allocations in place; Python returns a ``NuVertResDep``
+named tuple with NumPy arrays.
 """
 from __future__ import annotations
 
 import math
 import sys
-from typing import NamedTuple
 
 import numpy as np
 
 from clubb_jax.src.Input_fields.namelist import read_namelist
-
-# ---------------------------------------------------------------------------
-# NuVertResDep: mirrors clubb_python.derived_types.nu_vert_res_dep.NuVertResDep
-# ---------------------------------------------------------------------------
-
-class NuVertResDep(NamedTuple):
-    """Vertical-resolution-dependent nu coefficient arrays (one value per column)."""
-    nzm: int          # stored as ngrdcol to match the Fortran Python-API convention
-    nu1:   np.ndarray  # shape (ngrdcol,) — background eddy diff for wp2    [m²/s]
-    nu2:   np.ndarray  # shape (ngrdcol,) — background eddy diff for xp2    [m²/s]
-    nu6:   np.ndarray  # shape (ngrdcol,) — background eddy diff for wpxp   [m²/s]
-    nu8:   np.ndarray  # shape (ngrdcol,) — background eddy diff for wp3    [m²/s]
-    nu9:   np.ndarray  # shape (ngrdcol,) — background eddy diff for up2/vp2 [m²/s]
-    nu10:  np.ndarray  # shape (ngrdcol,) — background eddy diff for edsclrm [m²/s]
-    nu_hm: np.ndarray  # shape (ngrdcol,) — background eddy diff for hmm    [m²/s]
+from clubb_jax.src.CLUBB_core.nu_vert_res_dep import NuVertResDep
 
 
 # ---------------------------------------------------------------------------
-# Canonical 102-element parameter name list (matches Fortran params_list order)
+# These are referenced together often enough that it made sense to
+# make a list of them.  Note that lmin_coef is the input parameter,
+# while the actual lmin model constant is computed from this.
+#***************************************************************
+#                    ***** IMPORTANT *****
+# If you change the order of the parameters in the parameter_indices,
+# you will need to change the order of this list as well or the
+# tuner will break!
+#                    ***** IMPORTANT *****
+#***************************************************************
 # ---------------------------------------------------------------------------
 
 PARAM_NAMES: list[str] = [
@@ -151,32 +165,46 @@ def get_param_names() -> list[str]:
 
 
 def init_clubb_params(ngrdcol: int, filename: str) -> np.ndarray:
-    """Read tunable_parameters.in and return clubb_params array.
+    """Read a namelist containing the model parameters.
 
-    Parameters
-    ----------
-    ngrdcol:  number of grid columns
-    filename: path to tunable_parameters.in (Fortran namelist, group clubb_params_nl)
+    Description:
+    Read a namelist containing the model parameters
 
-    Returns
-    -------
-    clubb_params: ndarray of shape (ngrdcol, 102), dtype float64
+    References:
+    None
     """
     nparams = 102
 
-    # Start with defaults (broadcast to all columns)
-    values = np.array([_DEFAULTS[n] for n in PARAM_NAMES], dtype=np.float64)
+    # Set the default tunable parameter values
+    values = np.tile(
+        np.array([_DEFAULTS[n] for n in PARAM_NAMES], dtype=np.float64),
+        (ngrdcol, 1),
+    )
 
-    # Read and apply namelist overrides
+    # If the filename is empty, assume we're using a `working' set of
+    # parameters that are set statically here (handy for host models).
+    # Read the namelist
     nml = read_namelist(filename)
     for raw_name, val in nml.items():
         key = raw_name.lower().strip()
         if key in _NAME_TO_IDX:
-            values[_NAME_TO_IDX[key]] = float(val)
+            idx = _NAME_TO_IDX[key]
+            arr = np.asarray(val, dtype=np.float64)
+            if arr.ndim == 0:
+                values[:, idx] = float(arr)
+            else:
+                arr = arr.ravel()
+                if arr.size == 1:
+                    values[:, idx] = float(arr[0])
+                elif arr.size == ngrdcol:
+                    values[:, idx] = arr
+                else:
+                    raise ValueError(
+                        f"{raw_name} must be scalar or have ngrdcol={ngrdcol} values; "
+                        f"got {arr.size}."
+                    )
 
-    # Broadcast to (ngrdcol, nparams) — all columns get the same values
-    clubb_params = np.tile(values, (ngrdcol, 1))
-    return clubb_params
+    return values
 
 
 def calc_derrived_params(
@@ -187,62 +215,80 @@ def calc_derrived_params(
     clubb_params: np.ndarray,
     l_prescribed_avg_deltaz: bool,
 ) -> tuple[NuVertResDep, float, float]:
-    """Port of parameters_tunable.F90 calc_Derrived_Params_api.
+    """Calculate parameters that should be derrived from other quantities.
 
-    Computes lmin, mixt_frac_max_mag, and nu_vert_res_dep from clubb_params
-    and the vertical grid.
+    Description:
+      Calculates clubb parameters that should be derrived from other quantities.
 
-    Parameters
-    ----------
-    gr:       grid object with attributes zt (ngrdcol, nzt), zm (ngrdcol, nzm),
-              nzt, nzm, k_ub_zt, k_lb_zt, k_ub_zm, k_lb_zm
-    ngrdcol:  number of grid columns
-    grid_type: 1=evenly-spaced, 2=stretched zt-input, 3=stretched zm-input
-    deltaz:   shape (ngrdcol,) — evenly-spaced grid spacing or prescribed avg deltaz
-    clubb_params: shape (ngrdcol, 102)
-    l_prescribed_avg_deltaz: if True, avg_deltaz = deltaz directly
-
-    Returns
-    -------
-    nu_vert_res_dep, lmin, mixt_frac_max_mag
+      Adjusts the values of background eddy diffusivity based on
+      vertical grid spacing.
+      This code was made into a public subroutine so that it may be
+      called multiple times per model run in scenarios where grid
+      altitudes, and hence average grid spacing, change through space
+      and/or time.  This occurs, for example, when CLUBB is
+      implemented in WRF.  --ldgrant Jul 2010
     """
-    # ── 1. lmin (fixed formula, not grid-dependent) ────────────────────────
-    # Fortran: lmin = clubb_params(ngrdcol, ilmin_coef) * lmin_deltaz
-    # Python 0-based: clubb_params[ngrdcol-1, ilmin_coef-1]
-    # ilmin_coef = 62 → index 61
+    #------------------------------ Constant Parameters ------------------------------
+    # Fixed value for minimum value for the length scale.
     lmin_deltaz = 40.0
+
+    # It was decided after some experimentation, that the best
+    # way to produce grid independent results is to set lmin to be
+    # some fixed value. -dschanen 21 May 2007
+    # TODO: using "clubb_params(ngrdcol,ilmin_coef)", but lmin should really be
+    # changed to dimension(ngrdcol) to avoid this
     lmin = float(clubb_params[ngrdcol - 1, 61]) * lmin_deltaz
 
-    # ── 2. mixt_frac_max_mag ──────────────────────────────────────────────
-    # Fortran: 1 - 0.5*(1 - Skw_max/sqrt(4*(1-0.4)^3 + Skw_max^2))
-    # iSkw_max_mag = 79 → index 78
+    # Using ngrdcol here as well for temporary backward compatibility, same as above
     Skw_max = float(clubb_params[ngrdcol - 1, 78])
     inner = 4.0 * (1.0 - 0.4) ** 3 + Skw_max ** 2
     mixt_frac_max_mag = 1.0 - 0.5 * (1.0 - Skw_max / math.sqrt(inner))
+    # Known magic number
 
-    # ── 3. avg_deltaz per column ───────────────────────────────────────────
+    #------------------------------ Local Variables ------------------------------
+    # Average grid box height   [m]
     deltaz = np.asarray(deltaz, dtype=np.float64).ravel()
     avg_deltaz = np.empty(ngrdcol, dtype=np.float64)
 
     if l_prescribed_avg_deltaz or grid_type == 1:
         avg_deltaz[:] = deltaz
     elif grid_type == 2:
-        # Stretched grid on zt levels: average over interior zt levels
-        # Fortran: (zt(k_ub_zt) - zt(k_lb_zt)) / (nzt - 1)
+        # Stretched (unevenly-spaced) grid:  stretched thermodynamic level
+        # input.
+        # Find the average deltaz over the stretched grid based on
+        # thermodynamic level inputs.
         zt = np.asarray(gr.zt)  # (ngrdcol, nzt)
         for i in range(ngrdcol):
             avg_deltaz[i] = (zt[i, -1] - zt[i, 0]) / max(1, zt.shape[1] - 1)
     elif grid_type == 3:
-        # Stretched grid on zm levels
+        # CLUBB is implemented in a host model, or is using grid_type = 3
+        # Find the average deltaz over the grid based on momentum level
+        # inputs.
         zm = np.asarray(gr.zm)  # (ngrdcol, nzm)
         for i in range(ngrdcol):
             avg_deltaz[i] = (zm[i, -1] - zm[i, 0]) / max(1, zm.shape[1] - 1)
     else:
         avg_deltaz[:] = deltaz
 
-    # ── 4. mult_factor (l_adj_low_res_nu = True always) ───────────────────
+    # Flag for adjusting the values of the constant background eddy diffusivity
+    # coefficients based on the average vertical grid spacing.  If this flag is
+    # turned off, the values of the various nu coefficients will remain as they
+    # are declared in the tunable_parameters.in file.
+
+    # The size of the average vertical grid spacing that serves as a threshold
+    # for when to increase the size of the background eddy diffusivity
+    # coefficients (nus) by a certain factor above what the background
+    # coefficients are specified to be in tunable_parameters.in.  At any average
+    # grid spacing at or below this value, the values of the background
+    # diffusivities remain the same.  However, at any average vertical grid
+    # spacing above this value, the values of the background eddy diffusivities
+    # are increased.  Traditionally, the threshold grid spacing has been set to
+    # 40.0 meters.  This is only relevant if l_adj_low_res_nu is turned on.
     grid_spacing_thresh = 40.0
-    # imult_coef = 67 → index 66
+
+    # The factor by which to multiply the coefficients of background eddy
+    # diffusivity if the grid spacing threshold is exceeded and l_adj_low_res_nu
+    # is turned on.
     mult_factor = np.ones(ngrdcol, dtype=np.float64)
     for i in range(ngrdcol):
         if avg_deltaz[i] > grid_spacing_thresh:
@@ -250,9 +296,10 @@ def calc_derrived_params(
                 avg_deltaz[i] / grid_spacing_thresh
             )
 
-    # ── 5. nu_vert_res_dep (scaled nu coefficients) ───────────────────────
-    # Index mapping (0-based): inu1=39→38, inu2=41→40, inu6=43→42,
-    #   inu8=45→44, inu9=47→46, inu10=48→47, inu_hm=52→51
+    # The nu's are chosen for deltaz <= 40 m. Looks like they must
+    # be adjusted for larger grid spacings (Vince Larson)
+
+    # Use a constant mult_factor so nu does not depend on grid spacing
     nu1   = clubb_params[:, 38] * mult_factor
     nu2   = clubb_params[:, 40] * mult_factor
     nu6   = clubb_params[:, 42] * mult_factor
@@ -262,7 +309,7 @@ def calc_derrived_params(
     nu_hm = clubb_params[:, 51] * mult_factor   # zt-level
 
     nu_vert_res_dep = NuVertResDep(
-        nzm=ngrdcol,
+        nzm=int(gr.nzm),
         nu1=nu1.copy(),
         nu2=nu2.copy(),
         nu6=nu6.copy(),
@@ -289,10 +336,13 @@ def check_parameters(
     lmin: float,
     err_info,
 ):
-    """Port of parameters_tunable.F90:check_parameters_api.
+    """Validate tunable parameter constraints.
 
-    Validates that tunable parameter values satisfy required constraints.
-    Returns updated err_info.
+    Description:
+    Subroutine to setup model parameters
+
+    References:
+    None
     """
     err_code = np.zeros(ngrdcol, dtype=np.int32)
 
@@ -300,7 +350,9 @@ def check_parameters(
         print(msg, file=sys.stderr)
         err_code[col] = CLUBB_FATAL_ERROR
 
-    # ── lmin must be >= 1.0 ──────────────────────────────────────────────────
+    #-------------------- Begin code --------------------
+
+    # This should have ngrdcol dimensions, but doesn't yet
     if lmin < 1.0:
         print(f"lmin = {lmin}", file=sys.stderr)
         print("lmin is < 1.0", file=sys.stderr)
@@ -310,7 +362,7 @@ def check_parameters(
     for i in range(ngrdcol):
         p = clubb_params[i, :]
 
-        # All params >= 0 (except zeta_vrnce_rat which requires >= -1)
+        # Ensure all variables are greater than 0, and zeta_vrnce_rat is greater than -1
         for k in range(len(p)):
             if k != izeta and p[k] < 0.0:
                 pname = _idx_to_name(k)
@@ -343,22 +395,31 @@ def check_parameters(
         beta                        = p[PNAME_IDX["beta"]]
 
         if beta < 0.0 or beta > 3.0:
+            # Constraints on beta
             _err(f"beta = {beta}  (beta cannot be < 0 or > 3)", i)
         if slope_coef_spread_DG_means_w <= 0.0:
+            # Constraint on slope_coef_spread_DG_means_w
             _err(f"slope_coef_spread_DG_means_w = {slope_coef_spread_DG_means_w} (must be > 0)", i)
         if pdf_component_stdev_factor_w <= 0.0:
+            # Constraint on pdf_component_stdev_factor_w
             _err(f"pdf_component_stdev_factor_w = {pdf_component_stdev_factor_w} (must be > 0)", i)
         if coef_spread_DG_means_rt < 0.0 or coef_spread_DG_means_rt >= 1.0:
+            # Constraint on coef_spread_DG_means_rt
             _err(f"coef_spread_DG_means_rt = {coef_spread_DG_means_rt} (must be 0 <= x < 1)", i)
         if coef_spread_DG_means_thl < 0.0 or coef_spread_DG_means_thl >= 1.0:
+            # Constraint on coef_spread_DG_means_thl
             _err(f"coef_spread_DG_means_thl = {coef_spread_DG_means_thl} (must be 0 <= x < 1)", i)
         if omicron <= 0.0 or omicron > 1.0:
+            # Constraints on omicron
             _err(f"omicron = {omicron}  (omicron cannot be <= 0 or > 1)", i)
         if zeta_vrnce_rat <= -1.0:
+            # Constraints on zeta_vrnce_rat
             _err(f"zeta_vrnce_rat = {zeta_vrnce_rat}  (cannot be <= -1)", i)
         if upsilon_precip_frac_rat < 0.0 or upsilon_precip_frac_rat > 1.0:
+            # Constraints on upsilon_precip_frac_rat
             _err(f"upsilon_precip_frac_rat = {upsilon_precip_frac_rat} (must be 0 <= x <= 1)", i)
         if mu < 0.0:
+            # Constraints on entrainment rate, mu.
             _err(f"mu = {mu}  (mu cannot be < 0)", i)
 
         def _check_equal(a, b, aname, bname):
@@ -370,6 +431,9 @@ def check_parameters(
         _check_equal(C6rtb, C6thlb, "C6rtb", "C6thlb")
         _check_equal(C6rtc, C6thlc, "C6rtc", "C6thlc")
         _check_equal(C6rt_Lscale0, C6thl_Lscale0, "C6rt_Lscale0", "C6thl_Lscale0")
+
+        # The C6rt parameters must be set equal to the C6thl parameters.
+        # Otherwise, the wpthlp pr1 term will be calculated inconsistently.
 
         if C1 < 0.0:
             _err(f"C1 = {C1}  (C1 must satisfy 0.0 <= C1)", i)

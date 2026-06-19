@@ -21,7 +21,7 @@ from clubb_jax.src.Benchmark_cases.mpace_b import (
     mpace_b_tndcy, _D, _P_SFC, _PINV, _SEC_PER_DAY, _G_PER_KG)
 from clubb_jax.src.Benchmark_cases.lba import lba_tndcy
 from clubb_jax.src.CLUBB_core.constants_clubb import Rd, Cp, grav
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 
@@ -32,7 +32,7 @@ def _grid(nzt=40, dz=100.0):
 def _ref(p, thvm, gr):
     omega = np.minimum(_D * (_P_SFC - p), _D * (_P_SFC - _PINV))
     wm_zt = -omega * Rd * thvm / p / grav
-    wm_zm = np.array(zt2zm_jax(jnp.asarray(wm_zt), gr))   # writable copy
+    wm_zm = np.array(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(wm_zt)))   # writable copy
     wm_zm[:, 0] = 0.0; wm_zm[:, -1] = 0.0
     tt = np.minimum(-4.0, -15.0 * (1.0 - (_P_SFC - p) / 21818.0))
     thlm_f = (tt * (_P_SFC / p) ** (Rd / Cp)) / _SEC_PER_DAY

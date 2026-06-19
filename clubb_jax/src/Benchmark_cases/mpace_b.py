@@ -8,7 +8,7 @@ tested port of the oracle.
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.constants_clubb import Rd, Cp, grav, Lv
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 
 _D = 5.8e-6        # large-scale divergence [1/s]
 _P_SFC = 101000.0  # reference surface pressure [Pa]
@@ -32,7 +32,7 @@ def mpace_b_tndcy(p_in_Pa, thvm, gr):
     # Subsidence: omega = min(D(p_sfc-p), D(p_sfc-pinv)) (capped above the inversion); wm = -omega Rd thvm /(p g).
     velocity_omega = jnp.minimum(_D * (_P_SFC - p), _D * (_P_SFC - _PINV))
     wm_zt = -velocity_omega * Rd * thvm / p / grav
-    wm_zm = zt2zm_jax(wm_zt, gr)
+    wm_zm = zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, wm_zt)
     wm_zm = wm_zm.at[:, 0].set(0.0).at[:, -1].set(0.0)   # surface + top BCs
 
     # Radiative cooling thlm tendency [K/s]: min(-4, -15(1-(p_sfc-p)/21818)) K/day × exner factor.

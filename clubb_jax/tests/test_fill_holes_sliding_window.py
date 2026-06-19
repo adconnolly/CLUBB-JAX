@@ -41,7 +41,9 @@ def test_conservation_and_no_holes():
     field, rho_dz = _setup(rng)
     thr = 0.1
     lo, hi = 1, 10           # window k sweeps 3..8, fallback over [1,10]
-    out = np.asarray(fill_holes_sliding_window(jnp.asarray(field), jnp.asarray(rho_dz), thr, lo, hi))
+    nz = field.shape[1]; ngrdcol = field.shape[0]
+    rho_dz_j = jnp.asarray(rho_dz)
+    out = np.asarray(fill_holes_sliding_window(nz, ngrdcol, thr, lo, hi, rho_dz_j, jnp.ones_like(rho_dz_j), jnp.asarray(field)))
     m_in = np.sum(field[0, lo:hi + 1] * rho_dz[0, lo:hi + 1])
     m_out = np.sum(out[0, lo:hi + 1] * rho_dz[0, lo:hi + 1])
     assert abs(m_in - m_out) / (abs(m_in) + 1e-300) < 1e-12, f"mass not conserved: {m_in} vs {m_out}"
@@ -55,7 +57,9 @@ def test_no_holes_is_noop():
     rng = np.random.default_rng(3)
     rho_dz = rng.uniform(0.5, 2.0, (1, _NZ))
     field = rng.uniform(0.5, 3.0, (1, _NZ))   # all > thr=0.1
-    out = np.asarray(fill_holes_sliding_window(jnp.asarray(field), jnp.asarray(rho_dz), 0.1, 1, 10))
+    nz = field.shape[1]; ngrdcol = field.shape[0]
+    rho_dz_j = jnp.asarray(rho_dz)
+    out = np.asarray(fill_holes_sliding_window(nz, ngrdcol, 0.1, 1, 10, rho_dz_j, jnp.ones_like(rho_dz_j), jnp.asarray(field)))
     assert np.max(np.abs(out - field)) < 1e-13, "no-hole field should be unchanged"
     print("  no-hole field: unchanged (noop)  PASS")
 
@@ -63,9 +67,17 @@ def test_no_holes_is_noop():
 def test_grad_finite():
     rng = np.random.default_rng(9)
     field, rho_dz = _setup(rng)
-    g = jax.grad(lambda f: jnp.sum(fill_holes_sliding_window(f, jnp.asarray(rho_dz), 0.1, 1, 10) ** 2))(jnp.asarray(field))
-    assert np.all(np.isfinite(np.asarray(g))), "non-finite grad"
-    print("  jax.grad through fill_holes_sliding_window finite  PASS")
+    nz = field.shape[1]; ngrdcol = field.shape[0]
+    rho_dz_j = jnp.asarray(rho_dz)
+    # fill_holes_sliding_window sweeps a serial lax.fori_loop whose start/stop
+    # (lower_hf_level/upper_hf_level) are traced (not static) in the live
+    # fill_holes_vertical dispatcher.  JAX does not support REVERSE-mode AD
+    # through a fori_loop with dynamic bounds, so we check differentiability via
+    # FORWARD-mode (jax.jacfwd), which is supported and is what the global-fill
+    # path used in the whole-driver compare_grad gate exercises.
+    jac = jax.jacfwd(lambda f: fill_holes_sliding_window(nz, ngrdcol, 0.1, 1, 10, rho_dz_j, jnp.ones_like(rho_dz_j), f))(jnp.asarray(field))
+    assert np.all(np.isfinite(np.asarray(jac))), "non-finite jacobian"
+    print("  jax.jacfwd through fill_holes_sliding_window finite  PASS")
 
 
 def main():

@@ -1,6 +1,6 @@
 """Unit tests for JAX tridiagonal LU solver.
 
-Tests tridiag_lu_solve_jax against:
+Tests call_tridiag_lu_solve against:
   1. Shape check
   2. Identity-diagonal system (diagonal matrix)
   3. Known 3x3 hand-computed case
@@ -31,7 +31,11 @@ try:
 except ImportError:
     HAS_JAX = False
 
-from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve_jax
+from clubb_jax.src.CLUBB_core.tridiag_lu_solver import tridiag_lu_solve
+
+
+def call_tridiag_lu_solve(lhs, rhs):
+    return tridiag_lu_solve(rhs.shape[-1], lhs, rhs)
 
 
 def _make_lhs_from_bands(sup_np, mid_np, sub_np):
@@ -64,7 +68,7 @@ def test_solver_shape():
     sub = jnp.zeros((ngrdcol, ndim))
     lhs = jnp.stack([sup, mid, sub], axis=0)
     rhs = jnp.ones((ngrdcol, ndim))
-    soln = tridiag_lu_solve_jax(lhs, rhs)
+    soln = call_tridiag_lu_solve(lhs, rhs)
     assert soln.shape == (ngrdcol, ndim), f"Wrong shape: {soln.shape}"
     print(f"  shape = {soln.shape}  PASS")
 
@@ -81,7 +85,7 @@ def test_solver_diagonal():
     sub_np = np.zeros(ndim)
     lhs = _make_lhs_from_bands(sup_np, mid_np, sub_np)
     rhs = jnp.array(rhs_np[None, :], dtype=jnp.float64)   # (1, ndim)
-    soln = np.asarray(tridiag_lu_solve_jax(lhs, rhs))[0]   # (ndim,)
+    soln = np.asarray(call_tridiag_lu_solve(lhs, rhs))[0]   # (ndim,)
     expected = rhs_np / mid_np
     err = np.max(np.abs(soln - expected))
     print(f"  diagonal max_err = {err:.3e}  PASS" if err < 1e-14 else f"  FAIL err={err}")
@@ -105,7 +109,7 @@ def test_solver_known_3x3():
     rhs_np = np.array([1.0, 0.0, 1.0])
     lhs = _make_lhs_from_bands(sup_np, mid_np, sub_np)
     rhs = jnp.array(rhs_np[None, :], dtype=jnp.float64)
-    soln = np.asarray(tridiag_lu_solve_jax(lhs, rhs))[0]
+    soln = np.asarray(call_tridiag_lu_solve(lhs, rhs))[0]
     expected = np.array([1.0, 1.0, 1.0])
     err = np.max(np.abs(soln - expected))
     print(f"  3x3 soln={soln}  max_err = {err:.3e}",
@@ -132,7 +136,7 @@ def test_solver_vs_numpy_single_col():
 
     lhs = _make_lhs_from_bands(sup_np, mid_np, sub_np)
     rhs = jnp.array(rhs_np[None, :], dtype=jnp.float64)
-    soln = np.asarray(tridiag_lu_solve_jax(lhs, rhs))[0]
+    soln = np.asarray(call_tridiag_lu_solve(lhs, rhs))[0]
 
     err = np.max(np.abs(soln - expected))
     print(f"  single-col vs numpy max_err = {err:.3e}",
@@ -165,7 +169,7 @@ def test_solver_vs_numpy_multi_col():
         jnp.array(sub_np, dtype=jnp.float64),
     ], axis=0)   # (3, ngrdcol, ndim)
     rhs = jnp.array(rhs_np, dtype=jnp.float64)
-    soln = np.asarray(tridiag_lu_solve_jax(lhs, rhs))
+    soln = np.asarray(call_tridiag_lu_solve(lhs, rhs))
 
     err = np.max(np.abs(soln - expected))
     print(f"  multi-col vs numpy max_err = {err:.3e}",
@@ -192,7 +196,7 @@ def test_solver_residual():
         jnp.array(sub_np, dtype=jnp.float64),
     ], axis=0)
     rhs = jnp.array(rhs_np, dtype=jnp.float64)
-    soln_np = np.asarray(tridiag_lu_solve_jax(lhs, rhs))
+    soln_np = np.asarray(call_tridiag_lu_solve(lhs, rhs))
 
     # Compute residual: A*soln - rhs for each column
     max_res = 0.0
@@ -207,7 +211,7 @@ def test_solver_residual():
 
 
 def test_solver_f2py_oracle():
-    """f2py bit-shadow vs the Fortran oracle. tridiag_lu_solve_jax is a faithful port of
+    """f2py bit-shadow vs the Fortran oracle. call_tridiag_lu_solve is a faithful port of
     `tridiag_lu_solve_single_rhs_multiple_lhs` (tridiag_lu_solver.F90) — this is THE workhorse solver every
     prognostic advance routes through, so bit-matching the SPECIFIC Fortran LU (not merely numpy.linalg.solve,
     which only confirms the system is solved) is what underpins the whole bit-faithful case suite. SKIPs if
@@ -228,7 +232,7 @@ def test_solver_f2py_oracle():
         lhs[1] = rng.uniform(2.0, 4.0, (ng, nd))    # main (diagonally dominant → stable LU)
         lhs[2] = rng.uniform(-0.3, 0.3, (ng, nd))   # subdiagonal
         rhs = rng.uniform(-1.0, 1.0, (ng, nd))
-        j = np.asarray(tridiag_lu_solve_jax(jnp.asarray(lhs), jnp.asarray(rhs)))
+        j = np.asarray(call_tridiag_lu_solve(jnp.asarray(lhs), jnp.asarray(rhs)))
         f = np.asarray(clubb_f2py.f2py_tridiag_lu_solve_single_rhs_multiple_lhs(lhs, rhs))
         worst = max(worst, float(np.max(np.abs(j - f) / np.maximum(np.abs(f), 1e-30))))
     assert worst < 1e-12, f"tridiag_lu_solve f2py mismatch {worst:.2e}"

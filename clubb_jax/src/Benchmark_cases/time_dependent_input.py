@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
 import os
 from pathlib import Path
 
@@ -106,8 +106,9 @@ def apply_time_dependent_forcings(state: dict, time_current: float) -> None:
         rho = np.asarray(state['rho'], dtype=np.float64)
         w_zt = -(omega[np.newaxis, :] * fac) / (grav * rho)
         state['wm_zt'][:, :] = w_zt
+        gr = state['gr']
         state['wm_zm'][:, :] = np.asarray(
-            zt2zm_jax(jnp.asarray(state['wm_zt']), state['gr']), dtype=np.float64)
+            zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(state['wm_zt'])), dtype=np.float64)
     elif w_zt is not None:
         state['wm_zt'][:, :] = w_zt[np.newaxis, :]
         # Recompute wm_zm = zt2zm(wm_zt) each step the subsidence forcing updates wm_zt
@@ -116,8 +117,9 @@ def apply_time_dependent_forcings(state: dict, time_current: float) -> None:
         # by subsidence (thlp2_ma etc.) was missing, seeding a cold-cloud divergence. Raw zt2zm is
         # the faithful form (top→0, bottom→interpolated; verified vs the Fortran wm_zm to 4e-10) —
         # do NOT zero the bottom. No-op for cases whose subsidence is set at init (no w forcing column).
+        gr = state['gr']
         state['wm_zm'][:, :] = np.asarray(
-            zt2zm_jax(jnp.asarray(state['wm_zt']), state['gr']), dtype=np.float64)
+            zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(state['wm_zt'])), dtype=np.float64)
     # u/v momentum forcing and time/height-dependent geostrophic wind
     # (apply_time_dependent_forcings in time_dependent_input.F90). Missing these
     # broke gabls3_night (um_f / ug vary with height & time).

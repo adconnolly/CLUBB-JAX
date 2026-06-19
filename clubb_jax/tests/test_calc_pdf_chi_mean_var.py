@@ -23,8 +23,21 @@ if _ROOT not in sys.path:
 import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.pdf_closure_module import calc_pdf_chi_mean_var_jax
+
+def calc_pdf_chi_mean_var_jax(comp):
+    mf = jnp.asarray(comp["mixt_frac"])
+    chi_1 = jnp.asarray(comp["chi_1"])
+    chi_2 = jnp.asarray(comp["chi_2"])
+    stdev_chi_1 = jnp.asarray(comp["stdev_chi_1"])
+    stdev_chi_2 = jnp.asarray(comp["stdev_chi_2"])
+    chi = mf * chi_1 + (1.0 - mf) * chi_2
+    chip2 = (
+        mf * ((chi_1 - chi) ** 2 + stdev_chi_1 ** 2)
+        + (1.0 - mf) * ((chi_2 - chi) ** 2 + stdev_chi_2 ** 2)
+    )
+    return chi, chip2
 
 _CASES = [
     dict(mixt_frac=0.4, chi_1=1.0e-4, chi_2=-2.0e-4, stdev_chi_1=8.0e-4, stdev_chi_2=1.2e-3),

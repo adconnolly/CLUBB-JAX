@@ -46,6 +46,8 @@ from clubb_jax.src.Microphys.KK_microphys_module import kk_evap_coef, kk_auto_co
 from clubb_jax.src.CLUBB_core.pdf_utilities import (
     mean_L2N, stdev_L2N, corr_NL2NN, corr_LL2NN,
 )
+from clubb_jax.src.CLUBB_core.grid_class import ddzt, zt2zm
+from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _RICO_STATS = os.path.join(os.path.dirname(__file__),
                            "../../clubb_release/output/rico_fort/rico_stats.nc")
@@ -63,6 +65,26 @@ def _logm(mu, sig):
 
 def _rel(out, ref, mask):
     return np.abs(out[mask] - ref[mask]) / np.abs(ref[mask])
+
+
+def _grid_from_momentum_heights(zm, ngrdcol):
+    zm = np.asarray(zm, dtype=np.float64)
+    return setup_grid(
+        ngrdcol=ngrdcol,
+        deltaz=1.0,
+        zm_init=float(zm[0]),
+        zm_top=float(zm[-1]),
+        grid_type=3,
+        momentum_heights=np.tile(zm, (ngrdcol, 1)),
+    )
+
+
+def _zt2zm(value, gr):
+    return zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, value)
+
+
+def _ddzt(value, gr):
+    return ddzt(gr.nzm, gr.nzt, gr.ngrdcol, gr, value)
 
 
 def test_kk_rates_vs_rico_oracle():
@@ -401,17 +423,15 @@ def test_kk_sedimentation_vs_rico():
         print("  netCDF4 not available — SKIP"); return
     if not os.path.exists(_RICO_LONG_STATS):
         print("  rico_long_fort stats absent — SKIP"); return
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.KK_microphys_module import KK_sedimentation
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     ds = nc.Dataset(_RICO_LONG_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0])     # (time, nz)
     mvr, Vrr_f, VNr_f = g("mvrr"), g("Vrr"), g("VNr")
     zt, zm = np.asarray(ds["zt"][:]), np.asarray(ds["zm"][:]); ds.close()
     nt = mvr.shape[0]
-    gr = SimpleNamespace(zt=jnp.asarray(np.tile(zt, (nt, 1))), zm=jnp.asarray(np.tile(zm, (nt, 1))))
+    gr = _grid_from_momentum_heights(zm, nt)
     Vzt, Nzt = KK_sedimentation(jnp.asarray(mvr))          # zt-level velocities (KK00 Eq.37 + clip)
-    Vrr_j, VNr_j = np.asarray(zt2zm_jax(Vzt, gr)), np.asarray(zt2zm_jax(Nzt, gr))  # -> momentum levels
+    Vrr_j, VNr_j = np.asarray(_zt2zm(Vzt, gr)), np.asarray(_zt2zm(Nzt, gr))  # -> momentum levels
     mV, mN = Vrr_f < 0, VNr_f < 0                          # non-clipped rain points
     assert mV.sum() > 0, "no rain points to validate sedimentation"
     eV = np.abs(Vrr_j - Vrr_f).max()
@@ -536,11 +556,9 @@ def test_term_turb_sed_lhs_vs_rico():
         print("  netCDF4 not available — SKIP"); return
     if not os.path.exists(_RICO_LONG_STATS):
         print("  rico_long_fort stats absent — SKIP"); return
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import (
         sed_centered_diff_lhs, term_turb_sed_lhs, lhs_budget_term)
     from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import KK_sed_vel_covars
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N, corr_LL2NN
     ds = nc.Dataset(_RICO_LONG_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0])
@@ -560,8 +578,8 @@ def test_term_turb_sed_lhs_vs_rico():
     out = KK_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr, mrr1, mrr2, mNr1, mNr2,
                             L(mrr1, rs1), L(mrr2, rs2), L(mNr1, Ns1), L(mNr2, Ns2), srr1, srr2, sNr1, sNr2,
                             S(rs1), S(rs2), S(Ns1), S(Ns2), cc1, cc2, mf)
-    gr = SimpleNamespace(zt=jnp.asarray(np.tile(zt, (nt, 1))), zm=jnp.asarray(np.tile(zm, (nt, 1))))
-    Vimpc = np.asarray(zt2zm_jax(jnp.asarray(out["Vrrprrp_impc"]), gr))     # -> momentum
+    gr = _grid_from_momentum_heights(zm, nt)
+    Vimpc = np.asarray(_zt2zm(jnp.asarray(out["Vrrprrp_impc"]), gr))     # -> momentum
     wa = np.zeros(nzm); wa[1:nzt] = (zm[1:nzt] - zt[:nzt - 1]) / (zt[1:nzt] - zt[:nzt - 1])
     dzt = zm[1:nzm] - zm[:nzm - 1]
     idzt = np.tile(1.0 / dzt, (nt, 1)); irzt = 1.0 / rho_ds_zt; waT = np.tile(wa, (nt, 1))
@@ -582,10 +600,10 @@ def test_term_turb_sed_lhs_vs_rico():
 
 
 def test_microphys_mean_adv_vs_rico():
-    """The hydrometeor MEAN-ADVECTION budget (`term_ma_zt_lhs_jax` + `lhs_budget_term`) vs rico `rrm_ma`/
+    """The hydrometeor MEAN-ADVECTION budget (`term_ma_zt_lhs` + `lhs_budget_term`) vs rico `rrm_ma`/
     `Nrm_ma`. Unlike `rrm_ts`/`rrm_ta`, the mean-advection budget is a plain `stats_update(-lhs_ma·hmm)`
     (no explicit+implicit split), so at robust-rrm points (within-step ≈ end-of-step) it matches the
-    stored stat to machine precision — confirming the upwind `term_ma_zt_lhs_jax` (l_upwind_xm_ma=.true.
+    stored stat to machine precision — confirming the upwind `term_ma_zt_lhs` (l_upwind_xm_ma=.true.
     for rico) works for the hydrometeor transport and the grid (invrs_dzm) reconstruction is correct."""
     try:
         import netCDF4 as nc
@@ -593,18 +611,18 @@ def test_microphys_mean_adv_vs_rico():
         print("  netCDF4 not available — SKIP"); return
     if not os.path.exists(_RICO_LONG_STATS):
         print("  rico_long_fort stats absent — SKIP"); return
-    from types import SimpleNamespace
-    from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax
+    from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs
     from clubb_jax.src.Microphys.advance_microphys_module import lhs_budget_term
     ds = nc.Dataset(_RICO_LONG_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0])
-    zt = np.asarray(ds["zt"][:]); wm_zt = g("wm_zt")
+    zt = np.asarray(ds["zt"][:]); zm = np.asarray(ds["zm"][:]); wm_zt = g("wm_zt")
     rrm, rrm_ma_f, Nrm, Nrm_ma_f = g("rrm"), g("rrm_ma"), g("Nrm"), g("Nrm_ma"); ds.close()
     nzt, nt = zt.shape[0], rrm.shape[0]; nzm = nzt + 1
-    idzm = np.zeros(nzm); idzm[1:nzt] = 1.0 / (zt[1:nzt] - zt[:nzt - 1])
-    idzm[0] = idzm[1]; idzm[nzt] = idzm[nzt - 1]
-    gr = SimpleNamespace(invrs_dzm=jnp.asarray(np.tile(idzm, (nt, 1))))
-    ma = term_ma_zt_lhs_jax(jnp.asarray(wm_zt), gr)
+    gr = _grid_from_momentum_heights(zm, nt)
+    ma = term_ma_zt_lhs(
+        nzm, nzt, nt, jnp.asarray(wm_zt),
+        gr.weights_zt2zm, gr.invrs_dzt, gr.invrs_dzm, True, gr.grid_dir,
+    )
     worst = 0.0
     for nm, rr, ref, tol in [("rrm_ma", rrm, rrm_ma_f, 1e-7), ("Nrm_ma", Nrm, Nrm_ma_f, 1e2)]:
         out = np.asarray(lhs_budget_term(ma[0], ma[1], ma[2], jnp.asarray(rr)))
@@ -613,7 +631,7 @@ def test_microphys_mean_adv_vs_rico():
         rel = np.abs((out - ref)[sig] / ref[sig]).max()
         assert rel < 1e-10, f"{nm} mismatch: {rel:.2e}"
         worst = max(worst, rel)
-    print(f"  mean-adv budget (term_ma_zt_lhs_jax) vs rico rrm_ma/Nrm_ma: robust-pt rel max {worst:.1e}  PASS")
+    print(f"  mean-adv budget (term_ma_zt_lhs) vs rico rrm_ma/Nrm_ma: robust-pt rel max {worst:.1e}  PASS")
 
 
 def test_microphys_lhs_assembly():
@@ -621,17 +639,16 @@ def test_microphys_lhs_assembly():
     (i) it equals the sum of the independently-computed verified sub-operators (band alignment, signs,
     1/dt placement); (ii) the turbulent-advection (eddy-diffusion) part conserves mass exactly (zero
     column-mass-weighted sum, the zero-flux property)."""
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import (
         microphys_lhs, sed_centered_diff_lhs, term_turb_sed_lhs, lhs_budget_term)
-    from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs_jax
-    from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs_jax
+    from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs
+    from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs
     nzt = 30; nzm = nzt + 1; dt = 300.0; nu = 1.5
     zm = np.linspace(0.0, 4000.0, nzm); zt = 0.5 * (zm[1:] + zm[:-1])
     idzt = 1.0 / (zm[1:nzm] - zm[:nzm - 1])
     idzm = np.zeros(nzm); idzm[1:nzt] = 1.0 / (zt[1:nzt] - zt[:nzt - 1])
     idzm[0] = idzm[1]; idzm[nzt] = idzm[nzt - 1]
-    gr = SimpleNamespace(invrs_dzt=jnp.asarray(idzt[None]), invrs_dzm=jnp.asarray(idzm[None]))
+    gr = _grid_from_momentum_heights(zm, 1)
     rho_zt = (1.2 * np.exp(-zt / 8000.0))[None]; rho_zm = (1.2 * np.exp(-zm / 8000.0))[None]
     irzt = 1.0 / rho_zt
     wa = np.zeros((1, nzm)); wa[0, 1:nzt] = (zm[1:nzt] - zt[:nzt - 1]) / (zt[1:nzt] - zt[:nzt - 1])
@@ -640,10 +657,15 @@ def test_microphys_lhs_assembly():
     J = jnp.asarray
     s, m, sub = microphys_lhs(dt, J(K_hm), nu, J(wm), J(V), J(Vi), J(rho_zm), J(irzt), gr, J(wa))
     # Manual component sum
-    lta = 0.5 * np.asarray(diffusion_zt_lhs_jax(J(K_hm), jnp.array([nu]), J(irzt), J(rho_zm), gr))
+    lta = 0.5 * np.asarray(diffusion_zt_lhs(
+        nzm, nzt, 1, gr, J(K_hm), jnp.zeros((1, nzt), dtype=jnp.float64),
+        jnp.array([nu]), J(irzt), J(rho_zm),
+    ))
     bc = 0.5 * irzt[0, 0] * (idzt[0] * (K_hm[0, 1] + nu) * rho_zm[0, 1] * idzm[1])
     lta[0, 0, 0] = -bc; lta[1, 0, 0] = bc; lta[2, 0, 0] = 0.0
-    lma = np.asarray(term_ma_zt_lhs_jax(J(wm), gr))
+    lma = np.asarray(term_ma_zt_lhs(
+        nzm, nzt, 1, J(wm), gr.weights_zt2zm, gr.invrs_dzt, gr.invrs_dzm, True, gr.grid_dir,
+    ))
     ss = [np.asarray(x) for x in sed_centered_diff_lhs(J(V), J(rho_zm), J(irzt), J(idzt[None]), J(wa))]
     st = [np.asarray(x) for x in term_turb_sed_lhs(J(Vi), J(rho_zm), J(irzt), J(idzt[None]), J(wa))]
     exp_super = lta[0, 0] + lma[0, 0] + ss[0][0] + st[0][0]
@@ -674,11 +696,9 @@ def test_microphys_rhs_turb_sed_vs_rico():
         print("  netCDF4 not available — SKIP"); return
     if not os.path.exists(_RICO_LONG_STATS):
         print("  rico_long_fort stats absent — SKIP"); return
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import (
         term_turb_sed_lhs, term_turb_sed_rhs, lhs_budget_term)
     from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import KK_sed_vel_covars
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     from clubb_jax.src.CLUBB_core.pdf_utilities import mean_L2N, stdev_L2N, corr_LL2NN
     ds = nc.Dataset(_RICO_LONG_STATS)
     g = lambda n: np.asarray(ds[n][:, :, 0]); zt = np.asarray(ds["zt"][:]); zm = np.asarray(ds["zm"][:])
@@ -696,9 +716,9 @@ def test_microphys_rhs_turb_sed_vs_rico():
     out = KK_sed_vel_covars(pf1 * mrr1, pf2 * mrr2, pf1 * mNr1, pf2 * mNr2, mvr, mrr1, mrr2, mNr1, mNr2,
                             L(mrr1, rs1), L(mrr2, rs2), L(mNr1, Ns1), L(mNr2, Ns2), srr1, srr2, sNr1, sNr2,
                             S(rs1), S(rs2), S(Ns1), S(Ns2), cc1, cc2, mf)
-    gr = SimpleNamespace(zt=jnp.asarray(np.tile(zt, (nt, 1))), zm=jnp.asarray(np.tile(zm, (nt, 1))))
-    Vimpc = np.asarray(zt2zm_jax(jnp.asarray(out["Vrrprrp_impc"]), gr))
-    Vexpc = np.asarray(zt2zm_jax(jnp.asarray(out["Vrrprrp_expc"]), gr))
+    gr = _grid_from_momentum_heights(zm, nt)
+    Vimpc = np.asarray(_zt2zm(jnp.asarray(out["Vrrprrp_impc"]), gr))
+    Vexpc = np.asarray(_zt2zm(jnp.asarray(out["Vrrprrp_expc"]), gr))
     wa = np.zeros(nzm); wa[1:nzt] = (zm[1:nzt] - zt[:nzt - 1]) / (zt[1:nzt] - zt[:nzt - 1])
     idzt = np.tile(1.0 / (zm[1:nzm] - zm[:nzm - 1]), (nt, 1)); irzt = 1.0 / rho_ds_zt
     waT = np.tile(wa, (nt, 1)); J = jnp.asarray
@@ -718,14 +738,12 @@ def test_microphys_rhs_assembly():
     """`microphys_rhs` == hmm/dt + microphysics source + (-lhs_ta·hmm explicit ½-diffusion) +
     term_turb_sed_rhs (component bookkeeping); and `term_turb_sed_rhs` satisfies the conservation
     contract (column-mass Σ = surface flux rho_ds_zm[0]·Vexpc[0])."""
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import (
         microphys_rhs, term_turb_sed_rhs, _turb_adv_lhs, lhs_budget_term)
     nzt = 30; nzm = nzt + 1; dt = 300.0; nu = 1.5
     zm = np.linspace(0.0, 4000.0, nzm); zt = 0.5 * (zm[1:] + zm[:-1])
     idzt = 1.0 / (zm[1:nzm] - zm[:nzm - 1])
-    idzm = np.zeros(nzm); idzm[1:nzt] = 1.0 / (zt[1:nzt] - zt[:nzt - 1]); idzm[0] = idzm[1]; idzm[nzt] = idzm[nzt - 1]
-    gr = SimpleNamespace(invrs_dzt=jnp.asarray(idzt[None]), invrs_dzm=jnp.asarray(idzm[None]))
+    gr = _grid_from_momentum_heights(zm, 1)
     rho_zt = (1.2 * np.exp(-zt / 8000.0))[None]; rho_zm = (1.2 * np.exp(-zm / 8000.0))[None]; irzt = 1.0 / rho_zt
     K_hm = (5.0 * np.exp(-zm / 2000.0))[None]; hm = (1e-6 * np.exp(-((np.arange(nzt) - 12) / 6.0) ** 2))[None]
     src = (1e-9 * np.ones(nzt))[None]; Vexpc = (-1e-4 * np.exp(-zm / 2000.0))[None]; J = jnp.asarray
@@ -749,13 +767,11 @@ def test_calculate_K_hm():
     end-of-step; matches only to ~2%). Verified instead by the exact formula transcription against a
     hand-computed reference (reusing the bit-faithful zt2zm/ddzt), incl. the correlation cap and the
     K=0 boundaries; plus differentiability."""
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import calculate_K_hm, _C_K_HM, _EPS
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax, ddzt_jax
     nzt = 20; nzm = nzt + 1
     zm = np.linspace(0.0, 3000.0, nzm); zt = 0.5 * (zm[1:] + zm[:-1])
     idzm = np.zeros(nzm); idzm[1:nzt] = 1.0 / (zt[1:nzt] - zt[:nzt - 1]); idzm[0] = idzm[1]; idzm[nzt] = idzm[nzt - 1]
-    gr = SimpleNamespace(zt=jnp.asarray(zt[None]), zm=jnp.asarray(zm[None]), invrs_dzm=jnp.asarray(idzm[None]))
+    gr = _grid_from_momentum_heights(zm, 1)
     rng = np.arange(nzt)
     hm = (1e-5 * np.exp(-((rng - 8) / 4.0) ** 2) + 1e-9)[None]        # rain layer
     hmp2 = (3e-10 * np.exp(-((rng - 8) / 5.0) ** 2))[None]            # variance (zm-sized below)
@@ -764,7 +780,7 @@ def test_calculate_K_hm():
     Skw = (0.3 * np.sin(zm / 500.0))[None]; tol = 1e-10; J = jnp.asarray
     K = np.asarray(calculate_K_hm(J(wp2), J(Kh_zm), J(Skw), J(hm), J(hmp2), tol, gr))
     # Hand reference using the same verified zt2zm/ddzt.
-    hm_zm = np.asarray(zt2zm_jax(J(hm), gr)); dhm = np.asarray(ddzt_jax(J(hm), gr))
+    hm_zm = np.asarray(_zt2zm(J(hm), gr)); dhm = np.asarray(_ddzt(J(hm), gr))
     shmp2 = np.sqrt(np.maximum(hmp2, 0.0))
     ref = _C_K_HM * Kh_zm * (shmp2 / np.maximum(hm_zm, tol)) * (1.0 + np.abs(Skw))
     cap = np.sqrt(np.maximum(wp2, 0.0)) * shmp2 / np.where(np.abs(dhm) > _EPS, np.abs(dhm), 1.0)
@@ -783,14 +799,12 @@ def test_advance_one_hydrometeor():
     """`advance_one_hydrometeor` (assemble LHS+RHS, tridiag solve). Verify (i) the solve is consistent
     with the assembled system: lhs·soln == rhs to machine precision; (ii) physical sanity — with no
     microphysics source and downward sedimentation, a rain layer loses mass (column total decreases)."""
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.advance_microphys_module import (
         advance_one_hydrometeor, microphys_lhs, microphys_rhs)
     nzt = 30; nzm = nzt + 1; dt = 60.0; nu = 1.5
     zm = np.linspace(0.0, 4000.0, nzm); zt = 0.5 * (zm[1:] + zm[:-1])
     idzt = 1.0 / (zm[1:nzm] - zm[:nzm - 1])
-    idzm = np.zeros(nzm); idzm[1:nzt] = 1.0 / (zt[1:nzt] - zt[:nzt - 1]); idzm[0] = idzm[1]; idzm[nzt] = idzm[nzt - 1]
-    gr = SimpleNamespace(invrs_dzt=jnp.asarray(idzt[None]), invrs_dzm=jnp.asarray(idzm[None]))
+    gr = _grid_from_momentum_heights(zm, 1)
     rho_zt = (1.2 * np.exp(-zt / 8000.0))[None]; rho_zm = (1.2 * np.exp(-zm / 8000.0))[None]; irzt = 1.0 / rho_zt
     wa = np.zeros((1, nzm)); wa[0, 1:nzt] = (zm[1:nzt] - zt[:nzt - 1]) / (zt[1:nzt] - zt[:nzt - 1])
     K_hm = (5.0 * np.exp(-zm / 2000.0))[None]; wm = (-0.01 * np.ones(nzt))[None]
@@ -830,10 +844,8 @@ def test_kk_covar_driver_vs_rico():
         print("  netCDF4 not available — SKIP"); return
     if not os.path.exists(_RICO_STATS):
         print("  rico_fort stats absent — SKIP"); return
-    from types import SimpleNamespace
     from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_covariances import KK_upscaled_covar_driver
     from clubb_jax.src.Microphys.KK_microphys_module import kk_auto_coef
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     ds = nc.Dataset(_RICO_STATS)
     gz = lambda n: np.asarray(ds[n][:, :, 0])              # (time, zt) — zt-level stats
     gm = lambda n: np.asarray(ds[n][:, :, 0])              # (time, zm) — zm-level stats (_mc)
@@ -888,8 +900,7 @@ def test_kk_covar_driver_vs_rico():
         J(gz("crt_1")), J(gz("crt_2")), J(gz("cthl_1")), J(gz("cthl_2")))
     # zt -> zm + zero the boundary momentum levels (KK_microphys_module.F90:901-916)
     nt = chi1.shape[0]
-    gr = SimpleNamespace(zt=jnp.asarray(np.tile(np.asarray(ds["zt"][:]), (nt, 1))),
-                         zm=jnp.asarray(np.tile(np.asarray(ds["zm"][:]), (nt, 1))))
+    gr = _grid_from_momentum_heights(np.asarray(ds["zm"][:]), nt)
     names = ("wprtp_mc", "wpthlp_mc", "rtp2_mc", "thlp2_mc", "rtpthlp_mc")
     refs = {n: gm(n) for n in names}
     ds.close()
@@ -900,7 +911,7 @@ def test_kk_covar_driver_vs_rico():
     # max floor that tolerates the few evap-timing points (~2e-4).
     ok = True
     for nm, o_zt in zip(names, out):
-        o = np.array(zt2zm_jax(jnp.asarray(o_zt), gr))
+        o = np.array(_zt2zm(jnp.asarray(o_zt), gr))
         o[:, 0] = 0.0; o[:, -1] = 0.0
         ref = refs[nm]
         nz = np.abs(ref) > np.nanmax(np.abs(ref)) / 1e3      # significant points (within 3 orders of peak)

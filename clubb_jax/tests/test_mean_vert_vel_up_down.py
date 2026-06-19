@@ -27,19 +27,25 @@ import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.mono_flux_limiter import (
     calc_mean_w_up_down_component, mean_vert_vel_up_down)
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 
 _NZM = 6   # interior levels 1..4 (0 and 5 are zeroed boundaries)
+_NG = 1
 
 
 def _col(val):
-    a = np.full((1, _NZM), val)
+    a = np.full((_NG, _NZM), val)
     return a
+
+
+def _empty_stats():
+    return JaxStats.empty(l_sample=False, names=(), ncol=_NG, max_nlev=_NZM)
 
 
 def test_interior_truncated_means_vs_mc():
     wi, sig = 0.2, 0.5            # |wi| < 3σ (else branch), wm=0 so not too_weak
     var = sig ** 2
-    mwd, mwu = calc_mean_w_up_down_component(_col(wi), _col(var), _col(0.0))
+    mwd, mwu = calc_mean_w_up_down_component(_NZM, _NG, _col(wi), _col(var), 0.0, _col(0.0))
     mwd, mwu = float(mwd[0, 2]), float(mwu[0, 2])    # an interior level
     # closed form
     Phi = 0.5 * (1 + math.erf(wi / (sig * math.sqrt(2))))
@@ -58,17 +64,17 @@ def test_interior_truncated_means_vs_mc():
 
 def test_branches_and_boundary():
     sig = 0.3; var = sig ** 2
-    # too_weak: |wi|+3σ <= wm -> (0,0)
-    mwd, mwu = calc_mean_w_up_down_component(_col(0.1), _col(var), _col(5.0))
+    # too_weak: |wi|+3σ <= wm -> (0,0)  (w_ref=0.0, w_min=5.0)
+    mwd, mwu = calc_mean_w_up_down_component(_NZM, _NG, _col(0.1), _col(var), 0.0, _col(5.0))
     assert mwd[0, 2] == 0.0 and mwu[0, 2] == 0.0, "too_weak -> (0,0)"
-    # all_dn: wi+3σ <= 0 -> (wi, 0)
-    mwd, mwu = calc_mean_w_up_down_component(_col(-2.0), _col(var), _col(0.0))
+    # all_dn: wi+3σ <= w_ref=0 -> (wi, 0)
+    mwd, mwu = calc_mean_w_up_down_component(_NZM, _NG, _col(-2.0), _col(var), 0.0, _col(0.0))
     assert mwd[0, 2] == -2.0 and mwu[0, 2] == 0.0, "all_dn -> (wi, 0)"
-    # all_up: wi-3σ >= 0 -> (0, wi)
-    mwd, mwu = calc_mean_w_up_down_component(_col(2.0), _col(var), _col(0.0))
+    # all_up: wi-3σ >= w_ref=0 -> (0, wi)
+    mwd, mwu = calc_mean_w_up_down_component(_NZM, _NG, _col(2.0), _col(var), 0.0, _col(0.0))
     assert mwd[0, 2] == 0.0 and mwu[0, 2] == 2.0, "all_up -> (0, wi)"
     # boundaries zeroed
-    mwd, mwu = calc_mean_w_up_down_component(_col(0.2), _col(var), _col(0.0))
+    mwd, mwu = calc_mean_w_up_down_component(_NZM, _NG, _col(0.2), _col(var), 0.0, _col(0.0))
     assert mwd[0, 0] == 0.0 and mwu[0, 0] == 0.0 and mwd[0, -1] == 0.0 and mwu[0, -1] == 0.0, "boundary zero"
     print("  branches (too_weak/all_dn/all_up) + boundary (k=0,−1) zeroing  PASS")
 
@@ -76,10 +82,14 @@ def test_branches_and_boundary():
 def test_combine():
     # NB calc_mean_w_up_down_component returns numpy (a flux-limiter RANGE diagnostic, off the grad path) — no grad test.
     var1, var2 = 0.25, 0.16
-    mwd1, mwu1 = calc_mean_w_up_down_component(_col(0.2), _col(var1), _col(0.0))
-    mwd2, mwu2 = calc_mean_w_up_down_component(_col(-0.3), _col(var2), _col(0.0))
+    mwd1, mwu1 = calc_mean_w_up_down_component(_NZM, _NG, _col(0.2), _col(var1), 0.0, _col(0.0))
+    mwd2, mwu2 = calc_mean_w_up_down_component(_NZM, _NG, _col(-0.3), _col(var2), 0.0, _col(0.0))
     mf = 0.4
-    cwd, cwu = mean_vert_vel_up_down(_col(0.2), _col(-0.3), _col(var1), _col(var2), _col(mf), _col(0.0))
+    cwd, cwu, _stats = mean_vert_vel_up_down(
+        _NZM, _NG,
+        _col(0.2), _col(-0.3), _col(var1), _col(var2), _col(mf),
+        0.0, _col(0.0), _empty_stats(),
+    )
     assert np.allclose(np.asarray(cwd), mf * mwd1 + (1 - mf) * mwd2) and \
            np.allclose(np.asarray(cwu), mf * mwu1 + (1 - mf) * mwu2), "mixt_frac combine"
     print("  mean_vert_vel_up_down = mixt_frac-weighted combine of the two components  PASS")

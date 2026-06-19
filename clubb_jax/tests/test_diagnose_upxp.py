@@ -66,8 +66,8 @@ def test_f2py_oracle():
         tau  = rng.uniform(100.0, 900.0, (ng, nzm))
         C7   = rng.uniform(0.3, 0.8, (ng, nzm))
 
-        j = np.asarray(diagnose_upxp(jnp.asarray(ypwp), jnp.asarray(xm), jnp.asarray(wpxp),
-                                     jnp.asarray(ym), jnp.asarray(C6x), jnp.asarray(tau), jnp.asarray(C7), jgr))
+        j = np.asarray(diagnose_upxp(nzm, nzt, ng, jgr, jnp.asarray(ypwp), jnp.asarray(xm), jnp.asarray(wpxp),
+                                     jnp.asarray(ym), jnp.asarray(C6x), jnp.asarray(tau), jnp.asarray(C7)))
         ddzt_xm = ddzt(xm); ddzt_ym = ddzt(ym)
         ref = np.zeros((ng, nzm))
         for k in range(1, nzm - 1):

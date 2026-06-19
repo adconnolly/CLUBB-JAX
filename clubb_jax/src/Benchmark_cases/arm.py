@@ -5,7 +5,6 @@ Constants from constants_clubb.F90 (standalone block):
   Cp = 1004.67 J/(kg K), Lv = 2.5e6 J/kg, grav = 9.81 m/s^2, vonk = 0.4
 """
 
-import math
 import numpy as np
 import jax.numpy as jnp
 # Tracer-transparency (REFACTOR B5): only used to detect a jax.grad trace and route the surface-flux
@@ -17,7 +16,9 @@ from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg
 # other case surface schemes that import them from arm).
 from clubb_jax.src.Benchmark_cases.diag_ustar_module import _diag_ustar, diag_ustar
 from clubb_jax.src.Benchmark_cases.sfc_flux import (
-    compute_ht_mostr_flux, convert_sens_ht_to_km_s, convert_latent_ht_to_m_s)
+    compute_ht_mostr_flux, convert_sens_ht_to_km_s, convert_latent_ht_to_m_s,
+    compute_ubar, compute_momentum_flux,
+)
 
 # Physical constants — mirror the Fortran arm.F90 `use constants_clubb, only: grav` (Cp/Lv via sfc_flux.convert_*_ht)
 from clubb_jax.src.CLUBB_core.constants_clubb import grav as _grav
@@ -149,7 +150,7 @@ def load_arm_forcings_data(arm_forcings_file: str,
     }
 
 
-def arm_sfclyr(state: dict, time_current: float, ngrdcol: int, fd: dict, z_bot: float) -> None:
+def arm_sfclyr(state: dict, time_current: float, ngrdcol: int, fd: dict, z_bot) -> None:
     """arm.F90:arm_sfclyr — GCSS-ARM surface fluxes of heat/moisture/momentum + friction velocity.
     Time-interpolates the prescribed sensible/latent heat to wpthlp_sfc/wprtp_sfc, derives ustar via
     diag_ustar, and the momentum fluxes upwp_sfc/vpwp_sfc, writing them into `state`. (Extracted
@@ -163,28 +164,36 @@ def arm_sfclyr(state: dict, time_current: float, ngrdcol: int, fd: dict, z_bot: 
     wprtp_val  = convert_latent_ht_to_m_s(moisture_flx, _rho_sfc)  # m/s
 
     # The surface-layer scalars depend on um/vm/thlm at the bottom level, so under a jax.grad trace
-    # (REFACTOR B5) they are tracers. Dispatch on that: concrete runs keep the EXACT original Python
-    # float path (bit-identical); the trace takes the differentiable jnp mirror (diag_ustar).
-    _um0, _vm0, _thlm0 = state['um'][0, 0], state['vm'][0, 0], state['thlm'][0, 0]
-    if not _is_tracer_arg([_um0, _vm0, _thlm0]):
-        um_bot   = float(_um0)
-        vm_bot   = float(_vm0)
-        thlm_bot = float(_thlm0)
-        ubar  = max(0.25, math.sqrt(um_bot ** 2 + vm_bot ** 2))    # compute_ubar
-        bflx  = (_grav / thlm_bot) * wpthlp_val                    # buoyancy flux (m^2/s^3)
-        ustar = _diag_ustar(z_bot, bflx, ubar, _z0)                # scalar, ngrdcol=1 for SCM
+    # (REFACTOR B5) they are tracers. Dispatch on that: concrete runs keep the exact scalar
+    # `_diag_ustar` path column-by-column; the trace takes the differentiable jnp mirror.
+    um_bot = state['um'][:, 0]
+    vm_bot = state['vm'][:, 0]
+    thlm_bot = state['thlm'][:, 0]
+    ubar = compute_ubar(um_bot, vm_bot)
+    bflx = (_grav / thlm_bot) * wpthlp_val
+
+    if not _is_tracer_arg([um_bot, vm_bot, thlm_bot]):
+        z_arr = np.asarray(z_bot, dtype=np.float64)
+        ubar_arr = np.asarray(ubar, dtype=np.float64)
+        bflx_arr = np.asarray(bflx, dtype=np.float64)
+        ustar = np.array(
+            [
+                _diag_ustar(float(z_arr[i]), float(bflx_arr[i]), float(ubar_arr[i]), _z0)
+                for i in range(ngrdcol)
+            ],
+            dtype=np.float64,
+        )
         state['wpthlp_sfc'][:] = wpthlp_val
-        state['wprtp_sfc'][:]  = wprtp_val
-        state['upwp_sfc'][:] = -um_bot * ustar ** 2 / ubar         # compute_momentum_flux
-        state['vpwp_sfc'][:] = -vm_bot * ustar ** 2 / ubar
-        state['ustar'] = np.full(ngrdcol, ustar)
+        state['wprtp_sfc'][:] = wprtp_val
+        state['upwp_sfc'][:], state['vpwp_sfc'][:] = compute_momentum_flux(
+            np.asarray(um_bot), np.asarray(vm_bot), ubar_arr, ustar,
+        )
+        state['ustar'] = ustar
     else:
-        um_bot, vm_bot, thlm_bot = _um0, _vm0, _thlm0
-        ubar  = jnp.maximum(0.25, jnp.sqrt(um_bot ** 2 + vm_bot ** 2))
-        bflx  = (_grav / thlm_bot) * wpthlp_val
         ustar = diag_ustar(z_bot, bflx, ubar, _z0)
         state['wpthlp_sfc'] = jnp.full(ngrdcol, wpthlp_val)
         state['wprtp_sfc']  = jnp.full(ngrdcol, wprtp_val)
-        state['upwp_sfc'] = jnp.full(ngrdcol, -um_bot * ustar ** 2 / ubar)
-        state['vpwp_sfc'] = jnp.full(ngrdcol, -vm_bot * ustar ** 2 / ubar)
-        state['ustar'] = jnp.full(ngrdcol, ustar)
+        state['upwp_sfc'], state['vpwp_sfc'] = compute_momentum_flux(
+            um_bot, vm_bot, ubar, ustar,
+        )
+        state['ustar'] = ustar

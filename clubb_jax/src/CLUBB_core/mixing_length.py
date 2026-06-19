@@ -1,226 +1,1629 @@
-"""JAX implementations of mixing_length.F90.
+"""JAX port of ``src/CLUBB_core/mixing_length.F90``.
 
-diagnose_Lscale_from_tau:
-  ARM flags: l_e3sm_config=False, l_smooth_Heaviside_tau_wpxp=True,
-             l_smooth_min_max=False (local Fortran constant)
+Description:
+  Compute CLUBB's mixing length and dissipation time scales, including
+  Richardson-number-dependent damping terms and Lscale-related stats.
 
-compute_mixing_length:
-  Golaz et al. (2002) nonlocal parcel length scale.
-  Faithful port of compute_mixing_length (ascending grid only).
-
-calc_Lscale_directly:
-  Wrapper calling compute_mixing_length once (l_avg_Lscale=False).
+Porting deviations:
+- Stats are threaded explicitly with JaxStats because the Fortran routine uses
+  global stats side effects that are not JAX-compatible state.
+- ``compute_mixing_length`` uses small scan helpers to express the Fortran
+  parcel while-loops in JAX. Those helpers are local language adapters for the
+  dynamic loop structure, not physics abstractions.
+- The direct parcel-length branch currently mirrors the ascending-grid path
+  used by the SCM cases. The diagnosed-Lscale branch is fully vectorized.
+- ``calc_Lscale_directly`` keeps the Fortran ``l_avg_Lscale = .false.`` path.
+  The dormant perturbation/plume-centered branches are not expanded because the
+  Fortran parameter disables them in production.
 """
 
-import jax
-import jax.numpy as jnp
-import numpy as np
+from __future__ import annotations
 
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow, _safe_sqrt, _asarray, _xp  # REFACTOR B5: finite grad for max(x,0)**p / sqrt
-from clubb_jax.src.CLUBB_core.constants_clubb import Cp, em_min, ep, ep1, ep2, eps, grav, Lv, Rd, min_max_smth_mag, vonk, zero_threshold, itaumax, iC_invrs_tau_bkgnd, iC_invrs_tau_sfc, iC_invrs_tau_shear, iC_invrs_tau_N2, iC_invrs_tau_N2_wp2, iC_invrs_tau_N2_xp2, iC_invrs_tau_N2_wpxp, iC_invrs_tau_N2_clear_wp3, iC_invrs_tau_wpxp_Ri, iC_invrs_tau_wpxp_N2_thresh, ialtitude_threshold, iwpxp_Ri_exp, iz_displace, imu
-from clubb_jax.src.CLUBB_core.grid_class import (
-    zt2zm_jax,
-    zm2zt_jax,
-    zm2zt2zm_jax,
-    zt2zm,
+import jax
+
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from clubb_jax.src.CLUBB_core.advance_helper_module import (
+    calc_Ri_zm,
+    smooth_heaviside_peskin,
+    smooth_max,
 )
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    Cp,
+    Lv,
+    Rd,
+    em_min,
+    ep,
+    ep1,
+    ep2,
+    eps,
+    grav,
+    iC_invrs_tau_N2,
+    iC_invrs_tau_N2_clear_wp3,
+    iC_invrs_tau_N2_wp2,
+    iC_invrs_tau_N2_wpxp,
+    iC_invrs_tau_N2_xp2,
+    iC_invrs_tau_bkgnd,
+    iC_invrs_tau_sfc,
+    iC_invrs_tau_shear,
+    iC_invrs_tau_wpxp_N2_thresh,
+    iC_invrs_tau_wpxp_Ri,
+    ialtitude_threshold,
+    imu,
+    itaumax,
+    iwpxp_Ri_exp,
+    iz_displace,
+    min_max_smth_mag,
+    one,
+    one_fourth,
+    one_half,
+    rt_tol,
+    thl_tol,
+    two,
+    unused_var,
+    vonk,
+    zero,
+    zero_threshold,
+)
+from clubb_jax.src.CLUBB_core.error_code import clubb_at_least_debug_level
+from clubb_jax.src.CLUBB_core.grid_class import zm2zt, zm2zt2zm, zt2zm
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
 
-# Local Fortran constant: smoothing range for Peskin Heaviside
-_HEAVISIDE_SMTH_RANGE = 1.0
 
+def calc_Lscale(
+    nzm: int,
+    nzt: int,
+    ngrdcol: int,
+    gr,
+    l_implemented: bool,
+    host_dx,
+    host_dy,
+    p_in_Pa,
+    exner,
+    rtm,
+    thlm,
+    thvm,
+    thlp2,
+    rtp2,
+    rtpthlp,
+    pdf_params,
+    em,
+    thv_ds_zt,
+    lmin,
+    upwp_sfc,
+    vpwp_sfc,
+    ddzt_umvm_sqd,
+    ice_supersat_frac,
+    ufmin,
+    tau_const,
+    sfc_elevation,
+    clubb_params,
+    saturation_formula: int,
+    l_Lscale_plume_centered: bool,
+    l_diag_Lscale_from_tau: bool,
+    l_e3sm_config: bool,
+    l_smooth_Heaviside_tau_wpxp: bool,
+    l_modify_limiters_for_cnvg_test: bool,
+    l_use_invrs_tau_N2_iso: bool,
+    brunt_vaisala_freq_sqd_smth,
+    stats: JaxStats,
+    err_info,
+):
+    """Compute CLUBB's mixing length and dissipation time scales.
 
-# smooth_max lives only in advance_helper_module.F90; mixing_length.F90 `use`s it. Import the one
-# implementation rather than keeping a duplicate (`smooth_max(a, b, smth_coef)` is the same formula).
-from clubb_jax.src.CLUBB_core.advance_helper_module import smooth_max
-from clubb_jax.src.CLUBB_core.advance_helper_module import smooth_heaviside_peskin
-
-
-def _bounded_while(cond_fn, body_fn, init_state, max_iters):
-    """Reverse-mode-differentiable replacement for ``jax.lax.while_loop`` (REFACTOR B3, iter9).
-
-    Runs a FIXED ``max_iters`` ``lax.scan``; each step applies ``body_fn`` only where ``cond_fn`` is
-    still true (pytree select), freezing the state otherwise. For a loop whose body already no-ops once
-    its ``done`` flag is set, this reproduces the ``while_loop``'s final state **bit-exactly** as long as
-    ``max_iters >= the true iteration count`` — the extra steps are frozen no-ops. Unlike
-    ``lax.while_loop`` (dynamic trip count → reverse-mode AD raises), the fixed-length scan supports
-    ``jax.grad``. The body must be nan-free on frozen iterations (true here: the frozen index stays at a
-    valid level and the body has no 0-division), so the discarded computations don't poison the gradient.
+    References:
+      Guo et al. (2021, JAMES) for the diagnosed Lscale-from-tau option.
     """
+    l_smooth_min_max = False
+
+    # Determine the maximum allowable value for Lscale (in meters).
+    Lscale_max = set_Lscale_max(ngrdcol, l_implemented, host_dx, host_dy)
+
+    # Interpolate rtpthlp here so the diagnostic stats value is generated at
+    # the same point as the Lscale calculation that consumes it.
+    rtpthlp_zt = zm2zt(nzm, nzt, ngrdcol, gr, rtpthlp)
+    stats = stats.update("rtpthlp_zt", rtpthlp_zt)
+
+    # Calculate Richardson number Ri_zm.
+    if l_modify_limiters_for_cnvg_test:
+        Ri_zm = calc_Ri_zm(
+            nzm,
+            ngrdcol,
+            brunt_vaisala_freq_sqd_smth,
+            ddzt_umvm_sqd,
+            0.0,
+            1.0e-12,
+        )
+        Ri_zm = zm2zt2zm(nzm, nzt, ngrdcol, gr, Ri_zm)
+    else:
+        if l_smooth_min_max:
+            brunt_vaisala_freq_clipped = smooth_max(
+                nzm,
+                ngrdcol,
+                1.0e-7,
+                brunt_vaisala_freq_sqd_smth,
+                1.0e-4 * min_max_smth_mag,
+            )
+            ddzt_umvm_sqd_clipped = smooth_max(
+                nzm,
+                ngrdcol,
+                ddzt_umvm_sqd,
+                1.0e-7,
+                1.0e-6 * min_max_smth_mag,
+            )
+            Ri_zm = calc_Ri_zm(
+                nzm,
+                ngrdcol,
+                brunt_vaisala_freq_clipped,
+                ddzt_umvm_sqd_clipped,
+                0.0,
+                0.0,
+            )
+        else:
+            Ri_zm = calc_Ri_zm(
+                nzm,
+                ngrdcol,
+                brunt_vaisala_freq_sqd_smth,
+                ddzt_umvm_sqd,
+                1.0e-7,
+                1.0e-7,
+            )
+
+    stats = stats.update("Ri_zm", Ri_zm)
+
+    if not l_diag_Lscale_from_tau:
+        # Compute Lscale first using the buoyant parcel calculation.
+        newmu = clubb_params[:, imu]
+
+        # Interpolate thlp2 and rtp2 to thermodynamic levels.
+        thlp2_zt = zm2zt(nzm, nzt, ngrdcol, gr, thlp2, thl_tol**2)
+        rtp2_zt = zm2zt(nzm, nzt, ngrdcol, gr, rtp2, rt_tol**2)
+
+        err_info, Lscale, Lscale_up, Lscale_down, stats = calc_Lscale_directly(
+            ngrdcol,
+            nzm,
+            nzt,
+            gr,
+            l_implemented,
+            p_in_Pa,
+            exner,
+            rtm,
+            thlm,
+            thvm,
+            newmu,
+            rtp2_zt,
+            thlp2_zt,
+            rtpthlp_zt,
+            pdf_params,
+            em,
+            thv_ds_zt,
+            Lscale_max,
+            lmin,
+            clubb_params,
+            saturation_formula,
+            l_Lscale_plume_centered,
+            stats,
+            err_info,
+        )
+
+        # Calculate CLUBB's turbulent eddy-turnover time scale as CLUBB's
+        # length scale divided by a velocity scale.
+        em_zt = zm2zt(nzm, nzt, ngrdcol, gr, em, em_min)
+        tau_zt = jnp.minimum(
+            Lscale / jnp.sqrt(em_zt),
+            clubb_params[:, itaumax][:, None],
+        )
+
+        Lscale_zm_for_tau = zt2zm(nzm, nzt, ngrdcol, gr, Lscale, zero_threshold)
+        tau_zm = jnp.minimum(
+            Lscale_zm_for_tau / jnp.sqrt(jnp.maximum(em_min, em)),
+            clubb_params[:, itaumax][:, None],
+        )
+
+        invrs_tau_zm = one / tau_zm
+        invrs_tau_wp2_zm = invrs_tau_zm
+        invrs_tau_xp2_zm = invrs_tau_zm
+        invrs_tau_wpxp_zm = invrs_tau_zm
+        invrs_tau_wp3_zm = invrs_tau_zm
+        tau_max_zm = jnp.broadcast_to(clubb_params[:, itaumax][:, None], (ngrdcol, nzm))
+
+        invrs_tau_zt = one / tau_zt
+        invrs_tau_wp3_zt = invrs_tau_zt
+        tau_max_zt = jnp.broadcast_to(clubb_params[:, itaumax][:, None], (ngrdcol, nzt))
+
+        invrs_tau_sfc = jnp.zeros((ngrdcol, nzm))
+        invrs_tau_no_N2_zm = jnp.zeros((ngrdcol, nzm))
+        invrs_tau_bkgnd = jnp.zeros((ngrdcol, nzm))
+        invrs_tau_shear = jnp.zeros((ngrdcol, nzm))
+        invrs_tau_N2_iso = jnp.zeros((ngrdcol, nzm))
+    else:
+        # Diagnose simple tau and Lscale.
+        (
+            err_info,
+            invrs_tau_zt,
+            invrs_tau_zm,
+            invrs_tau_sfc,
+            invrs_tau_no_N2_zm,
+            invrs_tau_bkgnd,
+            invrs_tau_shear,
+            invrs_tau_N2_iso,
+            invrs_tau_wp2_zm,
+            invrs_tau_xp2_zm,
+            invrs_tau_wp3_zm,
+            invrs_tau_wp3_zt,
+            invrs_tau_wpxp_zm,
+            tau_max_zm,
+            tau_max_zt,
+            tau_zm,
+            tau_zt,
+            Lscale,
+            Lscale_up,
+            Lscale_down,
+            stats,
+        ) = diagnose_Lscale_from_tau(
+            nzm,
+            nzt,
+            ngrdcol,
+            gr,
+            upwp_sfc,
+            vpwp_sfc,
+            ddzt_umvm_sqd,
+            ice_supersat_frac,
+            em,
+            ufmin,
+            tau_const,
+            sfc_elevation,
+            Lscale_max,
+            clubb_params,
+            stats,
+            l_e3sm_config,
+            l_smooth_Heaviside_tau_wpxp,
+            brunt_vaisala_freq_sqd_smth,
+            Ri_zm,
+            err_info,
+        )
+
+    Lscale_zm = zt2zm(nzm, nzt, ngrdcol, gr, Lscale)
+
+    invrs_tau_C6_zm = invrs_tau_wpxp_zm
+    invrs_tau_C1_zm = invrs_tau_wp2_zm
+    invrs_tau_C14_zm = invrs_tau_wp2_zm
+
+    if (not l_diag_Lscale_from_tau) and l_use_invrs_tau_N2_iso:
+        err_info = err_info.set_fatal()
+
+    if not l_use_invrs_tau_N2_iso:
+        invrs_tau_C4_zm = invrs_tau_wp2_zm
+    else:
+        invrs_tau_C4_zm = invrs_tau_N2_iso
+
+    stats = stats.update("Lscale", Lscale)
+    stats = stats.update("Lscale_up", Lscale_up)
+    stats = stats.update("Lscale_down", Lscale_down)
+    stats = stats.update("tau_zm", tau_zm)
+    stats = stats.update("invrs_tau_zm", invrs_tau_zm)
+    stats = stats.update("invrs_tau_xp2_zm", invrs_tau_xp2_zm)
+    stats = stats.update("invrs_tau_wp2_zm", invrs_tau_wp2_zm)
+    stats = stats.update("invrs_tau_wpxp_zm", invrs_tau_wpxp_zm)
+    stats = stats.update("invrs_tau_wp3_zm", invrs_tau_wp3_zm)
+    stats = stats.update("tau_zt", tau_zt)
+
+    if l_diag_Lscale_from_tau:
+        stats = stats.update("invrs_tau_no_N2_zm", invrs_tau_no_N2_zm)
+        stats = stats.update("invrs_tau_bkgnd", invrs_tau_bkgnd)
+        stats = stats.update("invrs_tau_sfc", invrs_tau_sfc)
+        stats = stats.update("invrs_tau_shear", invrs_tau_shear)
+
+    return (
+        err_info,
+        invrs_tau_zt,
+        invrs_tau_zm,
+        invrs_tau_xp2_zm,
+        invrs_tau_wp3_zt,
+        invrs_tau_C1_zm,
+        invrs_tau_C4_zm,
+        invrs_tau_C6_zm,
+        invrs_tau_C14_zm,
+        tau_max_zm,
+        tau_max_zt,
+        tau_zm,
+        Lscale,
+        Lscale_zm,
+        Lscale_up,
+        Lscale_down,
+        stats,
+    )
+
+
+def set_Lscale_max(
+    ngrdcol: int,
+    l_implemented: bool,
+    host_dx,
+    host_dy,
+):
+    """Set the maximum allowable value of Lscale.
+
+    Description:
+      This subroutine sets the value of Lscale_max, which is the maximum
+      allowable value of Lscale.  For standard CLUBB, it is set to a very large
+      value so that Lscale will not be limited.  However, when CLUBB is running
+      as part of a host model, the value of Lscale_max is dependent on the size
+      of the host model's horizontal grid spacing.  The smaller the host model's
+      horizontal grid spacing, the smaller the value of Lscale_max.  When Lscale
+      is limited to a small value, the value of time-scale Tau is reduced, which
+      in turn produces greater damping on CLUBB's turbulent parameters.  This
+      is the desired effect on turbulent parameters for a host model with small
+      horizontal grid spacing, for small areas usually contain much less
+      variation in meteorological quantities than large areas.
+
+    References:
+      None
+    """
+    # Determine the maximum allowable value for Lscale (in meters).
+    if l_implemented:
+        return 0.25 * jnp.minimum(host_dx, host_dy)
+    return jnp.full((ngrdcol,), 1.0e5)
+
+
+def _bounded_while(cond_fn, body_fn, init_state, max_iters: int):
+    """Run a fixed scan that freezes state after the Fortran while condition fails."""
+
     def step(state, _):
         run = cond_fn(state)
-        new = body_fn(state)
-        state2 = jax.tree_util.tree_map(lambda o, n: jnp.where(run, n, o), state, new)
-        return state2, None
-    final, _ = jax.lax.scan(step, init_state, None, length=max_iters)
+        new_state = body_fn(state)
+        state = jax.tree_util.tree_map(
+            lambda old, new: jnp.where(run, new, old),
+            state,
+            new_state,
+        )
+        return state, None
+
+    final, _ = jax.lax.scan(step, init_state, None, length=int(max_iters))
     return final
 
 
-def diagnose_Lscale_from_tau(
-    upwp_sfc,                   # (ngrdcol,)
-    vpwp_sfc,                   # (ngrdcol,)
-    ddzt_umvm_sqd,              # (ngrdcol, nzm)
-    ice_supersat_frac,          # (ngrdcol, nzt)
-    em,                         # (ngrdcol, nzm)
-    sqrt_em_zt,                 # (ngrdcol, nzt)
-    ufmin,                      # scalar
-    tau_const,                  # scalar
-    sfc_elevation,              # (ngrdcol,)
-    Lscale_max,                 # (ngrdcol,)
-    clubb_params,               # (ngrdcol, nparams)  1-based indices
-    Ri_zm,                      # (ngrdcol, nzm)
-    brunt_vaisala_freq_sqd_smth, # (ngrdcol, nzm)
-    l_e3sm_config: bool,
-    l_smooth_Heaviside_tau_wpxp: bool,
-    gr,
+def _parcel_thv(thl_par, rt_par, exner_j, p_j, thv_ds_j, Lv_coef_j, saturation_formula):
+    # Include effects of latent heating on Lscale_up 6/12/00
+    # Use thermodynamic formula of Bougeault 1981 JAS Vol. 38, 2416
+    # Probably should use properties of bump 1 in Gaussian, not mean!!!
+    tl_par_j = thl_par * exner_j
+    rsatl_par_j = sat_mixrat_liq(p_j, tl_par_j, saturation_formula)
+    tl_par_j_sqd = tl_par_j**2
+    # s from Lewellen and Yoh 1993 (LY) eqn. 1
+    #                         s = ( rt - rsatl ) / ( 1 + beta * rsatl )
+    # and SD's beta (eqn. 8),
+    #                         beta = ep * ( Lv / ( Rd * tl ) ) * ( Lv / ( cp * tl ) )
+    #
+    # Simplified by multiplying top and bottom by tl^2 to avoid a
+    # divide and precalculating ep * Lv**2 / ( Rd * cp )
+    s_par_j = (
+        (rt_par - rsatl_par_j)
+        * tl_par_j_sqd
+        / (tl_par_j_sqd + ep * Lv**2 / (Rd * Cp) * rsatl_par_j)
+    )
+    rc_par_j = jnp.maximum(s_par_j, zero_threshold)
+    # theta_v of entraining parcel at grid level j
+    return thl_par + ep1 * thv_ds_j * rt_par + Lv_coef_j * rc_par_j
+
+
+def _upward_inner_while(
+    k,
+    tke,
+    thl_par_j,
+    rt_par_j,
+    dCAPE_dz_j_minus_1,
+    thl_par_j_precalc,
+    rt_par_j_precalc,
+    exp_mu_dzm,
+    grav_on_thvm,
+    Lv_coef,
+    thv_ds,
+    exner,
+    p_in_Pa,
+    thvm,
+    dzm,
+    invrs_dzm,
+    zt,
+    k_ub_zt,
+    saturation_formula,
 ):
-    """diagnose_Lscale_from_tau for ARM flags.
-
-    Returns:
-        invrs_tau_zt       (ngrdcol, nzt)
-        invrs_tau_zm       (ngrdcol, nzm)
-        invrs_tau_sfc      (ngrdcol, nzm)
-        invrs_tau_no_N2_zm (ngrdcol, nzm)
-        invrs_tau_bkgnd    (ngrdcol, nzm)
-        invrs_tau_shear    (ngrdcol, nzm)
-        invrs_tau_N2_iso   (ngrdcol, nzm)
-        invrs_tau_wp2_zm   (ngrdcol, nzm)
-        invrs_tau_xp2_zm   (ngrdcol, nzm)
-        invrs_tau_wp3_zm   (ngrdcol, nzm)
-        invrs_tau_wp3_zt   (ngrdcol, nzt)
-        invrs_tau_wpxp_zm  (ngrdcol, nzm)
-        tau_max_zm         (ngrdcol, nzm)
-        tau_max_zt         (ngrdcol, nzt)
-        tau_zm             (ngrdcol, nzm)
-        tau_zt             (ngrdcol, nzt)
-        Lscale             (ngrdcol, nzt)
-        Lscale_up          (ngrdcol, nzt)
-        Lscale_down        (ngrdcol, nzt)
-    """
-    zm = gr.zm   # (ngrdcol, nzm)
-
-    # --- Step 1: ustar (l_smooth_min_max=False → hard max) ---
-    ustar = jnp.maximum((upwp_sfc ** 2 + vpwp_sfc ** 2) ** 0.25, ufmin)  # (ngrdcol,)
-
-    # --- Step 2: invrs_tau_bkgnd ---
-    C_bkgnd = clubb_params[:, iC_invrs_tau_bkgnd - 1]       # (ngrdcol,)
-    invrs_tau_bkgnd = C_bkgnd[:, None] / tau_const           # (ngrdcol, nzm)
-
-    # --- Step 3–5: invrs_tau_shear via smoothed norm of ddzt ---
-    norm_ddzt_umvm = _safe_sqrt(ddzt_umvm_sqd)              # (ngrdcol, nzm) — _safe_sqrt: finite grad at
-    #   zero wind shear (sqrt(0) has inf derivative → nan'd the whole um/vm grad; REFACTOR B4, iter23)
-    smooth_norm = zm2zt2zm_jax(norm_ddzt_umvm, gr, zm_min=zero_threshold)  # (ngrdcol, nzm)
-    C_shear = clubb_params[:, iC_invrs_tau_shear - 1]
-    invrs_tau_shear_smooth = C_shear[:, None] * smooth_norm   # (ngrdcol, nzm)
-    # smooth_max(array, zero_threshold, min_max_smth_mag) ≈ max(array, 0)
-    invrs_tau_shear = smooth_max(invrs_tau_shear_smooth, zero_threshold, min_max_smth_mag)
-
-    # --- Step 6: invrs_tau_sfc ---
-    C_sfc = clubb_params[:, iC_invrs_tau_sfc - 1]            # (ngrdcol,)
-    z_displace = clubb_params[:, iz_displace - 1]             # (ngrdcol,)
-    z_eff = zm - sfc_elevation[:, None] + z_displace[:, None]  # (ngrdcol, nzm)
-    invrs_tau_sfc = C_sfc[:, None] * (ustar[:, None] / vonk) / z_eff  # (ngrdcol, nzm)
-
-    # --- Step 7: invrs_tau_no_N2_zm ---
-    invrs_tau_no_N2_zm = invrs_tau_bkgnd + invrs_tau_sfc + invrs_tau_shear
-
-    # --- Step 8: brunt_freq_pos (l_smooth_min_max=False) ---
-    # _safe_sqrt (REFACTOR B5): zero_threshold == 0.0, so this is the bare sqrt(max(0,·)) whose reverse-mode
-    # gradient is inf at the clip (bv_smth<=0 in convective/surface layers). This was THE binding inf-source
-    # of the bomex thlm whole-driver nan (stop_gradient bisection, iter29). Forward-identical.
-    brunt_freq_pos = _safe_sqrt(brunt_vaisala_freq_sqd_smth)
-
-    # --- Step 9: ice_supersat_frac_zm, brunt_freq_out_cloud ---
-    ice_supersat_frac_zm = zt2zm_jax(ice_supersat_frac, gr, zm_min=zero_threshold)
-    fac = jnp.minimum(1.0, jnp.maximum(zero_threshold, 1.0 - ice_supersat_frac_zm / 0.001))
-    brunt_freq_out_cloud = brunt_freq_pos * fac
-    # zero below altitude_threshold
-    alt_thresh = clubb_params[:, ialtitude_threshold - 1]     # (ngrdcol,)
-    brunt_freq_out_cloud = jnp.where(zm < alt_thresh[:, None], 0.0, brunt_freq_out_cloud)
-
-    # --- Step 10: invrs_tau_N2_iso, invrs_tau_wp2_zm, invrs_tau_zm ---
-    C_N2     = clubb_params[:, iC_invrs_tau_N2 - 1]          # (ngrdcol,)
-    C_N2_wp2 = clubb_params[:, iC_invrs_tau_N2_wp2 - 1]      # (ngrdcol,)
-
-    invrs_tau_N2_iso  = (invrs_tau_bkgnd + invrs_tau_shear
-                         + C_N2_wp2[:, None] * brunt_freq_pos)
-
-    invrs_tau_wp2_zm  = (invrs_tau_no_N2_zm
-                         + C_N2[:, None] * brunt_freq_pos
-                         + C_N2_wp2[:, None] * brunt_freq_out_cloud)
-
-    invrs_tau_zm      = invrs_tau_no_N2_zm + C_N2[:, None] * brunt_freq_pos
-
-    # --- Step 11: xp2 / wpxp (l_e3sm_config=False path) ---
-    if l_e3sm_config:
-        # Not the ARM path; included for completeness
-        invrs_tau_zm      = 0.5 * invrs_tau_zm
-        C_N2_xp2 = clubb_params[:, iC_invrs_tau_N2_xp2 - 1]
-        invrs_tau_xp2_zm  = (invrs_tau_no_N2_zm
-                              + C_N2_xp2[:, None] * brunt_freq_pos
-                              + C_sfc[:, None] * 2.0
-                              * jnp.sqrt(em) / z_eff)
-        bv_safe = jnp.maximum(1.0e-7, brunt_vaisala_freq_sqd_smth)
-        ratio = jnp.clip(_safe_sqrt(ddzt_umvm_sqd / bv_safe), 0.3, 1.0)   # _safe_sqrt: finite grad at zero shear
-        invrs_tau_xp2_zm  = ratio * invrs_tau_xp2_zm
-        C_N2_wpxp = clubb_params[:, iC_invrs_tau_N2_wpxp - 1]
-        invrs_tau_wpxp_zm = (2.0 * invrs_tau_zm
-                              + C_N2_wpxp[:, None] * brunt_freq_out_cloud)
-    else:
-        C_N2_xp2 = clubb_params[:, iC_invrs_tau_N2_xp2 - 1]
-        invrs_tau_xp2_zm  = (invrs_tau_no_N2_zm
-                              + C_N2[:, None] * brunt_freq_pos
-                              + C_N2_xp2[:, None] * brunt_freq_out_cloud)
-        C_N2_wpxp = clubb_params[:, iC_invrs_tau_N2_wpxp - 1]
-        invrs_tau_wpxp_zm = (invrs_tau_no_N2_zm
-                              + C_N2[:, None] * brunt_freq_pos
-                              + C_N2_wpxp[:, None] * brunt_freq_out_cloud)
-
-    # --- Step 12: Heaviside for invrs_tau_wpxp ---
-    C_N2_thresh = clubb_params[:, iC_invrs_tau_wpxp_N2_thresh - 1]  # (ngrdcol,)
-
-    if l_smooth_Heaviside_tau_wpxp:
-        bvf_thresh = brunt_vaisala_freq_sqd_smth / C_N2_thresh[:, None] - 1.0
-        H = smooth_heaviside_peskin(bvf_thresh, _HEAVISIDE_SMTH_RANGE)
-    else:
-        H = jnp.where(brunt_vaisala_freq_sqd_smth > C_N2_thresh[:, None], 1.0, 0.0)
-
-    # --- Step 13: Ri enhancement of invrs_tau_wpxp above altitude_threshold ---
-    C_wpxp_Ri  = clubb_params[:, iC_invrs_tau_wpxp_Ri - 1]   # (ngrdcol,)
-    wpxp_Ri_exp = clubb_params[:, iwpxp_Ri_exp - 1]           # (ngrdcol,)
-    # _safe_pow (REFACTOR B5): wpxp_Ri_exp can be <1, so the bare max(Ri_zm,0)**exp has an inf reverse-mode
-    # gradient at Ri_zm<=0 (unstable layers) — it poisoned the bomex thlm whole-driver grad. Forward-identical.
-    Ri_term = jnp.minimum(C_wpxp_Ri[:, None] * _safe_pow(Ri_zm, wpxp_Ri_exp[:, None]), 12.0)
-    above = zm > alt_thresh[:, None]
-    invrs_tau_wpxp_zm = jnp.where(
-        above,
-        invrs_tau_wpxp_zm * (1.0 + H * Ri_term),
-        invrs_tau_wpxp_zm,
+    init_state = (
+        k + 2,
+        tke,
+        thl_par_j,
+        rt_par_j,
+        dCAPE_dz_j_minus_1,
+        jnp.asarray(False),
+        k + 1,
+        tke,
+        dCAPE_dz_j_minus_1,
+        jnp.asarray(0.0),
     )
 
-    # --- Step 14: invrs_tau_wp3_zm ---
-    C_N2_clear_wp3 = clubb_params[:, iC_invrs_tau_N2_clear_wp3 - 1]
-    invrs_tau_wp3_zm = invrs_tau_wp2_zm + C_N2_clear_wp3[:, None] * brunt_freq_out_cloud
+    def cond_fn(state):
+        j, _tke, _thl, _rt, _dcape_prev, done, *_rest = state
+        return (~done) & (j < k_ub_zt)
 
-    # --- Step 15: tau_max_zm, tau_max_zt (l_smooth_min_max=False) ---
-    tau_max_zt = Lscale_max[:, None] / sqrt_em_zt                           # (ngrdcol, nzt)
-    tau_max_zm = Lscale_max[:, None] / jnp.sqrt(jnp.maximum(em, em_min))   # (ngrdcol, nzm)
+    def body_fn(state):
+        j, tke, thl_par_j, rt_par_j, dCAPE_dz_j_minus_1, done, j_last, tke_exit, dCAPE_exit_prev, dCAPE_exit_j = state
+        # thl, rt of parcel are conserved except for entrainment
+        #
+        # The values of thl_env and rt_env are treated as changing linearly for a parcel
+        # of air ascending from level j-1 to level j
 
-    # --- Step 16: tau_zm, tau_zt ---
-    tau_zm = jnp.minimum(1.0 / invrs_tau_zm, tau_max_zm)
-    tau_zt_raw = zm2zt_jax(tau_zm, gr)
-    tau_zt = jnp.minimum(tau_zt_raw, tau_max_zt)
+        # theta_l of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(thl_par)/dz = - mu * ( thl_par - thl_env )
+        thl_par_j_new = thl_par_j_precalc[j] + thl_par_j * exp_mu_dzm[j]
 
-    # --- Step 17: invrs_tau_zt, invrs_tau_wp3_zt ---
-    invrs_tau_zt    = zm2zt_jax(invrs_tau_zm, gr)
-    invrs_tau_wp3_zt = zm2zt_jax(invrs_tau_wp3_zm, gr)
+        # r_t of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(rt_par)/dz = - mu * ( rt_par - rt_env )
+        rt_par_j_new = rt_par_j_precalc[j] + rt_par_j * exp_mu_dzm[j]
+        thv_par_j = _parcel_thv(
+            thl_par_j_new,
+            rt_par_j_new,
+            exner[j],
+            p_in_Pa[j],
+            thv_ds[j],
+            Lv_coef[j],
+            saturation_formula,
+        )
+        # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
+        dCAPE_dz_j = grav_on_thvm[j] * (thv_par_j - thvm[j])
+        # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+        # Trapezoidal estimate between grid levels j and j-1
+        CAPE_incr = one_half * (dCAPE_dz_j + dCAPE_dz_j_minus_1) * dzm[j]
+        tke_new = tke + CAPE_incr
+        # Exit loop early if tke has been exhaused between level j and j+1
+        exhausted = tke_new <= zero
+        newly_exhausted = exhausted & (~done)
 
-    # --- Step 18: Lscale ---
-    Lscale      = tau_zt * sqrt_em_zt
-    Lscale_up   = jnp.zeros_like(Lscale)
-    Lscale_down = jnp.zeros_like(Lscale)
+        return (
+            jnp.where(exhausted, j, j + 1),
+            jnp.where(exhausted, tke, tke_new),
+            jnp.where(exhausted, thl_par_j, thl_par_j_new),
+            jnp.where(exhausted, rt_par_j, rt_par_j_new),
+            jnp.where(exhausted, dCAPE_dz_j_minus_1, dCAPE_dz_j),
+            done | exhausted,
+            jnp.where(exhausted, j_last, j),
+            jnp.where(newly_exhausted, tke, tke_exit),
+            jnp.where(newly_exhausted, dCAPE_dz_j_minus_1, dCAPE_exit_prev),
+            jnp.where(newly_exhausted, dCAPE_dz_j, dCAPE_exit_j),
+        )
+
+    final = _bounded_while(cond_fn, body_fn, init_state, k_ub_zt)
+    j, _tke, _thl, _rt, _dcape_prev, done, j_last, tke_exit, dCAPE_exit_prev, dCAPE_exit_j = final
+    return j_last, done, j, tke_exit, dCAPE_exit_prev, dCAPE_exit_j
+
+
+def _downward_inner_while(
+    k,
+    tke,
+    thl_par_j,
+    rt_par_j,
+    dCAPE_dz_j_plus_1,
+    thl_par_j_precalc,
+    rt_par_j_precalc,
+    exp_mu_dzm,
+    grav_on_thvm,
+    Lv_coef,
+    thv_ds,
+    exner,
+    p_in_Pa,
+    thvm,
+    dzm,
+    invrs_dzm,
+    zt,
+    k_lb_zt,
+    k_ub_zt,
+    saturation_formula,
+):
+    init_state = (
+        k - 2,
+        tke,
+        thl_par_j,
+        rt_par_j,
+        dCAPE_dz_j_plus_1,
+        jnp.asarray(False),
+        k - 1,
+        tke,
+        dCAPE_dz_j_plus_1,
+        jnp.asarray(0.0),
+    )
+
+    def cond_fn(state):
+        j, _tke, _thl, _rt, _dcape_next, done, *_rest = state
+        return (~done) & (j >= k_lb_zt)
+
+    def body_fn(state):
+        j, tke, thl_par_j, rt_par_j, dCAPE_dz_j_plus_1, done, j_last, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j = state
+        # thl, rt of parcel are conserved except for entrainment
+        #
+        # The values of thl_env and rt_env are treated as changing linearly for a parcel
+        # of air descending from level j to level j-1
+
+        # theta_l of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(thl_par)/dz = - mu * ( thl_par - thl_env )
+        thl_par_j_new = thl_par_j_precalc[j] + thl_par_j * exp_mu_dzm[j + 1]
+
+        # r_t of the parcel starting at grid level k, and currenly
+        # at grid level j
+        #
+        # d(rt_par)/dz = - mu * ( rt_par - rt_env )
+        rt_par_j_new = rt_par_j_precalc[j] + rt_par_j * exp_mu_dzm[j + 1]
+        thv_par_j = _parcel_thv(
+            thl_par_j_new,
+            rt_par_j_new,
+            exner[j],
+            p_in_Pa[j],
+            thv_ds[j],
+            Lv_coef[j],
+            saturation_formula,
+        )
+        # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
+        dCAPE_dz_j = grav_on_thvm[j] * (thv_par_j - thvm[j])
+        # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+        # Trapezoidal estimate between grid levels j+1 and j
+        CAPE_incr = one_half * (dCAPE_dz_j + dCAPE_dz_j_plus_1) * dzm[j + 1]
+        tke_new = tke - CAPE_incr
+        # Exit loop early if tke has been exhaused between level j+1 and j
+        exhausted = tke_new <= zero
+        newly_exhausted = exhausted & (~done)
+
+        return (
+            jnp.where(exhausted, j, j - 1),
+            jnp.where(exhausted, tke, tke_new),
+            jnp.where(exhausted, thl_par_j, thl_par_j_new),
+            jnp.where(exhausted, rt_par_j, rt_par_j_new),
+            jnp.where(exhausted, dCAPE_dz_j_plus_1, dCAPE_dz_j),
+            done | exhausted,
+            jnp.where(exhausted, j_last, j),
+            jnp.where(newly_exhausted, tke, tke_exit),
+            jnp.where(newly_exhausted, dCAPE_dz_j_plus_1, dCAPE_exit_plus1),
+            jnp.where(newly_exhausted, dCAPE_dz_j, dCAPE_exit_j),
+        )
+
+    final = _bounded_while(cond_fn, body_fn, init_state, k_ub_zt)
+    j, _tke, _thl, _rt, _dcape_next, done, j_last, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j = final
+    return j_last, done, j, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j
+
+
+def _compute_lscale_up_col(
+    tke_i,
+    thl_par_1,
+    rt_par_1,
+    dCAPE_dz_1,
+    CAPE_incr_1,
+    thl_par_j_precalc,
+    rt_par_j_precalc,
+    exp_mu_dzm,
+    grav_on_thvm,
+    Lv_coef,
+    thv_ds,
+    exner,
+    p_in_Pa,
+    thvm,
+    dzm,
+    invrs_dzm,
+    zt,
+    k_ub_zt,
+    saturation_formula,
+    nzt,
+):
+    zlmin = 0.1
+
+    def outer_step(Lscale_up_max_alt, k):
+        # If the initial turbulent kinetic energy (tke) has not been exhausted for this grid level
+        tke_after_first_level = tke_i[k] + CAPE_incr_1[k + 1]
+        dCAPE_dz_k_plus_1 = dCAPE_dz_1[k + 1]
+        # Find the remaining distance z - z_0 that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula. Simplified
+        # since dCAPE_dz_j_minus_1 = 0.0
+        dCAPE_safe = jnp.where(jnp.abs(dCAPE_dz_k_plus_1) > 0.0, dCAPE_dz_k_plus_1, 1.0)
+        frac_first = (
+            -jnp.sqrt(jnp.maximum(zero_threshold, -two * tke_i[k] * dzm[k + 1] * dCAPE_dz_k_plus_1))
+            / dCAPE_safe
+        )
+
+        (
+            j_last,
+            exited_early,
+            j,
+            tke_exit,
+            dCAPE_exit_prev,
+            dCAPE_exit_j,
+        ) = _upward_inner_while(
+            k,
+            tke_after_first_level,
+            thl_par_1[k + 1],
+            rt_par_1[k + 1],
+            dCAPE_dz_1[k + 1],
+            thl_par_j_precalc,
+            rt_par_j_precalc,
+            exp_mu_dzm,
+            grav_on_thvm,
+            Lv_coef,
+            thv_ds,
+            exner,
+            p_in_Pa,
+            thvm,
+            dzm,
+            invrs_dzm,
+            zt,
+            k_ub_zt,
+            saturation_formula,
+        )
+
+        # Loop terminated early, meaning TKE was completely exhaused at grid level j.
+        # Add the thickness z - z_0 (where z_0 < z <= z_1) to Lscale_up.
+        dCAPE_diff = dCAPE_exit_j - dCAPE_exit_prev
+        linear_case = jnp.abs(dCAPE_diff) * two <= jnp.abs(dCAPE_exit_j + dCAPE_exit_prev) * eps
+        dCAPE_j_safe = jnp.where(jnp.abs(dCAPE_exit_j) > 0.0, dCAPE_exit_j, 1.0)
+        # Special case where dCAPE/dz|_(z_1) - dCAPE/dz|_(z_0) = 0
+        # Find the remaining distance z - z_0 that it takes to
+        # exhaust the remaining TKE
+        frac_linear = -tke_exit / dCAPE_j_safe
+
+        # Case used for most scenarios where dCAPE/dz|_(z_1) /= dCAPE/dz|_(z_0)
+        # Find the remaining distance z - z_0 that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula (only the
+        # negative (-) root works in this scenario).
+        dCAPE_diff_safe = jnp.where(jnp.abs(dCAPE_diff) > 0.0, dCAPE_diff, 1.0)
+        invrs_dCAPE_diff = one / dCAPE_diff_safe
+        discriminant = dCAPE_exit_prev**2 - two * tke_exit * invrs_dzm[j] * dCAPE_diff
+        frac_quadratic = (
+            -dCAPE_exit_prev * invrs_dCAPE_diff * dzm[j]
+            - jnp.sqrt(jnp.maximum(zero_threshold, discriminant)) * invrs_dCAPE_diff * dzm[j]
+        )
+        frac_exhausted = jnp.where(linear_case, frac_linear, frac_quadratic)
+        frac_exhausted = jnp.where(exited_early, frac_exhausted, zero)
+
+        Lscale_up_k = jnp.where(
+            tke_after_first_level > zero,
+            zlmin + zt[j_last] - zt[k] + frac_exhausted,
+            zlmin + frac_first,
+        )
+        parcel_top = zt[k] + Lscale_up_k
+        # If a parcel at a previous grid level can rise past the parcel at this grid level
+        # then this one should also be able to rise up to that height. This feature insures
+        # that the profile of Lscale_up will be smooth, thus reducing numerical instability.
+        Lscale_up_k = jnp.where(
+            parcel_top < Lscale_up_max_alt,
+            Lscale_up_max_alt - zt[k],
+            Lscale_up_k,
+        )
+        Lscale_up_max_alt = jnp.where(
+            parcel_top < Lscale_up_max_alt,
+            Lscale_up_max_alt,
+            parcel_top,
+        )
+        return Lscale_up_max_alt, Lscale_up_k
+
+    _, values = jax.lax.scan(outer_step, jnp.asarray(0.0), jnp.arange(nzt - 2))
+    return jnp.concatenate([values, jnp.full((2,), zlmin)])
+
+
+def _compute_lscale_down_col(
+    tke_i,
+    thl_par_1,
+    rt_par_1,
+    dCAPE_dz_1,
+    CAPE_incr_1,
+    thl_par_j_precalc,
+    rt_par_j_precalc,
+    exp_mu_dzm,
+    grav_on_thvm,
+    Lv_coef,
+    thv_ds,
+    exner,
+    p_in_Pa,
+    thvm,
+    dzm,
+    invrs_dzm,
+    zt,
+    k_lb_zt,
+    k_ub_zt,
+    saturation_formula,
+    nzt,
+):
+    zlmin = 0.1
+
+    def outer_step(Lscale_down_min_alt, offset):
+        k = nzt - 1 - offset
+        # If the initial turbulent kinetic energy (tke) has not been exhausted for this grid level
+        tke_after_first_level = tke_i[k] - CAPE_incr_1[k - 1]
+        dCAPE_dz_k_minus_1 = dCAPE_dz_1[k - 1]
+        # Find the remaining distance z_0 - z that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula. Simplified
+        # since dCAPE_dz_j_plus_1 = 0.0
+        dCAPE_safe = jnp.where(jnp.abs(dCAPE_dz_k_minus_1) > 0.0, dCAPE_dz_k_minus_1, 1.0)
+        frac_first = (
+            jnp.sqrt(jnp.maximum(zero_threshold, two * tke_i[k] * dzm[k] * dCAPE_dz_k_minus_1))
+            / dCAPE_safe
+        )
+
+        (
+            j_last,
+            exited_early,
+            j,
+            tke_exit,
+            dCAPE_exit_plus1,
+            dCAPE_exit_j,
+        ) = _downward_inner_while(
+            k,
+            tke_after_first_level,
+            thl_par_1[k - 1],
+            rt_par_1[k - 1],
+            dCAPE_dz_1[k - 1],
+            thl_par_j_precalc,
+            rt_par_j_precalc,
+            exp_mu_dzm,
+            grav_on_thvm,
+            Lv_coef,
+            thv_ds,
+            exner,
+            p_in_Pa,
+            thvm,
+            dzm,
+            invrs_dzm,
+            zt,
+            k_lb_zt,
+            k_ub_zt,
+            saturation_formula,
+        )
+
+        # Loop terminated early, meaning TKE was completely exhaused at grid level j.
+        # Add the thickness z - z_0 (where z_0 < z <= z_1) to Lscale_up.
+        dCAPE_diff = dCAPE_exit_j - dCAPE_exit_plus1
+        linear_case = jnp.abs(dCAPE_diff) * two <= jnp.abs(dCAPE_exit_j + dCAPE_exit_plus1) * eps
+        dCAPE_j_safe = jnp.where(jnp.abs(dCAPE_exit_j) > 0.0, dCAPE_exit_j, 1.0)
+        # Special case where dCAPE/dz|_(z_(-1)) - dCAPE/dz|_(z_0) = 0
+        # Find the remaining distance z_0 - z that it takes to
+        # exhaust the remaining TKE
+        frac_linear = tke_exit / dCAPE_j_safe
+
+        # Case used for most scenarios where dCAPE/dz|_(z_(-1)) /= dCAPE/dz|_(z_0)
+        # Find the remaining distance z_0 - z that it takes to exhaust the
+        # remaining TKE (tke_i), using the quadratic formula (only the
+        # negative (-) root works in this scenario) -- however, the
+        # negative (-) root is divided by another negative (-) factor,
+        # which results in an overall plus (+) sign in front of the
+        # square root term in the equation below).
+        dCAPE_diff_safe = jnp.where(jnp.abs(dCAPE_diff) > 0.0, dCAPE_diff, 1.0)
+        invrs_dCAPE_diff = one / dCAPE_diff_safe
+        discriminant = dCAPE_exit_plus1**2 + two * tke_exit * invrs_dzm[j + 1] * dCAPE_diff
+        frac_quadratic = (
+            -dCAPE_exit_plus1 * invrs_dCAPE_diff * dzm[j + 1]
+            + jnp.sqrt(jnp.maximum(zero_threshold, discriminant)) * invrs_dCAPE_diff * dzm[j + 1]
+        )
+        frac_exhausted = jnp.where(linear_case, frac_linear, frac_quadratic)
+        frac_exhausted = jnp.where(exited_early, frac_exhausted, zero)
+
+        Lscale_down_k = jnp.where(
+            tke_after_first_level > zero,
+            zlmin + zt[k] - zt[j_last] + frac_exhausted,
+            zlmin + frac_first,
+        )
+        parcel_bottom = zt[k] - Lscale_down_k
+        # If a parcel at a previous grid level can descend past the parcel at this grid level
+        # then this one should also be able to descend down to that height. This feature insures
+        # that the profile of Lscale_down will be smooth, thus reducing numerical instability.
+        Lscale_down_k = jnp.where(
+            parcel_bottom > Lscale_down_min_alt,
+            zt[k] - Lscale_down_min_alt,
+            Lscale_down_k,
+        )
+        Lscale_down_min_alt = jnp.where(
+            parcel_bottom > Lscale_down_min_alt,
+            Lscale_down_min_alt,
+            parcel_bottom,
+        )
+        return Lscale_down_min_alt, (k, Lscale_down_k)
+
+    _, (indices, values) = jax.lax.scan(
+        outer_step,
+        zt[k_ub_zt],
+        jnp.arange(nzt - 1),
+    )
+    Lscale_down = jnp.full((nzt,), zlmin)
+    return Lscale_down.at[indices].set(values)
+
+
+def compute_mixing_length(
+    nzm: int,
+    nzt: int,
+    ngrdcol: int,
+    gr,
+    thvm,
+    thlm,
+    rtm,
+    em,
+    Lscale_max,
+    p_in_Pa,
+    exner,
+    thv_ds,
+    mu,
+    lmin,
+    saturation_formula: int,
+    l_implemented: bool,
+    err_info,
+):
+    """Larson's 5th moist, nonlocal length scale.
+
+    References:
+      Section 3b ( /Eddy length formulation/ ) of
+      ``A PDF-Based Model for Boundary Layer Clouds. Part I:
+      Method and Model Description'' Golaz, et al. (2002)
+      JAS, Vol. 59, pp. 3540--3551.
+
+    Notes:
+
+      The equation for the rate of change of theta_l and r_t of the parcel with
+      respect to height, due to entrainment, is:
+
+              d(thl_par)/dz = - mu * ( thl_parcel - thl_environment );
+
+              d(rt_par)/dz = - mu * ( rt_parcel - rt_environment );
+
+      where mu is the entrainment rate,
+      such that:
+
+              mu = (1/m)*(dm/dz);
+
+      where m is the mass of the parcel.  The value of mu is set to be a
+      constant.
+
+      The differential equations are solved for given the boundary condition
+      and given the fact that the value of thl_environment and rt_environment
+      are treated as changing linearly for a parcel of air from one grid level
+      to the next.
+
+      For the special case where entrainment rate, mu, is set to 0,
+      thl_parcel and rt_parcel remain constant
+
+
+      The equation for Lscale_up is:
+
+          INT(z_i:z_i+Lscale_up) g * ( thv_par - thvm ) / thvm dz = -em(z_i);
+
+      and for Lscale_down
+
+          INT(z_i-Lscale_down:z_i) g * ( thv_par - thvm ) / thvm dz = em(z_i);
+
+      where thv_par is theta_v of the parcel, thvm is the mean
+      environmental value of theta_v, z_i is the altitude that the parcel
+      started from, and em is the mean value of TKE at
+      altitude z_i (which gives the parcel its initial boost)
+
+      The increment of CAPE (convective air potential energy) for any two
+      successive vertical levels is:
+
+          Upwards:
+              CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+
+          Downwards:
+              CAPE_incr = INT(z_(-1):z_0) g * ( thv_par - thvm ) / thvm dz
+
+      Thus, the derivative of CAPE with respect to height is:
+
+              dCAPE/dz = g * ( thv_par - thvm ) / thvm.
+
+      A purely trapezoidal rule is used between levels, and is considered
+      to vary linearly at all altitudes.  Thus, dCAPE/dz is considered to be
+      of the form:  A * (z-zo) + dCAPE/dz|_(z_0),
+      where A = ( dCAPE/dz|_(z_1) - dCAPE/dz|_(z_0) ) / ( z_1 - z_0 )
+
+      The integral is evaluated to find the CAPE increment between two
+      successive vertical levels.  The result either adds to or depletes
+      from the total amount of energy that keeps the parcel ascending/descending.
+
+
+    IMPORTANT NOTE:
+      This subroutine has been optimized by adding precalculations, rearranging
+      equations to avoid divides, and modifying the algorithm entirely.
+          -Gunther Huebler
+
+      The algorithm previously used looped over every grid level, following a
+      a parcel up from its initial grid level to its max. The very nature of this
+      algorithm is an N^2
+    """
+    if gr.grid_dir_indx != 1:
+        raise NotImplementedError(
+            "JAX compute_mixing_length currently supports ascending grids only."
+        )
+
+    # The scan helpers index these arrays with traced loop indices, so the
+    # direct branch must establish JAX arrays at this boundary.
+    thvm = jnp.asarray(thvm)
+    thlm = jnp.asarray(thlm)
+    rtm = jnp.asarray(rtm)
+    em = jnp.asarray(em)
+    Lscale_max = jnp.asarray(Lscale_max)
+    p_in_Pa = jnp.asarray(p_in_Pa)
+    exner = jnp.asarray(exner)
+    thv_ds = jnp.asarray(thv_ds)
+    mu = jnp.asarray(mu)
+
+    # Error in grid column i -> set ith entry to clubb_fatal_error
+    mu_bad = jnp.abs(mu) < eps
+    err_info = err_info.set_fatal(mask=mu_bad)
+    mu = jnp.where(mu_bad, one, mu)
+
+    zlmin = 0.1
+    Lscale_sfclyr_depth = 500.0
+    invrs_Lscale_sfclyr_depth = one / Lscale_sfclyr_depth
+
+    # Calculate initial turbulent kinetic energy for each grid level
+    tke_i = zm2zt(nzm, nzt, ngrdcol, gr, em)
+    # Initialize arrays and precalculate values for computational efficiency
+    grav_on_thvm = grav / thvm
+    Lv_coef = Lv / (exner * Cp) - ep2 * thv_ds
+
+    # Precalculate values to avoid unnecessary calculations later
+    exp_mu_dzm = jnp.exp(-mu[:, None] * gr.dzm)
+    invrs_dzm_on_mu = gr.invrs_dzm / mu[:, None]
+    entrain_coef = (one - exp_mu_dzm) * invrs_dzm_on_mu
+
+    # Precalculations of single values to avoid unnecessary calculations later
+
+    # ---------------- Upwards Length Scale Calculation ----------------
+
+    # Precalculate values for upward Lscale, these are useful only if a parcel can rise
+    # more than one level. They are used in the equations that calculate thl and rt
+    # recursively for a parcel as it ascends
+    thl_par_j_precalc_up = jnp.concatenate(
+        [
+            jnp.zeros((ngrdcol, 1)),
+            thlm[:, 1:nzt - 1]
+            - thlm[:, :nzt - 2] * exp_mu_dzm[:, 1:nzt - 1]
+            - (thlm[:, 1:nzt - 1] - thlm[:, :nzt - 2])
+            * entrain_coef[:, 1:nzt - 1],
+            jnp.zeros((ngrdcol, 2)),
+        ],
+        axis=1,
+    )
+    rt_par_j_precalc_up = jnp.concatenate(
+        [
+            jnp.zeros((ngrdcol, 1)),
+            rtm[:, 1:nzt - 1]
+            - rtm[:, :nzt - 2] * exp_mu_dzm[:, 1:nzt - 1]
+            - (rtm[:, 1:nzt - 1] - rtm[:, :nzt - 2])
+            * entrain_coef[:, 1:nzt - 1],
+            jnp.zeros((ngrdcol, 2)),
+        ],
+        axis=1,
+    )
+
+    # Calculate the initial change in TKE for each level. This is done for computational
+    # efficiency, it helps because there will be at least one calculation for each grid level,
+    # meaning the first one can be done for every grid level and therefore the calculations can
+    # be vectorized, clubb:ticket:834. After the initial calculation however, it is uncertain
+    # how many more iterations should be done for each individual grid level, and calculating
+    # one change in TKE for each level until all are exhausted will result in many unnessary
+    # and expensive calculations.
+
+    # Calculate initial thl, tl, and rt for parcels at each grid level
+    thl_par_1_up_int = (
+        thlm[:, 1:] - (thlm[:, 1:] - thlm[:, :-1]) * entrain_coef[:, 1:nzt]
+    )
+    rt_par_1_up_int = (
+        rtm[:, 1:] - (rtm[:, 1:] - rtm[:, :-1]) * entrain_coef[:, 1:nzt]
+    )
+    tl_par_1_up_int = thl_par_1_up_int * exner[:, 1:]
+    rsatl_par_1_up_int = sat_mixrat_liq(
+        p_in_Pa[:, 1:],
+        tl_par_1_up_int,
+        saturation_formula,
+    )
+    tl_par_1_up_sqd = tl_par_1_up_int**2
+    # s from Lewellen and Yoh 1993 (LY) eqn. 1
+    #                           s = ( rt - rsatl ) / ( 1 + beta * rsatl )
+    # and SD's beta (eqn. 8),
+    #                           beta = ep * ( Lv / ( Rd * tl ) ) * ( Lv / ( cp * tl ) )
+    #
+    # Simplified by multiplying top and bottom by tl^2 to avoid a divide and precalculating
+    # ep * Lv**2 / ( Rd * cp )
+    s_par_1_up_int = (
+        (rt_par_1_up_int - rsatl_par_1_up_int)
+        * tl_par_1_up_sqd
+        / (tl_par_1_up_sqd + ep * Lv**2 / (Rd * Cp) * rsatl_par_1_up_int)
+    )
+    rc_par_1_up_int = jnp.maximum(s_par_1_up_int, zero_threshold)
+    # theta_v of entraining parcel at grid level j
+    thv_par_1_up_int = (
+        thl_par_1_up_int
+        + ep1 * thv_ds[:, 1:] * rt_par_1_up_int
+        + Lv_coef[:, 1:] * rc_par_1_up_int
+    )
+    # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
+    dCAPE_dz_1_up_int = grav_on_thvm[:, 1:] * (
+        thv_par_1_up_int - thvm[:, 1:]
+    )
+    # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+    # Trapezoidal estimate between grid levels, dCAPE at z_0 = 0 for this initial calculation
+    CAPE_incr_1_up_int = one_half * dCAPE_dz_1_up_int * gr.dzm[:, 1:nzt]
+
+    thl_par_1_up = jnp.concatenate(
+        [jnp.zeros((ngrdcol, 1)), thl_par_1_up_int],
+        axis=1,
+    )
+    rt_par_1_up = jnp.concatenate(
+        [jnp.zeros((ngrdcol, 1)), rt_par_1_up_int],
+        axis=1,
+    )
+    dCAPE_dz_1_up = jnp.concatenate(
+        [jnp.zeros((ngrdcol, 1)), dCAPE_dz_1_up_int],
+        axis=1,
+    )
+    CAPE_incr_1_up = jnp.concatenate(
+        [jnp.zeros((ngrdcol, 1)), CAPE_incr_1_up_int],
+        axis=1,
+    )
+
+    # ---------------- Downwards Length Scale Calculation ----------------
+
+    # Precalculate values for downward Lscale, these are useful only if a parcel can descend
+    # more than one level. They are used in the equations that calculate thl and rt
+    # recursively for a parcel as it descends
+    thl_par_j_precalc_down = jnp.concatenate(
+        [
+            thlm[:, :-1]
+            - thlm[:, 1:] * exp_mu_dzm[:, 1:nzt]
+            - (thlm[:, :-1] - thlm[:, 1:]) * entrain_coef[:, 1:nzt],
+            jnp.zeros((ngrdcol, 2)),
+        ],
+        axis=1,
+    )
+    rt_par_j_precalc_down = jnp.concatenate(
+        [
+            rtm[:, :-1]
+            - rtm[:, 1:] * exp_mu_dzm[:, 1:nzt]
+            - (rtm[:, :-1] - rtm[:, 1:]) * entrain_coef[:, 1:nzt],
+            jnp.zeros((ngrdcol, 2)),
+        ],
+        axis=1,
+    )
+
+    # Calculate the initial change in TKE for each level. This is done for computational
+    # efficiency, it helps because there will be at least one calculation for each grid level,
+    # meaning the first one can be done for every grid level and therefore the calculations can
+    # be vectorized, clubb:ticket:834. After the initial calculation however, it is uncertain
+    # how many more iterations should be done for each individual grid level, and calculating
+    # one change in TKE for each level until all are exhausted will result in many unnessary
+    # and expensive calculations.
+
+    # Calculate initial thl, tl, and rt for parcels at each grid level
+    thl_par_1_down_int = (
+        thlm[:, :-1] - (thlm[:, :-1] - thlm[:, 1:]) * entrain_coef[:, 1:nzt]
+    )
+    rt_par_1_down_int = (
+        rtm[:, :-1] - (rtm[:, :-1] - rtm[:, 1:]) * entrain_coef[:, 1:nzt]
+    )
+    tl_par_1_down_int = thl_par_1_down_int * exner[:, :-1]
+    rsatl_par_1_down_int = sat_mixrat_liq(
+        p_in_Pa[:, :-1],
+        tl_par_1_down_int,
+        saturation_formula,
+    )
+    tl_par_1_down_sqd = tl_par_1_down_int**2
+    # s from Lewellen and Yoh 1993 (LY) eqn. 1
+    #                           s = ( rt - rsatl ) / ( 1 + beta * rsatl )
+    # and SD's beta (eqn. 8),
+    #                           beta = ep * ( Lv / ( Rd * tl ) ) * ( Lv / ( cp * tl ) )
+    #
+    # Simplified by multiplying top and bottom by tl^2 to avoid a divide and precalculating
+    # ep * Lv**2 / ( Rd * cp )
+    s_par_1_down_int = (
+        (rt_par_1_down_int - rsatl_par_1_down_int)
+        * tl_par_1_down_sqd
+        / (tl_par_1_down_sqd + ep * Lv**2 / (Rd * Cp) * rsatl_par_1_down_int)
+    )
+    rc_par_1_down_int = jnp.maximum(s_par_1_down_int, zero_threshold)
+    # theta_v of entraining parcel at grid level j
+    thv_par_1_down_int = (
+        thl_par_1_down_int
+        + ep1 * thv_ds[:, :-1] * rt_par_1_down_int
+        + Lv_coef[:, :-1] * rc_par_1_down_int
+    )
+    # dCAPE/dz = g * ( thv_par - thvm ) / thvm.
+    dCAPE_dz_1_down_int = grav_on_thvm[:, :-1] * (
+        thv_par_1_down_int - thvm[:, :-1]
+    )
+    # CAPE_incr = INT(z_0:z_1) g * ( thv_par - thvm ) / thvm dz
+    # Trapezoidal estimate between grid levels, dCAPE at z_0 = 0 for this initial calculation
+    CAPE_incr_1_down_int = (
+        one_half * dCAPE_dz_1_down_int * gr.dzm[:, 1:nzt]
+    )
+
+    thl_par_1_down = jnp.concatenate(
+        [thl_par_1_down_int, jnp.zeros((ngrdcol, 1))],
+        axis=1,
+    )
+    rt_par_1_down = jnp.concatenate(
+        [rt_par_1_down_int, jnp.zeros((ngrdcol, 1))],
+        axis=1,
+    )
+    dCAPE_dz_1_down = jnp.concatenate(
+        [dCAPE_dz_1_down_int, jnp.zeros((ngrdcol, 1))],
+        axis=1,
+    )
+    CAPE_incr_1_down = jnp.concatenate(
+        [CAPE_incr_1_down_int, jnp.zeros((ngrdcol, 1))],
+        axis=1,
+    )
+
+    Lscale_up_cols = []
+    Lscale_down_cols = []
+    for i in range(ngrdcol):
+        Lscale_up_cols.append(
+            _compute_lscale_up_col(
+                tke_i[i],
+                thl_par_1_up[i],
+                rt_par_1_up[i],
+                dCAPE_dz_1_up[i],
+                CAPE_incr_1_up[i],
+                thl_par_j_precalc_up[i],
+                rt_par_j_precalc_up[i],
+                exp_mu_dzm[i],
+                grav_on_thvm[i],
+                Lv_coef[i],
+                thv_ds[i],
+                exner[i],
+                p_in_Pa[i],
+                thvm[i],
+                gr.dzm[i],
+                gr.invrs_dzm[i],
+                gr.zt[i],
+                gr.k_ub_zt,
+                saturation_formula,
+                nzt,
+            )
+        )
+        Lscale_down_cols.append(
+            _compute_lscale_down_col(
+                tke_i[i],
+                thl_par_1_down[i],
+                rt_par_1_down[i],
+                dCAPE_dz_1_down[i],
+                CAPE_incr_1_down[i],
+                thl_par_j_precalc_down[i],
+                rt_par_j_precalc_down[i],
+                exp_mu_dzm[i],
+                grav_on_thvm[i],
+                Lv_coef[i],
+                thv_ds[i],
+                exner[i],
+                p_in_Pa[i],
+                thvm[i],
+                gr.dzm[i],
+                gr.invrs_dzm[i],
+                gr.zt[i],
+                gr.k_lb_zt,
+                gr.k_ub_zt,
+                saturation_formula,
+                nzt,
+            )
+        )
+
+    Lscale_up = jnp.stack(Lscale_up_cols)
+    Lscale_down = jnp.stack(Lscale_down_cols)
+
+    # ---------------- Final Lscale Calculation ----------------
+
+    # Make lminh a linear function starting at value lmin at the bottom
+    # and going to zero at 500 meters in altitude.
+    if l_implemented:
+        # Within a host model, increase mixing length in 500 m layer above *ground*
+        lminh = (
+            jnp.maximum(
+                zero_threshold,
+                Lscale_sfclyr_depth - (gr.zt - gr.zm[:, gr.k_lb_zm][:, None]),
+            )
+            * lmin
+            * invrs_Lscale_sfclyr_depth
+        )
+    else:
+        # In standalone mode, increase mixing length in 500 m layer above *mean sea level*
+        lminh = (
+            jnp.maximum(zero_threshold, Lscale_sfclyr_depth - gr.zt)
+            * lmin
+            * invrs_Lscale_sfclyr_depth
+        )
+
+    Lscale_up = jnp.maximum(lminh, Lscale_up)
+    Lscale_down = jnp.maximum(lminh, Lscale_down)
+    # When L is large, turbulence is weakly damped
+    # When L is small, turbulence is strongly damped
+    # Use a geometric mean to determine final Lscale so that L tends to become small
+    # if either Lscale_up or Lscale_down becomes small.
+    Lscale = jnp.sqrt(jnp.maximum(zero_threshold, Lscale_up * Lscale_down))
+    # Set the value of Lscale at the upper and lower boundaries.
+    Lscale = Lscale.at[:, gr.k_ub_zt].set(Lscale[:, gr.k_ub_zt - gr.grid_dir_indx])
+    # Vince Larson limited Lscale to allow host
+    # model to take over deep convection.  13 Feb 2008.
+    Lscale = jnp.minimum(Lscale, Lscale_max[:, None])
+
+    # Ensure that no Lscale values are NaN
+    if clubb_at_least_debug_level(1):
+        err_info = err_info.set_fatal(mask=jnp.any(jnp.isnan(Lscale), axis=1))
+        err_info = err_info.set_fatal(mask=jnp.any(jnp.isnan(Lscale_up), axis=1))
+        err_info = err_info.set_fatal(mask=jnp.any(jnp.isnan(Lscale_down), axis=1))
+
+    return err_info, Lscale, Lscale_up, Lscale_down
+
+
+def calc_Lscale_directly(
+    ngrdcol: int,
+    nzm: int,
+    nzt: int,
+    gr,
+    l_implemented: bool,
+    p_in_Pa,
+    exner,
+    rtm,
+    thlm,
+    thvm,
+    newmu,
+    rtp2_zt,
+    thlp2_zt,
+    rtpthlp_zt,
+    pdf_params,
+    em,
+    thv_ds_zt,
+    Lscale_max,
+    lmin,
+    clubb_params,
+    saturation_formula: int,
+    l_Lscale_plume_centered: bool,
+    stats: JaxStats,
+    err_info,
+):
+    """Diagnose Lscale directly from thermodynamic profiles and PDF data."""
+    del rtp2_zt, thlp2_zt, rtpthlp_zt, pdf_params
+
+    # Lscale is calculated in subroutine compute_mixing_length
+    # if l_avg_Lscale is true, compute_mixing_length is called
+    # two additional times with
+    # perturbed values of rtm and thlm.  An average value of Lscale
+    # from the three calls to compute_mixing_length is then calculated.
+    # This reduces temporal noise in RICO, BOMEX, LBA, and other cases.
+    l_avg_Lscale = False
+
+    if clubb_at_least_debug_level(0):
+        if l_Lscale_plume_centered and not l_avg_Lscale:
+            # General error -> set all entries to clubb_fatal_error
+            err_info = err_info.set_fatal()
+            return (
+                err_info,
+                jnp.zeros((ngrdcol, nzt)),
+                jnp.zeros((ngrdcol, nzt)),
+                jnp.zeros((ngrdcol, nzt)),
+                stats,
+            )
+
+    Lscale_pert_1 = jnp.full((ngrdcol, nzt), unused_var)
+    Lscale_pert_2 = jnp.full((ngrdcol, nzt), unused_var)
+
+    # Undefined
+    stats = stats.update("Lscale_pert_1", Lscale_pert_1)
+    # Undefined
+    stats = stats.update("Lscale_pert_2", Lscale_pert_2)
+
+    # ********** NOTE: **********
+    # This call to compute_mixing_length must be last. Otherwise, the values of
+    # Lscale_up and Lscale_down in stats will be based on perturbation length
+    # scales rather than the mean length scale.
+    # Diagnose CLUBB's turbulent mixing length scale.
+    err_info, Lscale, Lscale_up, Lscale_down = compute_mixing_length(
+        nzm,
+        nzt,
+        ngrdcol,
+        gr,
+        thvm,
+        thlm,
+        rtm,
+        em,
+        Lscale_max,
+        p_in_Pa,
+        exner,
+        thv_ds_zt,
+        newmu,
+        lmin,
+        saturation_formula,
+        l_implemented,
+        err_info,
+    )
+
+    return err_info, Lscale, Lscale_up, Lscale_down, stats
+
+
+def diagnose_Lscale_from_tau(
+    nzm: int,
+    nzt: int,
+    ngrdcol: int,
+    gr,
+    upwp_sfc,
+    vpwp_sfc,
+    ddzt_umvm_sqd,
+    ice_supersat_frac,
+    em,
+    ufmin,
+    tau_const,
+    sfc_elevation,
+    Lscale_max,
+    clubb_params,
+    stats: JaxStats,
+    l_e3sm_config: bool,
+    l_smooth_Heaviside_tau_wpxp: bool,
+    brunt_vaisala_freq_sqd_smth,
+    Ri_zm,
+    err_info,
+):
+    """Diagnose inverse damping time scales (invrs_tau_...) and turbulent mixing length (Lscale).
+
+    References:
+        Guo et al.(2021, JAMES)
+    """
+    l_smooth_min_max = False
+    heaviside_smth_range = 1.0
+
+    em_zt = zm2zt(nzm, nzt, ngrdcol, gr, em, em_min)
+
+    # Error in grid column i -> set ith entry to clubb_fatal_error
+    lowest_zm_below_ground = (
+        gr.zm[:, gr.k_lb_zm]
+        - sfc_elevation
+        + clubb_params[:, iz_displace]
+        < eps
+    )
+    err_info = err_info.set_fatal(mask=lowest_zm_below_ground)
+
+    tmp_calc_ngrdcol = (upwp_sfc**2 + vpwp_sfc**2) ** one_fourth
+
+    if l_smooth_min_max:
+        # tmp_calc_ngrdcol used here because openacc has an issue with
+        #  a variable being both input and output of a function
+        ustar = smooth_max(
+            ngrdcol,
+            ngrdcol,
+            tmp_calc_ngrdcol,
+            ufmin,
+            min_max_smth_mag,
+        )
+    else:
+        ustar = jnp.maximum(tmp_calc_ngrdcol, ufmin)
+
+    invrs_tau_bkgnd = (
+        clubb_params[:, iC_invrs_tau_bkgnd][:, None] / tau_const
+        + jnp.zeros((ngrdcol, nzm))
+    )
+
+    norm_ddzt_umvm = jnp.sqrt(ddzt_umvm_sqd)
+    smooth_norm_ddzt_umvm = zm2zt2zm(nzm, nzt, ngrdcol, gr, norm_ddzt_umvm)
+
+    invrs_tau_shear_smooth = (
+        clubb_params[:, iC_invrs_tau_shear][:, None] * smooth_norm_ddzt_umvm
+    )
+
+    # Enforce that invrs_tau_shear is positive.
+    invrs_tau_shear = smooth_max(
+        nzm,
+        ngrdcol,
+        invrs_tau_shear_smooth,
+        zero_threshold,
+        min_max_smth_mag,
+    )
+
+    z_eff = (
+        gr.zm
+        - sfc_elevation[:, None]
+        + clubb_params[:, iz_displace][:, None]
+    )
+    z_eff = jnp.where(jnp.abs(z_eff) < eps, eps, z_eff)
+    invrs_tau_sfc = (
+        clubb_params[:, iC_invrs_tau_sfc][:, None]
+        * (ustar[:, None] / vonk)
+        / z_eff
+    )
+    # C_invrs_tau_sfc * ( wp2 / vonk /ustar ) / ( gr%zm(1,:) -sfc_elevation + z_displace )
+
+    invrs_tau_no_N2_zm = invrs_tau_bkgnd + invrs_tau_sfc + invrs_tau_shear
+
+    if l_smooth_min_max:
+        brunt_vaisala_freq_clipped = smooth_max(
+            nzm,
+            ngrdcol,
+            zero_threshold,
+            brunt_vaisala_freq_sqd_smth,
+            1.0e-4 * min_max_smth_mag,
+        )
+        brunt_freq_pos = jnp.sqrt(brunt_vaisala_freq_clipped)
+    else:
+        brunt_freq_pos = jnp.sqrt(
+            jnp.maximum(zero_threshold, brunt_vaisala_freq_sqd_smth)
+        )
+
+    ice_supersat_frac_zm = zt2zm(
+        nzm,
+        nzt,
+        ngrdcol,
+        gr,
+        ice_supersat_frac,
+        zero_threshold,
+    )
+
+    if l_smooth_min_max:
+        raise NotImplementedError("l_smooth_min_max is a disabled Fortran parameter.")
+    else:
+        brunt_freq_out_cloud = brunt_freq_pos * jnp.minimum(
+            one,
+            jnp.maximum(zero_threshold, one - ice_supersat_frac_zm / 0.001),
+        )
+
+    brunt_freq_out_cloud = jnp.where(
+        gr.zm < clubb_params[:, ialtitude_threshold][:, None],
+        zero,
+        brunt_freq_out_cloud,
+    )
+
+    # Write both bv extra terms to invrs_taus to disk
+    stats = stats.update("bv_freq_pos", brunt_freq_pos)
+    stats = stats.update("bv_freq_out_cloud", brunt_freq_out_cloud)
+
+    # This time scale is used optionally for the return-to-isotropy term. It
+    # omits invrs_tau_sfc based on the rationale that the isotropization
+    # rate shouldn't be enhanced near the ground.
+    invrs_tau_N2_iso = (
+        invrs_tau_bkgnd
+        + invrs_tau_shear
+        + clubb_params[:, iC_invrs_tau_N2_wp2][:, None] * brunt_freq_pos
+    )
+
+    invrs_tau_wp2_zm = (
+        invrs_tau_no_N2_zm
+        + clubb_params[:, iC_invrs_tau_N2][:, None] * brunt_freq_pos
+        + clubb_params[:, iC_invrs_tau_N2_wp2][:, None] * brunt_freq_out_cloud
+    )
+
+    invrs_tau_zm = (
+        invrs_tau_no_N2_zm
+        + clubb_params[:, iC_invrs_tau_N2][:, None] * brunt_freq_pos
+    )
+
+    if l_e3sm_config:
+        invrs_tau_zm = one_half * invrs_tau_zm
+        invrs_tau_xp2_zm = (
+            invrs_tau_no_N2_zm
+            + clubb_params[:, iC_invrs_tau_N2_xp2][:, None] * brunt_freq_pos
+            + clubb_params[:, iC_invrs_tau_sfc][:, None]
+            * two
+            * jnp.sqrt(em)
+            / z_eff
+        )
+        if l_smooth_min_max:
+            raise NotImplementedError("l_smooth_min_max is a disabled Fortran parameter.")
+        else:
+            invrs_tau_xp2_zm = (
+                jnp.minimum(
+                    jnp.maximum(
+                        jnp.sqrt(
+                            ddzt_umvm_sqd
+                            / jnp.maximum(1.0e-7, brunt_vaisala_freq_sqd_smth)
+                        ),
+                        0.3,
+                    ),
+                    one,
+                )
+                * invrs_tau_xp2_zm
+            )
+        invrs_tau_wpxp_zm = (
+            two * invrs_tau_zm
+            + clubb_params[:, iC_invrs_tau_N2_wpxp][:, None]
+            * brunt_freq_out_cloud
+        )
+    else:
+        # l_e3sm_config = false
+        invrs_tau_xp2_zm = (
+            invrs_tau_no_N2_zm
+            + clubb_params[:, iC_invrs_tau_N2][:, None] * brunt_freq_pos
+            + clubb_params[:, iC_invrs_tau_N2_xp2][:, None] * brunt_freq_out_cloud
+        )
+        ice_supersat_frac_zm = zt2zm(
+            nzm,
+            nzt,
+            ngrdcol,
+            gr,
+            ice_supersat_frac,
+            zero_threshold,
+        )
+        invrs_tau_wpxp_zm = (
+            invrs_tau_no_N2_zm
+            + clubb_params[:, iC_invrs_tau_N2][:, None] * brunt_freq_pos
+            + clubb_params[:, iC_invrs_tau_N2_wpxp][:, None]
+            * brunt_freq_out_cloud
+        )
+
+    if l_smooth_Heaviside_tau_wpxp:
+        bvf_thresh = (
+            brunt_vaisala_freq_sqd_smth
+            / clubb_params[:, iC_invrs_tau_wpxp_N2_thresh][:, None]
+            - one
+        )
+        H_invrs_tau_wpxp_N2 = smooth_heaviside_peskin(
+            nzm,
+            ngrdcol,
+            bvf_thresh,
+            heaviside_smth_range,
+        )
+    else:
+        # l_smooth_Heaviside_tau_wpxp = .false.
+        H_invrs_tau_wpxp_N2 = jnp.where(
+            brunt_vaisala_freq_sqd_smth
+            > clubb_params[:, iC_invrs_tau_wpxp_N2_thresh][:, None],
+            one,
+            zero,
+        )
+
+    if l_smooth_min_max:
+        raise NotImplementedError("l_smooth_min_max is a disabled Fortran parameter.")
+    else:
+        # l_smooth_min_max
+        invrs_tau_wpxp_zm = jnp.where(
+            gr.zm > clubb_params[:, ialtitude_threshold][:, None],
+            invrs_tau_wpxp_zm
+            * (
+                one
+                + H_invrs_tau_wpxp_N2
+                * jnp.minimum(
+                    clubb_params[:, iC_invrs_tau_wpxp_Ri][:, None]
+                    * jnp.maximum(Ri_zm, zero)
+                    ** clubb_params[:, iwpxp_Ri_exp][:, None],
+                    12.0,
+                )
+            ),
+            invrs_tau_wpxp_zm,
+        )
+
+    invrs_tau_wp3_zm = (
+        invrs_tau_wp2_zm
+        + clubb_params[:, iC_invrs_tau_N2_clear_wp3][:, None]
+        * brunt_freq_out_cloud
+    )
+
+    # Calculate the maximum allowable value of time-scale tau,
+    # which depends of the value of Lscale_max.
+    if l_smooth_min_max:
+        raise NotImplementedError("l_smooth_min_max is a disabled Fortran parameter.")
+    else:
+        tau_max_zt = Lscale_max[:, None] / jnp.sqrt(em_zt)
+        tau_max_zm = Lscale_max[:, None] / jnp.sqrt(jnp.maximum(em, em_min))
+
+    if l_smooth_min_max:
+        raise NotImplementedError("l_smooth_min_max is a disabled Fortran parameter.")
+    else:
+        tau_zm = jnp.minimum(one / invrs_tau_zm, tau_max_zm)
+        tau_zt = zm2zt(nzm, nzt, ngrdcol, gr, tau_zm)
+        tau_zt = jnp.minimum(tau_zt, tau_max_zt)
+
+    invrs_tau_zt = zm2zt(nzm, nzt, ngrdcol, gr, invrs_tau_zm)
+    invrs_tau_wp3_zt = zm2zt(nzm, nzt, ngrdcol, gr, invrs_tau_wp3_zm)
+
+    Lscale = tau_zt * jnp.sqrt(em_zt)
+
+    # Lscale_up and Lscale_down aren't calculated with this option. They are
+    # set to 0 for stats output.
+    Lscale_up = jnp.zeros((ngrdcol, nzt))
+    Lscale_down = jnp.zeros((ngrdcol, nzt))
 
     return (
+        err_info,
         invrs_tau_zt,
         invrs_tau_zm,
         invrs_tau_sfc,
@@ -240,727 +1643,5 @@ def diagnose_Lscale_from_tau(
         Lscale,
         Lscale_up,
         Lscale_down,
-        brunt_freq_pos,
-        brunt_freq_out_cloud,
-    )
-
-
-# ---------------------------------------------------------------------------
-# compute_mixing_length
-# Golaz et al. (2002) nonlocal parcel length scale.
-# Faithful port of mixing_length.F90:compute_mixing_length.
-# Ascending grid only (grid_dir_indx = +1).
-# ---------------------------------------------------------------------------
-
-_ZLMIN = 0.1               # minimum Lscale [m]
-_LSCALE_SFCLYR_DEPTH = 500.0  # surface-layer depth for lminh [m]
-_LV2_COEF = ep * Lv ** 2 / (Rd * Cp)  # ep*Lv²/(Rd*Cp)  [K²]
-
-
-def _parcel_thv(thl_par, rt_par, exner_j, p_j, thv_ds_j, Lv_coef_j, saturation_formula):
-    """Compute thv_par at a single level j (scalar).
-    Lewellen-Yoh (1993) condensate formula inside the parcel.
-    """
-    tl_j = thl_par * exner_j
-    rsat_j = sat_mixrat_liq(
-        jnp.reshape(p_j, (1, 1)),
-        jnp.reshape(tl_j, (1, 1)),
-        saturation_formula,
-    )[0, 0]
-    tl_sqd = tl_j ** 2
-    s_j = (rt_par - rsat_j) * tl_sqd / (tl_sqd + _LV2_COEF * rsat_j)
-    rc_j = jnp.maximum(s_j, zero_threshold)
-    return thl_par + ep1 * thv_ds_j * rt_par + Lv_coef_j * rc_j
-
-
-def _upward_inner_while(
-    k_py,
-    tke_0,
-    thl_init, rt_init, dCAPE_init,   # parcel state at k_py+1 (initial step result)
-    thl_precalc_up,                   # (nzm,) thl_par_j_precalc for upward
-    rt_precalc_up,                    # (nzm,)
-    exp_mu_dzm,                       # (nzm,) per zm level
-    grav_on_thvm, Lv_coef, thv_ds, exner, p, thvm,  # (nzt,) per zt level
-    dzm, invrs_dzm,                   # (nzm,)
-    zt,                               # (nzt,) altitude
-    k_ub_zt_py,
-    saturation_formula,
-):
-    """Inner while loop for upward parcel trajectory from k_py+2.
-
-    Fortran pattern:
-        j = k + 2
-        do while (j < k_ub_zt)
-            compute CAPE_incr at j using parcel thl/rt from prev step
-            if (tke + CAPE_incr <= 0) exit   ! j stays, early exit
-            tke += CAPE_incr; j += 1
-        end do
-        Lscale_up[k] += zt[j-1] - zt[k]  (full levels crossed)
-        + quadratic formula for fractional level
-
-    Returns (Lscale_up_k, j_final, exited_early, tke_exit, dCAPE_exit_prev, dCAPE_exit_j)
-    """
-    # State: (j, tke, thl_par, rt_par, dCAPE_prev, done, j_last_reached,
-    #         tke_at_exit, dCAPE_exit_prev, dCAPE_exit_j)
-    init_state = (
-        k_py + 2,           # j: next level to test (ascending)
-        tke_0,              # remaining TKE
-        thl_init,           # thl_par at level k_py+1 (from initial step)
-        rt_init,            # rt_par at level k_py+1
-        dCAPE_init,         # dCAPE/dz at level k_py+1 (for trapezoidal rule)
-        jnp.bool_(False),   # done (early exit flag)
-        k_py + 1,           # j_last: last fully-reached level (k_py+1 initially)
-        tke_0,              # tke_at_exit (TKE before exhaustion step)
-        dCAPE_init,         # dCAPE_exit_prev (dCAPE at j_last at time of exit)
-        jnp.float64(0.0),   # dCAPE_exit_j (dCAPE at exit level j)
-    )
-
-    def cond_fn(state):
-        j, tke, thl, rt, dCAPE_prev, done, j_last, tke_exit, dep, dej = state
-        return ~done & (j < k_ub_zt_py)
-
-    def body_fn(state):
-        j, tke, thl, rt, dCAPE_prev, done, j_last, tke_exit, dep, dej = state
-        # Ascending grid: j_zm = j (zm-level index same as zt-level for ascending)
-        thl_new = thl_precalc_up[j] + thl * exp_mu_dzm[j]
-        rt_new  = rt_precalc_up[j]  + rt  * exp_mu_dzm[j]
-        thv_new = _parcel_thv(thl_new, rt_new, exner[j], p[j], thv_ds[j], Lv_coef[j],
-                               saturation_formula)
-        dCAPE_j   = grav_on_thvm[j] * (thv_new - thvm[j])
-        CAPE_incr = 0.5 * (dCAPE_j + dCAPE_prev) * dzm[j]  # j_zm = j
-
-        new_tke   = tke + CAPE_incr
-        exhausted = new_tke <= 0.0
-        newly_ex  = exhausted & ~done
-
-        # Preserve exit info at first exhaustion
-        tke_exit_out = jnp.where(newly_ex, tke, tke_exit)
-        dep_out       = jnp.where(newly_ex, dCAPE_prev, dep)
-        dej_out       = jnp.where(newly_ex, dCAPE_j, dej)
-
-        # j increments only when NOT exhausted
-        j_out       = jnp.where(exhausted, j, j + 1)
-        tke_out     = jnp.where(exhausted, tke, new_tke)
-        thl_out     = jnp.where(exhausted, thl, thl_new)
-        rt_out      = jnp.where(exhausted, rt,  rt_new)
-        dCAPE_out   = jnp.where(exhausted, dCAPE_prev, dCAPE_j)
-        j_last_out  = jnp.where(exhausted, j_last, j)  # last fully reached = current j
-        done_out    = done | exhausted
-
-        return (j_out, tke_out, thl_out, rt_out, dCAPE_out, done_out,
-                j_last_out, tke_exit_out, dep_out, dej_out)
-
-    # REFACTOR B3: bit-exact bounded-scan replacement for while_loop (grad-able). The up-parcel ascends
-    # from j=k_py+2 to at most k_ub_zt_py, so k_ub_zt_py (=nzt-1, static) bounds the iteration count.
-    final = _bounded_while(cond_fn, body_fn, init_state, k_ub_zt_py)
-    j_final, tke_final, _, _, _, done_final, j_last, tke_exit, dCAPE_exit_prev, dCAPE_exit_j = final
-
-    exited_early = done_final  # True if TKE exhausted before reaching k_ub_zt
-    # j_final = exit level (j < k_ub_zt when exited_early),
-    #           or k_ub_zt when loop hit boundary (loop advanced j PAST boundary)
-    # j_last  = last fully-traversed level (j_final - 1 when exited early, else k_ub_zt - 1)
-
-    return j_last, exited_early, j_final, tke_exit, dCAPE_exit_prev, dCAPE_exit_j
-
-
-def _compute_lscale_up_col(
-    tke_i_col,            # (nzt,)
-    thl_par_1_up,         # (nzt,) initial parcel thl at j_py=1..nzt-1 (padded at 0)
-    rt_par_1_up,          # (nzt,)
-    dCAPE_dz_1_up,        # (nzt,) initial dCAPE at j_py=1..nzt-1 (padded at 0)
-    CAPE_incr_1_up,       # (nzt,) initial CAPE_incr at j_py=1..nzt-1 (padded at 0)
-    thl_precalc_up,       # (nzm,) thl_par_j_precalc, index 1..nzt-2 valid
-    rt_precalc_up,        # (nzm,)
-    exp_mu_dzm,           # (nzm,)
-    grav_on_thvm,         # (nzt,)
-    Lv_coef,              # (nzt,)
-    thv_ds,               # (nzt,)
-    exner,                # (nzt,)
-    p,                    # (nzt,)
-    thvm,                 # (nzt,)
-    dzm,                  # (nzm,)
-    invrs_dzm,            # (nzm,)
-    zt,                   # (nzt,)
-    k_ub_zt_py,
-    saturation_formula,
-    nzt,
-):
-    """Compute Lscale_up for a single column."""
-    zlmin = _ZLMIN
-
-    # Outer scan over starting levels k = 0..nzt-3
-    def outer_step(carry, k_py):
-        max_alt = carry  # Lscale_up_max_alt (running max of zt + Lscale_up)
-
-        tke_i_k = tke_i_col[k_py]
-        tke_0 = tke_i_k + CAPE_incr_1_up[k_py + 1]
-
-        # ---- Case A: TKE exhausted before reaching level k+1 ----
-        # kp1_zm = k+1 (ascending), dCAPE at k+1, tke = tke_i[k]
-        dCAPE_1_kp1 = dCAPE_dz_1_up[k_py + 1]
-        # Avoid division by zero: if dCAPE_1_kp1 = 0, set frac_a = 0
-        safe_dCAPE_a = jnp.where(jnp.abs(dCAPE_1_kp1) > 0.0, dCAPE_1_kp1, 1.0)
-        frac_a = -_safe_sqrt(-2.0 * tke_i_k * dzm[k_py + 1] * dCAPE_1_kp1) / safe_dCAPE_a
-
-        # ---- Case B/C: TKE survives initial step — run inner while loop ----
-        j_last, exited_early, j_final, tke_exit, dCAPE_exit_prev, dCAPE_exit_j = (
-            _upward_inner_while(
-                k_py,
-                tke_0,
-                thl_par_1_up[k_py + 1],
-                rt_par_1_up[k_py + 1],
-                dCAPE_dz_1_up[k_py + 1],
-                thl_precalc_up, rt_precalc_up,
-                exp_mu_dzm,
-                grav_on_thvm, Lv_coef, thv_ds, exner, p, thvm,
-                dzm, invrs_dzm,
-                zt,
-                k_ub_zt_py,
-                saturation_formula,
-            )
-        )
-
-        # Base distance: full levels crossed (zt[j_last] - zt[k_py])
-        base_dist = zt[j_last] - zt[k_py]
-
-        # Fractional correction when exited early (TKE exhausted at j_final)
-        dCAPE_diff = dCAPE_exit_j - dCAPE_exit_prev
-        # Linear case: |diff| * 2 <= |sum| * eps (dCAPE/dz nearly constant)
-        linear_case = (jnp.abs(dCAPE_diff) * 2.0
-                       <= jnp.abs(dCAPE_exit_j + dCAPE_exit_prev) * eps)
-        safe_dCAPE_j = jnp.where(jnp.abs(dCAPE_exit_j) > 0.0, dCAPE_exit_j, 1.0)
-        frac_linear = -tke_exit / safe_dCAPE_j
-
-        safe_diff = jnp.where(jnp.abs(dCAPE_diff) > 0.0, dCAPE_diff, 1.0)
-        invrs_diff = 1.0 / safe_diff
-        disc = (dCAPE_exit_prev ** 2
-                - 2.0 * tke_exit * invrs_dzm[j_final] * dCAPE_diff)
-        frac_quad = (
-            - dCAPE_exit_prev * invrs_diff * dzm[j_final]
-            - _safe_sqrt(disc) * invrs_diff * dzm[j_final]
-        )
-        frac_inner = jnp.where(linear_case, frac_linear, frac_quad)
-        frac_bc = jnp.where(exited_early, frac_inner, 0.0)
-
-        Lscale_up_k = jnp.where(
-            tke_0 > 0.0,
-            zlmin + base_dist + frac_bc,
-            zlmin + frac_a,
-        )
-
-        # Smooth-profile constraint: if a lower parcel can rise higher, use that
-        k_alt = zt[k_py] + Lscale_up_k
-        Lscale_up_k_smooth = jnp.where(k_alt < max_alt,
-                                         max_alt - zt[k_py],
-                                         Lscale_up_k)
-        new_max_alt = jnp.where(k_alt < max_alt, max_alt, k_alt)
-
-        return new_max_alt, Lscale_up_k_smooth
-
-    _, Lscale_up_values = jax.lax.scan(outer_step, jnp.float64(0.0), jnp.arange(nzt - 2))
-    # Lscale_up_values: shape (nzt-2,) for k=0..nzt-3
-    # Top level (nzt-2 and nzt-1) get zlmin
-    pad_top = jnp.full(2, _ZLMIN)
-    return jnp.concatenate([Lscale_up_values, pad_top])  # (nzt,)
-
-
-def _downward_inner_while(
-    k_py,
-    tke_0,
-    thl_init, rt_init, dCAPE_init,   # parcel state at k_py-1 (initial step result)
-    thl_precalc_down,                 # (nzm,) thl_par_j_precalc for downward
-    rt_precalc_down,                  # (nzm,)
-    exp_mu_dzm,                       # (nzm,)
-    grav_on_thvm, Lv_coef, thv_ds, exner, p, thvm,  # (nzt,)
-    dzm, invrs_dzm,                   # (nzm,)
-    zt,                               # (nzt,)
-    k_lb_zt_py,
-    saturation_formula,
-    max_iters,                        # static bound on the descent length (REFACTOR B3)
-):
-    """Inner while loop for downward parcel trajectory from k_py-2.
-
-    Fortran:
-        j = k - 2
-        do while (j >= k_lb_zt)     (ascending: j >= 0 in Python)
-            compute CAPE_incr at j
-            if (tke - CAPE_incr <= 0) exit
-            tke -= CAPE_incr; j -= 1
-        end do
-        Lscale_down[k] += zt[k] - zt[j+1]  (full levels crossed)
-        + quadratic formula for fractional level
-    """
-    init_state = (
-        k_py - 2,           # j: next level to test (descending)
-        tke_0,
-        thl_init,           # thl at k_py-1
-        rt_init,
-        dCAPE_init,         # dCAPE at k_py-1 (the dCAPE_j_plus_1 in Fortran)
-        jnp.bool_(False),
-        k_py - 1,           # j_last_reached (last fully crossed level)
-        tke_0,
-        dCAPE_init,         # dCAPE_exit_plus1 (= dCAPE_j_plus_1 at exit)
-        jnp.float64(0.0),   # dCAPE_exit_j
-    )
-
-    def cond_fn(state):
-        j, tke, thl, rt, dCAPE_plus1, done, j_last, tex, dep1, dej = state
-        return ~done & (j >= k_lb_zt_py)
-
-    def body_fn(state):
-        j, tke, thl, rt, dCAPE_plus1, done, j_last, tex, dep1, dej = state
-        # Ascending grid: jp1_zm = j+1
-        thl_new = thl_precalc_down[j] + thl * exp_mu_dzm[j + 1]
-        rt_new  = rt_precalc_down[j]  + rt  * exp_mu_dzm[j + 1]
-        thv_new = _parcel_thv(thl_new, rt_new, exner[j], p[j], thv_ds[j], Lv_coef[j],
-                               saturation_formula)
-        dCAPE_j   = grav_on_thvm[j] * (thv_new - thvm[j])
-        # Downward: CAPE_incr uses j+1 spacing (jp1_zm = j+1 ascending)
-        CAPE_incr = 0.5 * (dCAPE_j + dCAPE_plus1) * dzm[j + 1]
-
-        new_tke   = tke - CAPE_incr
-        exhausted = new_tke <= 0.0
-        newly_ex  = exhausted & ~done
-
-        tex_out  = jnp.where(newly_ex, tke, tex)
-        dep1_out = jnp.where(newly_ex, dCAPE_plus1, dep1)
-        dej_out  = jnp.where(newly_ex, dCAPE_j, dej)
-
-        j_out      = jnp.where(exhausted, j, j - 1)
-        tke_out    = jnp.where(exhausted, tke, new_tke)
-        thl_out    = jnp.where(exhausted, thl, thl_new)
-        rt_out     = jnp.where(exhausted, rt,  rt_new)
-        dCAPE_out  = jnp.where(exhausted, dCAPE_plus1, dCAPE_j)
-        j_last_out = jnp.where(exhausted, j_last, j)  # last fully crossed = current j
-        done_out   = done | exhausted
-
-        return (j_out, tke_out, thl_out, rt_out, dCAPE_out, done_out,
-                j_last_out, tex_out, dep1_out, dej_out)
-
-    # REFACTOR B3: bit-exact bounded-scan replacement for while_loop (grad-able). The down-parcel
-    # descends from j=k_py-2 to >= k_lb_zt_py; max_iters (=k_ub_zt_py=nzt-1, static) bounds it.
-    final = _bounded_while(cond_fn, body_fn, init_state, max_iters)
-    j_final, _, _, _, _, done_final, j_last, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j = final
-
-    exited_early = done_final
-    return j_last, exited_early, j_final, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j
-
-
-def _compute_lscale_down_col(
-    tke_i_col,
-    thl_par_1_down, rt_par_1_down, dCAPE_dz_1_down, CAPE_incr_1_down,
-    thl_precalc_down, rt_precalc_down,
-    exp_mu_dzm, grav_on_thvm, Lv_coef, thv_ds, exner, p, thvm,
-    dzm, invrs_dzm, zt,
-    k_ub_zt_py, k_lb_zt_py,
-    saturation_formula, nzt,
-):
-    """Compute Lscale_down for a single column.
-
-    Outer loop: k from k_ub_zt down to k_lb_zt+1 = nzt-1..1 (Python).
-    Scanned as i=0..nzt-2, k_py = nzt-1-i.
-    """
-    zlmin = _ZLMIN
-
-    def outer_step(carry, i):
-        min_alt = carry  # Lscale_down_min_alt (running min of zt - Lscale_down)
-        k_py = nzt - 1 - i  # descend from top
-
-        tke_i_k = tke_i_col[k_py]
-        # Downward initial: CAPE_incr at k-1 (Fortran k-1 = Python k_py-1)
-        tke_0 = tke_i_k - CAPE_incr_1_down[k_py - 1]
-
-        # ---- Case A: TKE exhausted before reaching level k-1 ----
-        # k_zm = k (ascending: k_zm = k for Lscale_down case, Fortran kp1_zm)
-        # Fortran uses k_zm for the boundary term: dzm[k_zm] where k_zm = k (ascending)
-        dCAPE_1_km1 = dCAPE_dz_1_down[k_py - 1]
-        safe_dCAPE_a = jnp.where(jnp.abs(dCAPE_1_km1) > 0.0, dCAPE_1_km1, 1.0)
-        frac_a = _safe_sqrt(2.0 * tke_i_k * dzm[k_py] * dCAPE_1_km1) / safe_dCAPE_a
-
-        # ---- Case B/C: TKE survives initial step ----
-        j_last, exited_early, j_final, tke_exit, dCAPE_exit_plus1, dCAPE_exit_j = (
-            _downward_inner_while(
-                k_py,
-                tke_0,
-                thl_par_1_down[k_py - 1],
-                rt_par_1_down[k_py - 1],
-                dCAPE_dz_1_down[k_py - 1],
-                thl_precalc_down, rt_precalc_down,
-                exp_mu_dzm,
-                grav_on_thvm, Lv_coef, thv_ds, exner, p, thvm,
-                dzm, invrs_dzm, zt,
-                k_lb_zt_py,
-                saturation_formula,
-                k_ub_zt_py,   # static descent bound (REFACTOR B3)
-            )
-        )
-
-        base_dist = zt[k_py] - zt[j_last]
-
-        dCAPE_diff = dCAPE_exit_j - dCAPE_exit_plus1
-        linear_case = (jnp.abs(dCAPE_diff) * 2.0
-                       <= jnp.abs(dCAPE_exit_j + dCAPE_exit_plus1) * eps)
-        safe_dCAPE_j = jnp.where(jnp.abs(dCAPE_exit_j) > 0.0, dCAPE_exit_j, 1.0)
-        frac_linear = tke_exit / safe_dCAPE_j
-
-        safe_diff = jnp.where(jnp.abs(dCAPE_diff) > 0.0, dCAPE_diff, 1.0)
-        invrs_diff = 1.0 / safe_diff
-        disc = (dCAPE_exit_plus1 ** 2
-                + 2.0 * tke_exit * invrs_dzm[j_final + 1] * dCAPE_diff)
-        frac_quad = (
-            - dCAPE_exit_plus1 * invrs_diff * dzm[j_final + 1]
-            + _safe_sqrt(disc) * invrs_diff * dzm[j_final + 1]
-        )
-        frac_inner = jnp.where(linear_case, frac_linear, frac_quad)
-        frac_bc = jnp.where(exited_early, frac_inner, 0.0)
-
-        Lscale_down_k = jnp.where(
-            tke_0 > 0.0,
-            zlmin + base_dist + frac_bc,
-            zlmin + frac_a,
-        )
-
-        k_alt = zt[k_py] - Lscale_down_k
-        Lscale_down_k_smooth = jnp.where(k_alt > min_alt,
-                                           zt[k_py] - min_alt,
-                                           Lscale_down_k)
-        new_min_alt = jnp.where(k_alt > min_alt, min_alt, k_alt)
-
-        return new_min_alt, (k_py, Lscale_down_k_smooth)
-
-    init_min_alt = zt[k_ub_zt_py]  # = zt[nzt-1] (top)
-    _, (k_indices, Lscale_down_values) = jax.lax.scan(
-        outer_step, init_min_alt, jnp.arange(nzt - 1)
-    )
-    # k_indices: shape (nzt-1,) values nzt-1..1
-    # Build Lscale_down array by scatter
-    Lscale_down_col = jnp.full(nzt, _ZLMIN)
-    Lscale_down_col = Lscale_down_col.at[k_indices].set(Lscale_down_values)
-    # k=0 (bottom) keeps zlmin
-    return Lscale_down_col
-
-
-def set_Lscale_max(l_implemented, host_dx, host_dy, ngrdcol):
-    """mixing_length.F90:set_Lscale_max.
-
-    Maximum allowable value for Lscale [m]. When CLUBB runs inside a host model the cap is
-    0.25*min(host_dx, host_dy) (smaller grid → smaller Lscale); standalone it is 1.0e5.
-    Returns a (ngrdcol,) array.
-    """
-    if l_implemented:
-        return 0.25 * jnp.minimum(jnp.asarray(host_dx), jnp.asarray(host_dy))
-    return jnp.full((ngrdcol,), 1.0e5)
-
-
-def compute_mixing_length(
-    thvm, thlm, rtm, em, Lscale_max, p_in_Pa, exner, thv_ds,
-    mu, lmin, saturation_formula, l_implemented, gr,
-):
-    """JAX port of mixing_length.F90:compute_mixing_length.
-
-    Golaz et al. (2002) nonlocal parcel length scale.
-    Ascending grid only (grid_dir_indx = +1).
-
-    Inputs (all float64):
-      thvm, thlm, rtm, p_in_Pa, exner, thv_ds: (ngrdcol, nzt)
-      em: (ngrdcol, nzm)
-      Lscale_max: (ngrdcol,)
-      mu: (ngrdcol,) entrainment rate [1/m]
-      lmin: scalar [m]
-      saturation_formula: int
-      l_implemented: bool (True = within host model)
-      gr: grid namedtuple
-    Returns:
-      Lscale, Lscale_up, Lscale_down: (ngrdcol, nzt)
-    """
-    ngrdcol, nzt = thvm.shape
-    nzm = em.shape[1]
-    k_ub_zt_py = gr.k_ub_zt   # = nzt - 1 = 132
-    k_lb_zt_py = gr.k_lb_zt   # = 0
-
-    # ---- Shared precomputations ----
-    tke_i = zm2zt_jax(em, gr)                             # (ngrdcol, nzt)
-    grav_on_thvm = grav / thvm                            # (ngrdcol, nzt)
-    Lv_coef = Lv / (exner * Cp) - ep2 * thv_ds           # (ngrdcol, nzt)
-
-    # zm-level precomputes (shape nzm)
-    exp_mu_dzm  = jnp.exp(-mu[:, None] * gr.dzm)          # (ngrdcol, nzm)
-    invrs_dzm_on_mu = gr.invrs_dzm / mu[:, None]           # (ngrdcol, nzm)
-    entrain_coef = (1.0 - exp_mu_dzm) * invrs_dzm_on_mu   # (ngrdcol, nzm)
-
-    # ---- Upward precalculations ----
-    # thl_par_j_precalc_up[i, j_py] for j_py = 1..nzt-2 (ascending: j_zm = j_py)
-    thl_mid = thlm[:, 1:nzt - 1]         # (ngrdcol, nzt-2)
-    thl_blw = thlm[:, 0:nzt - 2]
-    rt_mid  = rtm[:, 1:nzt - 1]
-    rt_blw  = rtm[:, 0:nzt - 2]
-    emu_up  = exp_mu_dzm[:, 1:nzt - 1]   # j_zm = j_py = 1..nzt-2
-    ec_up   = entrain_coef[:, 1:nzt - 1]
-
-    thl_precalc_up_int = thl_mid - thl_blw * emu_up - (thl_mid - thl_blw) * ec_up
-    rt_precalc_up_int  = rt_mid  - rt_blw  * emu_up - (rt_mid  - rt_blw)  * ec_up
-    _pad0   = jnp.zeros((ngrdcol, 1))
-    _pad2   = jnp.zeros((ngrdcol, 2))
-    # Shape (ngrdcol, nzm=nzt+1): index 0 unused, 1..nzt-2 valid, nzt-1..nzt unused
-    thl_precalc_up = jnp.concatenate([_pad0, thl_precalc_up_int, _pad2], axis=1)
-    rt_precalc_up  = jnp.concatenate([_pad0, rt_precalc_up_int,  _pad2], axis=1)
-
-    # Upward initial step: thl_par_1_up[i, j_py] for j_py = 1..nzt-1
-    # j_zm = j_py (ascending), entrain_coef[j_py] used
-    ec_init_up  = entrain_coef[:, 1:nzt]  # (ngrdcol, nzt-1)
-    thl_diff_up = thlm[:, 1:] - thlm[:, :-1]
-    rt_diff_up  = rtm[:, 1:]  - rtm[:, :-1]
-    thl_par_1_up_int = thlm[:, 1:] - thl_diff_up * ec_init_up  # (ngrdcol, nzt-1)
-    rt_par_1_up_int  = rtm[:, 1:]  - rt_diff_up  * ec_init_up
-
-    tl_par_1_up_int = thl_par_1_up_int * exner[:, 1:]           # (ngrdcol, nzt-1)
-    rsat_1_up_int   = sat_mixrat_liq(p_in_Pa[:, 1:], tl_par_1_up_int, saturation_formula)
-    tl_sqd_up       = tl_par_1_up_int ** 2
-    s_1_up          = ((rt_par_1_up_int - rsat_1_up_int) * tl_sqd_up
-                       / (tl_sqd_up + _LV2_COEF * rsat_1_up_int))
-    rc_1_up         = jnp.maximum(s_1_up, zero_threshold)
-    thv_1_up        = (thl_par_1_up_int + ep1 * thv_ds[:, 1:] * rt_par_1_up_int
-                       + Lv_coef[:, 1:] * rc_1_up)
-    dCAPE_dz_1_up_int  = grav_on_thvm[:, 1:] * (thv_1_up - thvm[:, 1:])   # (ngrdcol, nzt-1)
-    CAPE_incr_1_up_int = 0.5 * dCAPE_dz_1_up_int * gr.dzm[:, 1:nzt]      # j_zm = j_py
-
-    thl_par_1_up  = jnp.concatenate([_pad0, thl_par_1_up_int], axis=1)  # (ngrdcol, nzt)
-    rt_par_1_up   = jnp.concatenate([_pad0, rt_par_1_up_int],  axis=1)
-    dCAPE_dz_1_up = jnp.concatenate([_pad0, dCAPE_dz_1_up_int], axis=1)
-    CAPE_incr_1_up= jnp.concatenate([_pad0, CAPE_incr_1_up_int], axis=1)
-
-    # ---- Downward precalculations ----
-    # thl_par_j_precalc_down[i, j_py] for j_py = 0..nzt-2 (ascending: jp1_zm = j+1)
-    thl_abv  = thlm[:, 1:]             # (ngrdcol, nzt-1), j+1 = j_py+1
-    thl_at_j = thlm[:, :-1]            # j_py = 0..nzt-2
-    rt_abv   = rtm[:, 1:]
-    rt_at_j  = rtm[:, :-1]
-    emu_dn   = exp_mu_dzm[:, 1:nzt]    # jp1_zm = j+1, j_py = 0..nzt-2
-    ec_dn    = entrain_coef[:, 1:nzt]
-
-    thl_precalc_dn_int = thl_at_j - thl_abv * emu_dn - (thl_at_j - thl_abv) * ec_dn
-    rt_precalc_dn_int  = rt_at_j  - rt_abv  * emu_dn - (rt_at_j  - rt_abv)  * ec_dn
-    # Shape (ngrdcol, nzm=nzt+1): index 0..nzt-2 valid, nzt-1 unused
-    thl_precalc_down = jnp.concatenate([thl_precalc_dn_int, jnp.zeros((ngrdcol, 2))], axis=1)
-    rt_precalc_down  = jnp.concatenate([rt_precalc_dn_int,  jnp.zeros((ngrdcol, 2))], axis=1)
-
-    # Downward initial step: thl_par_1_down[i, j_py] for j_py = 0..nzt-2
-    # jp1_zm = j+1 (ascending), entrain_coef[j+1] used
-    ec_init_dn   = entrain_coef[:, 1:nzt]   # jp1_zm = j_py+1, j_py = 0..nzt-2
-    thl_diff_dn  = thlm[:, :-1] - thlm[:, 1:]
-    rt_diff_dn   = rtm[:, :-1]  - rtm[:, 1:]
-    thl_par_1_dn_int = thlm[:, :-1] - thl_diff_dn * ec_init_dn   # (ngrdcol, nzt-1)
-    rt_par_1_dn_int  = rtm[:, :-1]  - rt_diff_dn  * ec_init_dn
-
-    tl_par_1_dn_int = thl_par_1_dn_int * exner[:, :-1]
-    rsat_1_dn_int   = sat_mixrat_liq(p_in_Pa[:, :-1], tl_par_1_dn_int, saturation_formula)
-    tl_sqd_dn       = tl_par_1_dn_int ** 2
-    s_1_dn          = ((rt_par_1_dn_int - rsat_1_dn_int) * tl_sqd_dn
-                       / (tl_sqd_dn + _LV2_COEF * rsat_1_dn_int))
-    rc_1_dn         = jnp.maximum(s_1_dn, zero_threshold)
-    thv_1_dn        = (thl_par_1_dn_int + ep1 * thv_ds[:, :-1] * rt_par_1_dn_int
-                       + Lv_coef[:, :-1] * rc_1_dn)
-    dCAPE_dz_1_dn_int  = grav_on_thvm[:, :-1] * (thv_1_dn - thvm[:, :-1])
-    CAPE_incr_1_dn_int = 0.5 * dCAPE_dz_1_dn_int * gr.dzm[:, 1:nzt]   # jp1_zm = j_py+1
-
-    # Pad: index nzt-1 unused (level above top)
-    thl_par_1_down  = jnp.concatenate([thl_par_1_dn_int,  _pad0], axis=1)  # (ngrdcol, nzt)
-    rt_par_1_down   = jnp.concatenate([rt_par_1_dn_int,   _pad0], axis=1)
-    dCAPE_dz_1_down = jnp.concatenate([dCAPE_dz_1_dn_int, _pad0], axis=1)
-    CAPE_incr_1_down= jnp.concatenate([CAPE_incr_1_dn_int,_pad0], axis=1)
-
-    # ---- Per-column upward/downward computation (vmap over ngrdcol) ----
-    # Convert to JAX arrays (needed for dynamic indexing with traced indices)
-    zt_single  = jnp.asarray(gr.zt[0])
-    dzm_single = jnp.asarray(gr.dzm[0])
-    invrs_dzm_single = jnp.asarray(gr.invrs_dzm[0])
-
-    def col_lscale(i):
-        Lscale_up_col = _compute_lscale_up_col(
-            tke_i[i], thl_par_1_up[i], rt_par_1_up[i],
-            dCAPE_dz_1_up[i], CAPE_incr_1_up[i],
-            thl_precalc_up[i], rt_precalc_up[i],
-            exp_mu_dzm[i], grav_on_thvm[i], Lv_coef[i],
-            thv_ds[i], exner[i], p_in_Pa[i], thvm[i],
-            dzm_single, invrs_dzm_single, zt_single,
-            k_ub_zt_py, saturation_formula, nzt,
-        )
-        Lscale_down_col = _compute_lscale_down_col(
-            tke_i[i], thl_par_1_down[i], rt_par_1_down[i],
-            dCAPE_dz_1_down[i], CAPE_incr_1_down[i],
-            thl_precalc_down[i], rt_precalc_down[i],
-            exp_mu_dzm[i], grav_on_thvm[i], Lv_coef[i],
-            thv_ds[i], exner[i], p_in_Pa[i], thvm[i],
-            dzm_single, invrs_dzm_single, zt_single,
-            k_ub_zt_py, k_lb_zt_py, saturation_formula, nzt,
-        )
-        return Lscale_up_col, Lscale_down_col
-
-    Lscale_up_all   = jnp.stack([col_lscale(i)[0] for i in range(ngrdcol)])
-    Lscale_down_all = jnp.stack([col_lscale(i)[1] for i in range(ngrdcol)])
-
-    # ---- Apply lminh floor and Lscale_max cap ----
-    invrs_sfclyr = 1.0 / _LSCALE_SFCLYR_DEPTH
-    if l_implemented:
-        # Host model: surface layer above *ground* (bottom zm level)
-        zm_sfc = gr.zm[:, gr.k_lb_zm]  # (ngrdcol,)
-        lminh = (jnp.maximum(0.0, _LSCALE_SFCLYR_DEPTH - (gr.zt - zm_sfc[:, None]))
-                 * lmin * invrs_sfclyr)
-    else:
-        # Standalone: above mean sea level
-        lminh = (jnp.maximum(0.0, _LSCALE_SFCLYR_DEPTH - gr.zt)
-                 * lmin * invrs_sfclyr)
-
-    Lscale_up   = jnp.maximum(lminh, Lscale_up_all)
-    Lscale_down = jnp.maximum(lminh, Lscale_down_all)
-    # _safe_sqrt (REFACTOR B5): Lscale_down (and the lminh floor) -> 0 where a parcel cannot descend
-    # (near surface / very stable), so the bare sqrt of the product has an inf reverse-mode gradient there.
-    Lscale = _safe_sqrt(Lscale_up * Lscale_down)
-
-    # Upper boundary: Lscale[k_ub] = Lscale[k_ub - 1]
-    Lscale = Lscale.at[:, k_ub_zt_py].set(Lscale[:, k_ub_zt_py - 1])
-
-    # Global cap
-    Lscale = jnp.minimum(Lscale, Lscale_max[:, None])
-
-    return Lscale, Lscale_up, Lscale_down
-
-
-def calc_Lscale_directly(
-    thvm, thlm, rtm, em, Lscale_max, p_in_Pa, exner, thv_ds,
-    clubb_params, lmin, saturation_formula, l_implemented, gr,
-):
-    """JAX port of mixing_length.F90:calc_Lscale_directly.
-
-    l_avg_Lscale = False (Fortran compile-time constant).
-    Calls compute_mixing_length once with mean values.
-
-    Inputs:
-      clubb_params: (ngrdcol, nparams+1) — 1-indexed
-    Returns:
-      Lscale, Lscale_up, Lscale_down: (ngrdcol, nzt)
-    """
-    mu = clubb_params[:, imu]   # imu = 60 (1-indexed, column 0 unused)
-    return compute_mixing_length(
-        thvm, thlm, rtm, em, Lscale_max, p_in_Pa, exner, thv_ds,
-        mu, lmin, saturation_formula, l_implemented, gr,
-    )
-
-
-def calc_Lscale(*, thvm, thlm, rtm, em, sqrt_em_zt, Lscale_max, p_in_Pa, exner, thv_ds_zt,
-    clubb_params, lmin, l_implemented, upwp_sfc, vpwp_sfc, ddzt_umvm_sqd,
-    ice_supersat_frac, ufmin, tau_const, sfc_elevation, Ri_zm,
-    brunt_vaisala_freq_sqd_smth, flags, gr, ngrdcol, nzm, nzt):
-    """mixing_length.F90:calc_Lscale — the top-level mixing-length / dissipation-time-scale
-    dispatcher. Branches on flags.l_diag_Lscale_from_tau: diagnose_lscale_from_tau (returns the
-    tau fields directly) OR calc_lscale_directly (the parcel method) + derive tau from Lscale.
-    Relocated verbatim from advance_clubb_core's inline Block L; returns a dict of the Lscale /
-    Lscale_up/down + tau / invrs_tau fields (+ the two brunt-frequency diagnostics for the tau
-    branch, None in the directly branch). advance_clubb_core does the Lscale/tau stat_updates."""
-    one = 1.0
-    if not flags.l_diag_Lscale_from_tau:
-        # calc_lscale_directly (l_avg_Lscale=False, ascending grid)
-        _Lscale_j, _Lscale_up_j, _Lscale_down_j = calc_Lscale_directly(
-            jnp.asarray(thvm), jnp.asarray(thlm), jnp.asarray(rtm),
-            jnp.asarray(em), jnp.asarray(Lscale_max),
-            jnp.asarray(p_in_Pa), jnp.asarray(exner), jnp.asarray(thv_ds_zt),
-            jnp.asarray(clubb_params), lmin,
-            flags.saturation_formula, l_implemented, gr,
-        )
-        Lscale      = _asarray(_Lscale_j,      dtype=np.float64)
-        Lscale_up   = _asarray(_Lscale_up_j,   dtype=np.float64)
-        Lscale_down = _asarray(_Lscale_down_j, dtype=np.float64)
-
-        # tau from Lscale
-        tau_zt = _xp.minimum(Lscale / sqrt_em_zt,
-                            clubb_params[:, itaumax - 1:itaumax])
-
-        Lscale_zm = _xp.maximum(
-            _asarray(zt2zm(Lscale, gr)),
-            zero_threshold,
-        )
-
-        tau_zm = _xp.minimum(
-            Lscale_zm / _xp.sqrt(_xp.maximum(em_min, em)),
-            clubb_params[:, itaumax - 1:itaumax],
-        )
-
-        invrs_tau_zm = one / tau_zm
-        invrs_tau_wp2_zm = invrs_tau_zm.copy()
-        invrs_tau_xp2_zm = invrs_tau_zm.copy()
-        invrs_tau_wpxp_zm = invrs_tau_zm.copy()
-        invrs_tau_wp3_zm = invrs_tau_zm.copy()
-        tau_max_zm = _xp.broadcast_to(
-            clubb_params[:, itaumax - 1:itaumax], (ngrdcol, nzm)).copy()
-
-        invrs_tau_zt = one / tau_zt
-        invrs_tau_wp3_zt = invrs_tau_zt.copy()
-        tau_max_zt = _xp.broadcast_to(
-            clubb_params[:, itaumax - 1:itaumax], (ngrdcol, nzt)).copy()
-
-        # Placeholder variables not computed in this branch
-        invrs_tau_no_N2_zm = np.zeros((ngrdcol, nzm))
-        invrs_tau_bkgnd = np.zeros((ngrdcol, nzm))
-        invrs_tau_shear = np.zeros((ngrdcol, nzm))
-        invrs_tau_sfc = np.zeros((ngrdcol, nzm))
-        invrs_tau_N2_iso = np.zeros((ngrdcol, nzm))
-        _j_brunt_freq_pos = None
-        _j_brunt_freq_out_cloud = None
-    else:
-        # diagnose_lscale_from_tau
-        (_j_invrs_tau_zt, _j_invrs_tau_zm,
-         _j_invrs_tau_sfc, _j_invrs_tau_no_N2, _j_invrs_tau_bkgnd,
-         _j_invrs_tau_shear, _j_invrs_tau_N2_iso,
-         _j_invrs_tau_wp2, _j_invrs_tau_xp2,
-         _j_invrs_tau_wp3_zm, _j_invrs_tau_wp3_zt, _j_invrs_tau_wpxp,
-         _j_tau_max_zm, _j_tau_max_zt, _j_tau_zm, _j_tau_zt,
-         _j_Lscale, _j_Lscale_up, _j_Lscale_down,
-         _j_brunt_freq_pos, _j_brunt_freq_out_cloud) = diagnose_Lscale_from_tau(
-            upwp_sfc=jnp.asarray(upwp_sfc),
-            vpwp_sfc=jnp.asarray(vpwp_sfc),
-            ddzt_umvm_sqd=jnp.asarray(ddzt_umvm_sqd),
-            ice_supersat_frac=jnp.asarray(ice_supersat_frac),
-            em=jnp.asarray(em),
-            sqrt_em_zt=jnp.asarray(sqrt_em_zt),
-            ufmin=ufmin,
-            tau_const=tau_const,
-            sfc_elevation=jnp.asarray(sfc_elevation),
-            Lscale_max=jnp.asarray(Lscale_max),
-            clubb_params=jnp.asarray(clubb_params),
-            Ri_zm=jnp.asarray(Ri_zm),
-            brunt_vaisala_freq_sqd_smth=jnp.asarray(brunt_vaisala_freq_sqd_smth),
-            l_e3sm_config=flags.l_e3sm_config,
-            l_smooth_Heaviside_tau_wpxp=flags.l_smooth_Heaviside_tau_wpxp,
-            gr=gr,
-        )
-        invrs_tau_zt     = _asarray(_j_invrs_tau_zt,     dtype=np.float64)
-        invrs_tau_zm     = _asarray(_j_invrs_tau_zm,     dtype=np.float64)
-        invrs_tau_sfc    = _asarray(_j_invrs_tau_sfc,    dtype=np.float64)
-        invrs_tau_no_N2_zm = _asarray(_j_invrs_tau_no_N2, dtype=np.float64)
-        invrs_tau_bkgnd  = _asarray(_j_invrs_tau_bkgnd,  dtype=np.float64)
-        invrs_tau_shear  = _asarray(_j_invrs_tau_shear,  dtype=np.float64)
-        invrs_tau_N2_iso = _asarray(_j_invrs_tau_N2_iso, dtype=np.float64)
-        invrs_tau_wp2_zm = _asarray(_j_invrs_tau_wp2,    dtype=np.float64)
-        invrs_tau_xp2_zm = _asarray(_j_invrs_tau_xp2,    dtype=np.float64)
-        invrs_tau_wp3_zm = _asarray(_j_invrs_tau_wp3_zm, dtype=np.float64)
-        invrs_tau_wp3_zt = _asarray(_j_invrs_tau_wp3_zt, dtype=np.float64)
-        invrs_tau_wpxp_zm = _asarray(_j_invrs_tau_wpxp,  dtype=np.float64)
-        tau_max_zm       = _asarray(_j_tau_max_zm,       dtype=np.float64)
-        tau_max_zt       = _asarray(_j_tau_max_zt,       dtype=np.float64)
-        tau_zm           = _asarray(_j_tau_zm,           dtype=np.float64)
-        tau_zt           = _asarray(_j_tau_zt,           dtype=np.float64)
-        Lscale           = _asarray(_j_Lscale,           dtype=np.float64)
-        Lscale_up        = _asarray(_j_Lscale_up,        dtype=np.float64)
-        Lscale_down      = _asarray(_j_Lscale_down,      dtype=np.float64)
-    return dict(
-        Lscale=Lscale, Lscale_up=Lscale_up, Lscale_down=Lscale_down,
-        tau_zt=tau_zt, tau_zm=tau_zm, tau_max_zm=tau_max_zm, tau_max_zt=tau_max_zt,
-        invrs_tau_zm=invrs_tau_zm, invrs_tau_zt=invrs_tau_zt,
-        invrs_tau_wp2_zm=invrs_tau_wp2_zm, invrs_tau_xp2_zm=invrs_tau_xp2_zm,
-        invrs_tau_wpxp_zm=invrs_tau_wpxp_zm, invrs_tau_wp3_zm=invrs_tau_wp3_zm,
-        invrs_tau_wp3_zt=invrs_tau_wp3_zt,
-        invrs_tau_no_N2_zm=invrs_tau_no_N2_zm, invrs_tau_bkgnd=invrs_tau_bkgnd,
-        invrs_tau_shear=invrs_tau_shear, invrs_tau_sfc=invrs_tau_sfc,
-        invrs_tau_N2_iso=invrs_tau_N2_iso,
-        brunt_freq_pos=_j_brunt_freq_pos, brunt_freq_out_cloud=_j_brunt_freq_out_cloud,
+        stats,
     )

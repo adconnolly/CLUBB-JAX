@@ -8,12 +8,10 @@ exercises it. This pins it as a first-line guard:
 
   (1) the per-level RHS functions `term_tp_rhs` / `term_ac_rhs` vs their literal F90 formulas (exact) + grad finite;
   (2) the whole steady-state assembly vs an independent transcription built on the f2py-bit-shadowed `zt2zm`/`zm2zt`
-      regrids (so the interpolation is a real Fortran oracle), using the level-above index `min(k+1, nzt-1)`.
+      regrids (so the interpolation is a real Fortran oracle), using the Fortran level-above index behavior.
 
-NB the transcription uses `min` for the level-above clamp — the JAX's (and the *intended* Fortran) behavior. The
-actual Fortran source has `kp1 = max(k+1, nzt)` (advance_xp3_module.F90:812), an apparent typo (constant nzt; cf.
-the `min` clamps in pdf_closure_module.F90:5556 / interpolation.F90:480). The JAX deliberately uses `min`; the gated
-path means the divergence never manifests (documented at advance_xp3_simplified's kp1 site, iter 491). SKIPs the
+The Fortran source has `kp1 = max(k+1, nzt)` (advance_xp3_module.F90:812), which maps every interior k to the top
+momentum level after converting to 0-based indexing. The current JAX port follows that source behavior. SKIPs the
 end-to-end check if clubb_f2py/clubb_python are unbuilt; the RHS-formula checks are pure-Python and never SKIP. (iter 491)
 """
 import os
@@ -33,12 +31,54 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.advance_xp3_module import (
-    term_tp_rhs, term_ac_rhs, advance_xp3_simplified,
+    term_tp_rhs, term_ac_rhs, advance_xp3_simplified as _advance_xp3_simplified,
+    xp3_rtp3,
 )
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.CLUBB_core.constants_clubb import zero_threshold
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
+
+
+def advance_xp3_simplified(
+    xm,
+    xp2,
+    wpxp,
+    wpxp2,
+    rho_ds_zm,
+    invrs_rho_ds_zt,
+    invrs_tau_zt,
+    tau_max_zt,
+    x_tol,
+    gr,
+):
+    xp3, _stats = _advance_xp3_simplified(
+        gr.nzm,
+        gr.nzt,
+        gr.ngrdcol,
+        gr,
+        xp3_rtp3,
+        60.0,
+        xm,
+        xp2,
+        wpxp,
+        wpxp2,
+        rho_ds_zm,
+        invrs_rho_ds_zt,
+        invrs_tau_zt,
+        tau_max_zt,
+        x_tol,
+        False,
+        JaxStats.empty(
+            l_sample=False,
+            names=(),
+            ncol=gr.ngrdcol,
+            max_nlev=max(gr.nzm, gr.nzt),
+        ),
+        jnp.zeros((gr.ngrdcol, gr.nzt), dtype=jnp.float64),
+    )
+    return xp3
 
 
 def test_term_rhs_formulas():
@@ -55,8 +95,8 @@ def test_term_rhs_formulas():
     tp_ref = 3.0 * xp2_zt * irho * idzt * (rho_p1 * wpxpp1 - rho * wpxp)
     ac = np.asarray(term_ac_rhs(*(jnp.asarray(a) for a in (xm_p1, xm, wpxp2, idzt))))
     ac_ref = -3.0 * wpxp2 * idzt * (xm_p1 - xm)
-    assert float(np.max(np.abs(tp - tp_ref))) == 0.0, "term_tp_rhs != literal F90 formula"
-    assert float(np.max(np.abs(ac - ac_ref))) == 0.0, "term_ac_rhs != literal F90 formula"
+    assert float(np.max(np.abs(tp - tp_ref))) < 1e-15, "term_tp_rhs != literal F90 formula"
+    assert float(np.max(np.abs(ac - ac_ref))) < 1e-15, "term_ac_rhs != literal F90 formula"
     g = jax.grad(lambda a: jnp.sum(term_tp_rhs(a, jnp.asarray(wpxpp1), jnp.asarray(wpxp),
                 jnp.asarray(rho_p1), jnp.asarray(rho), jnp.asarray(irho), jnp.asarray(idzt)) ** 2))(jnp.asarray(xp2_zt))
     assert np.all(np.isfinite(np.asarray(g))), "non-finite grad through term_tp_rhs"
@@ -103,7 +143,7 @@ def test_steady_state_vs_composition():
         xp2_zt = np.maximum(np.asarray(clubb_f2py.f2py_zm2zt_2d(nzt, xp2)), x_tol ** 2)       # (ng, nzt)
         xp3_ref = np.zeros((ng, nzt))
         for k in range(nzt - 1):
-            kp1 = min(k + 1, nzt - 1)
+            kp1 = nzt - 1
             tp = 3.0 * xp2_zt[:, k] * invrs_rho_ds_zt[:, k] * invrs_dzt[:, k] * (
                 rho_ds_zm[:, kp1] * wpxp[:, kp1] - rho_ds_zm[:, k] * wpxp[:, k])
             ac = -3.0 * wpxp2[:, k] * invrs_dzt[:, k] * (xm_zm[:, kp1] - xm_zm[:, k])

@@ -1,122 +1,480 @@
-"""JAX port of Nc_Ncn_eqns.F90 — cloud-nuclei-concentration mean <Ncn>.
+"""JAX implementations of selected routines from ``Nc_Ncn_eqns.F90``.
 
-The simplified cloud nuclei concentration N_cn has a single lognormal marginal over the
-domain; cloud droplet concentration is Nc = Ncn*H(chi). These functions invert the PDF
-integral <Nc> = <Ncn> * SUM_i mixt_frac_i * <H(chi)>_i to get <Ncn> (Ncnm) from the
-in-cloud mean Nc and the chi-PDF parameters — Ncnm is the autoconversion-rate input mu_Ncn.
-Oracle: Nc_Ncn_eqns.F90:251 (Nc_in_cloud_to_Ncnm), :476 (Ncm_to_Ncnm), :856 (bivar_Ncnm_eqn_comp). The
-forward direction (Ncn → Nc) is also mirrored: :153 (Ncnm_to_Nc_in_cloud), :348 (Ncnm_to_Ncm), :707
-(bivar_NL_chi_Ncn_mean) — used by the Nc_Ncn G-unit test, completing the module mirror (mirror-refactor iter 267).
+Description:
+Equations are provided to perform calculations back-and-forth between Nc and
+Ncn, where Nc is cloud droplet concentration and Ncn is simplified cloud
+nuclei concentration.  The equation that relates the two is:
 
-Verified bit-to-bit against the f2py API (f2py_nc_in_cloud_to_ncnm); see tests/test_Nc_Ncn_eqns.py.
+Nc = Ncn * H(chi);
+
+where chi is extended liquid water mixing ratio, which is equal to cloud
+water mixing ratio, rc, when both are positive.  However, chi is negative in
+subsaturated air.
+
+Equation are provided relating mean cloud droplet concentration (overall),
+Ncm, and/or mean cloud droplet concentration (in-cloud), Nc_in_cloud, to
+mean simplified cloud nuclei concentration, Ncnm.
+
+Notes:
+
+Meaning of Nc flag combinations:
+
+l_const_Nc_in_cloud:
+When this flag is enabled, cloud droplet concentration (in-cloud) is
+constant (spatially) at a grid level (it is constant over the subgrid
+domain, but could vary over time depending on the value of l_predict_Nc).
+The value of in-cloud Nc does not vary at a grid level.  This also means
+that Ncn is constant across the entire grid level.  When this flag is turned
+off, both in-cloud Nc and Ncn vary at a grid level.
+
+l_predict_Nc:
+When this flag is enabled, Nc_in_cloud (or alternatively Ncm) is predicted.
+It is advanced every time step by a predictive equation, and can change
+at every time step at a grid level.  When this flag is turned off,
+Nc_in_cloud does not change at a grid level over the course of a model run.
+
+References:
+
+Porting deviations:
+Fortran elemental routines are represented as broadcasting JAX functions.
+Fortran branch bodies execute conditionally; JAX precomputes values for
+``where`` selection, so guarded denominators are used to avoid invalid work in
+unselected branches.  The long Fortran flow-chart module comment describes
+full CLUBB microphysics orchestration outside these local conversion helpers
+and is not repeated here.
 """
-import jax
+
+import jax.scipy.special as jsp
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
-
-# Nc_Ncn_eqns.F90 `use constants_clubb, only: sqrt_2, chi_tol, Ncn_tol, cloud_frac_min`
-from clubb_jax.src.CLUBB_core.constants_clubb import (
-    sqrt_2 as _SQRT_2, chi_tol as _CHI_TOL, Ncn_tol as _NCN_TOL, cloud_frac_min as _CLOUD_FRAC_MIN,
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    chi_tol,
+    cloud_frac_min,
+    eps,
+    Ncn_tol,
+    sqrt_2,
 )
-_EPS = jnp.finfo(jnp.float64).eps
 
 
-@jax.custom_jvp
-def _safe_div(num, den):
-    """num/den (den assumed > 0) with the FORWARD value exact but the gradient floored so
-    den^2 cannot underflow to 0. At clear-air points den ~ 1e-170 and num ~ 0, where the bare
-    quotient gradient -num/den^2 is 0/0 = nan; this regularizes it to a finite value."""
-    return num / den
+def Ncnm_to_Nc_in_cloud(
+    mu_chi_1,
+    mu_chi_2,
+    mu_Ncn_1,
+    mu_Ncn_2,
+    sigma_chi_1,
+    sigma_chi_2,
+    sigma_Ncn_1,
+    sigma_Ncn_2,
+    sigma_Ncn_1_n,
+    sigma_Ncn_2_n,
+    corr_chi_Ncn_1_n,
+    corr_chi_Ncn_2_n,
+    mixt_frac,
+    cloud_frac_1,
+    cloud_frac_2,
+):
+    """Calculate Nc_in_cloud from Ncn PDF parameters.
 
+    Description:
+    The in-cloud mean of cloud droplet concentration is calculated from the
+    PDF parameters involving simplified cloud nuclei concentration, Ncn, and
+    cloud fraction.  At any point, cloud droplet concentration, Nc, is given
+    by:
 
-@_safe_div.defjvp
-def _safe_div_jvp(primals, tangents):
-    num, den = primals
-    dnum, dden = tangents
-    den2 = jnp.maximum(den * den, 1.0e-300)
-    return num / den, (dnum * den - num * dden) / den2
+    Nc = Ncn * H(chi);
 
+    where extended liquid water mixing ratio, chi, is equal to cloud water
+    ratio, rc, when positive.  When the atmosphere is saturated at this point,
+    cloud water is found, and Nc = Ncn.  Otherwise, only clear air is found,
+    and Nc = 0.
 
-def bivar_Ncnm_eqn_comp(mu_chi_i, sigma_chi_i, const_Ncnp2_on_Ncnm2, const_corr_chi_Ncn):
-    """Per-component <H(chi)>_i denominator term. Nc_Ncn_eqns.F90:856.
+    The overall mean of cloud droplet concentration, <Nc>, is calculated from
+    the PDF parameters involving Ncn.  The in-cloud mean of cloud droplet
+    concentration is calculated from <Nc> and cloud fraction.
 
-    sigma_chi_i <= chi_tol: 1 if mu_chi_i>0 else 0; otherwise
-    0.5*erfc(-(1/sqrt2)*(mu_chi_i/sigma_chi_i + const_corr*sqrt(const_Ncnp2)))
-    (the single erfc form covers both const_Ncnp2>0 and =0)."""
-    sig_safe = jnp.maximum(sigma_chi_i, _CHI_TOL)
-    varies = 0.5 * jax.scipy.special.erfc(
-        -(1.0 / _SQRT_2) * (mu_chi_i / sig_safe
-                            + const_corr_chi_Ncn * jnp.sqrt(const_Ncnp2_on_Ncnm2)))
-    const = jnp.where(mu_chi_i > 0.0, 1.0, 0.0)
-    return jnp.where(sigma_chi_i <= _CHI_TOL, const, varies)
-
-
-def Ncm_to_Ncnm(mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi_2, mixt_frac, Ncm,
-                const_Ncnp2_on_Ncnm2, const_corr_chi_Ncn, Ncnm_val_denom_0):
-    """<Ncn> from the overall <Nc> and the chi PDF. Nc_Ncn_eqns.F90:476."""
-    denom = (mixt_frac * bivar_Ncnm_eqn_comp(mu_chi_1, sigma_chi_1,
-                                             const_Ncnp2_on_Ncnm2, const_corr_chi_Ncn)
-             + (1.0 - mixt_frac) * bivar_Ncnm_eqn_comp(mu_chi_2, sigma_chi_2,
-                                                       const_Ncnp2_on_Ncnm2, const_corr_chi_Ncn))
-    denom_safe = jnp.where(denom > 0.0, denom, 1.0)
-    return jnp.where(denom > 0.0, _safe_div(Ncm, denom_safe), Ncnm_val_denom_0)
-
-
-def Nc_in_cloud_to_Ncnm(mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi_2, mixt_frac,
-                        Nc_in_cloud, cloud_frac_1, cloud_frac_2,
-                        const_Ncnp2_on_Ncnm2, const_corr_chi_Ncn):
-    """<Ncn> from the in-cloud <Nc>. Nc_Ncn_eqns.F90:251.
-
-    cloud_frac = mixt_frac*cloud_frac_1 + (1-mixt_frac)*cloud_frac_2. When there is cloud
-    AND Ncn varies, Ncm = Nc_in_cloud*cloud_frac and Ncnm = Ncm_to_Ncnm(...); otherwise
-    (clear or constant Ncn) Ncnm = Nc_in_cloud."""
+    References:
+    """
+    # Calculate overall cloud fraction as calculated by the PDF.
+    # The variable cloud_frac is not used here because it is altered by factors
+    # such as the trapezoidal rule calculation.
+    # Cloud fraction can be recalculated here from cloud_frac_1 and cloud_frac_2
+    # as long neither of these variables are altered by any factor.  They can
+    # only be calculated from PDF.
     cloud_frac = mixt_frac * cloud_frac_1 + (1.0 - mixt_frac) * cloud_frac_2
+
+    # There is cloud found at this grid level.  Calculate Nc_in_cloud.
+    Ncm = Ncnm_to_Ncm(
+        mu_chi_1,
+        mu_chi_2,
+        mu_Ncn_1,
+        mu_Ncn_2,
+        sigma_chi_1,
+        sigma_chi_2,
+        sigma_Ncn_1,
+        sigma_Ncn_2,
+        sigma_Ncn_1_n,
+        sigma_Ncn_2_n,
+        corr_chi_Ncn_1_n,
+        corr_chi_Ncn_2_n,
+        mixt_frac,
+    )
+
+    cloud_frac_safe = jnp.where(cloud_frac > cloud_frac_min, cloud_frac, 1.0)
+
+    # This level is entirely clear.  Set Nc_in_cloud to <Ncn>.
+    # Since <Ncn> = mu_Ncn_1 = mu_Ncn_2, use mu_Ncn_1 here.
+    return jnp.where(cloud_frac > cloud_frac_min, Ncm / cloud_frac_safe, mu_Ncn_1)
+
+
+def Nc_in_cloud_to_Ncnm(
+    mu_chi_1,
+    mu_chi_2,
+    sigma_chi_1,
+    sigma_chi_2,
+    mixt_frac,
+    Nc_in_cloud,
+    cloud_frac_1,
+    cloud_frac_2,
+    const_Ncnp2_on_Ncnm2,
+    const_corr_chi_Ncn,
+):
+    """Calculate Ncnm from Nc_in_cloud and PDF parameters.
+
+    Description:
+    The overall mean of simplified cloud nuclei concentration, <Ncn>, is
+    calculated from the in-cloud mean of cloud droplet concentration, <Nc>,
+    cloud fraction, and some of the PDF parameters.
+
+    At any point, cloud droplet concentration, Nc, is given by:
+
+    Nc = Ncn * H(chi);
+
+    where extended liquid water mixing ratio, chi, is equal to cloud water
+    ratio, rc, when positive.  When the atmosphere is saturated at this point,
+    cloud water is found, and Nc = Ncn.  Otherwise, only clear air is found,
+    and Nc = 0.
+
+    The overall mean of cloud droplet concentration, <Nc>, is calculated from
+    Nc_in_cloud and cloud fraction.  The value of <Ncn> is calculated from
+    <Nc> and PDF parameters.
+
+    References:
+    """
+    # Calculate overall cloud fraction as calculated by the PDF.
+    # The variable cloud_frac is not used here because it is altered by factors
+    # such as the trapezoidal rule calculation.
+    # Cloud fraction can be recalculated here from cloud_frac_1 and cloud_frac_2
+    # as long neither of these variables are altered by any factor.  They can
+    # only be calculated from the PDF.
+    cloud_frac = mixt_frac * cloud_frac_1 + (1.0 - mixt_frac) * cloud_frac_2
+
+    # When Ncn is constant a a grid level, it is equal to Nc_in_cloud.
+    # Additionally, when a level is entirely clear, <Ncn>, which is based on
+    # Nc_in_cloud, here, must be set to something.  Set <Ncn> to Nc_in_cloud.
+    Ncnm = Nc_in_cloud
+
+    # There is cloud found at this grid level.  Additionally, Ncn varies.
+    # Calculate Nc_in_cloud.
     Ncm = Nc_in_cloud * cloud_frac
-    ncnm_vary = Ncm_to_Ncnm(mu_chi_1, mu_chi_2, sigma_chi_1, sigma_chi_2, mixt_frac, Ncm,
-                            const_Ncnp2_on_Ncnm2, const_corr_chi_Ncn, Nc_in_cloud)
-    cond = (cloud_frac > _CLOUD_FRAC_MIN) & \
-           (jnp.abs(const_corr_chi_Ncn * const_Ncnp2_on_Ncnm2) > _EPS)
-    return jnp.where(cond, ncnm_vary, Nc_in_cloud)
+
+    Ncnm_varying = Ncm_to_Ncnm(
+        mu_chi_1,
+        mu_chi_2,
+        sigma_chi_1,
+        sigma_chi_2,
+        mixt_frac,
+        Ncm,
+        const_Ncnp2_on_Ncnm2,
+        const_corr_chi_Ncn,
+        Nc_in_cloud,
+    )
+
+    l_varying_Ncn = (
+        (cloud_frac > cloud_frac_min)
+        & (jnp.abs(const_corr_chi_Ncn * const_Ncnp2_on_Ncnm2) > eps)
+    )
+    return jnp.where(l_varying_Ncn, Ncnm_varying, Ncnm)
 
 
-def bivar_NL_chi_Ncn_mean(mu_chi_i, mu_Ncn_i, sigma_chi_i, sigma_Ncn_i,
-                          sigma_Ncn_i_n, corr_chi_Ncn_i_n):
-    """Per-component <Nc>_i = INT INT Ncn*H(chi)*P_i(chi,Ncn) for the normal-lognormal joint PDF.
-    Nc_Ncn_eqns.F90:707 (forward direction, Ncn → Nc). The four Fortran branches:
-      sigma_chi <= chi_tol            : mu_Ncn_i if mu_chi_i>0 else 0 (both var-0 and chi-only-0 cases reduce to this)
-      sigma_Ncn <= Ncn_tol (chi varies): mu_Ncn_i * 0.5 * erfc(-mu_chi_i/(sqrt2*sigma_chi_i))
-      both vary                       : 0.5*mu_Ncn_i*erfc(-(1/sqrt2)*(mu_chi_i/sigma_chi_i + corr*sigma_Ncn_i_n))."""
-    sig_chi_safe = jnp.maximum(sigma_chi_i, _CHI_TOL)
-    const_branch = jnp.where(mu_chi_i > 0.0, mu_Ncn_i, 0.0)
-    ncn_const = mu_Ncn_i * 0.5 * jax.scipy.special.erfc(-(mu_chi_i / (_SQRT_2 * sig_chi_safe)))
-    both_vary = 0.5 * mu_Ncn_i * jax.scipy.special.erfc(
-        -(1.0 / _SQRT_2) * (mu_chi_i / sig_chi_safe + corr_chi_Ncn_i_n * sigma_Ncn_i_n))
-    varies = jnp.where(sigma_Ncn_i <= _NCN_TOL, ncn_const, both_vary)
-    return jnp.where(sigma_chi_i <= _CHI_TOL, const_branch, varies)
+def Ncnm_to_Ncm(
+    mu_chi_1,
+    mu_chi_2,
+    mu_Ncn_1,
+    mu_Ncn_2,
+    sigma_chi_1,
+    sigma_chi_2,
+    sigma_Ncn_1,
+    sigma_Ncn_2,
+    sigma_Ncn_1_n,
+    sigma_Ncn_2_n,
+    corr_chi_Ncn_1_n,
+    corr_chi_Ncn_2_n,
+    mixt_frac,
+):
+    """Calculate Ncm from Ncn PDF parameters.
+
+    Description:
+    The overall mean of cloud droplet concentration, <Nc>, is calculated from
+    the PDF parameters involving the simplified cloud nuclei concentration,
+    Ncn.  At any point, cloud droplet concentration, Nc, is given by:
+
+    Nc = Ncn * H(chi);
+
+    where extended liquid water mixing ratio, chi, is equal to cloud water
+    ratio, rc, when positive.  When the atmosphere is saturated at this point,
+    cloud water is found, and Nc = Ncn.  Otherwise, only clear air is found,
+    and Nc = 0.
+
+    The overall mean of cloud droplet concentration, <Nc>, is found by
+    integrating over the PDF of chi and Ncn, such that:
+
+    <Nc> = INT(-inf:inf) INT(0:inf) Ncn * H(chi) * P(chi,Ncn) dNcn dchi;
+
+    which can also be written as:
+
+    <Nc> = SUM(i=1,n) mixt_frac_i
+           * INT(-inf:inf) INT(0:inf) Ncn * H(chi) * P_i(chi,Ncn) dNcn dchi;
+
+    where n is the number of multivariate joint PDF components, mixt_frac_i is
+    the weight of the ith PDF component, and P_i is the functional form of the
+    multivariate joint PDF in the ith PDF component.
+
+    This equation is rewritten as:
+
+    <Nc> = SUM(i=1,n) mixt_frac_i
+           * INT(0:inf) INT(0:inf) Ncn * P_i(chi,Ncn) dNcn dchi.
+
+    References:
+    """
+    # Calculate mean cloud droplet concentration (overall), <Nc>.
+    Ncm = (
+        mixt_frac
+        * bivar_NL_chi_Ncn_mean(
+            mu_chi_1,
+            mu_Ncn_1,
+            sigma_chi_1,
+            sigma_Ncn_1,
+            sigma_Ncn_1_n,
+            corr_chi_Ncn_1_n,
+        )
+        + (1.0 - mixt_frac)
+        * bivar_NL_chi_Ncn_mean(
+            mu_chi_2,
+            mu_Ncn_2,
+            sigma_chi_2,
+            sigma_Ncn_2,
+            sigma_Ncn_2_n,
+            corr_chi_Ncn_2_n,
+        )
+    )
+
+    return Ncm
 
 
-def Ncnm_to_Ncm(mu_chi_1, mu_chi_2, mu_Ncn_1, mu_Ncn_2, sigma_chi_1, sigma_chi_2,
-                sigma_Ncn_1, sigma_Ncn_2, sigma_Ncn_1_n, sigma_Ncn_2_n,
-                corr_chi_Ncn_1_n, corr_chi_Ncn_2_n, mixt_frac):
-    """Overall mean cloud droplet concentration <Nc> from the Ncn PDF parameters (forward direction).
-    Nc_Ncn_eqns.F90:348 — the mixt_frac-weighted sum of the two per-component bivar_NL_chi_Ncn_mean integrals."""
-    return (mixt_frac * bivar_NL_chi_Ncn_mean(mu_chi_1, mu_Ncn_1, sigma_chi_1,
-                                              sigma_Ncn_1, sigma_Ncn_1_n, corr_chi_Ncn_1_n)
-            + (1.0 - mixt_frac) * bivar_NL_chi_Ncn_mean(mu_chi_2, mu_Ncn_2, sigma_chi_2,
-                                                        sigma_Ncn_2, sigma_Ncn_2_n, corr_chi_Ncn_2_n))
+def Ncm_to_Ncnm(
+    mu_chi_1,
+    mu_chi_2,
+    sigma_chi_1,
+    sigma_chi_2,
+    mixt_frac,
+    Ncm,
+    const_Ncnp2_on_Ncnm2,
+    const_corr_chi_Ncn,
+    Ncnm_val_denom_0,
+):
+    """Calculate Ncnm from Ncm and PDF parameters.
+
+    Description:
+    The overall mean of simplified cloud nuclei concentration, <Ncn>, is
+    calculated from the overall mean of cloud droplet concentration, <Nc>, and
+    some of the PDF parameters.
+
+    At any point, cloud droplet concentration, Nc, is given by:
+
+    Nc = Ncn * H(chi);
+
+    where extended liquid water mixing ratio, chi, is equal to cloud water
+    ratio, rc, when positive.  When the atmosphere is saturated at this point,
+    cloud water is found, and Nc = Ncn.  Otherwise, only clear air is found,
+    and Nc = 0.
+
+    Solving for <Ncn>
+    =================
+
+    In order to isolate <Ncn>, the value of <Ncn'^2>/<Ncn>^2 is set to a
+    constant value, const_Ncn.  The value of this constant does not depend on
+    <Ncn>.  Likewise, the value of rho_chi_Ncn does not depend on <Ncn>.
+    Solving for <Ncn>, the equation becomes:
+
+    <Ncn>
+    = <Nc> / ( SUM(i=1,n) mixt_frac_i
+                 ---
+                 | (1/2) * erfc( - ( 1 / sqrt(2) )
+                 |                 * ( ( mu_chi_i / sigma_chi_i )
+                 |                     + rho_chi_Ncn * sqrt( const_Ncn ) ) );
+                 | where sigma_chi_i > 0 and const_Ncn > 0;
+                 |
+               * | (1/2) * erfc( - ( mu_chi_i / ( sqrt(2) * sigma_chi_i ) ) );
+                 | where sigma_chi_i > 0 and const_Ncn = 0;
+                 |
+                 | 1; where sigma_chi_i = 0 and mu_chi_i > 0;
+                 |
+                 | 0; where sigma_chi_i = 0 and mu_chi_i <= 0               ).
+                 ---
+
+    When the denominator term is 0, there is only clear air.  Both the
+    numerator (<Nc>) and the denominator have a value of 0, and <Ncn> is set
+    to an appropriate value.
+
+    References:
+    """
+    # Denominator in the equation for <Ncn>
+    denominator = (
+        mixt_frac
+        * bivar_Ncnm_eqn_comp(
+            mu_chi_1,
+            sigma_chi_1,
+            const_Ncnp2_on_Ncnm2,
+            const_corr_chi_Ncn,
+        )
+        + (1.0 - mixt_frac)
+        * bivar_Ncnm_eqn_comp(
+            mu_chi_2,
+            sigma_chi_2,
+            const_Ncnp2_on_Ncnm2,
+            const_corr_chi_Ncn,
+        )
+    )
+
+    denominator_safe = jnp.where(denominator > 0.0, denominator, 1.0)
+
+    # When the denominator is 0, it is usually because there is only clear
+    # air.  In that scenario, Ncm should also be 0.  Set Ncnm to a value that
+    # is usual or typical
+    return jnp.where(denominator > 0.0, Ncm / denominator_safe, Ncnm_val_denom_0)
 
 
-def Ncnm_to_Nc_in_cloud(mu_chi_1, mu_chi_2, mu_Ncn_1, mu_Ncn_2, sigma_chi_1, sigma_chi_2,
-                        sigma_Ncn_1, sigma_Ncn_2, sigma_Ncn_1_n, sigma_Ncn_2_n,
-                        corr_chi_Ncn_1_n, corr_chi_Ncn_2_n, mixt_frac,
-                        cloud_frac_1, cloud_frac_2):
-    """In-cloud mean cloud droplet concentration from the Ncn PDF parameters (forward direction).
-    Nc_Ncn_eqns.F90:153. cloud_frac = mixt_frac*cloud_frac_1 + (1-mixt_frac)*cloud_frac_2; when cloudy,
-    Nc_in_cloud = Ncnm_to_Ncm(...)/cloud_frac; in entirely clear air, Nc_in_cloud = <Ncn> = mu_Ncn_1."""
-    cloud_frac = mixt_frac * cloud_frac_1 + (1.0 - mixt_frac) * cloud_frac_2
-    Ncm = Ncnm_to_Ncm(mu_chi_1, mu_chi_2, mu_Ncn_1, mu_Ncn_2, sigma_chi_1, sigma_chi_2,
-                      sigma_Ncn_1, sigma_Ncn_2, sigma_Ncn_1_n, sigma_Ncn_2_n,
-                      corr_chi_Ncn_1_n, corr_chi_Ncn_2_n, mixt_frac)
-    cf_safe = jnp.where(cloud_frac > _CLOUD_FRAC_MIN, cloud_frac, 1.0)
-    return jnp.where(cloud_frac > _CLOUD_FRAC_MIN, Ncm / cf_safe, mu_Ncn_1)
+def bivar_NL_chi_Ncn_mean(
+    mu_chi_i,
+    mu_Ncn_i,
+    sigma_chi_i,
+    sigma_Ncn_i,
+    sigma_Ncn_i_n,
+    corr_chi_Ncn_i_n,
+):
+    """Evaluate the per-component normal-lognormal Nc integral.
+
+    Description:
+    The double integral over Ncn * H(chi) multiplied by the
+    bivariate normal-lognormal joint PDF of chi and Ncn is evaluated.  The
+    integral is given by:
+
+    INT(-inf:inf) INT(0:inf) Ncn * H(chi) * P_i(chi,Ncn) dNcn dchi;
+
+    which reduces to:
+
+    INT(0:inf) INT(0:inf) Ncn * P_i(chi,Ncn) dNcn dchi;
+
+    where the individual marginal distribution of chi is normal in the ith PDF
+    component and the individual marginal distribution of Ncn is lognormal in
+    the ith PDF component.
+
+    References:
+    """
+    chi_and_Ncn_constant = (sigma_chi_i <= chi_tol) & (sigma_Ncn_i <= Ncn_tol)
+    chi_constant = sigma_chi_i <= chi_tol
+    Ncn_constant = sigma_Ncn_i <= Ncn_tol
+
+    # The ith PDF component variances of both chi and Ncn are 0.
+    # The ith PDF component variance of chi is 0.
+    constant_value = jnp.where(mu_chi_i > 0.0, mu_Ncn_i, 0.0)
+
+    sigma_chi_i_safe = jnp.where(sigma_chi_i > chi_tol, sigma_chi_i, 1.0)
+
+    # The ith PDF component variance of Ncn is 0.
+    Ncn_constant_value = (
+        mu_Ncn_i
+        * 0.5
+        * jsp.erfc(-(mu_chi_i / (sqrt_2 * sigma_chi_i_safe)))
+    )
+
+    # Both chi and Ncn vary in the ith PDF component.
+    both_vary_value = (
+        0.5
+        * mu_Ncn_i
+        * jsp.erfc(
+            -(1.0 / sqrt_2)
+            * ((mu_chi_i / sigma_chi_i_safe) + corr_chi_Ncn_i_n * sigma_Ncn_i_n)
+        )
+    )
+
+    return jnp.where(
+        chi_and_Ncn_constant,
+        constant_value,
+        jnp.where(
+            chi_constant,
+            constant_value,
+            jnp.where(Ncn_constant, Ncn_constant_value, both_vary_value),
+        ),
+    )
+
+
+def bivar_Ncnm_eqn_comp(
+    mu_chi_i,
+    sigma_chi_i,
+    const_Ncnp2_on_Ncnm2,
+    const_corr_chi_Ncn,
+):
+    """Calculate one PDF component's denominator term in the Ncnm equation.
+
+    Description:
+    When <Ncn> is found based on the value of <Nc>, the following equation is
+    used:
+
+    <Ncn>
+    = <Nc> / ( SUM(i=1,n) mixt_frac_i
+                 ---
+                 | (1/2) * erfc( - ( 1 / sqrt(2) )
+                 |                 * ( ( mu_chi_i / sigma_chi_i )
+                 |                     + rho_chi_Ncn * sqrt( const_Ncn ) ) );
+                 | where sigma_chi_i > 0 and const_Ncn > 0;
+                 |
+               * | (1/2) * erfc( - ( mu_chi_i / ( sqrt(2) * sigma_chi_i ) ) );
+                 | where sigma_chi_i > 0 and const_Ncn = 0;
+                 |
+                 | 1; where sigma_chi_i = 0 and mu_chi_i > 0;
+                 |
+                 | 0; where sigma_chi_i = 0 and mu_chi_i <= 0               ).
+                 ---
+
+    In the above equation, const_Ncn = <Ncn'^2> / <Ncn>^2.  It is a constant,
+    prescribed parameter.  Likewise, rho_chi_Ncn is a parameter that is not
+    based on the value of <Ncn>.
+
+    When the denominator term is 0, there is only clear air.  Both the
+    numerator (<Nc>) and the denominator have a value of 0, and <Ncn> is set
+    to an appropriate value.
+
+    The contribution of the ith PDF component to the denominator term in the
+    equation is calculated here.
+
+    References:
+    """
+    # The ith PDF component variances of chi is 0.  The value of the ith PDF
+    # component variance of Ncn does not matter in this scenario.
+    constant_value = jnp.where(mu_chi_i > 0.0, 1.0, 0.0)
+    sigma_chi_i_safe = jnp.where(sigma_chi_i > chi_tol, sigma_chi_i, 1.0)
+
+    # Both chi and Ncn vary in the ith PDF component.
+    varying_value = (
+        0.5
+        * jsp.erfc(
+            -(1.0 / sqrt_2)
+            * (
+                (mu_chi_i / sigma_chi_i_safe)
+                + const_corr_chi_Ncn * jnp.sqrt(const_Ncnp2_on_Ncnm2)
+            )
+        )
+    )
+
+    return jnp.where(sigma_chi_i <= chi_tol, constant_value, varying_value)

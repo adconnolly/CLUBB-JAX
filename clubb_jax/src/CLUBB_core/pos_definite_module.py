@@ -1,70 +1,144 @@
-"""JAX port of pos_definite_module.F90 — Smolarkiewicz (1989) positive-definite flux limiter.
+"""JAX port of `src/CLUBB_core/pos_definite_module.F90`.
 
-Mirrors `clubb_release/src/CLUBB_core/pos_definite_adj`: a flux-conservative positive-definite renormalization
-of the advective flux (Smolarkiewicz 1989, MWR 117, 2626), applied to `rtm` (gated by `l_pos_def`, OFF in the
-default config — the gated suite uses `mono_flux_limiter`). This is a completeness port, bit-validated against
-the f2py `f2py_pos_definite_adj` oracle (`tests/test_pos_definite.py`).
-
-Vectorized for the **ascending grid** (`grid_dir_indx == 1`, every gated case + the f2py setup); a descending
-grid raises (the mirrored index branches are untested without a descending oracle). Pure jnp → `jax.grad`-able
-(the max/min/where are subgradient-differentiable; the divide is floored at `eps`).
+Porting deviations:
+- The Fortran routine mutates `field_np1`, `flux_np1`, `field_pd`, and
+  `flux_pd` in-place. JAX returns those four arrays as
+  `(field_np1, flux_lim, field_pd, flux_pd)`.
+- Loops over columns and levels are vectorized with JAX array operations.
 """
+
+from __future__ import annotations
+
+from functools import partial
+
+import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.constants_clubb import zero_threshold, eps
-from clubb_jax.src.CLUBB_core.grid_class import ddzm_jax
+from clubb_jax.src.CLUBB_core.clubb_constants import eps, zero, zero_threshold
+from clubb_jax.src.CLUBB_core.grid_class import ddzm
 
 
-def pos_definite_adj(gr, dt, field_np1, flux_np1, field_n):
-    """Positive-definite flux adjustment (Smolarkiewicz 1989), flux on zm / field on zt.
+@partial(jax.jit, static_argnames=("nzm", "nzt", "ngrdcol"))
+def pos_definite_adj(
+    nzm: int,
+    nzt: int,
+    ngrdcol: int,
+    gr,
+    dt: float,
+    field_np1,
+    flux_np1,
+    field_n,
+):
+    """Applies a flux conservative positive definite scheme to a variable.
 
-    Args:
-      gr:        grid (uses .invrs_dzt, .grid_dir; ascending only).
-      dt:        timestep [s] (scalar).
-      field_np1: post-solve field, (ngrdcol, nzt).
-      flux_np1:  post-solve flux, (ngrdcol, nzm).
-      field_n:   field at the start of the step, (ngrdcol, nzt).
-    Returns:
-      (field_np1_adj, flux_lim, field_pd, flux_pd) — the renormalized field (zt) + flux (zm) and the two
-      diagnostic tendencies (zt / zm), matching the Fortran out-args.
+    Description:
+      Applies a  flux conservative positive definite scheme to a variable
+
+    There are two possible grids:
+    (1) flux on zm  field on zt
+    then
+    flux_zt(k) = ( flux_zm(k+1) + flux_zm(k) ) / 2
+
+          CLUBB grid                  Smolarkiewicz grid
+      m +-- flux  zm(k+1) --+               flux        k + 1/2
+      t +-- field zt(k)   --+               field, fout k
+      m +-- flux  zm(k)   --+               flux        k - 1/2
+      t +-- field zt(k-1) --+
+
+    (2) flux on zt field on zm
+    then
+    flux_zm(k) = ( flux_zt(k) + flux_zt(k-1) ) / 2
+
+          CLUBB grid                  Smolarkiewicz grid
+      m +-- field  (k+1)  --+
+      t +-- flux   (k)    --+               flux        k + 1/2
+      m +-- field  (k)    --+               field, fout k
+      t +-- flux   (k-1)  --+               flux        k - 1/2
+
+    References:
+      ``A Positive Definite Advection Scheme Obtained by
+        Nonlinear Renormalization of the Advective Fluxes'' Smolarkiewicz (1989)
+        Monthly Weather Review, Vol. 117, pp. 2626--2632
     """
-    if int(getattr(gr, "grid_dir_indx", 1)) != 1:
-        raise NotImplementedError("pos_definite_adj: only the ascending grid (grid_dir_indx==1) is ported.")
-    field_np1 = jnp.asarray(field_np1); flux_np1 = jnp.asarray(flux_np1); field_n = jnp.asarray(field_n)
-    dt = jnp.asarray(dt)
-    ngrdcol, nzm = flux_np1.shape
-    nzt = nzm - 1
+    field_np1 = jnp.asarray(field_np1, dtype=jnp.float64)
+    flux_np1 = jnp.asarray(flux_np1, dtype=jnp.float64)
+    field_n = jnp.asarray(field_n, dtype=jnp.float64)
 
-    # Smolarkiewicz F+ / F- on the flux (zm) levels (eqn 2).
+    # Def. of F+ and F- from eqn 2 Smolarkowicz
     flux_plus = jnp.maximum(zero_threshold, flux_np1)
     flux_minus = -jnp.minimum(zero_threshold, flux_np1)
 
-    # dz/dt on the field (zt) levels (grid_dir=+1 ascending).
     dz_over_dt = (1.0 / (gr.grid_dir * gr.invrs_dzt)) / dt
 
-    # Total outward flux per zt level k (eqn A4): F+ at the k+1/2 (=k+1) flux level + F- at the k-1/2 (=k)
-    # flux level, floored at eps. zt level j -> flux indices (j+1) above, j below.
-    fout = jnp.maximum(flux_plus[:, 1:nzm] + flux_minus[:, 0:nzt], eps)   # (ngrdcol, nzt)
+    if gr.grid_dir_indx > 0:
+        # Ascending grid
+        kphalf = jnp.minimum(jnp.arange(nzt) + 1, nzm - 1)  # k+1/2 flux level
+        kmhalf = jnp.maximum(jnp.arange(nzt), 0)            # k-1/2 flux level
+    else:
+        # Descending grid
+        kphalf = jnp.maximum(jnp.arange(nzt), 0)            # k+1/2 flux level
+        kmhalf = jnp.minimum(jnp.arange(nzt) + 1, nzm - 1)  # k-1/2 flux level
 
-    # Limited flux at the interior flux levels m=1..nzm-2 (eqn 10), vectorized:
-    #   flux_lim[m] = max( min( flux_np1[m], (F+[m]/fout[m-1])*field_n[m-1]*dz[m-1] ),
-    #                      -( (F-[m]/fout[m])  *field_n[m]  *dz[m-1] ) )
-    upper = (flux_plus[:, 1:nzm - 1] / fout[:, 0:nzt - 1]) * field_n[:, 0:nzt - 1] * dz_over_dt[:, 0:nzt - 1]
-    lower = -(flux_minus[:, 1:nzm - 1] / fout[:, 1:nzt]) * field_n[:, 1:nzt] * dz_over_dt[:, 0:nzt - 1]
-    interior = jnp.maximum(jnp.minimum(flux_np1[:, 1:nzm - 1], upper), lower)
-    # Boundary conditions: flux_lim[0]=flux_np1[0], flux_lim[nzm-1]=flux_np1[nzm-1].
-    flux_lim = jnp.concatenate([flux_np1[:, 0:1], interior, flux_np1[:, nzm - 1:nzm]], axis=1)
+    # Eqn A4 from Smolarkowicz
+    # We place a limiter of eps to prevent a divide by zero, and
+    #   after this calculation fout is on the scalar level, and
+    #   fout is the total outward flux for the scalar level k.
+    fout = jnp.maximum(
+        jnp.take(flux_plus, kphalf, axis=1) + jnp.take(flux_minus, kmhalf, axis=1),
+        eps,
+    )
 
-    # Diagnostic flux tendency — only where the column had a below-zero field (input field_np1).
-    neg_in = jnp.any(field_np1 < 0.0, axis=1, keepdims=True)
-    flux_pd = jnp.where(neg_in, (flux_lim - flux_np1) / dt, 0.0)
+    interior_idx = jnp.arange(1, nzm - 1)
+    # FIXME:
+    # We haven't tested this for negative values at the nz level
+    # -dschanen 13 June 2008
+    if gr.grid_dir_indx > 0:
+        # Ascending grid
+        k_zt = interior_idx - 1  # k scalar level
+        kp1 = interior_idx       # k+1 scalar level
+    else:
+        # Descending grid
+        k_zt = interior_idx      # k scalar level
+        kp1 = interior_idx - 1   # k+1 scalar level
 
-    # Apply the flux correction to the field: field += -dt * ddzm(flux_lim - flux_np1).
+    # Eqn 10 from Smolarkowicz (1989)
+    upper = (
+        (jnp.take(flux_plus, interior_idx, axis=1) / jnp.take(fout, k_zt, axis=1))
+        * jnp.take(field_n, k_zt, axis=1)
+        * jnp.take(dz_over_dt, k_zt, axis=1)
+    )
+    lower = -(
+        (jnp.take(flux_minus, interior_idx, axis=1) / jnp.take(fout, kp1, axis=1))
+        * jnp.take(field_n, kp1, axis=1)
+        * jnp.take(dz_over_dt, k_zt, axis=1)
+    )
+    flux_lim_int = jnp.maximum(
+        jnp.minimum(jnp.take(flux_np1, interior_idx, axis=1), upper),
+        lower,
+    )
+
+    # Boundary conditions
+    flux_lim = jnp.concatenate(
+        [flux_np1[:, :1], flux_lim_int, flux_np1[:, nzm - 1:nzm]],
+        axis=1,
+    )
+
+    # Only set flux_pd for a column if there is a below zero value in that column
+    l_negative_before = jnp.any(field_np1 < zero, axis=1, keepdims=True)
+    flux_pd = jnp.where(l_negative_before, (flux_lim - flux_np1) / dt, zero)
+
     field_nonlim = field_np1
-    field_np1_adj = -dt * ddzm_jax(flux_lim - flux_np1, gr) + field_np1
 
-    # Diagnostic field tendency — only where the UPDATED field went below zero.
-    neg_out = jnp.any(field_np1_adj < 0.0, axis=1, keepdims=True)
-    field_pd = jnp.where(neg_out, (field_np1_adj - field_nonlim) / dt, 0.0)
+    # Apply change to field at n+1
+    field_np1 = -dt * ddzm(nzm, nzt, ngrdcol, gr, flux_lim - flux_np1) + field_np1
 
-    return field_np1_adj, flux_lim, field_pd, flux_pd
+    # Determine the total time tendency in field due to this calculation
+    # (for diagnostic purposes)
+    l_negative_after = jnp.any(field_np1 < zero, axis=1, keepdims=True)
+    # Only set flux_pd for a column if there is a below zero value in that column
+    field_pd = jnp.where(l_negative_after, (field_np1 - field_nonlim) / dt, zero)
+
+    # Replace the non-limited flux with the limited flux
+    return field_np1, flux_lim, field_pd, flux_pd

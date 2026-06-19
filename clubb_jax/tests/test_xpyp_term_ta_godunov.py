@@ -30,7 +30,7 @@ from clubb_jax.src.CLUBB_core.turbulent_adv_pdf import (
 from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
-_GridShim = namedtuple("_GridShim", ["invrs_dzm"])
+_GridShim = namedtuple("_GridShim", ["invrs_dzm", "grid_dir"])
 
 
 def test_f2py_oracle():
@@ -55,7 +55,7 @@ def test_f2py_oracle():
     # Pull the EXACT stored grid so the JAX side uses identical invrs_dzm / grid_dir.
     g = clubb_f2py.get_grid(ng, nzm, nzt)
     invrs_dzm = np.asarray(g[4]); grid_dir = float(g[13])
-    shim = _GridShim(invrs_dzm=jnp.asarray(invrs_dzm))
+    shim = _GridShim(invrs_dzm=jnp.asarray(invrs_dzm), grid_dir=grid_dir)
 
     rng = np.random.default_rng(7)
     worst = 0.0
@@ -67,9 +67,9 @@ def test_f2py_oracle():
         sgn = np.sign(rng.uniform(-1, 1, (ng, nzt)))         # ±1 turbulent-velocity sign
 
         f_lhs = np.asarray(clubb_f2py.f2py_xpyp_term_ta_pdf_lhs_godunov(coef, irho, rho_zm))
-        j_lhs = np.asarray(xpyp_term_ta_pdf_lhs_godunov(coef, irho, rho_zm, shim, grid_dir))
+        j_lhs = np.asarray(xpyp_term_ta_pdf_lhs_godunov(nzm, nzt, ng, shim, coef, irho, rho_zm))
         f_rhs = np.asarray(clubb_f2py.f2py_xpyp_term_ta_pdf_rhs_godunov(term_zm, irho, sgn, rho_zm))
-        j_rhs = np.asarray(xpyp_term_ta_pdf_rhs_godunov(term_zm, irho, sgn, rho_zm, shim, grid_dir))
+        j_rhs = np.asarray(xpyp_term_ta_pdf_rhs_godunov(nzm, nzt, ng, shim, term_zm, irho, sgn, rho_zm))
         worst = max(worst, np.max(np.abs(j_lhs - f_lhs)), np.max(np.abs(j_rhs - f_rhs)))
     assert worst < 1e-12, f"xpyp_term_ta_*_godunov f2py mismatch {worst:.2e}"
     print(f"  f2py xpyp_term_ta_pdf_{{lhs,rhs}}_godunov: bit-match, worst {worst:.2e}  PASS")
@@ -82,13 +82,13 @@ def test_boundaries_and_grad():
     coef = rng.uniform(-2, 2, (ng, nzt)); irho = rng.uniform(0.5, 1.5, (ng, nzm))
     rho_zm = rng.uniform(0.5, 1.2, (ng, nzm)); term_zm = rng.uniform(-1, 1, (ng, nzm))
     sgn = np.sign(rng.uniform(-1, 1, (ng, nzt)))
-    lhs = np.asarray(xpyp_term_ta_pdf_lhs_godunov(coef, irho, rho_zm, jgr, jgr.grid_dir))
-    rhs = np.asarray(xpyp_term_ta_pdf_rhs_godunov(term_zm, irho, sgn, rho_zm, jgr, jgr.grid_dir))
+    lhs = np.asarray(xpyp_term_ta_pdf_lhs_godunov(nzm, nzt, ng, jgr, coef, irho, rho_zm))
+    rhs = np.asarray(xpyp_term_ta_pdf_rhs_godunov(nzm, nzt, ng, jgr, term_zm, irho, sgn, rho_zm))
     assert np.all(lhs[:, :, 0] == 0) and np.all(lhs[:, :, -1] == 0), "LHS boundaries not zero"
     assert np.all(rhs[:, 0] == 0) and np.all(rhs[:, -1] == 0), "RHS boundaries not zero"
 
     def loss(c):
-        return jnp.sum(xpyp_term_ta_pdf_lhs_godunov(c, irho, rho_zm, jgr, jgr.grid_dir) ** 2)
+        return jnp.sum(xpyp_term_ta_pdf_lhs_godunov(nzm, nzt, ng, jgr, c, irho, rho_zm) ** 2)
     grad = np.asarray(jax.grad(loss)(jnp.asarray(coef)))
     assert np.isfinite(grad).all(), "non-finite grad through lhs_godunov"
     print(f"  zero boundaries + finite jax.grad ({grad.size} entries)  PASS")

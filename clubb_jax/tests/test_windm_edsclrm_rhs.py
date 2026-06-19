@@ -27,9 +27,42 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.advance_windm_edsclrm_module import windm_edsclrm_rhs
+from clubb_jax.src.CLUBB_core.advance_windm_edsclrm_module import (
+    windm_edsclrm_rhs, windm_edsclrm_um,
+)
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
+from clubb_jax.src.derived_types.grid_class import setup_grid
 
 _NG, _NZT = 2, 8
+_DZ = 40.0
+
+
+def _make_gr():
+    # nzm = _NZT + 1 (momentum levels); nzt = _NZT (thermodynamic levels)
+    return setup_grid(_NG, _DZ, _DZ, _DZ * (_NZT + 1))
+
+
+def _empty_stats(gr):
+    return JaxStats.empty(
+        l_sample=False, names=(), ncol=gr.ngrdcol, max_nlev=max(gr.nzm, gr.nzt),
+    )
+
+
+def _rhs_call(gr, lhs_diff, xm, xm_tndcy, dt):
+    """Wrapper that supplies all new leading/trailing args, with l_imp_sfc_momentum_flux=True
+    to skip the surface-flux branch (so only the CN tridiagonal part is exercised)."""
+    nzm = gr.nzm; nzt = gr.nzt; ng = gr.ngrdcol
+    rho_ds_zm = jnp.ones((ng, nzm))
+    invrs_rho_ds_zt = jnp.ones((ng, nzt))
+    xpwp_sfc = jnp.zeros(ng)
+    rhs, _stats = windm_edsclrm_rhs(
+        nzm, nzt, ng, gr, windm_edsclrm_um, dt,
+        lhs_diff, xm, xm_tndcy,
+        rho_ds_zm, invrs_rho_ds_zt,
+        True, xpwp_sfc,
+        _empty_stats(gr),
+    )
+    return rhs
 
 
 def _banded_matvec(lhs_diff, xm):
@@ -56,10 +89,11 @@ def _inputs(rng):
 
 
 def test_rhs_is_cn_explicit_half():
+    gr = _make_gr()
     rng = np.random.default_rng(545)
     dt = 60.0
     lhs_diff, xm, xm_tndcy = _inputs(rng)
-    got = np.asarray(windm_edsclrm_rhs(jnp.asarray(lhs_diff), jnp.asarray(xm), jnp.asarray(xm_tndcy), dt))
+    got = np.asarray(_rhs_call(gr, jnp.asarray(lhs_diff), jnp.asarray(xm), jnp.asarray(xm_tndcy), dt))
     ref = -0.5 * _banded_matvec(lhs_diff, xm) + xm_tndcy + xm / dt
     worst = float(np.max(np.abs(got - ref)))
     assert worst < 1e-12, f"windm_edsclrm_rhs mismatch vs CN explicit half {worst:.2e}"
@@ -67,21 +101,23 @@ def test_rhs_is_cn_explicit_half():
 
 
 def test_no_diffusion_is_pure_time_plus_tendency():
+    gr = _make_gr()
     rng = np.random.default_rng(3)
     dt = 30.0
     _, xm, xm_tndcy = _inputs(rng)
     zero = np.zeros((3, _NG, _NZT))
-    got = np.asarray(windm_edsclrm_rhs(jnp.asarray(zero), jnp.asarray(xm), jnp.asarray(xm_tndcy), dt))
+    got = np.asarray(_rhs_call(gr, jnp.asarray(zero), jnp.asarray(xm), jnp.asarray(xm_tndcy), dt))
     ref = xm_tndcy + xm / dt
     assert np.max(np.abs(got - ref)) < 1e-13, "lhs_diff=0 must give rhs = xm/dt + tndcy"
     print("  no-diffusion: rhs = xm/dt + tndcy (pure time + tendency)  PASS")
 
 
 def test_grad_finite():
+    gr = _make_gr()
     rng = np.random.default_rng(99)
     lhs_diff, xm, xm_tndcy = _inputs(rng)
     g = jax.grad(lambda x: jnp.sum(
-        windm_edsclrm_rhs(jnp.asarray(lhs_diff), x, jnp.asarray(xm_tndcy), 60.0) ** 2))(jnp.asarray(xm))
+        _rhs_call(gr, jnp.asarray(lhs_diff), x, jnp.asarray(xm_tndcy), 60.0) ** 2))(jnp.asarray(xm))
     assert np.all(np.isfinite(np.asarray(g))), "non-finite grad wrt xm"
     print("  jax.grad(windm_edsclrm_rhs) wrt xm finite  PASS")
 

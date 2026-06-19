@@ -1,926 +1,2353 @@
-"""JAX implementations of advance_wp2_wp3 sub-functions.
+"""JAX-side entry point for ``src/CLUBB_core/advance_wp2_wp3_module.F90``.
 
-Faithful port of CLUBB_core/advance_wp2_wp3_module.F90.
-
-Functions implemented:
-  advance_wp2_wp3 -- full pentadiagonal LHS/RHS assembly and solve
-                         for the coupled wp2/wp3 system (ADG1 PDF, ascending grid).
-
-All functions operate in float64.
+Description:
+  Advance w'^2 and w'^3 one timestep.
 
 References:
-  src/CLUBB_core/advance_wp2_wp3_module.F90
+  https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:wp2_wp3_eqns
+
+  Eqn. 12 & 18 on p. 3545--3546 of
+  ``A PDF-Based Model for Boundary Layer Clouds. Part I:
+    Method and Model Description'' Golaz, et al. (2002)
+    JAS, Vol. 59, pp. 3540--3551.
+
+See also
+  ``Equations for CLUBB'', Section 6:
+  /Implict solution for the vertical velocity moments/
+
+Porting deviations:
+- Sponge damping blocks are unsupported here because clubb_case_initalization
+  rejects sponge-enabled Python/JAX driver cases before this routine is called.
+- The detailed Fortran error-print diagnostics and diagnostic-only early
+  returns are reduced until full JAX diagnostic state is available; fatal
+  conditions still mark err_info.
+- Stats are threaded explicitly with JaxStats because the Fortran routine uses
+  global stats side effects that are not JAX-compatible state.
+- Intent(out) and intent(inout) variables are returned explicitly instead of
+  being modified through Fortran argument side effects.
 """
 
-from __future__ import annotations
+from functools import partial
 
-import numpy as np
+import jax
+
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.grid_class import zm2zt_jax, zm2zt2zm_jax, zm2zt, zt2zm
-from clubb_jax.src.CLUBB_core.diffusion import (
-    diffusion_zm_lhs_jax,
-    diffusion_zt_lhs_jax,
-)
-from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zm_lhs_jax, term_ma_zt_lhs_jax
-from clubb_jax.src.CLUBB_core.penta_lu_solver import penta_lu_solve_jax
+from clubb_jax.src.CLUBB_core.Skx_module import Skx_func
+from clubb_jax.src.CLUBB_core.advance_helper_module import calc_wp3_on_wp2
+from clubb_jax.src.CLUBB_core.clip_explicit import clip_skewness, clip_variance
+from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs, diffusion_zm_lhs
+from clubb_jax.src.CLUBB_core.error_code import clubb_at_least_debug_level
 from clubb_jax.src.CLUBB_core.fill_holes import (
-    fill_holes_vertical, fill_holes_wp2_from_horz_tke,
+    fill_holes_vertical,
+    fill_holes_wp2_from_horz_tke,
 )
-from clubb_jax.src.CLUBB_core.clip_explicit import clip_variance, clip_skewness
-from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import (
-    apply_lhs_band3_interior_jax, apply_lhs_band2_zt2zm_interior_jax,
-    finalize_implicit_budget_interior_jax,
+from clubb_jax.src.CLUBB_core.grid_class import (
+    T_ABOVE,
+    T_BELOW,
+    ddzt,
+    zm2zt,
+    zm2zt2zm,
+    zt2zm,
 )
-from clubb_jax.src.CLUBB_core.tracer_numpy import _asarray, _xp, _iset
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
+from clubb_jax.src.CLUBB_core.mean_adv import term_ma_zt_lhs, term_ma_zm_lhs
+from clubb_jax.src.CLUBB_core.matrix_solver_wrapper import band_solve
+from clubb_jax.src.CLUBB_core.clubb_constants import (
+    clip_wp2,
+    eps,
+    five,
+    four,
+    gamma_over_implicit_ts,
+    grav,
+    iC1,
+    iC1b,
+    iC1c,
+    iC4,
+    iC8,
+    iC8b,
+    iC11,
+    iC11b,
+    iC11c,
+    iC12,
+    iC_uu_buoy,
+    iC_uu_shr,
+    iC_wp2_pr_dfsn,
+    iC_wp3_pr_dfsn,
+    iC_wp3_pr_tp,
+    iC_wp3_pr_turb,
+    iSkw_max_mag,
+    ia3_coef_min,
+    ic_K1,
+    ic_K8,
+    iiPDF_ADG1,
+    iiPDF_new,
+    iiPDF_new_hybrid,
+    l_explicit_turbulent_adv_wp3,
+    l_force_descending_solves,
+    max_mag_correlation_flux,
+    one,
+    one_half,
+    one_third,
+    penta_bicgstab,
+    three,
+    three_halves,
+    two,
+    two_thirds,
+    w_tol,
+    w_tol_sqd,
+    wp2_max,
+    zero,
+    zero_threshold,
+)
+from clubb_jax.src.CLUBB_core import (
+    ErrInfo,
+    Grid,
+    NuVertResDep,
+    implicit_coefs_terms,
+)
 
-import clubb_jax.src.CLUBB_core.constants_clubb as cc
 
-_gamma = cc.gamma_over_implicit_ts   # 1.5
-_grav  = cc.grav                     # 9.81
-_two_thirds = cc.two_thirds          # 2/3
-_one_third  = 1.0 / 3.0
+# Set logical to true for Crank-Nicholson diffusion scheme
+# or to false for completely implicit diffusion scheme.
+# Note:  Although Crank-Nicholson diffusion has usually been used for wp2
+#        and wp3 in the past, we found that using completely implicit
+#        diffusion stabilized the deep convective cases more while having
+#        almost no effect on the boundary layer cases.  Brian; 1/4/2008.
+l_crank_nich_diff = False
 
-
-# ===========================================================================
-# Private helpers
-# ===========================================================================
-
-def wp2_term_ta_lhs(invrs_rho_ds_zm, rho_ds_zt, gr):
-    """Turbulent advection LHS for wp2 (zm-level variable).
-
-    LHS[0] = coeff of wp3[k_py]   (super1 in pentadiag)
-    LHS[1] = coeff of wp3[k_py-1] (sub1 in pentadiag)
-
-    Shape: (2, ngrdcol, nzm).  Boundaries are 0.
-    """
-    fac = invrs_rho_ds_zm[:, 1:-1] * gr.invrs_dzm[:, 1:-1]
-    lhs = jnp.zeros((2,) + invrs_rho_ds_zm.shape)
-    lhs = lhs.at[0, :, 1:-1].set(fac * rho_ds_zt[:, 1:])
-    lhs = lhs.at[1, :, 1:-1].set(-fac * rho_ds_zt[:, :-1])
-    return lhs
+ndiags2 = 2
+ndiags3 = 3
+ndiags5 = 5
 
 
-def wp3_term_ta_ADG1_lhs(wp2, a1_coef_zt, a3_coef_zt, wp3_on_wp2,
-                           rho_ds_zm, invrs_rho_ds_zt, gr):
-    """5-band ADG1 turbulent advection LHS for wp3 (zt-level variable).
+@partial(
+    jax.jit,
+    static_argnames=(
+        "nzm",
+        "nzt",
+        "ngrdcol",
+        "iiPDF_type",
+        "penta_solve_method",
+        "fill_holes_type",
+        "l_min_wp2_from_corr_wx",
+        "l_upwind_xm_ma",
+        "l_tke_aniso",
+        "l_standard_term_ta",
+        "l_partial_upwind_wp3",
+        "l_damp_wp2_using_em",
+        "l_use_C11_Richardson",
+        "l_damp_wp3_Skw_squared",
+        "l_lmm_stepping",
+        "l_use_tke_in_wp3_pr_turb_term",
+        "l_use_tke_in_wp2_wp3_K_dfsn",
+        "l_use_wp3_lim_with_smth_Heaviside",
+        "l_wp2_fill_holes_tke",
+        "l_ho_nontrad_coriolis",
+        "l_implemented",
+    ),
+)
+def advance_wp2_wp3(
+    nzm: int, nzt: int, ngrdcol: int, gr: Grid, dt,
+    sfc_elevation, fcor_y, sigma_sqd_w, wm_zm,
+    wm_zt,
+    wpup2, wpvp2, wp2up2, wp2vp2, wp4,
+    wpthvp, wp2thvp, wp2up, um, vm, upwp, vpwp,
+    em, Kh_zm, Kh_zt, invrs_tau_C4_zm,
+    invrs_tau_wp3_zt, invrs_tau_C1_zm,
+    rho_ds_zm, rho_ds_zt, invrs_rho_ds_zm,
+    invrs_rho_ds_zt, thv_ds_zm,
+    thv_ds_zt, mixt_frac, Cx_fnc_Richardson,
+    lhs_splat_wp2, lhs_splat_wp3,
+    pdf_implicit_coefs_terms: implicit_coefs_terms,
+    wprtp, wpthlp, rtp2, thlp2,
+    clubb_params, nu_vert_res_dep: NuVertResDep,
+    iiPDF_type: int,
+    penta_solve_method: int,
+    fill_holes_type: int,
+    l_min_wp2_from_corr_wx: bool,
+    l_upwind_xm_ma: bool,
+    l_tke_aniso: bool,
+    l_standard_term_ta: bool,
+    l_partial_upwind_wp3: bool,
+    l_damp_wp2_using_em: bool,
+    l_use_C11_Richardson: bool,
+    l_damp_wp3_Skw_squared: bool,
+    l_lmm_stepping: bool,
+    l_use_tke_in_wp3_pr_turb_term: bool,
+    l_use_tke_in_wp2_wp3_K_dfsn: bool,
+    l_use_wp3_lim_with_smth_Heaviside: bool,
+    l_wp2_fill_holes_tke: bool,
+    l_ho_nontrad_coriolis: bool,
+    l_implemented: bool,
+    stats: JaxStats,
+    up2, vp2, wp2, wp3, err_info: ErrInfo,
+):
+    """Advance w'^2 and w'^3 one timestep."""
+    del mixt_frac
 
-    Band 0 (super2): coeff of wp3[k+1]
-    Band 1 (super1): coeff of wp2[k+1]
-    Band 2 (main):   coeff of wp3[k]
-    Band 3 (sub1):   coeff of wp2[k]
-    Band 4 (sub2):   coeff of wp3[k-1]
-
-    Shape: (5, ngrdcol, nzt).  Boundaries are 0.
-
-    Faithful port of wp3_term_ta_ADG1_lhs for l_standard_term_ta=False
-    (non-standard TA, uses a1 for wp3 fluxes, a3 for wp2 fluxes).
-    """
-    lhs = jnp.zeros((5,) + invrs_rho_ds_zt.shape)
-
-    inv  = invrs_rho_ds_zt[:, 1:-1]    # (ngrdcol, nzt-2)
-    a1   = a1_coef_zt[:, 1:-1]
-    a3   = a3_coef_zt[:, 1:-1]
-    idzt = gr.invrs_dzt[:, 1:-1]
-
-    # At zt level k_py (1..nzm-3), zm levels k_py and k_py+1 are adjacent.
-    # gr.weights_zt2zm indexed by zm level; T_ABOVE=0, T_BELOW=1.
-    rho_up  = rho_ds_zm[:, 2:-1]    # rho_ds_zm[k_py+1]
-    rho_lo  = rho_ds_zm[:, 1:-2]    # rho_ds_zm[k_py]
-    wp2_up  = wp2[:, 2:-1]          # wp2[k_py+1]
-    wp2_lo  = wp2[:, 1:-2]          # wp2[k_py]
-    w3w2_up = wp3_on_wp2[:, 2:-1]   # wp3_on_wp2[k_py+1]
-    w3w2_lo = wp3_on_wp2[:, 1:-2]   # wp3_on_wp2[k_py]
-    wt_up_tab = gr.weights_zt2zm[:, 2:-1, 0]  # T_ABOVE for zm[k_py+1]
-    wt_up_tbe = gr.weights_zt2zm[:, 2:-1, 1]  # T_BELOW for zm[k_py+1]
-    wt_lo_tab = gr.weights_zt2zm[:, 1:-2, 0]  # T_ABOVE for zm[k_py]
-    wt_lo_tbe = gr.weights_zt2zm[:, 1:-2, 1]  # T_BELOW for zm[k_py]
-
-    # Band 0: coefficient of wp3[k_py+1]
-    lhs = lhs.at[0, :, 1:-1].set(inv * a1 * idzt * rho_up * w3w2_up * wt_up_tab)
-    # Band 1: coefficient of wp2[k_py+1]
-    lhs = lhs.at[1, :, 1:-1].set(inv * a3 * idzt * rho_up * wp2_up)
-    # Band 2: coefficient of wp3[k_py]
-    lhs = lhs.at[2, :, 1:-1].set(
-        inv * a1 * idzt * (rho_up * w3w2_up * wt_up_tbe - rho_lo * w3w2_lo * wt_lo_tab)
+    wp2_zt = zm2zt(nzm, nzt, ngrdcol, gr, wp2, w_tol_sqd)
+    wp3_zm = zt2zm(nzm, nzt, ngrdcol, gr, wp3)
+    Skw_zt = Skx_func(nzt, ngrdcol, wp2_zt, wp3, w_tol, clubb_params)
+    Skw_zm = Skx_func(nzm, ngrdcol, wp2, wp3_zm, w_tol, clubb_params)
+    wp3_on_wp2, wp3_on_wp2_zt = calc_wp3_on_wp2(
+        nzm, nzt, ngrdcol, gr, wp2, wp3,
     )
-    # Band 3: coefficient of wp2[k_py]
-    lhs = lhs.at[3, :, 1:-1].set(-inv * a3 * idzt * rho_lo * wp2_lo)
-    # Band 4: coefficient of wp3[k_py-1]
-    lhs = lhs.at[4, :, 1:-1].set(-inv * a1 * idzt * rho_lo * w3w2_lo * wt_lo_tbe)
-    return lhs
+    del wp3_on_wp2_zt
 
+    # Compute the a3 coefficient (formula 25 in `Equations for CLUBB')
+    a3_coef = -two * (one - sigma_sqd_w) ** 2 + three
+    a3_coef = jnp.maximum(a3_coef, clubb_params[:, ia3_coef_min][:, None])
+    a3_coef_zt = zm2zt(nzm, nzt, ngrdcol, gr, a3_coef)
 
-def wp3_term_tp_lhs(coef, wp2, rho_ds_zm, invrs_rho_ds_zt, gr):
-    """Turbulent production LHS for wp3.
+    if stats.l_sample:
+        stats = stats.update("a3_coef_zt", a3_coef_zt)
+        stats = stats.update("a3_coef", a3_coef)
 
-    coef: (ngrdcol,) scalar coefficient per column.
-    Shape: (2, ngrdcol, nzt).  Boundaries are 0.
+    if l_crank_nich_diff and l_use_tke_in_wp2_wp3_K_dfsn:
+        # General error -> set all entries to clubb_fatal_error
+        err_info = err_info.set_fatal()
+        return up2, vp2, wp2, wp3, err_info, stats
 
-    Band 0 (k_mdiag):   coeff of wp2[k_py+1]
-    Band 1 (km1_mdiag): coeff of wp2[k_py]
-    """
-    lhs  = jnp.zeros((2,) + invrs_rho_ds_zt.shape)
-    c    = coef[:, None]                         # (ngrdcol, 1)
-    inv  = invrs_rho_ds_zt[:, 1:-1]
-    idzt = gr.invrs_dzt[:, 1:-1]
-    rho_up = rho_ds_zm[:, 2:-1]
-    wp2_up = wp2[:, 2:-1]
-    rho_lo = rho_ds_zm[:, 1:-2]
-    wp2_lo = wp2[:, 1:-2]
-    lhs = lhs.at[0, :, 1:-1].set(
-        c * (-3.0 * inv * idzt * rho_up * wp2_up + 1.5 * idzt * wp2_up)
-    )
-    lhs = lhs.at[1, :, 1:-1].set(
-        c * (3.0 * inv * idzt * rho_lo * wp2_lo - 1.5 * idzt * wp2_lo)
-    )
-    return lhs
-
-
-def wp3_terms_ac_pr2_lhs(C11_Skw_fnc, wm_zm, gr):
-    """Accumulation + pr2 LHS for wp3. (ngrdcol, nzt). Boundaries are 0."""
-    lhs = jnp.zeros(C11_Skw_fnc.shape)
-    d_wm = wm_zm[:, 2:-1] - wm_zm[:, 1:-2]   # wm_zm[k_py+1] - wm_zm[k_py]
-    lhs = lhs.at[:, 1:-1].set(
-        (1.0 - C11_Skw_fnc[:, 1:-1]) * 3.0 * gr.invrs_dzt[:, 1:-1] * d_wm
-    )
-    return lhs
-
-
-def wp2_terms_ac_pr2_lhs(C_uu_shr, wm_zt, gr):
-    """Accumulation + pr2 LHS for wp2. (ngrdcol, nzm). Boundaries are 0.
-
-    C_uu_shr: (ngrdcol,)
-    """
-    lhs = jnp.zeros((C_uu_shr.shape[0], gr.invrs_dzm.shape[1]))
-    d_wm = wm_zt[:, 1:] - wm_zt[:, :-1]    # wm_zt[k_py] - wm_zt[k_py-1]
-    lhs = lhs.at[:, 1:-1].set(
-        (1.0 - C_uu_shr[:, None]) * 2.0 * gr.invrs_dzm[:, 1:-1] * d_wm
-    )
-    return lhs
-
-
-def wp2_term_dp1_lhs(C1_Skw_fnc, invrs_tau_C1_zm):
-    """Dissipation term 1 LHS for wp2. (ngrdcol, nzm). Boundaries are 0."""
-    lhs = jnp.zeros_like(C1_Skw_fnc)
-    lhs = lhs.at[:, 1:-1].set(C1_Skw_fnc[:, 1:-1] * invrs_tau_C1_zm[:, 1:-1])
-    return lhs
-
-
-def wp2_term_pr1_lhs(C4, invrs_tau_C4_zm):
-    """Pressure term 1 LHS for wp2 (l_tke_aniso path). (ngrdcol, nzm). Boundaries 0.
-
-    C4: (ngrdcol,)
-    """
-    lhs = jnp.zeros_like(invrs_tau_C4_zm)
-    lhs = lhs.at[:, 1:-1].set(
-        (2.0 * C4[:, None] * invrs_tau_C4_zm[:, 1:-1]) / 3.0
-    )
-    return lhs
-
-
-def wp3_term_pr1_lhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt):
-    """Pressure term 1 LHS for wp3 (l_damp_wp3_Skw_squared path). (ngrdcol, nzt). Boundaries 0."""
-    lhs = jnp.zeros_like(invrs_tau_wp3_zt)
-    lhs = lhs.at[:, 1:-1].set(
-        C8[:, None] * invrs_tau_wp3_zt[:, 1:-1] * (3.0 * C8b[:, None] * Skw_zt[:, 1:-1] ** 2 + 1.0)
-    )
-    return lhs
-
-
-# ---------------------------------------------------------------------------
-# RHS sub-functions
-# ---------------------------------------------------------------------------
-
-def wp2_term_pr_dfsn_rhs(C_wp2_pr_dfsn, rho_ds_zt, invrs_rho_ds_zm, wpup2, wpvp2, wp3, gr):
-    """Pressure-diffusion RHS for wp2. (ngrdcol, nzm).
-
-    C_wp2_pr_dfsn: (ngrdcol,)
-    """
-    wpuip2 = wpup2 + wpvp2 + wp3                 # (ngrdcol, nzt)
-    rhs = jnp.zeros_like(invrs_rho_ds_zm)
-    fac = C_wp2_pr_dfsn[:, None] * invrs_rho_ds_zm[:, 1:-1] * gr.invrs_dzm[:, 1:-1]
-    interior = fac * (rho_ds_zt[:, 1:] * wpuip2[:, 1:] - rho_ds_zt[:, :-1] * wpuip2[:, :-1])
-    rhs = rhs.at[:, 1:-1].set(interior)
-    rhs = rhs.at[:, 0].set(rhs[:, 1])   # lower BC = first interior
-    return rhs
-
-
-def wp3_term_pr_turb_rhs(C_wp3_pr_turb, rho_ds_zm, invrs_rho_ds_zt, wp2_smth, em_smth, gr):
-    """Pressure-turbulence RHS for wp3 (l_use_tke_in_wp3_pr_turb_term=True). (ngrdcol, nzt).
-
-    C_wp3_pr_turb: (ngrdcol,)
-    wp2_smth, em_smth: (ngrdcol, nzm) smoothed zm-level arrays.
-    """
-    rhs = jnp.zeros_like(invrs_rho_ds_zt)
-    fac = -C_wp3_pr_turb[:, None] * invrs_rho_ds_zt[:, 1:-1] * gr.invrs_dzt[:, 1:-1]
-    val = (
-        rho_ds_zm[:, 2:-1] * wp2_smth[:, 2:-1] * em_smth[:, 2:-1]
-        - rho_ds_zm[:, 1:-2] * wp2_smth[:, 1:-2] * em_smth[:, 1:-2]
-    )
-    rhs = rhs.at[:, 1:-1].set(fac * val)
-    return rhs
-
-
-def wp3_term_pr_dfsn_rhs(C_wp3_pr_dfsn, rho_ds_zm, invrs_rho_ds_zt,
-                           wp2up2, wp2vp2, wp4, up2, vp2, wp2, gr):
-    """Pressure-diffusion RHS for wp3. (ngrdcol, nzt).
-
-    C_wp3_pr_dfsn: (ngrdcol,)
-    All zm-level inputs.
-    """
-    wp2uip2   = wp2up2 + wp2vp2 + wp4           # (ngrdcol, nzm)
-    wp2_uip2  = wp2 * (up2 + vp2 + wp2)         # (ngrdcol, nzm)
-    net       = wp2uip2 - wp2_uip2
-    rhs = jnp.zeros_like(invrs_rho_ds_zt)
-    fac = C_wp3_pr_dfsn[:, None] * invrs_rho_ds_zt[:, 1:-1] * gr.invrs_dzt[:, 1:-1]
-    val = rho_ds_zm[:, 2:-1] * net[:, 2:-1] - rho_ds_zm[:, 1:-2] * net[:, 1:-2]
-    rhs = rhs.at[:, 1:-1].set(fac * val)
-    return rhs
-
-
-def wp2_terms_bp_pr2_rhs(C_uu_buoy, thv_ds_zm, wpthvp):
-    """Buoyancy + pressure-2 RHS for wp2. (ngrdcol, nzm). Boundaries 0.
-
-    C_uu_buoy: (ngrdcol,)
-    """
-    rhs = jnp.zeros_like(thv_ds_zm)
-    rhs = rhs.at[:, 1:-1].set(
-        (1.0 - C_uu_buoy[:, None]) * 2.0
-        * (_grav / thv_ds_zm[:, 1:-1]) * wpthvp[:, 1:-1]
-    )
-    return rhs
-
-
-def wp2_term_dp1_rhs(C1_Skw_fnc, invrs_tau_C1_zm, up2, vp2):
-    """Dissipation-1 RHS for wp2 (l_damp_wp2_using_em=True). (ngrdcol, nzm). Boundaries 0."""
-    rhs = jnp.zeros_like(C1_Skw_fnc)
-    rhs = rhs.at[:, 1:-1].set(
-        -(C1_Skw_fnc[:, 1:-1] * invrs_tau_C1_zm[:, 1:-1]) * (up2[:, 1:-1] + vp2[:, 1:-1])
-    )
-    return rhs
-
-
-def wp2_term_pr3_rhs(C_uu_shr, C_uu_buoy, thv_ds_zm, wpthvp, upwp, um, vpwp, vm, gr):
-    """Pressure-3 RHS for wp2. (ngrdcol, nzm). Boundaries 0.
-
-    C_uu_shr, C_uu_buoy: (ngrdcol,)
-    um, vm: (ngrdcol, nzt) zt-level!  Fortran advance_wp2_wp3 signature line 243.
-    upwp, vpwp: (ngrdcol, nzm) zm-level.
-    """
-    rhs = jnp.zeros_like(thv_ds_zm)
-    buoy = C_uu_buoy[:, None] * (_grav / thv_ds_zm[:, 1:-1]) * wpthvp[:, 1:-1]
-    # Fortran loop k=2..nzm-1 accesses um(i,k) and um(i,k-1) where um is zt-level.
-    # In Python (0-based): um[k_py] at k_py=1..nzm-2 → um[:, 1:] (nzt elements starting at 1)
-    # and um[k_py-1] → um[:, :-1].  Both have shape (ngrdcol, nzm-2).
-    shear = C_uu_shr[:, None] * (
-        -upwp[:, 1:-1] * gr.invrs_dzm[:, 1:-1] * (um[:, 1:] - um[:, :-1])
-        - vpwp[:, 1:-1] * gr.invrs_dzm[:, 1:-1] * (vm[:, 1:] - vm[:, :-1])
-    )
-    val = _two_thirds * (buoy + shear)
-    val = jnp.maximum(val, 0.0)    # zero_threshold clip (Fortran line 4025)
-    rhs = rhs.at[:, 1:-1].set(val)
-    return rhs
-
-
-def wp2_term_pr1_rhs(C4, up2, vp2, invrs_tau_C4_zm):
-    """Pressure-1 RHS for wp2 (l_tke_aniso=True). (ngrdcol, nzm). Boundaries 0.
-
-    C4: (ngrdcol,)
-    """
-    rhs = jnp.zeros_like(invrs_tau_C4_zm)
-    rhs = rhs.at[:, 1:-1].set(
-        (C4[:, None] * (up2[:, 1:-1] + vp2[:, 1:-1]) * invrs_tau_C4_zm[:, 1:-1]) / 3.0
-    )
-    return rhs
-
-
-def wp3_terms_bp1_pr2_rhs(C11_Skw_fnc, thv_ds_zt, wp2thvp):
-    """Buoyancy + pressure-2 RHS for wp3. (ngrdcol, nzt). Boundaries 0."""
-    rhs = jnp.zeros_like(thv_ds_zt)
-    rhs = rhs.at[:, 1:-1].set(
-        (1.0 - C11_Skw_fnc[:, 1:-1]) * 3.0
-        * (_grav / thv_ds_zt[:, 1:-1]) * wp2thvp[:, 1:-1]
-    )
-    return rhs
-
-
-def wp3_term_pr1_rhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt, wp3):
-    """Pressure-1 RHS for wp3 (l_damp_wp3_Skw_squared=True). (ngrdcol, nzt). Boundaries 0."""
-    rhs = jnp.zeros_like(wp3)
-    rhs = rhs.at[:, 1:-1].set(
-        C8[:, None] * invrs_tau_wp3_zt[:, 1:-1]
-        * (2.0 * C8b[:, None] * Skw_zt[:, 1:-1] ** 2) * wp3[:, 1:-1]
-    )
-    return rhs
-
-
-# ===========================================================================
-# Main advance function
-# ===========================================================================
-
-def wp23_rhs(*, nzm, ngrdcol, invrs_dt,
-                 rhs_pr_turb_wp3, rhs_pr_dfsn_wp3, rhs_pr_dfsn_wp2,
-                 rhs_pr1_wp2, rhs_bp1_pr2_wp3, rhs_pr1_wp3,
-                 rhs_bp_pr2_wp2, rhs_pr3_wp2, rhs_dp1_wp2,
-                 lhs_pr1_wp2, lhs_tp_wp3, lhs_pr1_wp3, lhs_dp1_wp2, lhs_ta_wp3,
-                 wp2, wp3, wp2up, upwp,
-                 l_ho_nontrad_coriolis, fcor_y, gr):
-    """advance_wp2_wp3_module.F90:wp23_rhs — assemble the coupled wp2/wp3 explicit RHS vector.
-
-    Interleaving: wp2[k] at global index 2k, wp3[k] at 2k+1 (ascending grid). The over-implicit
-    contributions use the lhs_* terms; BCs set the four corner rows. Returns rhs (ngrdcol, 2*nzm-1).
-    """
-    ndim = 2 * nzm - 1
-    rhs  = jnp.zeros((ngrdcol, ndim))
-
-    # --- wp3 interior: global indices 3, 5, ..., 2*nzm-5 (slice 3:-2:2) ---
-    # rhs_pr_turb_wp3 + rhs_pr_dfsn_wp3 (set, not +=)
-    rhs = rhs.at[:, 3:-2:2].set(rhs_pr_turb_wp3[:, 1:-1] + rhs_pr_dfsn_wp3[:, 1:-1])
-
-    # --- wp2 interior: global indices 2, 4, ..., 2*nzm-4 (slice 2:-1:2) ---
-    # rhs_pr_dfsn_wp2 (set, not +=)
-    rhs = rhs.at[:, 2:-1:2].set(rhs_pr_dfsn_wp2[:, 1:-1])
-
-    # --- l_tke_aniso=True: add pr1 and over-implicit pr1 to wp2 rows ---
-    rhs = rhs.at[:, 2:-1:2].add(rhs_pr1_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add((1.0 - _gamma) * (-lhs_pr1_wp2[:, 1:-1] * wp2[:, 1:-1]))
-
-    # --- Time tendency and main terms ---
-    # wp3:
-    rhs = rhs.at[:, 3:-2:2].add(invrs_dt * wp3[:, 1:-1])
-    rhs = rhs.at[:, 3:-2:2].add(
-        (1.0 - _gamma) * (-lhs_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
-                          - lhs_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2])
-    )
-    rhs = rhs.at[:, 3:-2:2].add(rhs_bp1_pr2_wp3[:, 1:-1])
-    rhs = rhs.at[:, 3:-2:2].add(rhs_pr1_wp3[:, 1:-1])
-    rhs = rhs.at[:, 3:-2:2].add((1.0 - _gamma) * (-lhs_pr1_wp3[:, 1:-1] * wp3[:, 1:-1]))
-
-    # wp2:
-    rhs = rhs.at[:, 2:-1:2].add(invrs_dt * wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add(rhs_bp_pr2_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add(rhs_pr3_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add(rhs_dp1_wp2[:, 1:-1])
-    rhs = rhs.at[:, 2:-1:2].add((1.0 - _gamma) * (-lhs_dp1_wp2[:, 1:-1] * wp2[:, 1:-1]))
-
-    # --- ADG1 TA for wp3 (implicit, over-implicit) ---
-    # RHS over-implicit contribution: (1-gamma)*(-lhs_ta_wp3 * [wp3/wp2])
-    # bands: 0→wp3[k+1], 1→wp2[k+1], 2→wp3[k], 3→wp2[k], 4→wp3[k-1]
-    rhs = rhs.at[:, 3:-2:2].add(
-        (1.0 - _gamma) * (
-            -lhs_ta_wp3[0, :, 1:-1] * wp3[:, 2:]    # wp3[k_py+1]
-            - lhs_ta_wp3[1, :, 1:-1] * wp2[:, 2:-1] # wp2[k_py+1]
-            - lhs_ta_wp3[2, :, 1:-1] * wp3[:, 1:-1] # wp3[k_py]
-            - lhs_ta_wp3[3, :, 1:-1] * wp2[:, 1:-2] # wp2[k_py]
-            - lhs_ta_wp3[4, :, 1:-1] * wp3[:, :-2]  # wp3[k_py-1]
+    # Vince Larson added code to make C11 function of Skw. 13 Mar 2005
+    # If this code is used, C11 is no longer relevant, i.e. constants
+    #    are hardwired.
+    if l_use_C11_Richardson:
+        C11_Skw_fnc = zm2zt(
+            nzm, nzt, ngrdcol, gr, Cx_fnc_Richardson, zero_threshold,
         )
+    else:
+        C11 = clubb_params[:, iC11]
+        C11b = clubb_params[:, iC11b]
+        C11c = clubb_params[:, iC11c]
+        C11c_safe = jnp.where(jnp.abs(C11c) > zero, C11c, one)
+        C11_varying = jnp.abs(C11 - C11b) > jnp.abs(C11 + C11b) * eps / two
+        # Calculate C_{1} and C_{11} as functions of skewness of w.
+        # The if..then here is only for computational efficiency -dschanen 2 Sept 08
+        C11_Skw_fnc = jnp.where(
+            C11_varying[:, None],
+            C11b[:, None]
+            + (C11 - C11b)[:, None]
+            * jnp.exp(-one_half * (Skw_zt / C11c_safe[:, None]) ** 2),
+            C11b[:, None],
+        )
+
+    C1 = clubb_params[:, iC1]
+    C1b = clubb_params[:, iC1b]
+    C1c = clubb_params[:, iC1c]
+    C1c_safe = jnp.where(jnp.abs(C1c) > zero, C1c, one)
+    C1_varying = jnp.abs(C1 - C1b) > jnp.abs(C1 + C1b) * eps / two
+    # The if..then here is only for computational efficiency -dschanen 2 Sept 08
+    C1_Skw_fnc = jnp.where(
+        C1_varying[:, None],
+        C1b[:, None]
+        + (C1 - C1b)[:, None]
+        * jnp.exp(-one_half * (Skw_zm / C1c_safe[:, None]) ** 2),
+        C1b[:, None],
     )
 
-    # --- Non-traditional Coriolis (Iter103); no-op for the 15 cases + rico ---
-    if l_ho_nontrad_coriolis:
-        _fy = jnp.asarray(fcor_y)
-        if _fy.ndim == 1:
-            _fy = _fy[:, None]
-        # wp2 RHS += 2*fcor_y*upwp   (upwp on zm levels, interior)
-        rhs = rhs.at[:, 2:-1:2].add(2.0 * _fy * upwp[:, 1:-1])
-        # wp3 RHS += 3*fcor_y*wp2up  (wp2up on zt levels, interior)
-        rhs = rhs.at[:, 3:-2:2].add(3.0 * _fy * jnp.asarray(wp2up)[:, 1:-1])
+    if l_damp_wp2_using_em:
+        # Insert 1/3 here to account for the fact that in the dissipation term,
+        #   (2/3)*em = (2/3)*(1/2)*(wp2+up2+vp2).  Then we can insert wp2, up2,
+        #   and vp2 directly into the dissipation subroutines without prefixing them by (1/3).
+        C1_Skw_fnc = one_third * C1_Skw_fnc
 
-    # --- Boundary conditions ---
-    # Lower wp2: global 0
-    k_lb_zm = gr.k_lb_zm   # Python 0-based lower boundary index for zm
-    rhs = rhs.at[:, 0].set(wp2[:, k_lb_zm])
-    # Lower wp3: global 1
-    rhs = rhs.at[:, 1].set(0.0)
-    # Upper wp3: global 2*nzm-3 (= 2*(nzt-1)-1 = 2*nzt-3)
-    rhs = rhs.at[:, 2 * nzm - 3].set(0.0)
-    # Upper wp2: global 2*nzm-2
-    rhs = rhs.at[:, 2 * nzm - 2].set(cc.w_tol_sqd)
-    return rhs
+    # Set C16_fnc based on Richardson_num
+    C16_fnc = Cx_fnc_Richardson[:, :nzt]
+
+    if clubb_at_least_debug_level(0):
+        # Assertion check for C11_Skw_fnc
+        C11_bad = jnp.any((C11_Skw_fnc > one) | (C11_Skw_fnc < zero), axis=1)
+        # Assertion check for C11_Skw_fnc
+        C16_bad = jnp.any((C16_fnc > one) | (C16_fnc < zero), axis=1)
+        # Error in grid column i -> set ith entry to clubb_fatal_error
+        err_info = err_info.set_fatal(mask=C11_bad | C16_bad)
+
+    if stats.l_sample:
+        stats = stats.update("C11_Skw_fnc", C11_Skw_fnc)
+        stats = stats.update("C1_Skw_fnc", C1_Skw_fnc)
+
+    # Define the Coefficent of Eddy Diffusivity for the wp2 and wp3.
+    # Kw1 is used for wp2, which is located on momentum levels.
+    # Kw1 is located on thermodynamic levels.
+    # Kw1 = c_K1 * Kh_zt ! c_K1 variable is commented out
+    Kw1 = clubb_params[:, ic_K1][:, None] * Kh_zt
+    # Kw8 is used for wp3, which is located on thermodynamic levels.
+    # Kw8 is located on momentum levels.
+    # Note: Kw8 is usually defined to be 1/2 of Kh_zm.
+    # Kw8 = c_K8 * Kh_zm ! c_K8 variable is commented out
+    Kw8 = clubb_params[:, ic_K8][:, None] * Kh_zm
+
+    coef_wp4_implicit = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    a1_coef = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    a1_coef_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+
+    if not l_explicit_turbulent_adv_wp3:
+        if iiPDF_type == iiPDF_new or iiPDF_type == iiPDF_new_hybrid:
+            # Unpack coef_wp4_implicit from pdf_implicit_coefs_terms.
+            # Since PDF parameters and the resulting implicit coefficients and
+            # explicit terms are calculated on thermodynamic levels, the <w'^4>
+            # implicit coefficient needs to be unpacked as coef_wp4_implicit_zt.
+            coef_wp4_implicit_zt = pdf_implicit_coefs_terms.coef_wp4_implicit
+            # The values of <w'^4> are located on momentum levels.  Interpolate
+            # coef_wp4_implicit_zt to momentum levels as coef_wp4_implicit.  The
+            # discretization diagram is found in the description section of
+            # function wp3_term_ta_new_pdf_lhs below.  These values are always
+            # positive.
+            coef_wp4_implicit = zt2zm(
+                nzm, nzt, ngrdcol, gr, coef_wp4_implicit_zt, zero_threshold,
+            )
+            # Set the value of coef_wp4_implicit to 0 at the lower boundary and at
+            # the upper boundary.  This sets the value of <w'^4> to 0 at the lower
+            # and upper boundaries.
+            coef_wp4_implicit = coef_wp4_implicit.at[:, gr.k_lb_zm].set(zero)
+            coef_wp4_implicit = coef_wp4_implicit.at[:, gr.k_ub_zm].set(zero)
+            if stats.l_sample:
+                stats = stats.update("coef_wp4_implicit", coef_wp4_implicit)
+        elif iiPDF_type == iiPDF_ADG1:
+            # Define a_1 and a_3 (both are located on momentum levels).
+            # They are variables that are both functions of sigma_sqd_w (where
+            # sigma_sqd_w is located on momentum levels).
+            a1_coef = one / (one - sigma_sqd_w)
+            # Interpolate a_1 from momentum levels to thermodynamic levels.  This
+            # will be used for the w'^3 turbulent advection (ta) term.
+            a1_coef_zt = zm2zt(
+                nzm, nzt, ngrdcol, gr, a1_coef, zero_threshold,
+            )
+
+    # Not using pressure term, set to 0
+    rhs_pr3_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+
+    # Initiaize some terms to zero
+    wp3_term_ta_lhs_result = jnp.zeros((ndiags5, ngrdcol, nzt), dtype=jnp.float64)
+    wp3_pr3_lhs = jnp.zeros((ndiags5, ngrdcol, nzt), dtype=jnp.float64)
+
+    Kw1_zm = zt2zm(nzm, nzt, ngrdcol, gr, Kw1, zero)
+    Kw8_zt = zm2zt(nzm, nzt, ngrdcol, gr, Kw8, zero)
+
+    # Experimental bouyancy term
+    # Experimental term from CLUBB TRAC ticket #411
+    # Compute the vertical derivative of the u and v winds
+    if not l_use_tke_in_wp3_pr_turb_term:
+        dum_dz = ddzt(nzm, nzt, ngrdcol, gr, um)
+        dvm_dz = ddzt(nzm, nzt, ngrdcol, gr, vm)
+    else:
+        dum_dz = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        dvm_dz = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+
+    em_smth = zm2zt2zm(nzm, nzt, ngrdcol, gr, em)
+    wp2_smth = zm2zt2zm(nzm, nzt, ngrdcol, gr, wp2)
+
+    rhs_pr_turb_wp3 = wp3_term_pr_turb_rhs(
+        nzm, nzt, ngrdcol, gr, clubb_params[:, iC_wp3_pr_turb],
+        Kh_zt, wpthvp,
+        dum_dz, dvm_dz,
+        upwp, vpwp,
+        thv_ds_zt,
+        rho_ds_zm, invrs_rho_ds_zt,
+        em_smth, wp2_smth,
+        l_use_tke_in_wp3_pr_turb_term,
+    )
+
+    # Calculate term
+    rhs_pr_dfsn_wp3 = wp3_term_pr_dfsn_rhs(
+        nzm, nzt, ngrdcol, gr,
+        clubb_params[:, iC_wp3_pr_dfsn],
+        rho_ds_zm, invrs_rho_ds_zt,
+        wp2up2, wp2vp2, wp4,
+        up2, vp2, wp2,
+    )
+
+    rhs_pr_dfsn_wp2 = wp2_term_pr_dfsn_rhs(
+        nzm, nzt, ngrdcol, gr, clubb_params[:, iC_wp2_pr_dfsn],
+        rho_ds_zt, invrs_rho_ds_zm,
+        wpup2, wpvp2, wp3,
+    )
+
+    # This part handles the wp2 equation terms.
+    lhs_diff_zm = diffusion_zm_lhs(
+        nzm, nzt, ngrdcol, gr, Kw1, Kw1_zm, nu_vert_res_dep.nu1,
+        invrs_rho_ds_zm, rho_ds_zt,
+    )
+
+    # This part handles the wp3 equation terms.
+    lhs_diff_zt = diffusion_zt_lhs(
+        nzm, nzt, ngrdcol, gr, Kw8, Kw8_zt, nu_vert_res_dep.nu8,
+        invrs_rho_ds_zt, rho_ds_zm,
+    )
+
+    lhs_diff_zm_crank = jnp.zeros_like(lhs_diff_zm)
+    lhs_diff_zt_crank = jnp.zeros_like(lhs_diff_zt)
+    if l_crank_nich_diff:
+        # Calculate RHS eddy diffusion terms for w'2 and w'3
+        lhs_diff_zm_crank = lhs_diff_zm_crank.at[:, :, 1:-1].set(
+            one_half * lhs_diff_zm[:, :, 1:-1]
+        )
+        lhs_diff_zt_crank = lhs_diff_zt_crank.at[:, :, 1:-1].set(
+            one_half
+            * lhs_diff_zt[:, :, 1:-1]
+            * clubb_params[:, iC12][None, :, None]
+        )
+
+    if l_tke_aniso:
+        # Calculate "over-implicit" pressure terms for w'2 and w'3
+        rhs_pr1_wp2 = wp2_term_pr1_rhs(
+            nzm, ngrdcol, gr, clubb_params[:, iC4],
+            up2, vp2, invrs_tau_C4_zm,
+        )
+
+        # Note:  An "over-implicit" weighted time step is applied to the  term.
+        #        A weighting factor of greater than 1 may be used to make the
+        #        term more numerically stable (see note below for w'^3 RHS
+        #        turbulent advection (ta) term).
+        lhs_pr1_wp2 = wp2_term_pr1_lhs(
+            nzm, ngrdcol, gr,
+            clubb_params[:, iC4], invrs_tau_C4_zm,
+        )
+    else:
+        rhs_pr1_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        lhs_pr1_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+
+    # Calculate turbulent production terms of w'^3
+    C_wp3_pr_tp = jnp.ones((ngrdcol,), dtype=jnp.float64)
+    lhs_adv_tp_wp3 = wp3_term_tp_lhs(
+        nzm, nzt, ngrdcol, gr, C_wp3_pr_tp,
+        wp2, rho_ds_zm, invrs_rho_ds_zt,
+    )
+
+    # Calculate pressure damping of turbulent production of w'^3
+    C_wp3_pr_tp = -clubb_params[:, iC_wp3_pr_tp]
+    lhs_pr_tp_wp3 = wp3_term_tp_lhs(
+        nzm, nzt, ngrdcol, gr, C_wp3_pr_tp,
+        wp2, rho_ds_zm, invrs_rho_ds_zt,
+    )
+
+    # Sum contributions to turbulent production from standard term & damping
+    lhs_tp_wp3 = lhs_adv_tp_wp3 + lhs_pr_tp_wp3
+
+    # Calculate pressure terms 1 for w'^3
+    lhs_pr1_wp3 = wp3_term_pr1_lhs(
+        nzt, ngrdcol, gr,
+        clubb_params[:, iC8], clubb_params[:, iC8b],
+        invrs_tau_wp3_zt, Skw_zt,
+        l_damp_wp3_Skw_squared,
+    )
+
+    # Calculate dissipation terms 1 for w'^2
+    lhs_dp1_wp2 = wp2_term_dp1_lhs(
+        nzm, ngrdcol, gr,
+        C1_Skw_fnc, invrs_tau_C1_zm,
+    )
+
+    # Calculate buoyancy production of w'^2 and w'^2 pressure term 2
+    rhs_bp_pr2_wp2 = wp2_terms_bp_pr2_rhs(
+        nzm, ngrdcol, gr,
+        clubb_params[:, iC_uu_buoy],
+        thv_ds_zm, wpthvp,
+    )
+
+    # Calculate pressure terms 3 for w'^2
+    rhs_pr3_wp2 = wp2_term_pr3_rhs(
+        nzm, nzt, ngrdcol, gr,
+        clubb_params[:, iC_uu_shr],
+        clubb_params[:, iC_uu_buoy],
+        thv_ds_zm, wpthvp, upwp,
+        um, vpwp, vm,
+    )
+
+    # Calculate dissipation terms 1 for w'^2
+    rhs_dp1_wp2 = wp2_term_dp1_rhs(
+        nzm, ngrdcol, gr, C1_Skw_fnc,
+        invrs_tau_C1_zm, w_tol_sqd, up2, vp2,
+        l_damp_wp2_using_em,
+    )
+
+    # Calculate buoyancy production of w'^3 and w'^3 pressure term 2
+    rhs_bp1_pr2_wp3 = wp3_terms_bp1_pr2_rhs(
+        nzt, ngrdcol, gr, C11_Skw_fnc,
+        thv_ds_zt, wp2thvp,
+    )
+
+    # Calculate pressure terms 1 for w'^3
+    rhs_pr1_wp3 = wp3_term_pr1_rhs(
+        nzt, ngrdcol, gr,
+        clubb_params[:, iC8], clubb_params[:, iC8b],
+        invrs_tau_wp3_zt, Skw_zt, wp3,
+        l_damp_wp3_Skw_squared,
+    )
+
+    lhs_ta_wp3 = jnp.zeros((ndiags2, ngrdcol, nzt), dtype=jnp.float64)
+    rhs_ta_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    if l_explicit_turbulent_adv_wp3:
+        # The turbulent advection term is being solved explicitly.
+        # The w'^3 turbulent advection term is being solved explicitly.
+        rhs_ta_wp3 = wp3_term_ta_explicit_rhs(
+            nzm, nzt, ngrdcol, gr,
+            wp4, rho_ds_zm, invrs_rho_ds_zt,
+        )
+    else:
+        # The turbulent advection term is being solved implicitly.
+        if iiPDF_type == iiPDF_ADG1:
+            # The ADG1 PDF is used.
+            wp3_term_ta_lhs_result = wp3_term_ta_ADG1_lhs(
+                nzm, nzt, ngrdcol, gr,
+                wp2, a1_coef, a1_coef_zt,
+                a3_coef, a3_coef_zt,
+                wp3_on_wp2, rho_ds_zm,
+                rho_ds_zt, invrs_rho_ds_zt,
+                l_standard_term_ta,
+                l_partial_upwind_wp3,
+            )
+        elif iiPDF_type == iiPDF_new or iiPDF_type == iiPDF_new_hybrid:
+            # The new PDF or the new hybrid PDF is used.
+            lhs_ta_wp3 = wp3_term_ta_new_pdf_lhs(
+                nzm, nzt, ngrdcol, gr, coef_wp4_implicit,
+                wp2, rho_ds_zm, invrs_rho_ds_zt,
+            )
+            wp3_term_ta_lhs_result = wp3_term_ta_lhs_result.at[1, :, :].set(
+                lhs_ta_wp3[0, :, :]
+            )
+            wp3_term_ta_lhs_result = wp3_term_ta_lhs_result.at[3, :, :].set(
+                lhs_ta_wp3[1, :, :]
+            )
+
+    rhs, stats = wp23_rhs(
+        nzm, nzt, ngrdcol, gr, dt, fcor_y,
+        wp3_term_ta_lhs_result,
+        lhs_diff_zm, lhs_diff_zt, lhs_diff_zm_crank, lhs_diff_zt_crank,
+        lhs_tp_wp3, lhs_adv_tp_wp3, lhs_pr_tp_wp3,
+        lhs_ta_wp3, lhs_dp1_wp2, rhs_dp1_wp2, lhs_pr1_wp2,
+        rhs_pr1_wp2, lhs_pr1_wp3, rhs_pr1_wp3, rhs_bp_pr2_wp2,
+        rhs_pr_dfsn_wp2, rhs_bp1_pr2_wp3, rhs_pr3_wp2, rhs_pr3_wp3,
+        rhs_ta_wp3, rhs_pr_turb_wp3, rhs_pr_dfsn_wp3,
+        wp2, wp3, wpup2, wpvp2,
+        wpthvp, wp2thvp, wp2up, up2, vp2, upwp,
+        C11_Skw_fnc, thv_ds_zm, thv_ds_zt,
+        lhs_splat_wp2, lhs_splat_wp3,
+        clubb_params,
+        iiPDF_type,
+        l_tke_aniso,
+        l_use_tke_in_wp2_wp3_K_dfsn,
+        l_ho_nontrad_coriolis,
+        stats,
+    )
+
+    lhs_ma_zm = term_ma_zm_lhs(
+        nzm, nzt, ngrdcol, wm_zm,
+        gr.invrs_dzm, gr.weights_zm2zt,
+    )
+
+    lhs_ma_zt = term_ma_zt_lhs(
+        nzm, nzt, ngrdcol, wm_zt, gr.weights_zt2zm,
+        gr.invrs_dzt, gr.invrs_dzm,
+        l_upwind_xm_ma, gr.grid_dir,
+    )
+
+    lhs_diff_zt = lhs_diff_zt * clubb_params[:, iC12][None, :, None]
+
+    if l_crank_nich_diff:
+        lhs_diff_zm = lhs_diff_zm.at[:, :, 1:-1].set(
+            one_half * lhs_diff_zm[:, :, 1:-1]
+        )
+        lhs_diff_zt = lhs_diff_zt.at[:, :, 1:-1].set(
+            one_half * lhs_diff_zt[:, :, 1:-1]
+        )
+
+    lhs_ta_wp2 = wp2_term_ta_lhs(
+        nzm, nzt, ngrdcol, gr,
+        rho_ds_zt, invrs_rho_ds_zm,
+    )
+
+    lhs_ac_pr2_wp2 = wp2_terms_ac_pr2_lhs(
+        nzm, nzt, ngrdcol, gr,
+        clubb_params[:, iC_uu_shr], wm_zt,
+    )
+
+    lhs_ac_pr2_wp3 = wp3_terms_ac_pr2_lhs(
+        nzm, nzt, ngrdcol, gr, C11_Skw_fnc, wm_zm,
+    )
+
+    lhs = wp23_lhs(
+        nzm, nzt, ngrdcol, dt,
+        wp3_term_ta_lhs_result,
+        lhs_diff_zm, lhs_diff_zt, lhs_ma_zm,
+        lhs_ma_zt, lhs_ta_wp2,
+        lhs_tp_wp3,
+        lhs_ac_pr2_wp2, lhs_ac_pr2_wp3, lhs_dp1_wp2,
+        lhs_pr1_wp3, lhs_pr1_wp2, lhs_splat_wp2, lhs_splat_wp3,
+        l_tke_aniso,
+    )
+
+    wp2_old = wp2
+    wp3_old = wp3
+
+    up2, vp2, wp2, wp3, wp3_zm, wp2_zt, err_info, stats = wp23_solve(
+        nzm, nzt, ngrdcol, gr, dt, lhs, rhs,
+        lhs_ma_zm, lhs_dp1_wp2, lhs_diff_zm,
+        lhs_ta_wp2, lhs_pr1_wp2, lhs_pr1_wp3,
+        lhs_diff_zt, lhs_adv_tp_wp3, lhs_pr_tp_wp3,
+        wp3_pr3_lhs, lhs_ma_zt,
+        wp3_term_ta_lhs_result,
+        wm_zm, wm_zt,
+        sfc_elevation, C11_Skw_fnc,
+        rho_ds_zm,
+        upwp, vpwp, wprtp, wpthlp, rtp2, thlp2,
+        clubb_params,
+        penta_solve_method,
+        fill_holes_type,
+        l_min_wp2_from_corr_wx,
+        l_tke_aniso,
+        l_use_tke_in_wp2_wp3_K_dfsn,
+        l_use_wp3_lim_with_smth_Heaviside,
+        l_wp2_fill_holes_tke,
+        l_implemented,
+        stats,
+        up2, vp2, wp2, wp3, wp3_zm, wp2_zt, err_info,
+    )
+
+    if l_lmm_stepping:
+        wp2 = one_half * (wp2_old + wp2)
+        wp3 = one_half * (wp3_old + wp3)
+
+    if stats.l_sample:
+        stats = stats.update("wp2_zt", wp2_zt)
+        stats = stats.update("wp3_zm", wp3_zm)
+
+    return up2, vp2, wp2, wp3, err_info, stats
 
 
-def wp23_lhs(*, nzm, ngrdcol, ndim, invrs_dt,
-                 lhs_ma_zm, lhs_diff_zm, lhs_ta_wp2, lhs_ac_pr2_wp2,
-                 lhs_dp1_wp2, lhs_pr1_wp2, lhs_splat_wp2,
-                 lhs_ma_zt, lhs_diff_zt, lhs_tp_wp3, lhs_ac_pr2_wp3,
-                 lhs_pr1_wp3, lhs_splat_wp3, lhs_ta_wp3):
-    """advance_wp2_wp3_module.F90:wp23_lhs — assemble the coupled wp2/wp3 pentadiagonal LHS matrix.
+def wp23_solve(
+    nzm, nzt, ngrdcol, gr, dt, lhs, rhs,
+    lhs_ma_zm, lhs_dp1_wp2, lhs_diff_zm,
+    lhs_ta_wp2, lhs_pr1_wp2, lhs_pr1_wp3,
+    lhs_diff_zt, lhs_adv_tp_wp3, lhs_pr_tp_wp3,
+    wp3_pr3_lhs, lhs_ma_zt,
+    wp3_term_ta_lhs_result,
+    wm_zm, wm_zt,
+    sfc_elevation, C11_Skw_fnc,
+    rho_ds_zm,
+    upwp, vpwp, wprtp, wpthlp, rtp2, thlp2,
+    clubb_params,
+    penta_solve_method,
+    fill_holes_type,
+    l_min_wp2_from_corr_wx,
+    l_tke_aniso,
+    l_use_tke_in_wp2_wp3_K_dfsn,
+    l_use_wp3_lim_with_smth_Heaviside,
+    l_wp2_fill_holes_tke,
+    l_implemented,
+    stats,
+    up2, vp2, wp2, wp3, wp3_zm, wp2_zt, err_info,
+):
+    """Decompose, and back substitute the matrix for wp2/wp3.
 
-    Interleaving: wp2[k] at global index 2k, wp3[k] at 2k+1 (ascending grid). The over-implicit
-    contributions scale the implicit lhs_* terms by gamma_over_implicit_ts. Identity rows pin the
-    four BC corners. Returns lhs (5, ngrdcol, 2*nzm-1).
+    References:
+    _Equations for CLUBB_ section 6.3
     """
-    lhs = jnp.zeros((5, ngrdcol, ndim))
+    # Save the value of rhs, which will be overwritten with the solution as
+    # part of the solving routine.
+    rhs_save = rhs
 
-    # Lower boundary: wp2 (global 0), wp3 (global 1) → identity
-    lhs = lhs.at[2, :, 0].set(1.0)
-    lhs = lhs.at[2, :, 1].set(1.0)
+    old_solut = jnp.zeros((ngrdcol, 2 * nzm - 1), dtype=jnp.float64)
+    if penta_solve_method == penta_bicgstab:
+        old_solut = old_solut.at[:, 0::2].set(wp2)
+        old_solut = old_solut.at[:, 1::2].set(wp3)
 
-    # wp2 interior rows (global 2*k_py, k_py=1..nzm-2)
-    # Band 0 (super2): lhs_ma_zm[0] + lhs_diff_zm[0]
+    lhs_solve = lhs
+    rhs_solve = rhs
+    old_solut_solve = old_solut
+    if l_force_descending_solves and gr.grid_dir_indx > 0:
+        # Matrix solves are bit-different between ascending and descending.
+        # This ensures matrices are solved in the same (descending) order,
+        # which is useful for ensuring BFBness between grid modes
+        # We need to flip in both the vertical dimensions and the bands for the lhs
+        lhs_solve = lhs_solve[::-1, :, ::-1]
+        rhs_solve = rhs_solve[:, ::-1]
+        old_solut_solve = old_solut_solve[:, ::-1]
+
+    l_need_rcond = bool(
+        stats.l_sample and stats.var_on_stats_list("wp23_matrix_condt_num")
+    )
+
+    # Solve the system with LAPACK
+    # Solve the system and return condition number
+    # Note: When using lapack this can change the answer slightly
+    err_info, solut, rcond = band_solve(
+        "wp2_wp3", penta_solve_method,
+        ngrdcol, 2, 2, 2 * nzm - 1, 1,
+        l_implemented,
+        lhs_solve, rhs_solve, err_info,
+        old_soln=old_solut_solve,
+        use_rcond=l_need_rcond,
+    )
+
+    if l_need_rcond and stats.l_sample:
+        # Est. of the condition number of the w'^2/w^3 LHS matrix
+        stats = stats.update("wp23_matrix_condt_num", one / rcond)
+
+    if l_force_descending_solves and gr.grid_dir_indx > 0:
+        # Flip the back to the ascending direction if we forced the solve
+        # to be in descending mode
+        solut = solut[:, ::-1]
+
+    # Copy result into output arrays and clip
+    wp2 = solut[:, 0::2]
+    wp3 = solut[:, 1::2]
+
+    if stats.l_sample:
+        C_uu_shr_zeros = jnp.zeros((ngrdcol,), dtype=jnp.float64)
+        C_uu_shr_plus_one = clubb_params[:, iC_uu_shr] + one
+        C11_Skw_fnc_zeros = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        C11_Skw_fnc_plus_one = C11_Skw_fnc + one
+
+        lhs_wp2_ac_term = wp2_terms_ac_pr2_lhs(
+            nzm, nzt, ngrdcol, gr, C_uu_shr_zeros, wm_zt,
+        )
+        lhs_wp2_pr2_term = wp2_terms_ac_pr2_lhs(
+            nzm, nzt, ngrdcol, gr, C_uu_shr_plus_one, wm_zt,
+        )
+        lhs_wp3_ac_term = wp3_terms_ac_pr2_lhs(
+            nzm, nzt, ngrdcol, gr, C11_Skw_fnc_zeros, wm_zm,
+        )
+        lhs_wp3_pr2_term = wp3_terms_ac_pr2_lhs(
+            nzm, nzt, ngrdcol, gr, C11_Skw_fnc_plus_one, wm_zm,
+        )
+
+        # Finalize implicit contributions for wp2
+        # Finalize the implicit pieces of wp2/wp3 budgets after the solve.
+        # The companion explicit pieces were opened earlier with begin_budget.
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+            -gamma_over_implicit_ts * lhs_dp1_wp2[:, 1:-1] * wp2[:, 1:-1]
+        )
+        # w'^2 term dp1 has both implicit and explicit components.
+        stats = stats.finalize_budget("wp2_dp1", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        if gr.grid_dir_indx > 0:
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+                -lhs_diff_zm[2, :, 1:-1] * wp2[:, :-2]
+                -lhs_diff_zm[1, :, 1:-1] * wp2[:, 1:-1]
+                -lhs_diff_zm[0, :, 1:-1] * wp2[:, 2:]
+            )
+        else:
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+                -lhs_diff_zm[0, :, 1:-1] * wp2[:, 2:]
+                -lhs_diff_zm[1, :, 1:-1] * wp2[:, 1:-1]
+                -lhs_diff_zm[2, :, 1:-1] * wp2[:, :-2]
+            )
+        if l_crank_nich_diff or l_use_tke_in_wp2_wp3_K_dfsn:
+            # dp2 has explicit and implicit pieces for CN/tke diffusion.
+            # w'^2 term dp2 has both implicit and explicit components.
+            stats = stats.finalize_budget("wp2_dp2", stats_tmp_zm)
+        else:
+            # Otherwise dp2 is fully implicit.
+            # w'^2 term dp2 is completely implicit; call stat_update_var_pt.
+            stats = stats.update("wp2_dp2", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+            -lhs_ta_wp2[1, :, 1:-1] * wp3[:, :-1]
+            -lhs_ta_wp2[0, :, 1:-1] * wp3[:, 1:]
+        )
+        # w'^2 term ta is completely implicit; call stat_update_var_pt.
+        stats = stats.update("wp2_ta", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        if gr.grid_dir_indx > 0:
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+                -lhs_ma_zm[2, :, 1:-1] * wp2[:, :-2]
+                -lhs_ma_zm[1, :, 1:-1] * wp2[:, 1:-1]
+                -lhs_ma_zm[0, :, 1:-1] * wp2[:, 2:]
+            )
+        else:
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+                -lhs_ma_zm[0, :, 1:-1] * wp2[:, 2:]
+                -lhs_ma_zm[1, :, 1:-1] * wp2[:, 1:-1]
+                -lhs_ma_zm[2, :, 1:-1] * wp2[:, :-2]
+            )
+        # w'^2 term ma is completely implicit; call stat_update_var_pt.
+        stats = stats.update("wp2_ma", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+            -lhs_wp2_ac_term[:, 1:-1] * wp2[:, 1:-1]
+        )
+        # w'^2 term ac is completely implicit; call stat_update_var_pt.
+        stats = stats.update("wp2_ac", stats_tmp_zm)
+
+        if l_tke_aniso:
+            stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+                -gamma_over_implicit_ts * lhs_pr1_wp2[:, 1:-1] * wp2[:, 1:-1]
+            )
+            # w'^2 term pr1 has both implicit and explicit components.
+            stats = stats.finalize_budget("wp2_pr1", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+            -lhs_wp2_pr2_term[:, 1:-1] * wp2[:, 1:-1]
+        )
+        # w'^2 term pr2 has both implicit and explicit components.
+        stats = stats.finalize_budget("wp2_pr2", stats_tmp_zm)
+
+        # Finalize implicit contributions for wp3
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -gamma_over_implicit_ts * lhs_pr1_wp3[:, 1:-1] * wp3[:, 1:-1]
+        )
+        # w'^3 term pr1 has both implicit and explicit components.
+        stats = stats.finalize_budget("wp3_pr1", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        if gr.grid_dir_indx > 0:
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+                -lhs_diff_zt[2, :, 1:-1] * wp3[:, :-2]
+                -lhs_diff_zt[1, :, 1:-1] * wp3[:, 1:-1]
+                -lhs_diff_zt[0, :, 1:-1] * wp3[:, 2:]
+            )
+        else:
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+                -lhs_diff_zt[0, :, 1:-1] * wp3[:, 2:]
+                -lhs_diff_zt[1, :, 1:-1] * wp3[:, 1:-1]
+                -lhs_diff_zt[2, :, 1:-1] * wp3[:, :-2]
+            )
+        if l_crank_nich_diff or l_use_tke_in_wp2_wp3_K_dfsn:
+            # dp1 has explicit and implicit pieces for CN/tke diffusion.
+            # w'^3 term dp1 has both implicit and explicit components.
+            stats = stats.finalize_budget("wp3_dp1", stats_tmp_zt)
+        else:
+            # Otherwise dp1 is fully implicit.
+            # w'^3 term dp1 is completely implicit; call stat_update_var_pt.
+            stats = stats.update("wp3_dp1", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -gamma_over_implicit_ts * wp3_term_ta_lhs_result[4, :, 1:-1] * wp3[:, :-2]
+            -gamma_over_implicit_ts * wp3_term_ta_lhs_result[3, :, 1:-1] * wp2[:, 1:-2]
+            -gamma_over_implicit_ts * wp3_term_ta_lhs_result[2, :, 1:-1] * wp3[:, 1:-1]
+            -gamma_over_implicit_ts * wp3_term_ta_lhs_result[1, :, 1:-1] * wp2[:, 2:-1]
+            -gamma_over_implicit_ts * wp3_term_ta_lhs_result[0, :, 1:-1] * wp3[:, 2:]
+        )
+        # w'^3 term ta has both implicit and explicit components.
+        stats = stats.finalize_budget("wp3_ta", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -gamma_over_implicit_ts * lhs_adv_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2]
+            -gamma_over_implicit_ts * lhs_adv_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+        )
+        # w'^3 term tp has both implicit and explicit components.
+        stats = stats.finalize_budget("wp3_tp", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -gamma_over_implicit_ts * lhs_pr_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2]
+            -gamma_over_implicit_ts * lhs_pr_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+        )
+        # w'^3 term pr_tp same as above tp term but opposite sign.
+        stats = stats.finalize_budget("wp3_pr_tp", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -wp3_pr3_lhs[4, :, 1:-1] * wp3[:, :-2]
+            -wp3_pr3_lhs[3, :, 1:-1] * wp2[:, 1:-2]
+            -wp3_pr3_lhs[2, :, 1:-1] * wp3[:, 1:-1]
+            -wp3_pr3_lhs[1, :, 1:-1] * wp2[:, 2:-1]
+            -wp3_pr3_lhs[0, :, 1:-1] * wp3[:, 2:]
+        )
+        # w'^3 pressure term 3 (pr3) has both implicit and explicit components.
+        stats = stats.finalize_budget("wp3_pr3", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        if gr.grid_dir_indx > 0:
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+                -lhs_ma_zt[2, :, 1:-1] * wp3[:, :-2]
+                -lhs_ma_zt[1, :, 1:-1] * wp3[:, 1:-1]
+                -lhs_ma_zt[0, :, 1:-1] * wp3[:, 2:]
+            )
+        else:
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+                -lhs_ma_zt[0, :, 1:-1] * wp3[:, 2:]
+                -lhs_ma_zt[1, :, 1:-1] * wp3[:, 1:-1]
+                -lhs_ma_zt[2, :, 1:-1] * wp3[:, :-2]
+            )
+        # w'^3 term ma is completely implicit; call stat_update_var_pt.
+        stats = stats.update("wp3_ma", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -lhs_wp3_ac_term[:, 1:-1] * wp3[:, 1:-1]
+        )
+        # w'^3 term ac is completely implicit; call stat_update_var_pt.
+        stats = stats.update("wp3_ac", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -lhs_wp3_pr2_term[:, 1:-1] * wp3[:, 1:-1]
+        )
+        # w'^3 term pr2 has both implicit and explicit components.
+        stats = stats.finalize_budget("wp3_pr2", stats_tmp_zt)
+
+    if stats.l_sample:
+        # Store previous value for effect of the positive definite scheme
+        # Bracket the positive-definite/hole-filling adjustments so the pd
+        # budget terms report only the limiter-induced change.
+        stats = stats.begin_budget("wp2_pd", wp2 / dt)
+        # up2_pd and vp2_pd are also modified in a call to pos_definite_variances
+        # in advance_xp2_xpyp, so we need to use stat_modify here instead of stat_begin_update
+        stats = stats.begin_budget("up2_pd", up2 / dt)
+        stats = stats.begin_budget("vp2_pd", vp2 / dt)
+
+    if fill_holes_type != 0:
+        # Use a simple hole filling algorithm
+        # upper_hf_level = nzm-1 since we are filling the zm levels
+        wp2 = fill_holes_vertical(
+            nzm, ngrdcol, w_tol_sqd,
+            gr.k_lb_zm + gr.grid_dir_indx,
+            gr.k_ub_zm - gr.grid_dir_indx,
+            gr.dzm, rho_ds_zm, gr.grid_dir_indx,
+            fill_holes_type,
+            wp2,
+        )
+
+        if l_wp2_fill_holes_tke:
+            wp2, up2, vp2 = fill_holes_wp2_from_horz_tke(
+                nzm, ngrdcol, w_tol_sqd, 1, nzm - 2,
+                wp2, up2, vp2,
+            )
+
+    if stats.l_sample:
+        # Store updated value for effect of the positive definite scheme
+        stats = stats.finalize_budget("wp2_pd", wp2 / dt)
+        stats = stats.finalize_budget("up2_pd", up2 / dt, l_count_sample=False)
+        stats = stats.finalize_budget("vp2_pd", vp2 / dt, l_count_sample=False)
+
+    # Clip <w'^2> at a minimum and maximum threshold.
+    # We attempt to clip extreme values of wp2 to prevent a crash of the
+    # type found on the Climate Process Team ticket #49.  Chris Golaz found that
+    # instability caused by large wp2 in CLUBB led unrealistic results in AM3.
+    # -dschanen 11 Apr 2011
+
+    # The value of <w'^2> is not allowed to become smaller than the threshold
+    # value of w_tol^2.  Additionally, that threshold value may be boosted at
+    # any grid level in order to keep the overall correlation of w and rt or
+    # the overall correlation of w and theta-l between the values of
+    # -max_mag_correlation_flux and max_mag_correlation_flux by boosting <w'^2>
+    # rather than by limiting the magnitude of <w'rt'> or <w'thl'>.
+    if l_min_wp2_from_corr_wx:
+        # The overall correlation of w and rt is:
+        #
+        # corr_w_rt = wprtp / ( sqrt( wp2 ) * sqrt( rtp2 ) );
+        #
+        # and the overall correlation of w and thl is:
+        #
+        # corr_w_thl = wpthlp / ( sqrt( wp2 ) * sqrt( thlp2 ) ).
+        #
+        # Squaring both sides, the equations becomes:
+        #
+        # corr_w_rt^2 = wprtp^2 / ( wp2 * rtp2 ); and
+        #
+        # corr_w_thl^2 = wpthlp^2 / ( wp2 * thlp2 ).
+        #
+        # Using max_mag_correlation_flux for the correlation and then solving for
+        # the minimum of wp2, the equation becomes:
+        #
+        # wp2|_min = max( wprtp^2 / ( rtp2 * max_mag_correlation_flux^2 ),
+        #                 wpthlp^2 / ( thlp2 * max_mag_correlation_flux^2 ) ).
+        #
+        # And similarly for upwp and vpwp
+        corr_max_sqd = max_mag_correlation_flux ** 2
+        wp2_min_array = jnp.maximum(
+            w_tol_sqd,
+            wprtp ** 2 / (rtp2 * corr_max_sqd),
+        )
+        wp2_min_array = jnp.maximum(
+            wp2_min_array,
+            wpthlp ** 2 / (thlp2 * corr_max_sqd),
+        )
+        wp2_min_array = jnp.maximum(
+            wp2_min_array,
+            upwp ** 2 / (up2 * corr_max_sqd),
+        )
+        wp2_min_array = jnp.maximum(
+            wp2_min_array,
+            vpwp ** 2 / (vp2 * corr_max_sqd),
+        )
+        wp2_min_array = jnp.minimum(one, wp2_min_array)
+    else:
+        # Consider only the minimum tolerance threshold value for wp2.
+        wp2_min_array = jnp.full((ngrdcol, nzm), w_tol_sqd, dtype=jnp.float64)
+
+    wp2, stats = clip_variance(
+        nzm, ngrdcol, gr, clip_wp2, dt, wp2_min_array,
+        stats,
+        wp2,
+        wp2_max,
+    )
+
+    # Interpolate w'^2 from momentum levels to thermodynamic levels.
+    # This is used for the clipping of w'^3 according to the value
+    # of Sk_w now that w'^2 and w'^3 have been advanced one timestep.
+    wp2_zt = zm2zt(nzm, nzt, ngrdcol, gr, wp2, w_tol_sqd)
+
+    # Clip w'^3 by limiting skewness.
+    wp3, stats = clip_skewness(
+        nzt, ngrdcol, gr, dt, sfc_elevation,
+        clubb_params[:, iSkw_max_mag], wp2_zt,
+        l_use_wp3_lim_with_smth_Heaviside,
+        stats,
+        wp3,
+    )
+
+    # Compute wp3_zm for output purposes
+    wp3_zm = zt2zm(nzm, nzt, ngrdcol, gr, wp3)
+
+    del rhs_save
+    return up2, vp2, wp2, wp3, wp3_zm, wp2_zt, err_info, stats
+
+
+def wp23_lhs(
+    nzm, nzt, ngrdcol, dt,
+    wp3_term_ta_lhs_result,
+    lhs_diff_zm, lhs_diff_zt, lhs_ma_zm,
+    lhs_ma_zt, lhs_ta_wp2,
+    lhs_tp_wp3,
+    lhs_ac_pr2_wp2, lhs_ac_pr2_wp3, lhs_dp1_wp2,
+    lhs_pr1_wp3, lhs_pr1_wp2, lhs_splat_wp2, lhs_splat_wp3,
+    l_tke_aniso,
+):
+    """Compute LHS band diagonal matrix for w'^2 and w'^3.
+
+    This subroutine computes the implicit portion
+    of the w'^2 and w'^3 equations.
+
+    Boundary conditions
+
+      Both wp2 and wp3 used fixed-point boundary conditions.
+      Therefore, anything set in the above loop at both the upper
+      and lower boundaries would be overwritten here.  However, the
+      above loop does not extend to the boundary levels.  An array
+      with a value of 1 at the main diagonal on the left-hand side
+      and with values of 0 at all other diagonals on the left-hand
+      side will preserve the right-hand side value at that level.
+
+         wp2(1)  wp3(1)  ...  wp3(nzt)  wp2(nzm)
+        [  0.0     0.0          0.0       0.0  ]
+        [  0.0     0.0          0.0       0.0  ]
+        [  1.0     1.0   ...    1.0       1.0  ]
+        [  0.0     0.0          0.0       0.0  ]
+        [  0.0     0.0          0.0       0.0  ]
+
+     WARNING: This subroutine has been optimized. Significant changes could
+              noticeably  impact computational efficiency. See clubb:ticket:834
+    """
+    del nzt
+    # Calculate invrs_dt
+    invrs_dt = one / dt
+    lhs = jnp.zeros((ndiags5, ngrdcol, 2 * nzm - 1), dtype=jnp.float64)
+
+    # Lower (upper) boundary for w'2 on ascending (descending) grid.
+    lhs = lhs.at[2, :, 0].set(one)
+    # Lower (upper) boundary for w'3 on ascending (descending) grid.
+    lhs = lhs.at[2, :, 1].set(one)
+
+    # Combine terms to calculate non-boundary lhs values
+    # ------ w'2 ------
+    # LHS mean advection (ma) and diffusion (diff) terms
     lhs = lhs.at[0, :, 2:-1:2].set(lhs_ma_zm[0, :, 1:-1] + lhs_diff_zm[0, :, 1:-1])
-    # Band 1 (super1): lhs_ta_wp2[0]  (coeff of wp3[k_py])
+    # LHS turbulent advection (ta) term.
     lhs = lhs.at[1, :, 2:-1:2].set(lhs_ta_wp2[0, :, 1:-1])
-    # Band 2 (main): lhs_ma_zm[1] + lhs_diff_zm[1] + lhs_ac_pr2_wp2 + gamma*lhs_dp1_wp2 + invrs_dt
+    # LHS mean advection (ma) and diffusion (diff) terms
+    # LHS accumulation (ac) term and pressure term 2 (pr2).
+    # LHS dissipation term 1 (dp1).
+    # Note:  An "over-implicit" weighted time step is applied to this term.
+    #        A weighting factor of greater than 1 may be used to make the term
+    #        more numerically stable (see note below for w'^3 LHS turbulent
+    #        advection (ta) term).
+    # LHS time tendency.
     lhs = lhs.at[2, :, 2:-1:2].set(
         lhs_ma_zm[1, :, 1:-1] + lhs_diff_zm[1, :, 1:-1]
         + lhs_ac_pr2_wp2[:, 1:-1]
-        + _gamma * lhs_dp1_wp2[:, 1:-1]
+        + gamma_over_implicit_ts * lhs_dp1_wp2[:, 1:-1]
         + invrs_dt
     )
-    # Band 3 (sub1): lhs_ta_wp2[1]  (coeff of wp3[k_py-1])
+    # LHS turbulent advection (ta) term.
     lhs = lhs.at[3, :, 2:-1:2].set(lhs_ta_wp2[1, :, 1:-1])
-    # Band 4 (sub2): lhs_ma_zm[2] + lhs_diff_zm[2]
+    # LHS mean advection (ma) and diffusion (diff) terms
     lhs = lhs.at[4, :, 2:-1:2].set(lhs_ma_zm[2, :, 1:-1] + lhs_diff_zm[2, :, 1:-1])
 
-    # l_tke_aniso=True: add gamma*lhs_pr1_wp2 to main diagonal of wp2 rows
-    lhs = lhs.at[2, :, 2:-1:2].add(_gamma * lhs_pr1_wp2[:, 1:-1])
-
-    # lhs_splat_wp2 on main diagonal of wp2 rows
-    lhs = lhs.at[2, :, 2:-1:2].add(lhs_splat_wp2[:, 1:-1])
-
-    # wp3 interior rows (global 2*k_py+1, k_py=1..nzt-2)
-    # Band 0 (super2): lhs_ma_zt[0] + lhs_diff_zt[0]
+    # ------ w'3 ------
+    # LHS mean advection (ma) and diffusion (diff) terms
     lhs = lhs.at[0, :, 3:-2:2].set(lhs_ma_zt[0, :, 1:-1] + lhs_diff_zt[0, :, 1:-1])
-    # Band 1 (super1): gamma*lhs_tp_wp3[0]  (coeff of wp2[k_py+1])
-    lhs = lhs.at[1, :, 3:-2:2].set(_gamma * lhs_tp_wp3[0, :, 1:-1])
-    # Band 2 (main): lhs_ma_zt[1] + lhs_diff_zt[1] + lhs_ac_pr2_wp3 + gamma*lhs_pr1_wp3 + lhs_splat_wp3 + invrs_dt
+    # LHS turbulent production (tp) term.
+    # Note:  An "over-implicit" weighted time step is applied to this term.
+    lhs = lhs.at[1, :, 3:-2:2].set(gamma_over_implicit_ts * lhs_tp_wp3[0, :, 1:-1])
+    # LHS mean advection (ma) and diffusion (diff) terms
+    # LHS accumulation (ac) term and pressure term 2 (pr2).
+    # LHS pressure term 1 (pr1).
+    # Note:  An "over-implicit" weighted time step is applied to this term.
+    # Add implicit splatting
+    # LHS time tendency.
     lhs = lhs.at[2, :, 3:-2:2].set(
         lhs_ma_zt[1, :, 1:-1] + lhs_diff_zt[1, :, 1:-1]
         + lhs_ac_pr2_wp3[:, 1:-1]
-        + _gamma * lhs_pr1_wp3[:, 1:-1]
+        + gamma_over_implicit_ts * lhs_pr1_wp3[:, 1:-1]
         + lhs_splat_wp3[:, 1:-1]
         + invrs_dt
     )
-    # Band 3 (sub1): gamma*lhs_tp_wp3[1]  (coeff of wp2[k_py])
-    lhs = lhs.at[3, :, 3:-2:2].set(_gamma * lhs_tp_wp3[1, :, 1:-1])
-    # Band 4 (sub2): lhs_ma_zt[2] + lhs_diff_zt[2]
+    # LHS turbulent production (tp) term.
+    # Note:  An "over-implicit" weighted time step is applied to this term.
+    lhs = lhs.at[3, :, 3:-2:2].set(gamma_over_implicit_ts * lhs_tp_wp3[1, :, 1:-1])
+    # LHS mean advection (ma) and diffusion (diff) terms
     lhs = lhs.at[4, :, 3:-2:2].set(lhs_ma_zt[2, :, 1:-1] + lhs_diff_zt[2, :, 1:-1])
 
-    # ADG1 TA for wp3: add gamma * lhs_ta_wp3 to all 5 bands of wp3 rows
-    for b in range(5):
-        lhs = lhs.at[b, :, 3:-2:2].add(_gamma * lhs_ta_wp3[b, :, 1:-1])
+    # Upper (lower) boundary for w'3 on ascending (descending) grid.
+    lhs = lhs.at[2, :, 2 * nzm - 3].set(one)
+    # Upper (lower) boundary for w'2 on ascending (desceding) grid.
+    lhs = lhs.at[2, :, 2 * nzm - 2].set(one)
 
-    # Upper boundaries: wp3 (global 2*nzm-3), wp2 (global 2*nzm-2) → identity
-    lhs = lhs.at[2, :, 2 * nzm - 3].set(1.0)
-    lhs = lhs.at[2, :, 2 * nzm - 2].set(1.0)
-    # Ensure off-diagonals are zero at upper boundaries (they were zero-initialized)
+    # LHS pressure term 1 (pr1) for wp2
+    if l_tke_aniso:
+        # Note:  An "over-implicit" weighted time step is applied to this term.
+        #        A weighting factor of greater than 1 may be used to make the term
+        #        more numerically stable (see note below for w'^3 LHS turbulent
+        #        advection (ta) term).
+        # Reference:
+        # https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:wp2_pr
+        # Add terms to lhs
+        lhs = lhs.at[2, :, 2:-1:2].add(
+            gamma_over_implicit_ts * lhs_pr1_wp2[:, 1:-1]
+        )
+
+    # Add implicit splatting to wp2
+    lhs = lhs.at[2, :, 2:-1:2].add(lhs_splat_wp2[:, 1:-1])
+
+    # LHS turbulent advection (ta) term for wp3
+    if not l_explicit_turbulent_adv_wp3:
+        # Note:  An "over-implicit" weighted time step is applied to this term.
+        #        The weight of the implicit portion of this term is controlled
+        #        by the factor gamma_over_implicit_ts (abbreviated "gamma" in
+        #        the expression below).  A factor is added to the right-hand
+        #        side of the equation in order to balance a weight that is not
+        #        equal to 1, such that:
+        #             -y(t) * [ gamma * X(t+1) + ( 1 - gamma ) * X(t) ] + RHS;
+        #        where X is the variable that is being solved for in a
+        #        predictive equation (w'^3 in this case), y(t) is the
+        #        linearized portion of the term that gets treated implicitly,
+        #        and RHS is the portion of the term that is always treated
+        #        explicitly (in the case of the w'^3 turbulent advection term,
+        #        RHS = 0).  A weight of greater than 1 can be applied to make
+        #        the term more numerically stable.
+        # Add terms to lhs
+        lhs = lhs.at[:, :, 3:-2:2].add(
+            gamma_over_implicit_ts * wp3_term_ta_lhs_result[:, :, 1:-1]
+        )
+
     return lhs
 
 
-def wp23_solve(lhs, rhs):
-    """Pentadiagonal solve of the coupled wp2/wp3 system, then de-interleave the solution —
-    the JAX analog of advance_wp2_wp3_module.F90:wp23_solve. The solution vector packs the two
-    prognostics on alternating slots; returns ``(wp2_new, wp3_new)`` (wp2 on even slots, wp3 on odd)."""
-    solution = penta_lu_solve_jax(lhs, rhs)   # (ngrdcol, 2*nzm-1)
-    return solution[:, 0::2], solution[:, 1::2]
+def wp23_rhs(
+    nzm, nzt, ngrdcol, gr, dt, fcor_y,
+    wp3_term_ta_lhs_result,
+    lhs_diff_zm, lhs_diff_zt, lhs_diff_zm_crank, lhs_diff_zt_crank,
+    lhs_tp_wp3, lhs_adv_tp_wp3, lhs_pr_tp_wp3,
+    lhs_ta_wp3, lhs_dp1_wp2, rhs_dp1_wp2, lhs_pr1_wp2,
+    rhs_pr1_wp2, lhs_pr1_wp3, rhs_pr1_wp3, rhs_bp_pr2_wp2,
+    rhs_pr_dfsn_wp2, rhs_bp1_pr2_wp3, rhs_pr3_wp2, rhs_pr3_wp3,
+    rhs_ta_wp3, rhs_pr_turb_wp3, rhs_pr_dfsn_wp3,
+    wp2, wp3, wpup2, wpvp2,
+    wpthvp, wp2thvp, wp2up, up2, vp2, upwp,
+    C11_Skw_fnc, thv_ds_zm, thv_ds_zt,
+    lhs_splat_wp2, lhs_splat_wp3,
+    clubb_params,
+    iiPDF_type,
+    l_tke_aniso,
+    l_use_tke_in_wp2_wp3_K_dfsn,
+    l_ho_nontrad_coriolis,
+    stats,
+):
+    """Compute RHS vector for w'^2 and w'^3.
 
+    This subroutine computes the explicit portion of
+    the w'^2 and w'^3 equations.
 
-def advance_wp2_wp3(
-    wp2,              # (ngrdcol, nzm)
-    wp3,              # (ngrdcol, nzt)
-    up2, vp2,         # (ngrdcol, nzm)
-    sigma_sqd_w,      # (ngrdcol, nzm) from pdf_params
-    wp3_on_wp2,       # (ngrdcol, nzm)
-    em,               # (ngrdcol, nzm)
-    wpup2, wpvp2,     # (ngrdcol, nzt)
-    wp2up2, wp2vp2, wp4,   # (ngrdcol, nzm)
-    wpthvp,           # (ngrdcol, nzm)  zm-level
-    wp2thvp,          # (ngrdcol, nzt)  zt-level
-    um, vm,           # (ngrdcol, nzt) zt-level (Fortran advance_wp2_wp3 signature)
-    upwp, vpwp,       # (ngrdcol, nzm)
-    wm_zm, wm_zt,     # (ngrdcol, nzm), (ngrdcol, nzt)
-    Kh_zm, Kh_zt,     # (ngrdcol, nzm), (ngrdcol, nzt)
-    invrs_tau_C4_zm,  # (ngrdcol, nzm)
-    invrs_tau_wp3_zt, # (ngrdcol, nzt)
-    invrs_tau_C1_zm,  # (ngrdcol, nzm)
-    Skw_zm, Skw_zt,   # (ngrdcol, nzm), (ngrdcol, nzt)
-    rho_ds_zm, rho_ds_zt,
-    invrs_rho_ds_zm, invrs_rho_ds_zt,
-    thv_ds_zm, thv_ds_zt,
-    lhs_splat_wp2,    # (ngrdcol, nzm)
-    lhs_splat_wp3,    # (ngrdcol, nzt)
-    wprtp, wpthlp, rtp2, thlp2,   # (ngrdcol, nzm)
-    clubb_params,     # (ngrdcol, nparams)
-    dt: float,
-    nu1: float,       # background diffusivity for wp2
-    nu8: float,       # background diffusivity for wp3
-    gr,
-    flags=None,
-    sfc_elevation=None,
-    stats_writer=None,
-    l_sample: bool = False,
-    l_ho_nontrad_coriolis: bool = False,
-    fcor_y=None,
-    wp2up=None,
-) -> tuple:
-    """Full JAX solve for wp2 (zm-level) and wp3 (zt-level).
+    Notes:
+         For LHS turbulent advection (ta) term.
+            An "over-implicit" weighted time step is applied to this term.
+            The weight of the implicit portion of this term is controlled
+            by the factor gamma_over_implicit_ts (abbreviated "gamma" in
+            the expression below).  A factor is added to the right-hand
+            side of the equation in order to balance a weight that is not
+            equal to 1, such that:
+                 -y(t) * [ gamma * X(t+1) + ( 1 - gamma ) * X(t) ] + RHS;
+            where X is the variable that is being solved for in a
+            predictive equation (w'^3 in this case), y(t) is the
+            linearized portion of the term that gets treated implicitly,
+            and RHS is the portion of the term that is always treated
+            explicitly (in the case of the w'^3 turbulent advection term,
+            RHS = 0).  A weight of greater than 1 can be applied to make
+            the term more numerically stable.
 
-    Implements the coupled pentadiagonal system for the ADG1 PDF,
-    ascending grid, with ARM model flags:
-      l_standard_term_ta=False, l_damp_wp2_using_em=True,
-      l_use_tke_in_wp3_pr_turb_term=True, l_damp_wp3_Skw_squared=True,
-      l_use_C11_Richardson=False, l_tke_aniso=True,
-      l_crank_nich_diff=False, l_use_tke_in_wp2_wp3_K_dfsn=False,
-      l_lmm_stepping=False.
-
-    Non-traditional Coriolis (Iter103): when l_ho_nontrad_coriolis=True, add the
-    explicit RHS contributions wp2 += 2·fcor_y·upwp and wp3 += 3·fcor_y·wp2up
-    (fcor_y the meridional Coriolis parameter, wp2up = <w'^2 u'> on zt). It is a
-    no-op for the 15 faithful cases + rico (flag False); only coriolis_test uses it.
-
-    Returns (wp2_new, wp3_new) as JAX arrays (raw solve result,
-    before fill_holes and clip_variance/skewness).
+     WARNING: This subroutine has been optimized. Significant changes could
+              noticeably  impact computational efficiency. See clubb:ticket:834
     """
-    ngrdcol = wp2.shape[0]
-    nzm     = wp2.shape[1]
-    nzt     = wp3.shape[1]
-    invrs_dt = 1.0 / dt
+    # Calculate invers_dt
+    invrs_dt = one / dt
+    # Initialize to zero
+    rhs = jnp.zeros((ngrdcol, 2 * nzm - 1), dtype=jnp.float64)
 
-    # Broadcast nu to per-column arrays
-    nu1_arr = jnp.full((ngrdcol,), nu1)
-    nu8_arr = jnp.full((ngrdcol,), nu8)
+    # Experimental bouyancy term
+    # Experimental term from CLUBB TRAC ticket #411
+    rhs = rhs.at[:, 3:-2:2].set(rhs_pr_turb_wp3[:, 1:-1] + rhs_pr_dfsn_wp3[:, 1:-1])
+    rhs = rhs.at[:, 2:-1:2].add(rhs_pr_dfsn_wp2[:, 1:-1])
 
-    # ------------------------------------------------------------------
-    # Extract per-column parameters (1-based constants in clubb_params)
-    # ------------------------------------------------------------------
-    C4       = clubb_params[:, cc.iC4      - 1]
-    C8       = clubb_params[:, cc.iC8      - 1]
-    C8b      = clubb_params[:, cc.iC8b     - 1]
-    C11      = clubb_params[:, cc.iC11     - 1]
-    C11b     = clubb_params[:, cc.iC11b    - 1]
-    C11c     = clubb_params[:, cc.iC11c    - 1]
-    C1       = clubb_params[:, cc.iC1      - 1]
-    C1b      = clubb_params[:, cc.iC1b     - 1]
-    C1c      = clubb_params[:, cc.iC1c     - 1]
-    C12      = clubb_params[:, cc.iC12     - 1]   # (ngrdcol,)
-    a3_min   = clubb_params[:, cc.ia3_coef_min - 1]
-    C_uu_shr  = clubb_params[:, cc.iC_uu_shr  - 1]
-    C_uu_buoy = clubb_params[:, cc.iC_uu_buoy - 1]
-    C_wp2_pr_dfsn = clubb_params[:, cc.iC_wp2_pr_dfsn - 1]
-    C_wp3_pr_tp   = clubb_params[:, cc.iC_wp3_pr_tp   - 1]
-    C_wp3_pr_turb = clubb_params[:, cc.iC_wp3_pr_turb - 1]
-    C_wp3_pr_dfsn = clubb_params[:, cc.iC_wp3_pr_dfsn - 1]
-    c_K1     = clubb_params[:, cc.ic_K1 - 1]
-    c_K8     = clubb_params[:, cc.ic_K8 - 1]
-
-    # ------------------------------------------------------------------
-    # Pre-computation
-    # ------------------------------------------------------------------
-
-    # a3_coef (zm): -2*(1-sigma_sqd_w)^2 + 3, clipped from below by a3_coef_min
-    a3_coef = -2.0 * (1.0 - sigma_sqd_w) ** 2 + 3.0
-    a3_coef = jnp.maximum(a3_coef, a3_min[:, None])
-
-    # a1_coef (zm): 1 / (1 - sigma_sqd_w)
-    a1_coef = 1.0 / (1.0 - sigma_sqd_w)
-
-    # Interpolate a3 and a1 to zt levels
-    a3_coef_zt = zm2zt_jax(a3_coef, gr)
-    a1_coef_zt = zm2zt_jax(a1_coef, gr)
-
-    # C11_Skw_fnc (zt): skewness-dependent C11
-    diff_C11 = jnp.abs(C11 - C11b)
-    thresh_C11 = jnp.abs(C11 + C11b) * cc.eps / 2.0
-    C11_Skw_fnc = jnp.where(
-        diff_C11[:, None] > thresh_C11[:, None],
-        C11b[:, None] + (C11[:, None] - C11b[:, None]) * jnp.exp(-0.5 * (Skw_zt / C11c[:, None]) ** 2),
-        C11b[:, None] * jnp.ones_like(Skw_zt),
-    )
-
-    # C1_Skw_fnc (zm): skewness-dependent C1 (x1/3 for l_damp_wp2_using_em=True)
-    diff_C1 = jnp.abs(C1 - C1b)
-    thresh_C1 = jnp.abs(C1 + C1b) * cc.eps / 2.0
-    C1_Skw_fnc = jnp.where(
-        diff_C1[:, None] > thresh_C1[:, None],
-        C1b[:, None] + (C1[:, None] - C1b[:, None]) * jnp.exp(-0.5 * (Skw_zm / C1c[:, None]) ** 2),
-        C1b[:, None] * jnp.ones_like(Skw_zm),
-    )
-    C1_Skw_fnc = C1_Skw_fnc * _one_third   # absorb 1/3 for l_damp_wp2_using_em=True
-
-    # Eddy diffusivities
-    Kw1 = c_K1[:, None] * Kh_zt           # (ngrdcol, nzt) zt-level for wp2
-    Kw8 = c_K8[:, None] * Kh_zm           # (ngrdcol, nzm) zm-level for wp3
-
-    # Smoothed fields for wp3_term_pr_turb
-    em_smth  = zm2zt2zm_jax(em, gr)       # (ngrdcol, nzm)
-    wp2_smth = zm2zt2zm_jax(wp2, gr)      # (ngrdcol, nzm)
-
-    # ------------------------------------------------------------------
-    # RHS sub-terms
-    # ------------------------------------------------------------------
-
-    rhs_pr_turb_wp3 = wp3_term_pr_turb_rhs(
-        C_wp3_pr_turb, rho_ds_zm, invrs_rho_ds_zt, wp2_smth, em_smth, gr
-    )
-    rhs_pr_dfsn_wp3 = wp3_term_pr_dfsn_rhs(
-        C_wp3_pr_dfsn, rho_ds_zm, invrs_rho_ds_zt,
-        wp2up2, wp2vp2, wp4, up2, vp2, wp2, gr
-    )
-    rhs_pr_dfsn_wp2 = wp2_term_pr_dfsn_rhs(
-        C_wp2_pr_dfsn, rho_ds_zt, invrs_rho_ds_zm, wpup2, wpvp2, wp3, gr
-    )
-    rhs_bp_pr2_wp2 = wp2_terms_bp_pr2_rhs(C_uu_buoy, thv_ds_zm, wpthvp)
-    rhs_dp1_wp2    = wp2_term_dp1_rhs(C1_Skw_fnc, invrs_tau_C1_zm, up2, vp2)
-    rhs_pr3_wp2    = wp2_term_pr3_rhs(C_uu_shr, C_uu_buoy, thv_ds_zm, wpthvp, upwp, um, vpwp, vm, gr)
-    rhs_pr1_wp2    = wp2_term_pr1_rhs(C4, up2, vp2, invrs_tau_C4_zm)    # l_tke_aniso=True
-    rhs_bp1_pr2_wp3 = wp3_terms_bp1_pr2_rhs(C11_Skw_fnc, thv_ds_zt, wp2thvp)
-    rhs_pr1_wp3     = wp3_term_pr1_rhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt, wp3)
-
-    # ------------------------------------------------------------------
-    # LHS sub-terms (computed before wp23_rhs but used in both RHS and LHS)
-    # ------------------------------------------------------------------
-
-    # Diffusion LHSes
-    lhs_diff_zm = diffusion_zm_lhs_jax(Kw1, nu1_arr, invrs_rho_ds_zm, rho_ds_zt, gr)
-    lhs_diff_zt = diffusion_zt_lhs_jax(Kw8, nu8_arr, invrs_rho_ds_zt, rho_ds_zm, gr)
-
-    # wp3 turbulent production (two calls: C=1 and C=-C_wp3_pr_tp)
-    ones_col = jnp.ones((ngrdcol,))
-    lhs_adv_tp_wp3 = wp3_term_tp_lhs(ones_col, wp2, rho_ds_zm, invrs_rho_ds_zt, gr)
-    lhs_pr_tp_wp3  = wp3_term_tp_lhs(-C_wp3_pr_tp, wp2, rho_ds_zm, invrs_rho_ds_zt, gr)
-    lhs_tp_wp3     = lhs_adv_tp_wp3 + lhs_pr_tp_wp3   # (2, ngrdcol, nzt)
-
-    # wp3 pressure-1 and dissipation
-    lhs_pr1_wp3 = wp3_term_pr1_lhs(C8, C8b, invrs_tau_wp3_zt, Skw_zt)
-    lhs_dp1_wp2 = wp2_term_dp1_lhs(C1_Skw_fnc, invrs_tau_C1_zm)
-    lhs_pr1_wp2 = wp2_term_pr1_lhs(C4, invrs_tau_C4_zm)   # l_tke_aniso=True
-
-    # ADG1 TA for wp3
-    lhs_ta_wp3 = wp3_term_ta_ADG1_lhs(
-        wp2, a1_coef_zt, a3_coef_zt, wp3_on_wp2,
-        rho_ds_zm, invrs_rho_ds_zt, gr
-    )
-
-    # ------------------------------------------------------------------
-    # wp23_rhs assembly
-    # Interleaving: wp2[k_py] at global index 2*k_py, wp3[k_py] at 2*k_py+1
-    # Ascending grid: global indices 0..2*nzm-2
-    # ------------------------------------------------------------------
-
-    ndim = 2 * nzm - 1
-    rhs = wp23_rhs(
-        nzm=nzm, ngrdcol=ngrdcol, invrs_dt=invrs_dt,
-        rhs_pr_turb_wp3=rhs_pr_turb_wp3, rhs_pr_dfsn_wp3=rhs_pr_dfsn_wp3,
-        rhs_pr_dfsn_wp2=rhs_pr_dfsn_wp2, rhs_pr1_wp2=rhs_pr1_wp2,
-        rhs_bp1_pr2_wp3=rhs_bp1_pr2_wp3, rhs_pr1_wp3=rhs_pr1_wp3,
-        rhs_bp_pr2_wp2=rhs_bp_pr2_wp2, rhs_pr3_wp2=rhs_pr3_wp2, rhs_dp1_wp2=rhs_dp1_wp2,
-        lhs_pr1_wp2=lhs_pr1_wp2, lhs_tp_wp3=lhs_tp_wp3, lhs_pr1_wp3=lhs_pr1_wp3,
-        lhs_dp1_wp2=lhs_dp1_wp2, lhs_ta_wp3=lhs_ta_wp3,
-        wp2=wp2, wp3=wp3, wp2up=wp2up, upwp=upwp,
-        l_ho_nontrad_coriolis=l_ho_nontrad_coriolis, fcor_y=fcor_y, gr=gr)
-
-    # ------------------------------------------------------------------
-    # Scale lhs_diff_zt by C12 (AFTER wp23_rhs, BEFORE wp23_lhs)
-    # ------------------------------------------------------------------
-
-    lhs_diff_zt = lhs_diff_zt * C12[None, :, None]   # (3, ngrdcol, nzt)
-
-    # ------------------------------------------------------------------
-    # Remaining LHS sub-terms (computed after C12 scaling)
-    # ------------------------------------------------------------------
-
-    lhs_ma_zm  = term_ma_zm_lhs_jax(wm_zm, gr)             # (3, ngrdcol, nzm)
-    lhs_ma_zt  = term_ma_zt_lhs_jax(wm_zt, gr)             # (3, ngrdcol, nzt)
-    lhs_ta_wp2 = wp2_term_ta_lhs(invrs_rho_ds_zm, rho_ds_zt, gr)   # (2, ngrdcol, nzm)
-    lhs_ac_pr2_wp2 = wp2_terms_ac_pr2_lhs(C_uu_shr, wm_zt, gr)     # (ngrdcol, nzm)
-    lhs_ac_pr2_wp3 = wp3_terms_ac_pr2_lhs(C11_Skw_fnc, wm_zm, gr)  # (ngrdcol, nzt)
-
-    # ------------------------------------------------------------------
-    # wp23_lhs assembly
-    # ------------------------------------------------------------------
-
-    lhs = wp23_lhs(
-        nzm=nzm, ngrdcol=ngrdcol, ndim=ndim, invrs_dt=invrs_dt,
-        lhs_ma_zm=lhs_ma_zm, lhs_diff_zm=lhs_diff_zm, lhs_ta_wp2=lhs_ta_wp2,
-        lhs_ac_pr2_wp2=lhs_ac_pr2_wp2, lhs_dp1_wp2=lhs_dp1_wp2,
-        lhs_pr1_wp2=lhs_pr1_wp2, lhs_splat_wp2=lhs_splat_wp2,
-        lhs_ma_zt=lhs_ma_zt, lhs_diff_zt=lhs_diff_zt, lhs_tp_wp3=lhs_tp_wp3,
-        lhs_ac_pr2_wp3=lhs_ac_pr2_wp3, lhs_pr1_wp3=lhs_pr1_wp3,
-        lhs_splat_wp3=lhs_splat_wp3, lhs_ta_wp3=lhs_ta_wp3)
-
-    # ------------------------------------------------------------------
-    # Solve the pentadiagonal system
-    # ------------------------------------------------------------------
-
-    # Solve + de-interleave wp2 (even slots) and wp3 (odd slots) — wp23_solve
-    wp2_new, wp3_new = wp23_solve(lhs, rhs)    # wp2 (ngrdcol, nzm), wp3 (ngrdcol, nzt)
-
-    # ------------------------------------------------------------------
-    # Budget stats dict — intermediate terms for caller
-    # ------------------------------------------------------------------
-    # wp2 stats-only terms (C_uu_buoy=0 gives bp, C_uu_buoy+1 gives pr2)
-    rhs_bp_wp2     = wp2_terms_bp_pr2_rhs(jnp.zeros_like(C_uu_buoy), thv_ds_zm, wpthvp)
-    rhs_pr2_wp2    = wp2_terms_bp_pr2_rhs(C_uu_buoy + 1.0, thv_ds_zm, wpthvp)
-    lhs_wp2_pr2_term = wp2_terms_ac_pr2_lhs(C_uu_shr + 1.0, wm_zt, gr)
-
-    # wp3 stats-only terms
-    rhs_bp1_wp3    = wp3_terms_bp1_pr2_rhs(jnp.zeros_like(C11_Skw_fnc), thv_ds_zt, wp2thvp)
-    rhs_pr2_wp3    = wp3_terms_bp1_pr2_rhs(C11_Skw_fnc + 1.0, thv_ds_zt, wp2thvp)
-    lhs_wp3_pr2_term = wp3_terms_ac_pr2_lhs(C11_Skw_fnc + 1.0, wm_zm, gr)
-
-    # ------------------------------------------------------------------
-    # Post-solve fill_holes / clip / clip_skewness + budget stats
-    # (advance_wp2_wp3 subroutine tail; mirrors the Fortran in-routine
-    #  fill_holes/clip_variance/clip_skewness + stat_update calls)
-    # ------------------------------------------------------------------
-    _wp2_jax_w23 = _asarray(wp2_new, dtype=np.float64).copy()
-    _wp3_jax_w23 = _asarray(wp3_new, dtype=np.float64).copy()
-
-    # fill_holes_vertical on wp2
-    _hf_lower_w23 = gr.k_lb_zm + gr.grid_dir_indx   # Python 0-based
-    _hf_upper_w23 = gr.k_ub_zm - gr.grid_dir_indx   # Python 0-based
-    _wp2_jax_w23 = _asarray(fill_holes_vertical(
-        field=jnp.asarray(_wp2_jax_w23),
-        rho_ds=jnp.asarray(rho_ds_zm),
-        dz=jnp.asarray(gr.dzm),
-        threshold=float(cc.w_tol_sqd),
-        lower_k=_hf_lower_w23, upper_k=_hf_upper_w23,
-        fill_holes_type=flags.fill_holes_type,
-    ), dtype=np.float64)
-
-    # fill_holes_wp2_from_horz_tke (ARM: l_wp2_fill_holes_tke=True)
-    _up2_out_w23 = up2
-    _vp2_out_w23 = vp2
-    if flags.l_wp2_fill_holes_tke:
-        # Fortran lower_hf_level=1 (1-based) → Python lower_k=0
-        # Fortran upper_hf_level=nzm-2 (1-based) → Python upper_k=nzm-3
-        (_wp2_jax_w23, _up2_out_w23, _vp2_out_w23) = [
-            _asarray(x, dtype=np.float64)
-            for x in fill_holes_wp2_from_horz_tke(
-                wp2=jnp.asarray(_wp2_jax_w23),
-                up2=jnp.asarray(_asarray(up2, dtype=np.float64)),
-                vp2=jnp.asarray(_asarray(vp2, dtype=np.float64)),
-                threshold=float(cc.w_tol_sqd),
-                lower_k=0,
-                upper_k=nzm - 3,
+    # These lines are for the diffusional term with a Crank-Nicholson
+    # time step.  They are not used for completely implicit diffusion.
+    if l_crank_nich_diff:
+        # Add diffusion terms
+        if gr.grid_dir_indx > 0:
+            rhs = rhs.at[:, 2:-1:2].add(
+                -lhs_diff_zm_crank[2, :, 1:-1] * wp2[:, :-2]
+                -lhs_diff_zm_crank[1, :, 1:-1] * wp2[:, 1:-1]
+                -lhs_diff_zm_crank[0, :, 1:-1] * wp2[:, 2:]
             )
-        ]
+            rhs = rhs.at[:, 3:-2:2].add(
+                -lhs_diff_zt_crank[2, :, 1:-1] * wp3[:, :-2]
+                -lhs_diff_zt_crank[1, :, 1:-1] * wp3[:, 1:-1]
+                -lhs_diff_zt_crank[0, :, 1:-1] * wp3[:, 2:]
+            )
+        else:
+            rhs = rhs.at[:, 2:-1:2].add(
+                -lhs_diff_zm_crank[0, :, 1:-1] * wp2[:, 2:]
+                -lhs_diff_zm_crank[1, :, 1:-1] * wp2[:, 1:-1]
+                -lhs_diff_zm_crank[2, :, 1:-1] * wp2[:, :-2]
+            )
+            rhs = rhs.at[:, 3:-2:2].add(
+                -lhs_diff_zt_crank[0, :, 1:-1] * wp3[:, 2:]
+                -lhs_diff_zt_crank[1, :, 1:-1] * wp3[:, 1:-1]
+                -lhs_diff_zt_crank[2, :, 1:-1] * wp3[:, :-2]
+            )
 
-    # clip_variance on wp2 (solve_type=12, wp2_min=cc.w_tol_sqd for l_min_wp2_from_corr_wx=False)
-    _wp2_min_w23 = _xp.full_like(_wp2_jax_w23, float(cc.w_tol_sqd))
-    if flags.l_min_wp2_from_corr_wx:
-        _corr_max2 = cc.max_mag_correlation_flux ** 2   # wp2_min from corr_wx (advance_wp2_wp3_module.F90:1986-1987)
-        _wprtp_np_w23 = _asarray(wprtp, dtype=np.float64)
-        _wpthlp_np_w23 = _asarray(wpthlp, dtype=np.float64)
-        _upwp_np_w23 = _asarray(upwp, dtype=np.float64)
-        _vpwp_np_w23 = _asarray(vpwp, dtype=np.float64)
-        _rtp2_np_w23 = _asarray(rtp2, dtype=np.float64)
-        _thlp2_np_w23 = _asarray(thlp2, dtype=np.float64)
-        _up2_np_w23 = _asarray(up2, dtype=np.float64)
-        _vp2_np_w23 = _asarray(vp2, dtype=np.float64)
-        _wp2_min_w23 = _xp.minimum(1.0, _xp.maximum(_wp2_min_w23,
-            _wprtp_np_w23 ** 2 / (_rtp2_np_w23 * _corr_max2),
-            _wpthlp_np_w23 ** 2 / (_thlp2_np_w23 * _corr_max2),
-            _upwp_np_w23 ** 2 / (_up2_np_w23 * _corr_max2),
-            _vpwp_np_w23 ** 2 / (_vp2_np_w23 * _corr_max2),
-        ))
-    # clip_variance on wp2
-    _wp2_jax_w23 = _asarray(clip_variance(
-        xp2=jnp.asarray(_wp2_jax_w23),
-        threshold_lo=jnp.asarray(_wp2_min_w23),
-    ), dtype=np.float64)
+    # This code block adds terms to the right-hand side so that TKE is being
+    # used in eddy diffusion instead of just wp2 or wp3.  For example, in the
+    # wp2 equation, if this flag is false, the eddy diffusion term would
+    # normally be completely implicit (hence no right-hand side contribution),
+    # and equal to +d/dz((K+nu)d/dz(wp2)).  With this flag set to true, the eddy
+    # diffusion term will be +d/dz((K+nu)d/dz(up2+vp2+wp2)), but the up2 and vp2
+    # parts are added on here as if they were right-hand side terms. For the wp3
+    # equation, with this flag false, the eddy diffusion term is
+    # +d/dz((K+nu)d/dz(wp3)), but with this flag true, it will be
+    # +d/dz((K+nu)d/dz(wpup2+wpvp2+wp3)).
+    if l_use_tke_in_wp2_wp3_K_dfsn:
+        if gr.grid_dir_indx > 0:
+            rhs = rhs.at[:, 2:-1:2].add(
+                -lhs_diff_zm[2, :, 1:-1] * (up2[:, :-2] + vp2[:, :-2])
+                -lhs_diff_zm[1, :, 1:-1] * (up2[:, 1:-1] + vp2[:, 1:-1])
+                -lhs_diff_zm[0, :, 1:-1] * (up2[:, 2:] + vp2[:, 2:])
+            )
+            rhs = rhs.at[:, 3:-2:2].add(
+                -lhs_diff_zt[2, :, 1:-1] * (wpup2[:, :-2] + wpvp2[:, :-2])
+                -lhs_diff_zt[1, :, 1:-1] * (wpup2[:, 1:-1] + wpvp2[:, 1:-1])
+                -lhs_diff_zt[2, :, 1:-1] * (wpup2[:, 2:] + wpvp2[:, 2:])
+            )
+        else:
+            rhs = rhs.at[:, 2:-1:2].add(
+                -lhs_diff_zm[0, :, 1:-1] * (up2[:, 2:] + vp2[:, 2:])
+                -lhs_diff_zm[1, :, 1:-1] * (up2[:, 1:-1] + vp2[:, 1:-1])
+                -lhs_diff_zm[2, :, 1:-1] * (up2[:, :-2] + vp2[:, :-2])
+            )
+            rhs = rhs.at[:, 3:-2:2].add(
+                -lhs_diff_zt[0, :, 1:-1] * (wpup2[:, 2:] + wpvp2[:, 2:])
+                -lhs_diff_zt[1, :, 1:-1] * (wpup2[:, 1:-1] + wpvp2[:, 1:-1])
+                -lhs_diff_zt[0, :, 1:-1] * (wpup2[:, :-2] + wpvp2[:, :-2])
+            )
 
-    # zm2zt to get wp2_zt
-    _wp2_zt_jax_w23 = _asarray(zm2zt(_wp2_jax_w23, gr), dtype=np.float64)
-    _wp2_zt_jax_w23 = _xp.maximum(_wp2_zt_jax_w23, cc.w_tol_sqd)   # positive definite
+    if l_tke_aniso:
+        # Add pressure terms and splat terms
+        rhs = rhs.at[:, 2:-1:2].add(rhs_pr1_wp2[:, 1:-1])
+        rhs = rhs.at[:, 2:-1:2].add(
+            (one - gamma_over_implicit_ts)
+            * (-lhs_pr1_wp2[:, 1:-1] * wp2[:, 1:-1])
+        )
 
-    # clip_skewness on wp3 — the budget wrapper records the wp3_cl clip tendency internally
-    # (mirroring the Fortran clip_skewness → clip_skewness_core split).
-    _skw_max_w23 = clubb_params[:, cc.iSkw_max_mag - 1]
-    _wp3_jax_w23 = _asarray(clip_skewness(
-        wp3=jnp.asarray(_wp3_jax_w23),
-        wp2_zt=jnp.asarray(_wp2_zt_jax_w23),
-        zt=jnp.asarray(gr.zt),
-        sfc_elevation=jnp.asarray(sfc_elevation),
-        Skw_max_mag=jnp.asarray(_skw_max_w23),
-        dt=float(dt),
-        l_use_wp3_lim_with_smth_Heaviside=flags.l_use_wp3_lim_with_smth_Heaviside,
-        stats_writer=stats_writer, l_sample=l_sample,
-    ), dtype=np.float64)
+    if l_ho_nontrad_coriolis:
+        # Add the nontraditional Coriolis term for wp2
+        # Hing Ong, 19 July 2025
+        rhs = rhs.at[:, 2:-1:2].add(two * fcor_y[:, None] * upwp[:, 1:-1])
+        # Add the nontraditional Coriolis term for wp3
+        # Hing Ong, 1 Septempber 2025
+        rhs = rhs.at[:, 3:-2:2].add(three * fcor_y[:, None] * wp2up[:, 1:-1])
+
+    # Combine terms
+    # ------ Combine terms for 3rd moment of vertical velocity, <w'^3> ------ !
+    # RHS time tendency.
+    rhs = rhs.at[:, 3:-2:2].add(invrs_dt * wp3[:, 1:-1])
+    # RHS contribution from "over-implicit" turbulent production (tp) term.
+    rhs = rhs.at[:, 3:-2:2].add(
+        (one - gamma_over_implicit_ts)
+        * (
+            -lhs_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+            -lhs_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2]
+        )
+    )
+    # RHS buoyancy production (bp) term and pressure term 2 (pr2).
+    rhs = rhs.at[:, 3:-2:2].add(rhs_bp1_pr2_wp3[:, 1:-1])
+    # RHS pressure term 1
+    rhs = rhs.at[:, 3:-2:2].add(rhs_pr1_wp3[:, 1:-1])
+    # RHS "over implicit" pressure term 1 (pr1).
+    rhs = rhs.at[:, 3:-2:2].add(
+        (one - gamma_over_implicit_ts)
+        * (-lhs_pr1_wp3[:, 1:-1] * wp3[:, 1:-1])
+    )
+
+    # ------ Combine terms for 2nd moment of vertical velocity, <w'^2> ------ !
+    # RHS time tendency.
+    rhs = rhs.at[:, 2:-1:2].add(invrs_dt * wp2[:, 1:-1])
+    # RHS buoyancy production (bp) term and pressure term 2 (pr2).
+    rhs = rhs.at[:, 2:-1:2].add(rhs_bp_pr2_wp2[:, 1:-1])
+    # RHS pressure term 3 (pr3).
+    rhs = rhs.at[:, 2:-1:2].add(rhs_pr3_wp2[:, 1:-1])
+    # RHS dissipation term 1 (dp1).
+    rhs = rhs.at[:, 2:-1:2].add(rhs_dp1_wp2[:, 1:-1])
+    # RHS "over implicit" pressure term 1 (pr1).
+    rhs = rhs.at[:, 2:-1:2].add(
+        (one - gamma_over_implicit_ts)
+        * (-lhs_dp1_wp2[:, 1:-1] * wp2[:, 1:-1])
+    )
+
+    if l_explicit_turbulent_adv_wp3:
+        # The turbulent advection term is being solved explicitly.
+        # Add RHS turbulent advection (ta) terms
+        rhs = rhs.at[:, 3:-2:2].add(rhs_ta_wp3[:, 1:-1])
+    else:
+        # The turbulent advection term is being solved implicitly. See note above
+        if iiPDF_type == iiPDF_ADG1:
+            # The ADG1 PDF is used.
+            # Brian -- come up with better method for testing ascending vs descending
+            rhs = rhs.at[:, 3:-2:2].add(
+                (one - gamma_over_implicit_ts)
+                * (
+                    -wp3_term_ta_lhs_result[0, :, 1:-1] * wp3[:, 2:]
+                    -wp3_term_ta_lhs_result[1, :, 1:-1] * wp2[:, 2:-1]
+                    -wp3_term_ta_lhs_result[2, :, 1:-1] * wp3[:, 1:-1]
+                    -wp3_term_ta_lhs_result[3, :, 1:-1] * wp2[:, 1:-2]
+                    -wp3_term_ta_lhs_result[4, :, 1:-1] * wp3[:, :-2]
+                )
+            )
+        elif iiPDF_type == iiPDF_new or iiPDF_type == iiPDF_new_hybrid:
+            # The new PDF or the new hybrid PDF is used.
+            # Add terms
+            rhs = rhs.at[:, 3:-2:2].add(
+                (one - gamma_over_implicit_ts)
+                * (
+                    -lhs_ta_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+                    -lhs_ta_wp3[1, :, 1:-1] * wp2[:, 1:-2]
+                )
+            )
+
+    # --------- Boundary Conditions ---------
+
+    # Both wp2 and wp3 used fixed-point boundary conditions.
+    # Therefore, anything set in the above loop at both the upper
+    # and lower boundaries would be overwritten here.  However, the
+    # above loop does not extend to the boundary levels.  An array
+    # with a value of 1 at the main diagonal on the left-hand side
+    # and with values of 0 at all other diagonals on the left-hand
+    # side will preserve the right-hand side value at that level.
+
+    # The value of w'^2 at the lower boundary will remain the same.
+    # When the lower boundary is at the surface, the surface value of
+    # w'^2 is set in subroutine calc_surface_varnce (surface_varnce_module.F).
+
+    # The value of w'^3 at the lower boundary will be 0.
+
+    # The value of w'^2 at the upper boundary will be set to the threshold
+    # minimum value of w_tol_sqd.
+
+    # The value of w'^3 at the upper boundary will be set to 0.
+    if gr.grid_dir_indx > 0:
+        # Ascending Grid
+        rhs = rhs.at[:, 0].set(wp2[:, gr.k_lb_zm])
+        rhs = rhs.at[:, 1].set(zero)
+        rhs = rhs.at[:, 2 * nzt - 1].set(zero)
+        rhs = rhs.at[:, 2 * nzm - 2].set(w_tol_sqd)
+    else:
+        # Descending Grid
+        rhs = rhs.at[:, 2 * nzm - 2].set(wp2[:, gr.k_lb_zm])
+        rhs = rhs.at[:, 2 * nzt - 1].set(zero)
+        rhs = rhs.at[:, 1].set(zero)
+        rhs = rhs.at[:, 0].set(w_tol_sqd)
+
+    # --------- Statistics output ---------
+    if stats.l_sample:
+        C_uu_buoy_zeros = jnp.zeros((ngrdcol,), dtype=jnp.float64)
+        C_uu_buoy_plus_one = clubb_params[:, iC_uu_buoy] + one
+        C11_Skw_fnc_zeros = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        C11_Skw_fnc_plus_one = C11_Skw_fnc + one
+
+        rhs_bp_wp2 = wp2_terms_bp_pr2_rhs(
+            nzm, ngrdcol, gr, C_uu_buoy_zeros, thv_ds_zm, wpthvp,
+        )
+        rhs_pr2_wp2 = wp2_terms_bp_pr2_rhs(
+            nzm, ngrdcol, gr, C_uu_buoy_plus_one, thv_ds_zm, wpthvp,
+        )
+        rhs_bp1_wp3 = wp3_terms_bp1_pr2_rhs(
+            nzt, ngrdcol, gr, C11_Skw_fnc_zeros, thv_ds_zt, wp2thvp,
+        )
+        rhs_pr2_wp3 = wp3_terms_bp1_pr2_rhs(
+            nzt, ngrdcol, gr, C11_Skw_fnc_plus_one, thv_ds_zt, wp2thvp,
+        )
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(rhs_bp_wp2[:, 1:-1])
+        stats = stats.update("wp2_bp", stats_tmp_zm)
+
+        if l_ho_nontrad_coriolis:
+            stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(two * fcor_y[:, None] * upwp[:, 1:-1])
+            stats = stats.update("wp2_nct", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(rhs_pr_dfsn_wp2[:, 1:-1])
+        stats = stats.update("wp2_pr_dfsn", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(-lhs_splat_wp2[:, 1:-1] * wp2[:, 1:-1])
+        stats = stats.update("wp2_splat", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(rhs_pr3_wp2[:, 1:-1])
+        stats = stats.update("wp2_pr3", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(-rhs_pr2_wp2[:, 1:-1])
+        stats = stats.begin_budget("wp2_pr2", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(-rhs_dp1_wp2[:, 1:-1])
+        stats = stats.begin_budget("wp2_dp1", stats_tmp_zm)
+
+        stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+        stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+            (one - gamma_over_implicit_ts)
+            * (-lhs_dp1_wp2[:, 1:-1] * wp2[:, 1:-1])
+        )
+        stats = stats.update_budget("wp2_dp1", stats_tmp_zm)
+
+        if l_crank_nich_diff or l_use_tke_in_wp2_wp3_K_dfsn:
+            stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            if l_crank_nich_diff:
+                if gr.grid_dir_indx > 0:
+                    stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].add(
+                        lhs_diff_zm_crank[2, :, 1:-1] * wp2[:, :-2]
+                        + lhs_diff_zm_crank[1, :, 1:-1] * wp2[:, 1:-1]
+                        + lhs_diff_zm_crank[0, :, 1:-1] * wp2[:, 2:]
+                    )
+                else:
+                    stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].add(
+                        lhs_diff_zm_crank[0, :, 1:-1] * wp2[:, 2:]
+                        + lhs_diff_zm_crank[1, :, 1:-1] * wp2[:, 1:-1]
+                        + lhs_diff_zm_crank[2, :, 1:-1] * wp2[:, :-2]
+                    )
+            if l_use_tke_in_wp2_wp3_K_dfsn:
+                if gr.grid_dir_indx > 0:
+                    stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].add(
+                        lhs_diff_zm[2, :, 1:-1] * (up2[:, :-2] + vp2[:, :-2])
+                        + lhs_diff_zm[1, :, 1:-1] * (up2[:, 1:-1] + vp2[:, 1:-1])
+                        + lhs_diff_zm[0, :, 1:-1] * (up2[:, 2:] + vp2[:, 2:])
+                    )
+                else:
+                    stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].add(
+                        lhs_diff_zm[0, :, 1:-1] * (up2[:, 2:] + vp2[:, 2:])
+                        + lhs_diff_zm[1, :, 1:-1] * (up2[:, 1:-1] + vp2[:, 1:-1])
+                        + lhs_diff_zm[2, :, 1:-1] * (up2[:, :-2] + vp2[:, :-2])
+                    )
+            stats = stats.begin_budget("wp2_dp2", stats_tmp_zm)
+
+        if l_tke_aniso:
+            stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(-rhs_pr1_wp2[:, 1:-1])
+            stats = stats.begin_budget("wp2_pr1", stats_tmp_zm)
+            stats_tmp_zm = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+            stats_tmp_zm = stats_tmp_zm.at[:, 1:-1].set(
+                (one - gamma_over_implicit_ts)
+                * (-lhs_pr1_wp2[:, 1:-1] * wp2[:, 1:-1])
+            )
+            stats = stats.update_budget("wp2_pr1", stats_tmp_zm)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(rhs_bp1_wp3[:, 1:-1])
+        stats = stats.update("wp3_bp1", stats_tmp_zt)
+
+        if l_ho_nontrad_coriolis:
+            stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(three * fcor_y[:, None] * wp2up[:, 1:-1])
+            stats = stats.update("wp3_nct", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(rhs_pr_turb_wp3[:, 1:-1])
+        stats = stats.update("wp3_pr_turb", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(rhs_pr_dfsn_wp3[:, 1:-1])
+        stats = stats.update("wp3_pr_dfsn", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(-lhs_splat_wp3[:, 1:-1] * wp3[:, 1:-1])
+        stats = stats.update("wp3_splat", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(-rhs_pr2_wp3[:, 1:-1])
+        stats = stats.begin_budget("wp3_pr2", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(-rhs_pr1_wp3[:, 1:-1])
+        stats = stats.begin_budget("wp3_pr1", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            (one - gamma_over_implicit_ts)
+            * (-lhs_pr1_wp3[:, 1:-1] * wp3[:, 1:-1])
+        )
+        stats = stats.update_budget("wp3_pr1", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        if l_explicit_turbulent_adv_wp3:
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(-rhs_ta_wp3[:, 1:-1])
+        elif iiPDF_type == iiPDF_ADG1:
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+                -(one - gamma_over_implicit_ts)
+                * (
+                    -wp3_term_ta_lhs_result[0, :, 1:-1] * wp3[:, 2:]
+                    -wp3_term_ta_lhs_result[1, :, 1:-1] * wp2[:, 2:-1]
+                    -wp3_term_ta_lhs_result[2, :, 1:-1] * wp3[:, 1:-1]
+                    -wp3_term_ta_lhs_result[3, :, 1:-1] * wp2[:, 1:-2]
+                    -wp3_term_ta_lhs_result[4, :, 1:-1] * wp3[:, :-2]
+                )
+            )
+        elif iiPDF_type == iiPDF_new or iiPDF_type == iiPDF_new_hybrid:
+            stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+                -(one - gamma_over_implicit_ts)
+                * (
+                    -lhs_ta_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+                    -lhs_ta_wp3[1, :, 1:-1] * wp2[:, 1:-2]
+                )
+            )
+        stats = stats.begin_budget("wp3_ta", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -(one - gamma_over_implicit_ts)
+            * (
+                -lhs_adv_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+                -lhs_adv_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2]
+            )
+        )
+        stats = stats.begin_budget("wp3_tp", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(
+            -(one - gamma_over_implicit_ts)
+            * (
+                -lhs_pr_tp_wp3[0, :, 1:-1] * wp2[:, 2:-1]
+                -lhs_pr_tp_wp3[1, :, 1:-1] * wp2[:, 1:-2]
+            )
+        )
+        stats = stats.begin_budget("wp3_pr_tp", stats_tmp_zt)
+
+        stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+        stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].set(rhs_pr3_wp3[:, 1:-1])
+        stats = stats.begin_budget("wp3_pr3", stats_tmp_zt)
+
+        if l_crank_nich_diff or l_use_tke_in_wp2_wp3_K_dfsn:
+            stats_tmp_zt = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+            if l_crank_nich_diff:
+                if gr.grid_dir_indx > 0:
+                    stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].add(
+                        lhs_diff_zt[2, :, 1:-1] * wp3[:, :-2]
+                        + lhs_diff_zt[1, :, 1:-1] * wp3[:, 1:-1]
+                        + lhs_diff_zt[0, :, 1:-1] * wp3[:, 2:]
+                    )
+                else:
+                    stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].add(
+                        lhs_diff_zt[0, :, 1:-1] * wp3[:, 2:]
+                        + lhs_diff_zt[1, :, 1:-1] * wp3[:, 1:-1]
+                        + lhs_diff_zt[2, :, 1:-1] * wp3[:, :-2]
+                    )
+            if l_use_tke_in_wp2_wp3_K_dfsn:
+                if gr.grid_dir_indx > 0:
+                    stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].add(
+                        lhs_diff_zt[2, :, 1:-1] * (wpup2[:, :-2] + wpvp2[:, :-2])
+                        + lhs_diff_zt[1, :, 1:-1] * (wpup2[:, 1:-1] + wpvp2[:, 1:-1])
+                        + lhs_diff_zt[0, :, 1:-1] * (wpup2[:, 2:] + wpvp2[:, 2:])
+                    )
+                else:
+                    stats_tmp_zt = stats_tmp_zt.at[:, 1:-1].add(
+                        lhs_diff_zt[0, :, 1:-1] * (wpup2[:, 2:] + wpvp2[:, 2:])
+                        + lhs_diff_zt[1, :, 1:-1] * (wpup2[:, 1:-1] + wpvp2[:, 1:-1])
+                        + lhs_diff_zt[2, :, 1:-1] * (wpup2[:, :-2] + wpvp2[:, :-2])
+                    )
+            stats = stats.begin_budget("wp3_dp1", stats_tmp_zt)
+
+    return rhs, stats
 
 
-    # advance_wp2_wp3_module.F90 stats writes (C1/C11_Skw_fnc, budgets)
-    if l_sample and stats_writer is not None:
-        stats_writer.update("C1_Skw_fnc",  _asarray(C1_Skw_fnc,  dtype=np.float64))
-        stats_writer.update("C11_Skw_fnc", _asarray(C11_Skw_fnc, dtype=np.float64))
+def wp2_term_ta_lhs(nzm, nzt, ngrdcol, gr, rho_ds_zt, invrs_rho_ds_zm):
+    """Turbulent advection term for w'^2:  implicit portion of the code.
 
-        # ---- post-advance wp2_zt and wp3_zm (fix: written here, not earlier) ----
-        _wp3_zm_jax_w23 = _asarray(zt2zm(jnp.asarray(_wp3_jax_w23), gr), dtype=np.float64)
-        stats_writer.update("wp2_zt", _wp2_zt_jax_w23)
-        stats_writer.update("wp3_zm", _wp3_zm_jax_w23)
+    The d(w'^2)/dt equation contains a turbulent advection term:
 
-        # ---- wp2/wp3 clipping budget stats ----
-        # (wp3_cl is now recorded inside clip_skewness — the Fortran clip_skewness budget wrapper)
-        _dt_w23 = float(dt)
-        stats_writer.update("wp2_pd",
-            (_asarray(_wp2_jax_w23, dtype=np.float64) - _asarray(wp2_new, dtype=np.float64)) / _dt_w23)
-        _up2_out_w23_np = _asarray(_up2_out_w23 if flags.l_wp2_fill_holes_tke else up2, dtype=np.float64)
-        _vp2_out_w23_np = _asarray(_vp2_out_w23 if flags.l_wp2_fill_holes_tke else vp2, dtype=np.float64)
-        # Mirror Fortran: up2_pd/vp2_pd contribution from wp2 block uses
-        # l_count_sample=.false. so nsamples is NOT incremented here.
-        up2_np = _asarray(up2, dtype=np.float64)
-        vp2_np = _asarray(vp2, dtype=np.float64)
-        stats_writer.begin_budget("up2_pd", up2_np / _dt_w23)
-        stats_writer.begin_budget("vp2_pd", vp2_np / _dt_w23)
-        stats_writer.finalize_budget("up2_pd", _up2_out_w23_np / _dt_w23, l_count_sample=False)
-        stats_writer.finalize_budget("vp2_pd", _vp2_out_w23_np / _dt_w23, l_count_sample=False)
+    - (1/rho_ds) * d( rho_ds * w'^3 )/dz.
 
-        # ---- wp2/wp3 budget terms (pre/post advance values) ----
-        _g = cc.gamma_over_implicit_ts
-        _wp2_pre = _asarray(wp2, dtype=np.float64)
-        _wp3_pre = _asarray(wp3, dtype=np.float64)
-        _wp2_post = _asarray(wp2_new, dtype=np.float64)  # pre-clip post-solve
-        _wp3_post = _asarray(wp3_new, dtype=np.float64)  # pre-clip post-solve
-        _wp2_mix = (1.0 - _g) * _wp2_pre + _g * _wp2_post
-        _wp3_mix = (1.0 - _g) * _wp3_pre + _g * _wp3_post
+    The term is solved for completely implicitly, such that:
 
-        # ------ wp2 budget terms ------
+    - (1/rho_ds) * d( rho_ds * w'^3(t+1) )/dz.
 
-        # wp2_bp: C_uu_buoy=0 → 2*g/thv*wpthvp
-        stats_writer.update("wp2_bp",   _asarray(rhs_bp_wp2, dtype=np.float64))
-        # wp2_pr3: explicit RHS pressure term 3
-        stats_writer.update("wp2_pr3",  _asarray(rhs_pr3_wp2, dtype=np.float64))
-        # wp2_splat: in Fortran stats_update("wp2_splat", -lhs_splat_wp2*wp2_old) before solve
-        stats_writer.update("wp2_splat", -(_asarray(lhs_splat_wp2, dtype=np.float64) * _wp2_pre))
+    Note:  When the term is brought over to the left-hand side, the sign
+           is reversed and the leading "-" in front of the term is changed
+           to a "+".
 
-        # wp2_dp1: rhs_dp1_wp2 - lhs_dp1_wp2 * wp2_mix — diagonal implicit-budget finalize kernel
-        _lhs_dp1 = _asarray(lhs_dp1_wp2, dtype=np.float64)
-        _rhs_dp1 = _asarray(rhs_dp1_wp2, dtype=np.float64)
-        stats_writer.update("wp2_dp1",
-            finalize_implicit_budget_interior_jax(_rhs_dp1, _lhs_dp1, _wp2_mix))
+    invrs_dzm(k) = 1 / ( zt(k) - zt(k-1) )
+    """
+    del nzt
+    lhs_ta_wp2 = jnp.zeros((ndiags2, ngrdcol, nzm), dtype=jnp.float64)
+    fac = invrs_rho_ds_zm[:, 1:-1] * gr.invrs_dzm[:, 1:-1]
+    # Thermodynamic superdiagonal: [ x wp3(k,<t+1>) ]
+    lhs_ta_wp2 = lhs_ta_wp2.at[0, :, 1:-1].set(fac * rho_ds_zt[:, 1:])
+    # Thermodynamic subdiagonal: [ x wp3(k-1,<t+1>) ]
+    lhs_ta_wp2 = lhs_ta_wp2.at[1, :, 1:-1].set(-fac * rho_ds_zt[:, :-1])
+    return lhs_ta_wp2
 
-        # wp2_pr1: rhs_pr1_wp2 - lhs_pr1_wp2 * wp2_mix  (l_tke_aniso=True)
-        _lhs_pr1 = _asarray(lhs_pr1_wp2, dtype=np.float64)
-        _rhs_pr1 = _asarray(rhs_pr1_wp2, dtype=np.float64)
-        stats_writer.update("wp2_pr1",
-            finalize_implicit_budget_interior_jax(_rhs_pr1, _lhs_pr1, _wp2_mix))
 
-        # wp2_pr2: rhs_pr2_wp2 - lhs_wp2_pr2_term * wp2_post
-        _rhs_pr2 = _asarray(rhs_pr2_wp2, dtype=np.float64)
-        _lhs_pr2t = _asarray(lhs_wp2_pr2_term, dtype=np.float64)
-        stats_writer.update("wp2_pr2",
-            finalize_implicit_budget_interior_jax(_rhs_pr2, _lhs_pr2t, _wp2_post))
+def wp2_terms_ac_pr2_lhs(nzm, nzt, ngrdcol, gr, C_uu_shr, wm_zt):
+    """Accumulation of w'^2 and w'^2 pressure term 2:  implicit portion of the
+    code.
 
-        # wp2_dp2: fully implicit, -(lhs_diff_zm @ wp2_post) tri-band — the shared 3-band interior
-        # apply kernel (advance_xp2_xpyp_module.apply_lhs_band3_interior_jax), same matrix-vector form
-        # the Fortran budget-finalize uses for the implicit diffusion contribution.
-        _lhs_dz = _asarray(lhs_diff_zm, dtype=np.float64)  # (3, ngrdcol, nzm)
-        _wp2_dp2 = -apply_lhs_band3_interior_jax(_lhs_dz, _wp2_post)
-        stats_writer.update("wp2_dp2", _wp2_dp2)
+    The d(w'^2)/dt equation contains an accumulation term:
 
-        # wp2_ta: fully implicit, -(lhs_ta_wp2 @ wp3_post) — shared zt→zm 2-band apply kernel
-        _lhs_ta2 = _asarray(lhs_ta_wp2, dtype=np.float64)  # (2, ngrdcol, nzm)
-        _wp2_ta = -apply_lhs_band2_zt2zm_interior_jax(_lhs_ta2, _wp3_post)
-        stats_writer.update("wp2_ta", _wp2_ta)
+    - 2 w'^2 dw/dz;
 
-        # wp2_pr_dfsn already in stats? Skip (passes). wp2_ac, wp2_ma → already pass.
+    and pressure term 2:
 
-        # ------ wp3 budget terms ------
+    - C_5 ( -2 w'^2 dw/dz + 2 (g/th_0) w'th_v' ).
 
-        # wp3_bp1: C11_Skw_fnc=0 → 3*g/thv*wp2thvp
-        stats_writer.update("wp3_bp1",     _asarray(rhs_bp1_wp3, dtype=np.float64))
-        # wp3_pr_turb: explicit RHS
-        stats_writer.update("wp3_pr_turb", _asarray(rhs_pr_turb_wp3, dtype=np.float64))
+    Note 1:  When the term is brought over to the left-hand side, the sign
+             is reversed and the leading "-" in front of the "2" is changed
+             to a "+".
+    Note 2:  We have broken C5 up into C_uu_shr for this term
+             and C_uu_buoy for the buoyancy term.
+    """
+    del nzt
+    lhs_ac_pr2_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Momentum main diagonal: [ x wp2(k,<t+1>) ]
+    lhs_ac_pr2_wp2 = lhs_ac_pr2_wp2.at[:, 1:-1].set(
+        (one - C_uu_shr[:, None]) * two * gr.invrs_dzm[:, 1:-1]
+        * (wm_zt[:, 1:] - wm_zt[:, :-1])
+    )
+    return lhs_ac_pr2_wp2
 
-        # wp3_pr1: rhs_pr1_wp3 - lhs_pr1_wp3 * wp3_mix — diagonal implicit-budget finalize kernel
-        _lhs_pr1_3 = _asarray(lhs_pr1_wp3, dtype=np.float64)
-        _rhs_pr1_3 = _asarray(rhs_pr1_wp3, dtype=np.float64)
-        stats_writer.update("wp3_pr1",
-            finalize_implicit_budget_interior_jax(_rhs_pr1_3, _lhs_pr1_3, _wp3_mix))
 
-        # wp3_pr2: rhs_pr2_wp3 - lhs_wp3_pr2_term * wp3_post — diagonal implicit-budget finalize kernel
-        _rhs_pr2_3 = _asarray(rhs_pr2_wp3, dtype=np.float64)
-        _lhs_pr2t_3 = _asarray(lhs_wp3_pr2_term, dtype=np.float64)
-        stats_writer.update("wp3_pr2",
-            finalize_implicit_budget_interior_jax(_rhs_pr2_3, _lhs_pr2t_3, _wp3_post))
+def wp2_term_dp1_lhs(nzm, ngrdcol, gr, C1_Skw_fnc, invrs_tau1m):
+    """Dissipation term 1 for w'^2:  implicit portion of the code.
 
-        # wp3_dp1: fully implicit (ARM: l_crank_nich_diff=False), -(lhs_diff_zt @ wp3_post) — the same
-        # shared 3-band interior apply kernel (apply_lhs_band3_interior_jax).
-        _lhs_dt = _asarray(lhs_diff_zt, dtype=np.float64)  # (3, ngrdcol, nzt)
-        _wp3_dp1 = -apply_lhs_band3_interior_jax(_lhs_dt, _wp3_post)
-        stats_writer.update("wp3_dp1", _wp3_dp1)
+    The d(w'^2)/dt equation contains dissipation term 1:
 
-        # wp3_ta: -(lhs_ta_wp3 @ mixed) 5-band
-        _lhs_ta3 = _asarray(lhs_ta_wp3, dtype=np.float64)  # (5, ngrdcol, nzt)
-        _wp3_ta = _xp.zeros_like(_wp3_pre)
-        _wp3_ta = _iset(_wp3_ta, np.s_[:, 1:-1], -(
-            _lhs_ta3[0, :, 1:-1] * _wp3_mix[:, 2:]     # wp3[k+1]
-            + _lhs_ta3[1, :, 1:-1] * _wp2_mix[:, 2:-1]   # wp2[k+1]
-            + _lhs_ta3[2, :, 1:-1] * _wp3_mix[:, 1:-1]   # wp3[k]
-            + _lhs_ta3[3, :, 1:-1] * _wp2_mix[:, 1:-2]   # wp2[k]
-            + _lhs_ta3[4, :, 1:-1] * _wp3_mix[:, :-2]    # wp3[k-1]
-        ))
-        stats_writer.update("wp3_ta", _wp3_ta)
+    - ( C_1 / tau_1m ) w'^2.
 
-        # wp3_tp: -(lhs_adv_tp_wp3 @ wp2_mix)
-        _lhs_tp3 = _asarray(lhs_adv_tp_wp3, dtype=np.float64)  # (2, ngrdcol, nzt)
-        _wp3_tp = _xp.zeros_like(_wp3_pre)
-        _wp3_tp = _iset(_wp3_tp, np.s_[:, 1:-1], -(
-            _lhs_tp3[0, :, 1:-1] * _wp2_mix[:, 2:-1]   # wp2[k+1]
-            + _lhs_tp3[1, :, 1:-1] * _wp2_mix[:, 1:-2]   # wp2[k]
-        ))
-        stats_writer.update("wp3_tp", _wp3_tp)
+    Since w'^2 has a minimum threshold, the term should be damped only to that
+    threshold.  The term becomes:
 
-    return _wp2_jax_w23, _wp3_jax_w23, _wp2_zt_jax_w23
+    - ( C_1 / tau_1m ) * ( w'^2 - threshold ).
+
+    Note:  When the implicit term is brought over to the left-hand side, the
+           sign is reversed and the leading "-" in front of the term is
+           changed to a "+".
+    """
+    del gr
+    lhs_dp1_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Momentum main diagonal: [ x wp2(k,<t+1>) ]
+    lhs_dp1_wp2 = lhs_dp1_wp2.at[:, 1:-1].set(
+        C1_Skw_fnc[:, 1:-1] * invrs_tau1m[:, 1:-1]
+    )
+    return lhs_dp1_wp2
+
+
+def wp2_term_pr1_lhs(nzm, ngrdcol, gr, C4, invrs_tau_C4_zm):
+    """Pressure term 1 for w'^2:  implicit portion of the code.
+
+    The d(w'^2)/dt equation contains pressure term 1:
+
+    - ( C_4 / tau_1m ) * ( w'^2 - (2/3)*em ),
+
+    where em = (1/2) * ( w'^2 + u'^2 + v'^2 ).
+
+    Pressure term 1 has both implicit and explicit components.  The implicit
+    portion is:
+
+    - ( C_4 / tau_1m ) * (2/3) * w'^2(t+1);
+    """
+    del gr
+    lhs_pr1_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Momentum main diagonal: [ x wp2(k,<t+1>) ]
+    lhs_pr1_wp2 = lhs_pr1_wp2.at[:, 1:-1].set(
+        (two * C4[:, None] * invrs_tau_C4_zm[:, 1:-1]) / three
+    )
+    return lhs_pr1_wp2
+
+
+def wp2_terms_bp_pr2_rhs(nzm, ngrdcol, gr, C_uu_buoy, thv_ds_zm, wpthvp):
+    """Buoyancy production of w'^2 and w'^2 pressure term 2:  explicit portion of
+    the code.
+
+    The d(w'^2)/dt equation contains a buoyancy production term:
+
+    + 2 (g/thv_ds) w'th_v';
+
+    and pressure term 2:
+
+    - C_5 ( -2 w'^2 dw/dz + 2 (g/thv_ds) w'th_v' ).
+
+    Note:  We have broken C5 up into C_uu_shr for the accumulation term
+           and C_uu_buoy for the buoyancy term.
+    """
+    del gr
+    rhs_bp_pr2_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
+    rhs_bp_pr2_wp2 = rhs_bp_pr2_wp2.at[:, 1:-1].set(
+        (one - C_uu_buoy[:, None]) * two
+        * (grav / thv_ds_zm[:, 1:-1]) * wpthvp[:, 1:-1]
+    )
+    return rhs_bp_pr2_wp2
+
+
+def wp2_term_dp1_rhs(
+    nzm, ngrdcol, gr, C1_Skw_fnc,
+    invrs_tau1m, threshold, up2, vp2,
+    l_damp_wp2_using_em,
+):
+    """Dissipation term 1 for w'^2:  explicit portion of the code.
+
+    When l_damp_wp2_using_em == .false., then
+    Dissipation term 1 for w'^2:  explicit portion of the code.
+
+    if l_damp_wp2_using_em == .true., then
+    we damp wp2 using a more standard turbulence closure, -(2/3)*em/tau
+    This only works if C1=C14 and l_stability_correct_tau_zm =.false.
+    A factor of (1/3) is absorbed into C1.
+    The threshold is implicitly set to 0.
+    """
+    del gr
+    rhs_dp1_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
+    if l_damp_wp2_using_em:
+        rhs_dp1_wp2 = rhs_dp1_wp2.at[:, 1:-1].set(
+            -(C1_Skw_fnc[:, 1:-1] * invrs_tau1m[:, 1:-1])
+            * (up2[:, 1:-1] + vp2[:, 1:-1])
+        )
+    else:
+        rhs_dp1_wp2 = rhs_dp1_wp2.at[:, 1:-1].set(
+            (C1_Skw_fnc[:, 1:-1] * invrs_tau1m[:, 1:-1]) * threshold
+        )
+    return rhs_dp1_wp2
+
+
+def wp2_term_pr3_rhs(
+    nzm, nzt, ngrdcol, gr,
+    C_uu_shr,
+    C_uu_buoy,
+    thv_ds_zm, wpthvp, upwp,
+    um, vpwp, vm,
+):
+    """Pressure term 3 for w'^2:  explicit portion of the code.
+
+    The d(w'^2)/dt equation contains pressure term 3:
+
+    + (2/3) C_5 [ (g/thv_ds) w'th_v' - u'w' du/dz - v'w' dv/dz ].
+
+    Note that below we have broken up C5 into C_uu_shr for shear terms and
+    C_uu_buoy for buoyancy terms.
+    """
+    del nzt
+    rhs_pr3_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Michael Falk, 2 August 2007
+    # Use the following code for standard mixing, with c_k=0.548:
+    rhs_pr3_wp2 = rhs_pr3_wp2.at[:, 1:-1].set(
+        two_thirds
+        * (
+            C_uu_buoy[:, None]
+            * (grav / thv_ds_zm[:, 1:-1]) * wpthvp[:, 1:-1]
+            + C_uu_shr[:, None]
+            * (
+                -upwp[:, 1:-1] * gr.invrs_dzm[:, 1:-1] * (um[:, 1:] - um[:, :-1])
+                -vpwp[:, 1:-1] * gr.invrs_dzm[:, 1:-1] * (vm[:, 1:] - vm[:, :-1])
+            )
+        )
+    )
+    # Added by dschanen for ticket #36
+    # We have found that when shear generation is zero this term will only be
+    # offset by hole-filling (wp2_pd) and reduces turbulence
+    # unrealistically at lower altitudes to make up the difference.
+    rhs_pr3_wp2 = rhs_pr3_wp2.at[:, 1:-1].set(
+        jnp.maximum(rhs_pr3_wp2[:, 1:-1], zero_threshold)
+    )
+    return rhs_pr3_wp2
+
+
+def wp2_term_pr1_rhs(nzm, ngrdcol, gr, C4, up2, vp2, invrs_tau_C4_zm):
+    """Pressure term 1 for w'^2:  explicit portion of the code.
+
+    Pressure term 1 has both implicit and explicit components.
+    The explicit portion is:
+
+    + ( C_4 / tau_1m ) * (1/3) * ( u'^2 + v'^2 );
+
+    and is computed in this function.
+    """
+    del gr
+    rhs_pr1_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
+    rhs_pr1_wp2 = rhs_pr1_wp2.at[:, 1:-1].set(
+        (C4[:, None] * (up2[:, 1:-1] + vp2[:, 1:-1])
+         * invrs_tau_C4_zm[:, 1:-1]) / three
+    )
+    return rhs_pr1_wp2
+
+
+def wp2_term_pr_dfsn_rhs(
+    nzm, nzt, ngrdcol, gr, C_wp2_pr_dfsn,
+    rho_ds_zt, invrs_rho_ds_zm,
+    wpup2, wpvp2, wp3,
+):
+    """Pressure-diffusion RHS for w'^2.
+
+    This term is intended to represent the "diffusion" part of the wp2
+    pressure correlation.  The total pressure diffusion term,
+
+      -1 / rho * ( d( <u_k'p'> )/dx_i + d( <u_i'p'> )/dx_k )
+
+    becomes
+
+      -2 / rho * d( <w'p'> )/dz
+
+    for the w'^2 equation.
+
+    References:
+      Lumley 1978, p. 170.  See eq. 6.47 and accompanying discussion.
+    """
+    del nzt
+    wpuip2 = wpup2 + wpvp2 + wp3
+    rhs_pr_dfsn_wp2 = jnp.zeros((ngrdcol, nzm), dtype=jnp.float64)
+    rhs_pr_dfsn_wp2 = rhs_pr_dfsn_wp2.at[:, 1:-1].set(
+        C_wp2_pr_dfsn[:, None] * invrs_rho_ds_zm[:, 1:-1]
+        * gr.invrs_dzm[:, 1:-1]
+        * (
+            rho_ds_zt[:, 1:] * wpuip2[:, 1:]
+            - rho_ds_zt[:, :-1] * wpuip2[:, :-1]
+        )
+    )
+    if gr.grid_dir_indx > 0:
+        # Set lower boundary condition
+        rhs_pr_dfsn_wp2 = rhs_pr_dfsn_wp2.at[:, gr.k_lb_zm].set(
+            rhs_pr_dfsn_wp2[:, gr.k_lb_zm + gr.grid_dir_indx]
+        )
+    else:
+        # Set lower boundary condition
+        rhs_pr_dfsn_wp2 = rhs_pr_dfsn_wp2.at[:, gr.k_lb_zm].set(
+            rhs_pr_dfsn_wp2[:, gr.k_lb_zm + gr.grid_dir_indx]
+        )
+    # Set upper boundary to 0
+    rhs_pr_dfsn_wp2 = rhs_pr_dfsn_wp2.at[:, gr.k_ub_zm].set(zero)
+    return rhs_pr_dfsn_wp2
+
+
+def wp3_term_ta_new_pdf_lhs(
+    nzm, nzt, ngrdcol, gr, coef_wp4_implicit,
+    wp2, rho_ds_zm, invrs_rho_ds_zt,
+):
+    """Turbulent advection of <w'^3>:  implicit portion of the code.
+
+    This implicit discretization is specifically for the new PDF.
+
+    The d<w'^3>/dt equation contains a turbulent advection term:
+
+    - (1/rho_ds) * d( rho_ds * <w'^4> )/dz.
+
+    A substitution, which is specific to the new PDF, is made in order to
+    close the turbulent advection term, such that:
+
+    <w'^4> = coef_wp4_implicit * <w'^2>^2.
+
+    invrs_dzt(k) = 1 / ( zm(k+1) - zm(k) )
+    """
+    del nzm
+    lhs_ta_wp3 = jnp.zeros((ndiags2, ngrdcol, nzt), dtype=jnp.float64)
+    # Momentum superdiagonal: [ x wp2(k+1,<t+1>) ]
+    lhs_ta_wp3 = lhs_ta_wp3.at[0, :, 1:-1].set(
+        invrs_rho_ds_zt[:, 1:-1] * gr.invrs_dzt[:, 1:-1]
+        * rho_ds_zm[:, 2:nzt] * coef_wp4_implicit[:, 2:nzt] * wp2[:, 2:nzt]
+    )
+    # Momentum subdiagonal: [ x wp2(k,<t+1>) ]
+    lhs_ta_wp3 = lhs_ta_wp3.at[1, :, 1:-1].set(
+        -invrs_rho_ds_zt[:, 1:-1] * gr.invrs_dzt[:, 1:-1]
+        * rho_ds_zm[:, 1:nzt - 1] * coef_wp4_implicit[:, 1:nzt - 1] * wp2[:, 1:nzt - 1]
+    )
+    return lhs_ta_wp3
+
+
+def wp3_term_ta_ADG1_lhs(
+    nzm, nzt, ngrdcol, gr,
+    wp2, a1_coef, a1_coef_zt,
+    a3_coef, a3_coef_zt,
+    wp3_on_wp2, rho_ds_zm,
+    rho_ds_zt, invrs_rho_ds_zt,
+    l_standard_term_ta,
+    l_partial_upwind_wp3,
+):
+    """Turbulent advection of w'^3:  implicit portion of the code.
+
+    This implicit discretization is specifically for the ADG1 PDF.
+
+    The d(w'^3)/dt equation contains a turbulent advection term:
+
+    - (1/rho_ds) * d( rho_ds * w'^4 )/dz.
+
+    A substitution, which is specific to ADG1, is made in order to close the
+    turbulent advection term, such that:
+
+    w'^4 = a_3 * (w'^2)^2  +  a_1 * ( (w'^3)^2 / w'^2 );
+
+    where both a_1 and a_3 are variables that are functions of sigma_sqd_w,
+    such that:
+
+    a_1 = 1 / (1 - sigma_sqd_w); and
+
+    a_3 = 3*(sigma_sqd_w)^2 + 6*(1 - sigma_sqd_w)*sigma_sqd_w
+          + (1 - sigma_sqd_w)^2.
+
+    https://arxiv.org/pdf/1711.03675v1.pdf#nameddest=url:wp4_diagnosis
+    """
+    del nzm
+    lhs_ta_wp3 = jnp.zeros((ndiags5, ngrdcol, nzt), dtype=jnp.float64)
+    inv = invrs_rho_ds_zt[:, 1:-1]
+    idzt = gr.invrs_dzt[:, 1:-1]
+
+    if l_standard_term_ta:
+        # The turbulent advection term is discretized normally, in accordance
+        # with the model equations found in the documentation and the description
+        # listed above.
+        if not l_partial_upwind_wp3:
+            # All portions of the wp3 turbulent advection term for ADG1 use
+            # centered discretization in accordance with description and diagram
+            # shown above.
+            # Thermodynamic superdiagonal: [ x wp3(k+1,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[0, :, 1:-1].set(
+                inv * idzt
+                * rho_ds_zm[:, 2:nzt] * a1_coef[:, 2:nzt] * wp3_on_wp2[:, 2:nzt]
+                * gr.weights_zt2zm[:, 2:nzt, T_ABOVE]
+            )
+            # Momentum superdiagonal: [ x wp2(k+1,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[1, :, 1:-1].set(
+                inv * idzt
+                * rho_ds_zm[:, 2:nzt] * a3_coef[:, 2:nzt] * wp2[:, 2:nzt]
+            )
+            # Thermodynamic main diagonal: [ x wp3(k,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[2, :, 1:-1].set(
+                inv * idzt
+                * (
+                    rho_ds_zm[:, 2:nzt] * a1_coef[:, 2:nzt] * wp3_on_wp2[:, 2:nzt]
+                    * gr.weights_zt2zm[:, 2:nzt, T_BELOW]
+                    - rho_ds_zm[:, 1:nzt - 1] * a1_coef[:, 1:nzt - 1]
+                    * wp3_on_wp2[:, 1:nzt - 1]
+                    * gr.weights_zt2zm[:, 1:nzt - 1, T_ABOVE]
+                )
+            )
+            # Momentum subdiagonal: [ x wp2(k,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[3, :, 1:-1].set(
+                -inv * idzt
+                * rho_ds_zm[:, 1:nzt - 1] * a3_coef[:, 1:nzt - 1]
+                * wp2[:, 1:nzt - 1]
+            )
+            # Thermodynamic subdiagonal: [ x wp3(k-1,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[4, :, 1:-1].set(
+                -inv * idzt
+                * rho_ds_zm[:, 1:nzt - 1] * a1_coef[:, 1:nzt - 1]
+                * wp3_on_wp2[:, 1:nzt - 1]
+                * gr.weights_zt2zm[:, 1:nzt - 1, T_BELOW]
+            )
+        else:
+            # Partial upwinding of the wp3 turbulent advection term, where the
+            # portion of the wp3 turbulent advection term that is linearized in
+            # terms of wp2<t+1> is still handled using centered discretization,
+            # but the portion of the term that is linearized in terms of wp3<t+1>
+            # is handled using an "upwind" discretization that also takes into
+            # "winds" that converge or diverge around the central thermodynamic
+            # grid level.  Provided by Chris Vogl and Shixuan Zhang.
+            grid_dir = gr.grid_dir
+            # Thermodynamic superdiagonal: [ x wp3(k+1,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[0, :, 1:-1].set(
+                inv * idzt * rho_ds_zt[:, 2:nzt] * grid_dir
+                * jnp.minimum(
+                    grid_dir * a1_coef[:, 2:nzt] * wp3_on_wp2[:, 2:nzt],
+                    zero,
+                )
+            )
+            # Momentum superdiagonal: [ x wp2(k+1,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[1, :, 1:-1].set(
+                inv * idzt
+                * rho_ds_zm[:, 2:nzt] * a3_coef[:, 2:nzt] * wp2[:, 2:nzt]
+            )
+            # Thermodynamic main diagonal: [ x wp3(k,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[2, :, 1:-1].set(
+                inv * idzt * rho_ds_zt[:, 1:-1] * grid_dir
+                * (
+                    jnp.maximum(
+                        grid_dir * a1_coef[:, 2:nzt] * wp3_on_wp2[:, 2:nzt],
+                        zero,
+                    )
+                    - jnp.minimum(
+                        grid_dir * a1_coef[:, 1:nzt - 1]
+                        * wp3_on_wp2[:, 1:nzt - 1],
+                        zero,
+                    )
+                )
+            )
+            # Momentum subdiagonal: [ x wp2(k,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[3, :, 1:-1].set(
+                -inv * idzt
+                * rho_ds_zm[:, 1:nzt - 1] * a3_coef[:, 1:nzt - 1]
+                * wp2[:, 1:nzt - 1]
+            )
+            # Thermodynamic subdiagonal: [ x wp3(k-1,<t+1>) ]
+            lhs_ta_wp3 = lhs_ta_wp3.at[4, :, 1:-1].set(
+                -inv * idzt * rho_ds_zt[:, :nzt - 2] * grid_dir
+                * jnp.maximum(
+                    grid_dir * a1_coef[:, 1:nzt - 1]
+                    * wp3_on_wp2[:, 1:nzt - 1],
+                    zero,
+                )
+            )
+    else:
+        # Alternate discretization for the turbulent advection term, which
+        # contains the term:
+        #  - (1/rho_ds) * d [ rho_ds * a_1 * (w'^3)^2 / w'^2 ] / dz.  In order
+        # to help stabilize w'^3, a_1 has been pulled outside of the derivative.
+        # On the left-hand side of the equation, this effects the thermodynamic
+        # superdiagonal (kp1_tdiag), the thermodynamic main diagonal (k_tdiag),
+        # and the thermodynamic subdiagonal (km1_tdiag).
+        #
+        # Additionally, the discretization of the turbulent advection term, which
+        # contains the term:
+        #  - (1/rho_ds) * d [ rho_ds * a_3 * (w'^2)^2 ] / dz, has been altered to
+        # pull a_3 outside of the derivative.  This was done in order to help
+        # stabilize w'^3.  On the left-hand side of the equation, this effects
+        # the momentum superdiagonal (k_mdiag) and the momentum subdiagonal
+        # (km1_mdiag).
+        # Thermodynamic superdiagonal: [ x wp3(k+1,<t+1>) ]
+        lhs_ta_wp3 = lhs_ta_wp3.at[0, :, 1:-1].set(
+            inv * a1_coef_zt[:, 1:-1] * idzt
+            * rho_ds_zm[:, 2:nzt] * wp3_on_wp2[:, 2:nzt]
+            * gr.weights_zt2zm[:, 2:nzt, T_ABOVE]
+        )
+        # Momentum superdiagonal: [ x wp2(k+1,<t+1>) ]
+        lhs_ta_wp3 = lhs_ta_wp3.at[1, :, 1:-1].set(
+            inv * a3_coef_zt[:, 1:-1] * idzt
+            * rho_ds_zm[:, 2:nzt] * wp2[:, 2:nzt]
+        )
+        # Thermodynamic main diagonal: [ x wp3(k,<t+1>) ]
+        lhs_ta_wp3 = lhs_ta_wp3.at[2, :, 1:-1].set(
+            inv * a1_coef_zt[:, 1:-1] * idzt
+            * (
+                rho_ds_zm[:, 2:nzt] * wp3_on_wp2[:, 2:nzt]
+                * gr.weights_zt2zm[:, 2:nzt, T_BELOW]
+                - rho_ds_zm[:, 1:nzt - 1] * wp3_on_wp2[:, 1:nzt - 1]
+                * gr.weights_zt2zm[:, 1:nzt - 1, T_ABOVE]
+            )
+        )
+        # Momentum subdiagonal: [ x wp2(k,<t+1>) ]
+        lhs_ta_wp3 = lhs_ta_wp3.at[3, :, 1:-1].set(
+            -inv * a3_coef_zt[:, 1:-1] * idzt
+            * rho_ds_zm[:, 1:nzt - 1] * wp2[:, 1:nzt - 1]
+        )
+        # Thermodynamic subdiagonal: [ x wp3(k-1,<t+1>) ]
+        lhs_ta_wp3 = lhs_ta_wp3.at[4, :, 1:-1].set(
+            -inv * a1_coef_zt[:, 1:-1] * idzt
+            * rho_ds_zm[:, 1:nzt - 1] * wp3_on_wp2[:, 1:nzt - 1]
+            * gr.weights_zt2zm[:, 1:nzt - 1, T_BELOW]
+        )
+
+    return lhs_ta_wp3
+
+
+def wp3_term_tp_lhs(nzm, nzt, ngrdcol, gr, coef_wp3_tp, wp2, rho_ds_zm, invrs_rho_ds_zt):
+    """Turbulent production of w'^3:  implicit portion of the code.
+
+    The d(w'^3)/dt equation contains a turbulent production term:
+
+    + 3 w'^2 dw'^2/dz.
+
+    The pressure scrambling terms damp this term by the coefficient
+    coef_wp3_tp.
+    """
+    del nzm
+    lhs_tp_wp3 = jnp.zeros((ndiags2, ngrdcol, nzt), dtype=jnp.float64)
+    # Momentum superdiagonal: [ x wp2(k+1,<t+1>) ]
+    lhs_tp_wp3 = lhs_tp_wp3.at[0, :, 1:-1].set(
+        -coef_wp3_tp[:, None] * three * invrs_rho_ds_zt[:, 1:-1]
+        * gr.invrs_dzt[:, 1:-1]
+        * rho_ds_zm[:, 2:nzt] * wp2[:, 2:nzt]
+        + coef_wp3_tp[:, None] * three_halves * gr.invrs_dzt[:, 1:-1]
+        * wp2[:, 2:nzt]
+    )
+    # Momentum subdiagonal: [ x wp2(k,<t+1>) ]
+    lhs_tp_wp3 = lhs_tp_wp3.at[1, :, 1:-1].set(
+        coef_wp3_tp[:, None] * three * invrs_rho_ds_zt[:, 1:-1]
+        * gr.invrs_dzt[:, 1:-1]
+        * rho_ds_zm[:, 1:nzt - 1] * wp2[:, 1:nzt - 1]
+        - coef_wp3_tp[:, None] * three_halves * gr.invrs_dzt[:, 1:-1]
+        * wp2[:, 1:nzt - 1]
+    )
+    return lhs_tp_wp3
+
+
+def wp3_terms_ac_pr2_lhs(nzm, nzt, ngrdcol, gr, C11_Skw_fnc, wm_zm):
+    """Accumulation of w'^3 and w'^3 pressure term 2:  implicit portion of the
+    code.
+
+    The w'^3 accumulation term is completely implicit, while w'^3 pressure
+    term 2 has both implicit and explicit components.
+    """
+    del nzm
+    lhs_ac_pr2_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    # Thermodynamic main diagonal: [ x wp3(k,<t+1>) ]
+    lhs_ac_pr2_wp3 = lhs_ac_pr2_wp3.at[:, 1:-1].set(
+        (one - C11_Skw_fnc[:, 1:-1])
+        * three * gr.invrs_dzt[:, 1:-1]
+        * (wm_zm[:, 2:nzt] - wm_zm[:, 1:nzt - 1])
+    )
+    return lhs_ac_pr2_wp3
+
+
+def wp3_term_pr1_lhs(
+    nzt, ngrdcol, gr,
+    C8, C8b,
+    invrs_tau_wp3_zt, Skw_zt,
+    l_damp_wp3_Skw_squared,
+):
+    """Pressure term 1 for w'^3:  implicit portion of the code.
+
+    Pressure term 1 is the term:
+
+    - (C_8/tau_w3t) * ( C_8b * Sk_wt^2 + 1 ) * w'^3;
+
+    where Sk_wt = w'^3 / (w'^2)^(3/2).
+
+    A Taylor Series expansion (truncated after the first derivative term) of
+    L(w'^3) around w'^3 = w'^3(t) is used to linearize pressure term 1.
+    """
+    del gr
+    lhs_pr1_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
+    if l_damp_wp3_Skw_squared:
+        lhs_pr1_wp3 = lhs_pr1_wp3.at[:, 1:-1].set(
+            (C8[:, None] * invrs_tau_wp3_zt[:, 1:-1])
+            * (three * C8b[:, None] * Skw_zt[:, 1:-1] ** 2 + one)
+        )
+    else:
+        lhs_pr1_wp3 = lhs_pr1_wp3.at[:, 1:-1].set(
+            (C8[:, None] * invrs_tau_wp3_zt[:, 1:-1])
+            * (five * C8b[:, None] * Skw_zt[:, 1:-1] ** 4 + one)
+        )
+    return lhs_pr1_wp3
+
+
+def wp3_term_ta_explicit_rhs(nzm, nzt, ngrdcol, gr, wp4, rho_ds_zm, invrs_rho_ds_zt):
+    """Turbulent advection of <w'^3>:  explicit portion of the code.
+
+    This explicit discretization works generally for any PDF.
+
+    The d<w'^3>/dt equation contains a turbulent advection term:
+
+    - (1/rho_ds) * d( rho_ds * <w'^4> )/dz.
+    """
+    del nzm
+    rhs_ta_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
+    rhs_ta_wp3 = rhs_ta_wp3.at[:, 1:-1].set(
+        -invrs_rho_ds_zt[:, 1:-1] * gr.invrs_dzt[:, 1:-1]
+        * (
+            rho_ds_zm[:, 2:nzt] * wp4[:, 2:nzt]
+            - rho_ds_zm[:, 1:nzt - 1] * wp4[:, 1:nzt - 1]
+        )
+    )
+    return rhs_ta_wp3
+
+
+def wp3_terms_bp1_pr2_rhs(nzt, ngrdcol, gr, C11_Skw_fnc, thv_ds_zt, wp2thvp):
+    """Buoyancy production of w'^3 and w'^3 pressure term 2:  explicit portion of
+    the code.
+
+    The d(w'^3)/dt equation contains a buoyancy production term:
+
+    + 3 (g/thv_ds) w'^2th_v';
+
+    and pressure term 2:
+
+    - C_11 ( -3 w'^3 dw/dz + 3 (g/thv_ds) w'^2th_v' ).
+    """
+    del gr
+    rhs_bp1_pr2_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
+    rhs_bp1_pr2_wp3 = rhs_bp1_pr2_wp3.at[:, 1:-1].set(
+        (one - C11_Skw_fnc[:, 1:-1])
+        * three * (grav / thv_ds_zt[:, 1:-1]) * wp2thvp[:, 1:-1]
+    )
+    return rhs_bp1_pr2_wp3
+
+
+def wp3_term_pr_turb_rhs(
+    nzm, nzt, ngrdcol, gr, C_wp3_pr_turb,
+    Kh_zt, wpthvp, dum_dz, dvm_dz,
+    upwp, vpwp,
+    thv_ds_zt,
+    rho_ds_zm, invrs_rho_ds_zt,
+    em, wp2,
+    l_use_tke_in_wp3_pr_turb_term,
+):
+    """Pressure-turbulence correlation RHS for w'^3.
+
+    Experimental term from CLUBB TRAC ticket #411. The derivative here is of
+    the form used to match LES data.
+
+    This does not appear in Andre et al. 1976 or Bougeault et al. 1981, but
+    is based on experiments in matching LES data.
+
+    References:
+      None
+    """
+    del nzm
+    rhs_pr_turb_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    if not l_use_tke_in_wp3_pr_turb_term:
+        rhs_pr_turb_wp3 = rhs_pr_turb_wp3.at[:, 1:-1].set(
+            -C_wp3_pr_turb[:, None] * Kh_zt[:, 1:-1] * gr.invrs_dzt[:, 1:-1]
+            * (
+                grav / thv_ds_zt[:, 1:-1]
+                * (wpthvp[:, 2:nzt] - wpthvp[:, 1:nzt - 1])
+                - (
+                    upwp[:, 2:nzt] * dum_dz[:, 2:nzt]
+                    - upwp[:, 1:nzt - 1] * dum_dz[:, 1:nzt - 1]
+                )
+                - (
+                    vpwp[:, 2:nzt] * dvm_dz[:, 2:nzt]
+                    - vpwp[:, 1:nzt - 1] * dvm_dz[:, 1:nzt - 1]
+                )
+            )
+        )
+    else:
+        rhs_pr_turb_wp3 = rhs_pr_turb_wp3.at[:, 1:-1].set(
+            -C_wp3_pr_turb[:, None] * invrs_rho_ds_zt[:, 1:-1]
+            * gr.invrs_dzt[:, 1:-1]
+            * (
+                rho_ds_zm[:, 2:nzt] * wp2[:, 2:nzt] * em[:, 2:nzt]
+                - rho_ds_zm[:, 1:nzt - 1] * wp2[:, 1:nzt - 1] * em[:, 1:nzt - 1]
+            )
+        )
+    return rhs_pr_turb_wp3
+
+
+def wp3_term_pr_dfsn_rhs(
+    nzm, nzt, ngrdcol, gr, C_wp3_pr_dfsn,
+    rho_ds_zm, invrs_rho_ds_zt,
+    wp2up2, wp2vp2, wp4,
+    up2, vp2, wp2,
+):
+    """Pressure-diffusion RHS for w'^3.
+
+    This term is intended to represent the "diffusion" part of the total wp3
+    pressure correlation.  The total wp3 pressure term, -3w'^2/rho*dp'/dz, can be
+    split into
+
+      -3w'^2/rho*dp'/dz = + 3p'/rho*d(w'^2)/dz - 3/rho*d(w'^2p')/dz
+
+    using the product rule.  The second term on the RHS we consider to be the
+    diffusion part, calculated by this subroutine.
+
+    References:
+      Lumley 1978, p. 170.  See eq. 6.47 and accompanying discussion.
+    """
+    del nzm
+    wp2uip2 = wp2up2 + wp2vp2 + wp4
+    wp2_uip2 = wp2 * up2 + wp2 * vp2 + wp2 * wp2
+    rhs_pr_dfsn_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    rhs_pr_dfsn_wp3 = rhs_pr_dfsn_wp3.at[:, 1:-1].set(
+        C_wp3_pr_dfsn[:, None] * invrs_rho_ds_zt[:, 1:-1]
+        * gr.invrs_dzt[:, 1:-1]
+        * (
+            rho_ds_zm[:, 2:nzt] * (wp2uip2[:, 2:nzt] - wp2_uip2[:, 2:nzt])
+            - rho_ds_zm[:, 1:nzt - 1]
+            * (wp2uip2[:, 1:nzt - 1] - wp2_uip2[:, 1:nzt - 1])
+        )
+    )
+    return rhs_pr_dfsn_wp3
+
+
+def wp3_term_pr1_rhs(
+    nzt, ngrdcol, gr,
+    C8, C8b,
+    invrs_tau_wp3_zt, Skw_zt, wp3,
+    l_damp_wp3_Skw_squared,
+):
+    """Pressure term 1 for w'^3:  explicit portion of the code.
+
+    Pressure term 1 is the term:
+
+    - (C_8/tau_w3t) * ( C_8b * Sk_wt^2 + 1 ) * w'^3;
+
+    where Sk_wt = w'^3 / (w'^2)^(3/2).
+
+    The explicit portion is:
+
+    + (C_8/tau_w3t) * ( 2 * C_8b * Sk_wt^2 + 1 ) * w'^3(t).
+    """
+    del gr
+    rhs_pr1_wp3 = jnp.zeros((ngrdcol, nzt), dtype=jnp.float64)
+    # Calculate term at all interior grid levels.
+    if l_damp_wp3_Skw_squared:
+        rhs_pr1_wp3 = rhs_pr1_wp3.at[:, 1:-1].set(
+            (C8[:, None] * invrs_tau_wp3_zt[:, 1:-1])
+            * (two * C8b[:, None] * Skw_zt[:, 1:-1] ** 2) * wp3[:, 1:-1]
+        )
+    else:
+        rhs_pr1_wp3 = rhs_pr1_wp3.at[:, 1:-1].set(
+            (C8[:, None] * invrs_tau_wp3_zt[:, 1:-1])
+            * (four * C8b[:, None] * Skw_zt[:, 1:-1] ** 4) * wp3[:, 1:-1]
+        )
+    return rhs_pr1_wp3
+
+
+__all__ = [
+    "advance_wp2_wp3",
+    "wp23_solve",
+    "wp23_lhs",
+    "wp23_rhs",
+    "wp2_term_ta_lhs",
+    "wp2_terms_ac_pr2_lhs",
+    "wp2_term_dp1_lhs",
+    "wp2_term_pr1_lhs",
+    "wp2_terms_bp_pr2_rhs",
+    "wp2_term_dp1_rhs",
+    "wp2_term_pr3_rhs",
+    "wp2_term_pr1_rhs",
+    "wp2_term_pr_dfsn_rhs",
+    "wp3_term_ta_new_pdf_lhs",
+    "wp3_term_ta_ADG1_lhs",
+    "wp3_term_tp_lhs",
+    "wp3_terms_ac_pr2_lhs",
+    "wp3_term_pr1_lhs",
+    "wp3_term_ta_explicit_rhs",
+    "wp3_terms_bp1_pr2_rhs",
+    "wp3_term_pr_turb_rhs",
+    "wp3_term_pr_dfsn_rhs",
+    "wp3_term_pr1_rhs",
+]

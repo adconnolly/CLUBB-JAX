@@ -21,6 +21,9 @@ import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5: detect a jax.grad trace
 from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction
+from clubb_jax.src.CLUBB_core.grid_class import zt2zm
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
+from clubb_jax.src.CLUBB_core.err_info import ErrInfo
 from clubb_jax.src.Microphys.KK_microphys.kk_microphys_driver import compute_kk_microphysics
 
 _UPSILON_IDX = 64   # clubb_params index of upsilon_precip_frac_rat (numerical_check._PNAME_IDX)
@@ -110,10 +113,38 @@ def advance_kk_microphysics(state: dict):
         if np.asarray(state['clubb_params']).ndim == 1 else \
         float(np.asarray(state['clubb_params'])[0, _UPSILON_IDX])
 
+    gr = state['gr']
+    clubb_params = jnp.asarray(np.asarray(state['clubb_params'], np.float64))
+    if clubb_params.ndim == 1:
+        clubb_params = clubb_params[None, :]
+    stats = JaxStats.empty(
+        l_sample=False,
+        names=(),
+        ncol=gr.ngrdcol,
+        max_nlev=max(gr.nzm, gr.nzt),
+    )
+    _err, precip_frac, precip_frac_1, precip_frac_2, precip_frac_tol, _stats = precip_fraction(
+        gr,
+        gr.nzt,
+        gr.ngrdcol,
+        hydromet.shape[-1],
+        hydromet,
+        cloud_frac,
+        cf1,
+        l_mix,
+        l_frozen,
+        hm_tol,
+        cf2,
+        isf,
+        isf1,
+        isf2,
+        mixt_frac,
+        clubb_params,
+        ErrInfo.initialized(gr.ngrdcol),
+        stats,
+    )
     precip_frac, precip_frac_1, precip_frac_2, precip_frac_tol = (
-        np.asarray(x) for x in precip_fraction(
-            hydromet, cloud_frac, cf1, cf2, isf, isf1, isf2, mixt_frac,
-            l_mix, l_frozen, hm_tol, upsilon))
+        np.asarray(x) for x in (precip_frac, precip_frac_1, precip_frac_2, precip_frac_tol))
 
     rho = np.asarray(state['rho'], np.float64)
     exner = np.asarray(state['exner'], np.float64)
@@ -144,11 +175,9 @@ def advance_kk_microphysics(state: dict):
     # then zt2zm with the boundary momentum levels zeroed (KK_microphys_module.F90:901-916), and stored
     # for the next step's second-moment forcings (l_var_covar_src; applied in advance_clubb_to_end.py).
     if state.get('l_var_covar_src', True):
-        from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
-        gr = state['gr']
         mc_zt = _compute_kk_covar_mc(state, pdf, prereqs, precip_frac_1, precip_frac_2)
         for nm, v_zt in zip(('wprtp_mc', 'wpthlp_mc', 'rtp2_mc', 'thlp2_mc', 'rtpthlp_mc'), mc_zt):
-            v_zm = np.array(zt2zm_jax(v_zt, gr), np.float64)
+            v_zm = np.array(zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, v_zt), np.float64)
             v_zm[:, 0] = 0.0
             v_zm[:, -1] = 0.0
             state['_kk_' + nm] = v_zm
@@ -165,15 +194,13 @@ def advance_kk_microphysics(state: dict):
     from clubb_jax.src.CLUBB_core.setup_clubb_pdf_params import hydrometp2_zt
     from clubb_jax.src.Microphys.KK_microphys.KK_upscaled_turbulent_sed import KK_sed_vel_covars
     from clubb_jax.src.Microphys.advance_microphys_module import calculate_K_hm, advance_one_hydrometeor
-    from clubb_jax.src.CLUBB_core.grid_class import zt2zm_jax
     from clubb_jax.src.CLUBB_core.Skx_module import Skx_func
     from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical, fill_holes_hydromet_clip_jax
 
-    gr = state['gr']
     clubb_params = jnp.asarray(np.asarray(state['clubb_params'], np.float64))
     w_tol = float(state.get('w_tol', 2.0e-3))
     wp2 = jnp.asarray(np.asarray(state['wp2'], np.float64))            # (ng, nzm)
-    wp3_zm = zt2zm_jax(jnp.asarray(np.asarray(state['wp3'], np.float64)), gr)
+    wp3_zm = zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(np.asarray(state['wp3'], np.float64)))
     Skw_zm = Skx_func(wp2, wp3_zm, w_tol, clubb_params)            # (ng, nzm)
     Kh_zm = jnp.asarray(np.asarray(state['Kh_zm'], np.float64))
     wm_zt = jnp.asarray(np.asarray(state['wm_zt'], np.float64))
@@ -195,11 +222,13 @@ def advance_kk_microphysics(state: dict):
         prereqs['corr_rr_Nr_n'], prereqs['corr_rr_Nr_n'], jnp.asarray(mixt_frac))
 
     def _advance_hm(hm, hm_tndcy, ratio, V_zt, Vi_zt, Ve_zt):
-        hmp2_zm = zt2zm_jax(hydrometp2_zt(hm, jnp.asarray(precip_frac), ratio), gr)
+        hmp2_zm = zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, hydrometp2_zt(hm, jnp.asarray(precip_frac), ratio))
         K_hm = calculate_K_hm(wp2, Kh_zm, Skw_zm, hm, hmp2_zm, hm_tol, gr)
         out = advance_one_hydrometeor(
             float(dt), hm, hm_tndcy, K_hm, nu_hm, wm_zt,
-            zt2zm_jax(V_zt, gr), zt2zm_jax(Vi_zt, gr), zt2zm_jax(Ve_zt, gr),
+            zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, V_zt),
+            zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, Vi_zt),
+            zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, Ve_zt),
             rho_ds_zm, invrs_rho_ds_zt, gr, w_above)
         # fill_holes_vertical: faithful to fill_holes_driver_api (fill_holes.F90) — threshold is
         # zero_threshold (0), NOT hydromet_tol (the JAX previously over-filled tiny-positive edge values

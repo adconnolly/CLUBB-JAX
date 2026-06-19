@@ -1,19 +1,15 @@
-"""JAX port of calc_roots.F90 — closed-form roots of cubic/quadratic polynomials.
+"""JAX port of `src/CLUBB_core/calc_roots.F90`.
 
-Mirrors `clubb_release/src/CLUBB_core/calc_roots.F90` (`cubic_solve`, `quadratic_solve`, `cube_root`).
-`cubic_solve` is Cardano's formula in complex128 (x64 enabled at import). The cube roots of the Cardano
-coefficients S, T use `_cardano_cbrt`, which takes the **real, sign-preserving** cube root when the argument is
-real (determinant D >= 0) and the principal complex branch otherwise — this reproduces gfortran's complex
-`**(1/3)` behavior and yields mathematically-correct roots (a naive principal-branch `**(1/3)` returns garbage
-for the negative-real arguments that arise when D > 0 with R < 0; iter-71 bug fix). The returned roots SATISFY
-the cubic to ~1e-16 and set-match `numpy.roots`; the ordering of the conjugate-pair / real root for D > 0 can
-differ from gfortran's branch-cut convention, so the f2py shadow compares sorted real parts (what the
-`new_pdf`/responder-limit consumers use). All three functions are vectorized (pass arrays; they broadcast) and
-`jax.grad`-able away from the branch points (cube-root cusp at 0, determinant=0 double-root).
-
-In CLUBB these are used by the `new_pdf` / ADG closures; the gated ADG1 path does not call them, so this is a
-completeness port validated by the polynomial-residual + `numpy.roots` oracle (the roots ARE the roots) and,
-when available, the f2py `calc_roots` shadow.
+Porting deviations:
+- The Fortran routines take an explicit ``nz`` and loop over 1D arrays.  The
+  JAX routines broadcast over any leading array shape and stack roots on the
+  last axis.
+- ``cubic_solve`` follows the Fortran Cardano formula, but `_cardano_cbrt`
+  takes the real, sign-preserving cube root when the Cardano argument is real.
+  This is required for mathematically correct roots when ``D > 0`` and
+  ``R - sqrt(D)`` is a negative real number; the plain principal complex branch
+  can return non-roots for that case.  The deviation is covered by residual and
+  set-match tests against `numpy.roots`.
 """
 import jax
 jax.config.update("jax_enable_x64", True)   # cubic_solve uses complex128 (principal-branch ** and sqrt)
@@ -42,26 +38,82 @@ def _cardano_cbrt(z):
 
 
 def cubic_solve(a_coef, b_coef, c_coef, d_coef):
-    """Roots of ``a*x^3 + b*x^2 + c*x + d = 0`` (a /= 0) via Cardano's formula.
+    """Solve for the roots of x in a cubic equation.
 
-    Returns a complex array with the three roots stacked on the LAST axis (shape ``(..., 3)``), in the same
-    order as the Fortran: ``roots[...,0]`` is the always-real root; ``roots[...,1]``/``[...,2]`` are a complex
-    conjugate pair when the determinant D = Q^3 + R^2 > 0, else real."""
+    Fortran comments:
+      Description:
+        Solve for the roots of x in a cubic equation.
+
+        The cubic equation has the form:
+
+        f(x) = a*x^3 + b*x^2 + c*x + d;
+
+        where a /= 0.  When f(x) = 0, the cubic formula is used to solve:
+
+        a*x^3 + b*x^2 + c*x + d = 0.
+
+        The cubic formula is also called Cardano's Formula.
+
+        The three solutions for x are:
+
+        x(1) = -(1/3)*(b/a) + ( S + T );
+        x(2) = -(1/3)*(b/a) - (1/2) * ( S + T ) + (1/2)i * sqrt(3) * ( S - T );
+        x(3) = -(1/3)*(b/a) - (1/2) * ( S + T ) - (1/2)i * sqrt(3) * ( S - T );
+
+        where:
+
+        S = ( R + sqrt( D ) )^(1/3); and
+        T = ( R - sqrt( D ) )^(1/3).
+
+        The determinant, D, is given by:
+
+        D = R^2 + Q^3.
+
+        The values of R and Q relate back to the a, b, c, and d coefficients:
+
+        Q = ( 3*(c/a) - (b/a)^2 ) / 9; and
+        R = ( 9*(b/a)*(c/a) - 27*(d/a) - 2*(b/a)^3 ) / 54.
+
+        When D < 0, there are three unique, real-valued roots.  When D = 0, there
+        are three real-valued roots, but one root is a double root or a triple
+        root.  When D > 0, there is one real-valued root and there are two roots
+        that are complex conjugates.
+
+      References:
+        http://mathworld.wolfram.com/CubicFormula.html
+    """
     a = jnp.asarray(a_coef); b = jnp.asarray(b_coef)
     c = jnp.asarray(c_coef); d = jnp.asarray(d_coef)
 
     ba = b / a
     ca = c / a
     da = d / a
-    cap_Q = (3.0 * ca - ba ** 2) / 9.0                                   # Q = (3(c/a) - (b/a)^2)/9
-    cap_R = (9.0 * ba * ca - 27.0 * da - 2.0 * ba ** 3) / 54.0           # R = (9(b/a)(c/a) - 27(d/a) - 2(b/a)^3)/54
-    determinant = cap_Q ** 3 + cap_R ** 2                               # D = Q^3 + R^2
 
-    sqrt_det = jnp.sqrt(determinant.astype(_C))                          # complex sqrt, principal branch
+    # Find the value of the coefficient Q; where
+    # Q = ( 3*(c/a) - (b/a)^2 ) / 9.
+    cap_Q = (3.0 * ca - ba ** 2) / 9.0
+
+    # Find the value of the coefficient R; where
+    # R = ( 9*(b/a)*(c/a) - 27*(d/a) - 2*(b/a)^3 ) / 54.
+    cap_R = (9.0 * ba * ca - 27.0 * da - 2.0 * ba ** 3) / 54.0
+
+    # Find the value of the determinant D; where
+    # D = R^2 + Q^3.
+    determinant = cap_Q ** 3 + cap_R ** 2
+
+    # Calculate the square root of the determinant.  This will be a complex
+    # number.
+    sqrt_det = jnp.sqrt(determinant.astype(_C))
     R_c = cap_R.astype(_C)
     one_third_c = _C(_ONE_THIRD)
-    cap_S = _cardano_cbrt(R_c + sqrt_det)                                # S = (R + sqrt(D))^(1/3) (gfortran branch)
-    cap_T = _cardano_cbrt(R_c - sqrt_det)                                # T = (R - sqrt(D))^(1/3) (gfortran branch)
+
+    # Find the value of the coefficient S; where
+    # S = ( R + sqrt( D ) )^(1/3).
+    cap_S = _cardano_cbrt(R_c + sqrt_det)
+
+    # Find the value of the coefficient T; where
+    # T = ( R - sqrt( D ) )^(1/3).
+    cap_T = _cardano_cbrt(R_c - sqrt_det)
 
     sqrt_3 = jnp.sqrt(jnp.asarray(3.0, dtype=_C))
     i_c = _C(1j)
@@ -69,30 +121,98 @@ def cubic_solve(a_coef, b_coef, c_coef, d_coef):
     base = -one_third_c * ba_c                                          # -(1/3)(b/a)
     SpT = cap_S + cap_T
     SmT = cap_S - cap_T
+    # Find the values of the roots.
+    # This root is always real-valued.
+    # x(1) = -(1/3)*(b/a) + ( S + T ).
     root1 = base + SpT
+
+    # This root is real-valued when D < 0 (even though the square root of the
+    # determinant is a complex number), as well as when D = 0 (when it is part
+    # of a double or triple root).  When D > 0, this root is a complex number.
+    # It is the complex conjugate of roots(3).
+    # x(2) = -(1/3)*(b/a) - (1/2) * ( S + T ) + (1/2)i * sqrt(3) * ( S - T ).
     root2 = base - _C(0.5) * SpT + _C(0.5) * i_c * sqrt_3 * SmT
+
+    # This root is real-valued when D < 0 (even though the square root of the
+    # determinant is a complex number), as well as when D = 0 (when it is part
+    # of a double or triple root).  When D > 0, this root is a complex number.
+    # It is the complex conjugate of roots(2).
+    # x(3) = -(1/3)*(b/a) - (1/2) * ( S + T ) - (1/2)i * sqrt(3) * ( S - T ).
     root3 = base - _C(0.5) * SpT - _C(0.5) * i_c * sqrt_3 * SmT
     return jnp.stack([root1, root2, root3], axis=-1)
 
 
 def quadratic_solve(a_coef, b_coef, c_coef):
-    """Roots of ``a*x^2 + b*x + c = 0`` (a /= 0). Returns complex ``(..., 2)``:
-    ``(-b ± sqrt(b^2 - 4ac)) / (2a)`` (real when the determinant >= 0)."""
+    """Solve for the roots of x in a quadratic equation.
+
+    Fortran comments:
+      Description:
+        Solve for the roots of x in a quadratic equation.
+
+        The equation has the form:
+
+        f(x) = a*x^2 + b*x + c;
+
+        where a /= 0.  When f(x) = 0, the quadratic formula is used to solve:
+
+        a*x^2 + b*x + c = 0.
+
+        The two solutions for x are:
+
+        x(1) = ( -b + sqrt( b^2 - 4*a*c ) ) / (2*a); and
+        x(2) = ( -b - sqrt( b^2 - 4*a*c ) ) / (2*a).
+
+        The determinant, D, is given by:
+
+        D = b^2 - 4*a*c.
+
+        When D > 0, there are two unique, real-valued roots.  When D = 0, there
+        are two real-valued roots, but they are a double root.  When D < 0, there
+        there are two roots that are complex conjugates.
+
+      References:
+    """
     a = jnp.asarray(a_coef); b = jnp.asarray(b_coef); c = jnp.asarray(c_coef)
+
+    # Find the value of the determinant D; where
+    # D = b^2 - 4*a*c.
     determinant = b ** 2 - 4.0 * a * c
+
+    # Calculate the square root of the determinant.  This will be a complex
+    # number.
     sqrt_det = jnp.sqrt(determinant.astype(_C))
     b_c = b.astype(_C)
     two_a = (2.0 * a).astype(_C)
+
+    # Find the values of the roots.
+    # This root is real-valued when D > 0, as well as when D = 0 (when it is
+    # part of a double root).  When D < 0, this root is a complex number.  It is
+    # the complex conjugate of roots(2).
+    # x(1) = ( -b + sqrt( b^2 - 4*a*c ) ) / (2*a); and
     root1 = (-b_c + sqrt_det) / two_a
+
+    # This root is real-valued when D > 0, as well as when D = 0 (when it is
+    # part of a double root).  When D < 0, this root is a complex number.  It is
+    # the complex conjugate of roots(1).
+    # x(2) = ( -b - sqrt( b^2 - 4*a*c ) ) / (2*a).
     root2 = (-b_c - sqrt_det) / two_a
     return jnp.stack([root1, root2], axis=-1)
 
 
 def cube_root(x):
-    """Real cube root: ``x^(1/3)`` for x>=0, ``-|x|^(1/3)`` for x<0 (the Fortran's NaN-avoiding form).
+    """Calculates the cube root of x.
 
-    Computed as ``sign-adjusted |x|^(1/3)`` so the unused branch carries no NaN; forward-identical to the
-    Fortran. (The fractional power has an infinite derivative at x=0 — a genuine cusp, not a port artifact.)"""
+    Fortran comments:
+      Description:
+        Calculates the cube root of x.
+
+        When x >= 0, this code simply calculates x^(1/3).  When x < 0, this code
+        uses x^(1/3) = -|x|^(1/3).  This eliminates numerical errors when the
+        exponent of 1/3 is not treated as exactly 1/3, which would sometimes
+        result in values of NaN.
+
+      References:
+    """
     x = jnp.asarray(x)
     abs_cbrt = jnp.abs(x) ** _ONE_THIRD
     return jnp.where(x >= 0.0, abs_cbrt, -abs_cbrt)

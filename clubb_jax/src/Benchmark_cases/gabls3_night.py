@@ -23,13 +23,19 @@ from clubb_jax.src.Benchmark_cases.sfc_flux import compute_momentum_flux
 _PI = math.pi
 
 
+def _alog_real32(x):
+    return float(np.log(np.float32(x)).astype(np.float32))
+
+
 # Businger-Dyer stability functions (gabls3_night.F90: gm1/gh1/fm1/fh1) + the integrated psi_h.
 def gm1(x): return (1.0 - 15.0 * x) ** 0.25
 def gh1(x): return math.sqrt(abs(1.0 - 9.0 * x)) / 0.74
-def fm1(x): return (2.0 * math.log((1.0 + x) / 2.0)
-                     + math.log((1.0 + x * x) / 2.0)
+def fm1(x): return (2.0 * _alog_real32((np.float32(1.0) + np.float32(x)) / np.float32(2.0))
+                     + _alog_real32((np.float32(1.0) + np.float32(x * x)) / np.float32(2.0))
                      - 2.0 * math.atan(x) + _PI / 2.0)
-def fh1(x): return 2.0 * math.log((1.0 + 0.74 * x) / 2.0)
+def fh1(x): return 2.0 * _alog_real32(
+    (np.float32(1.0) + np.float32(0.74) * np.float32(x)) / np.float32(2.0)
+)
 def psi_h(x, xlmo): return (-5.0 * x) / xlmo
 
 
@@ -38,19 +44,20 @@ def _landflx_scalar(th, ts, qh, qs, uh, vh, h, z0):
 
     Returns (shf, lhf, vel, ustar) — all in natural CLUBB units.
     """
-    zody = math.log(h / z0)
+    zody = _alog_real32(np.float32(h) / np.float32(z0))
     vel  = math.sqrt(max(0.5, uh ** 2 + vh ** 2))
     r    = 9.81 / ts * (th * (1.0 + ep1 * qh) - ts * (1.0 + ep1 * qs)) * h / vel ** 2
 
     if r < 0.0:
         # Unstable: 3 explicit Businger-Dyer iterations
         xsi = 0.0
-        for _ in range(3):
+        for iter_idx in range(3):
             xm  = gm1(xsi);  xh = gh1(xsi)
             fm  = zody - fm1(xm)
             fh  = 0.74 * (zody - fh1(xh))
             xsi = r / fh * fm ** 2
-            xsi = -abs(xsi)
+            if iter_idx < 2:
+                xsi = -abs(xsi)
     else:
         # Stable: quadratic formula
         a = 4.8 ** 2 * r - 6.35
@@ -60,7 +67,7 @@ def _landflx_scalar(th, ts, qh, qs, uh, vh, h, z0):
         disc = max(0.0, disc)
         xsi1 = (-b + math.sqrt(disc)) / (2.0 * a)
         xsi2 = (-b - math.sqrt(disc)) / (2.0 * a)
-        xsi  = max(xsi1, xsi2)
+        xsi  = float(np.float32(max(np.float32(xsi1), np.float32(xsi2))))
         fm   = zody + 4.8 * xsi
         fh   = zody + 7.8 * xsi   # 1.0 * (...)
 
@@ -69,7 +76,7 @@ def _landflx_scalar(th, ts, qh, qs, uh, vh, h, z0):
 
     xsi = max(1e-5, xsi) if xsi >= 0.0 else min(-1e-5, xsi)
     xlmo = h / xsi
-    denom = math.log(h / 0.25) - psi_h(h, xlmo) + psi_h(0.25, xlmo)
+    denom = _alog_real32(np.float32(h) / np.float32(0.25)) - psi_h(h, xlmo) + psi_h(0.25, xlmo)
     shf = 0.4 * ustar * (ts - th) / denom
     lhf = 0.4 * ustar * (qs - qh) / denom
     return shf, lhf, vel, ustar
@@ -91,13 +98,15 @@ def landflx(th, ts, qh, qs, uh, vh, h, z0):
     xsi_u = jnp.zeros_like(r)
     fm_u = zody
     fh_u = 0.74 * zody
-    for _ in range(3):
+    for iter_idx in range(3):
         xm = (1.0 - 15.0 * xsi_u) ** 0.25                           # base = 1-15*xsi_u >= 1 (xsi_u<=0)
         xh = _safe_sqrt(jnp.abs(1.0 - 9.0 * xsi_u)) / 0.74
         fm_u = zody - (2.0 * jnp.log((1.0 + xm) / 2.0) + jnp.log((1.0 + xm * xm) / 2.0)
                        - 2.0 * jnp.arctan(xm) + jnp.pi / 2.0)
         fh_u = 0.74 * (zody - 2.0 * jnp.log((1.0 + 0.74 * xh) / 2.0))
         xsi_u = -jnp.abs(r / fh_u * fm_u ** 2)
+        if iter_idx == 2:
+            xsi_u = r / fh_u * fm_u ** 2
 
     # stable: quadratic root
     a = 4.8 ** 2 * r - 6.35

@@ -1,153 +1,266 @@
-"""JAX port of diagnose_correlations_module.F90 (active routines).
+"""JAX port of CLUBB_core/diagnose_correlations_module.F90.
 
-Mirrors `clubb_release/src/CLUBB_core/diagnose_correlations_module.F90`: `diagnose_correlations` diagnoses a
-hydrometeor correlation matrix (Larson et al. 2011, JGR 116 D00T02) to feed SILHS — it swaps the w-variable to
-row/col 1 (`rearrange_corr_array`), fills the missing upper-triangle correlations via eq. (15)/(16)
-(`diagnose_corr`), then swaps back. Plus the PDF helpers `calc_w_corr`, `calc_varnce`, `calc_mean`.
-
-This is a completeness port (the gated config uses PRESCRIBED correlations via `corr_varnce_module`, not this
-dynamic diagnosis; the commented-out `approx_w_corr` w-correlation path is NOT ported, so `l_calc_w_corr=True`
-is unsupported — the Fortran leaves the swapped array uninitialised there). Bit-validated against the f2py
-`f2pydiagnose_correlations` oracle (`tests/testdiagnose_correlations.py`). Pure jnp → `jax.grad`-able.
+Porting deviations:
+- ``iiPDF_w`` follows the Fortran-facing API and is 1-based.  Callers using
+  JAX metadata must pass ``hm_metadata.iiPDF_w + 1``.
+- The Fortran ``approx_w_corr`` and ``approx_w_covar`` routines are commented
+  out in the source and are not ported.  Therefore ``l_calc_w_corr=True``
+  raises ``NotImplementedError`` instead of silently taking an incomplete path.
+- Fortran intent(out/inout) arguments are returned as values.
+- Fortran error-stops in correlation assertion checks are exposed as concrete
+  boolean helpers instead of host-side side effects inside JAX array code.
 """
+
 import numpy as np
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.constants_clubb import max_mag_correlation
-from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
+from clubb_jax.src.CLUBB_core.clubb_constants import max_mag_correlation
 
 
-def corr_array_assertion_checks(corr_array):
-    """Validity checks for a correlation matrix (diagnose_correlations_module.F90:corr_array_assertion_checks).
-
-    The Fortran error-stops at debug level >=1 if any off-diagonal correlation is outside
-    [-max_mag_correlation, max_mag_correlation], and at debug level >=2 if any diagonal element differs from 1
-    by more than 1e-6. The JAX path never error-stops, so this returns True iff both hold. Concrete-numpy check
-    (not in any gradient path)."""
-    c = np.asarray(corr_array, dtype=np.float64)
-    n = c.shape[0]
-    off = c[~np.eye(n, dtype=bool)]
-    in_range = bool(np.all(np.abs(off) <= max_mag_correlation))
-    unit_diag = bool(np.all(np.abs(np.diagonal(c) - 1.0) <= 1.0e-6))
-    return in_range and unit_diag
+_SQRT_FLOOR = jnp.finfo(jnp.float64).tiny
 
 
-def rearrange_corr_array(pdf_dim, iipdf_w, corr_array):
-    """Swap variable `iipdf_w` (1-based) with variable 1 in the (lower-triangular-stored) correlation matrix.
-    Faithful 0-based transcription of the Fortran section assignments (all RHS read the ORIGINAL matrix —
-    the in-place writes do not alias the reads)."""
-    n = int(pdf_dim)
-    w0 = int(iipdf_w) - 1
-    C = jnp.asarray(corr_array)
-    swap = C[:, 0]                                              # saved original column 1
-    out = C
-    out = out.at[0:w0 + 1, 0].set(C[w0, w0::-1])               # col1[0..w0] = row w0 reversed (cols w0..0)
-    out = out.at[w0 + 1:n, 0].set(C[w0 + 1:n, w0])            # col1[w0+1..] = col w0[w0+1..]
-    out = out.at[w0, 0:w0 + 1].set(swap[w0::-1])              # row w0[0..w0] = saved col1 reversed
-    out = out.at[w0 + 1:n, w0].set(swap[w0 + 1:n])           # col w0[w0+1..] = saved col1[w0+1..]
-    return out
+def _safe_corr_sqrt(value):
+    """sqrt(max(value, 0)) with finite gradient at exactly zero."""
+    value = jnp.asarray(value, dtype=jnp.float64)
+    return jnp.where(value > 0.0, jnp.sqrt(jnp.maximum(value, _SQRT_FLOOR)), 0.0)
 
 
-def diagnose_corr(corr_approx, corr_prescribed):
-    """Diagnose the upper-triangle correlations (Larson 2011 eq. 15):
-    `c_ij = c_i1*c_j1 + f_ij*sqrt(1-c_i1^2)*sqrt(1-c_j1^2)`, `f_ij = clip(c_ij^prescribed, ±0.99)`,
-    for j=2..n-1, i=j+1..n (1-based). `sqrt_sigma2_on_mu2_ip` is unused (always 0 in the driver)."""
-    Ca = jnp.asarray(corr_approx)
-    Cp = jnp.asarray(corr_prescribed)
-    n = Ca.shape[0]
-    s_1j = _safe_sqrt(1.0 - Ca[:, 0] ** 2)                     # forward-identical to sqrt(1-c^2) for |c|<=1
-    f = jnp.clip(Cp, -max_mag_correlation, max_mag_correlation)
-    diagnosed = jnp.outer(Ca[:, 0], Ca[:, 0]) + f * jnp.outer(s_1j, s_1j)
-    i_idx = jnp.arange(n)[:, None]
-    j_idx = jnp.arange(n)[None, :]
-    mask = (i_idx > j_idx) & (j_idx >= 1) & (j_idx <= n - 2)   # upper-tri, cols 2..n-1 (1-based)
-    return jnp.where(mask, diagnosed, Ca)
+def diagnose_correlations(pdf_dim, iiPDF_w, corr_array_pre, l_calc_w_corr=False):
+    """This subroutine diagnoses the correlation matrix in order to feed it
+    into SILHS microphysics.
 
-
-def diagnose_correlations(pdf_dim, iipdf_w, corr_array_pre, l_calc_w_corr=False):
-    """Diagnose the correlation matrix for SILHS (Larson et al. 2011). Returns the (pdf_dim, pdf_dim)
-    diagnosed `corr_array`. `l_calc_w_corr=True` (the commented-out approx_w_corr path) is unsupported."""
+    References:
+      Larson et al. (2011), J. of Geophysical Research, Vol. 116, D00T02
+      (see CLUBB Trac ticket#514)
+    """
     if l_calc_w_corr:
-        raise NotImplementedError("diagnose_correlations: l_calc_w_corr=True (approx_w_corr) is not ported "
-                                  "(commented out in the Fortran; it leaves the swapped array uninitialised).")
-    pre_swapped = rearrange_corr_array(pdf_dim, iipdf_w, corr_array_pre)
-    swapped = diagnose_corr(pre_swapped, pre_swapped)         # corr_array_swapped = pre_swapped (not l_calc_w_corr)
-    return rearrange_corr_array(pdf_dim, iipdf_w, swapped)
+        raise NotImplementedError(
+            "diagnose_correlations: l_calc_w_corr=True is not ported; the "
+            "underlying Fortran approx_w_corr path is commented out."
+        )
+
+    # Initialize sigma2_on_mu2_ip_array
+
+    # Swap the w-correlations to the first row for the prescribed correlations
+    corr_array_pre_swapped = rearrange_corr_array(pdf_dim, iiPDF_w, corr_array_pre)
+    corr_array_swapped = corr_array_pre_swapped
+
+    # diagnose correlations
+    corr_array_swapped = diagnose_corr(
+        pdf_dim,
+        jnp.zeros((pdf_dim,), dtype=jnp.float64),
+        corr_array_pre_swapped,
+        corr_array_swapped,
+    )
+    # Swap rows back
+    return rearrange_corr_array(pdf_dim, iiPDF_w, corr_array_swapped)
+
+
+def diagnose_corr(n_variables, sqrt_sigma2_on_mu2_ip,
+                  corr_matrix_prescribed, corr_matrix_approx):
+    """This subroutine diagnoses the correlation matrix for each timestep.
+
+    References:
+      Larson et al. (2011), J. of Geophysical Research, Vol. 116, D00T02
+      (see CLUBB Trac ticket#514)
+    """
+    del sqrt_sigma2_on_mu2_ip
+
+    # calculate all square roots
+    s_1j = _safe_corr_sqrt(1.0 - corr_matrix_approx[:, 0] ** 2)
+    f_ij = jnp.clip(
+        corr_matrix_prescribed,
+        -max_mag_correlation,
+        max_mag_correlation,
+    )
+    diagnosed = (
+        # formula (15) in the ref. paper (Larson et al. (2011))
+        corr_matrix_approx[:, 0, None] * corr_matrix_approx[:, 0][None, :]
+        + f_ij * s_1j[:, None] * s_1j[None, :]
+    )
+
+    rows = jnp.arange(n_variables)[:, None]
+    cols = jnp.arange(n_variables)[None, :]
+    mask = (rows > cols) & (cols >= 1) & (cols <= n_variables - 2)
+    return jnp.where(mask, diagnosed, corr_matrix_approx)
 
 
 def calc_w_corr(wpxp, stdev_w, stdev_x, w_tol, x_tol):
-    """Correlation of w with x, clipped to ±max_mag_correlation: `wpxp/(max(stdev_x,x_tol)*max(stdev_w,w_tol))`."""
-    corr = wpxp / (jnp.maximum(stdev_x, x_tol) * jnp.maximum(stdev_w, w_tol))
-    return jnp.clip(corr, -max_mag_correlation, max_mag_correlation)
+    """Compute the correlations of w with the hydrometeors.
+
+    References:
+      clubb:ticket:514
+    """
+    calc_w_corr_value = wpxp / (
+        jnp.maximum(stdev_x, x_tol) * jnp.maximum(stdev_w, w_tol)
+    )
+    # Make sure the correlation is in [-1,1]
+    return jnp.clip(
+        calc_w_corr_value,
+        -max_mag_correlation,
+        max_mag_correlation,
+    )
 
 
 def calc_varnce(mixt_frac, x1, x2, xm, x1p2, x2p2):
-    """Variance of x from its two PDF components: `a*((x1-xm)^2+x1p2) + (1-a)*((x2-xm)^2+x2p2)`."""
-    return mixt_frac * ((x1 - xm) ** 2 + x1p2) + (1.0 - mixt_frac) * ((x2 - xm) ** 2 + x2p2)
+    """Calculate the variance xp2 from the components x1, x2.
+
+    References:
+      Larson et al. (2011), J. of Geophysical Research, Vol. 116, D00T02,
+      page 3535
+    """
+    return (
+        mixt_frac * ((x1 - xm) ** 2 + x1p2)
+        + (1.0 - mixt_frac) * ((x2 - xm) ** 2 + x2p2)
+    )
 
 
 def calc_mean(mixt_frac, x1, x2):
-    """Mean of x from its two PDF components: `a*x1 + (1-a)*x2`."""
+    """Calculate the mean xm from the components x1, x2.
+
+    References:
+      Larson et al. (2011), J. of Geophysical Research, Vol. 116, D00T02,
+      page 3535
+    """
     return mixt_frac * x1 + (1.0 - mixt_frac) * x2
 
 
-def setup_corr_cholesky_mtx(n_variables, corr_matrix):
-    """Transposed correlation Cholesky matrix L' from a correlation matrix (Larson 2011 formula 10;
-    diagnose_correlations_module.F90:setup_corr_cholesky_mtx).
+def calc_cholesky_corr_mtx_approx(n_variables, iiPDF_w, corr_matrix):
+    """This subroutine calculates the transposed correlation cholesky matrix
+    from the correlation matrix
 
-    Uses the angle parameterization s(j,i)=sqrt(1-corr(j,i)^2): the result is lower-triangular (0-based
-    row>=col), with diagonal L'(j,j)=prod_{i<j} s(j,i), first column L'(j,0)=corr(j,0), and off-diagonal
-    L'(j,i)=corr(j,i)*prod_{k<i} s(j,k). Pure-jnp (n_variables is static) → differentiable."""
-    n = int(n_variables)
-    C = jnp.asarray(corr_matrix, dtype=jnp.float64)
-    s = _safe_sqrt(1.0 - C ** 2)                       # s[j,i] = sqrt(1 - corr[j,i]^2)
-    rows = jnp.arange(n)[:, None]
-    cols = jnp.arange(n)[None, :]
-    M = jnp.where(rows >= cols, 1.0, 0.0)              # init lower triangle + diagonal to 1
+    References:
+      1 Larson et al. (2011), J. of Geophysical Research, Vol. 116, D00T02
+      2 CLUBB Trac ticket#514
+    """
+    corr_mtx_swap = rearrange_corr_array(n_variables, iiPDF_w, corr_matrix)
+    corr_cholesky_mtx_swap = setup_corr_cholesky_mtx(
+        n_variables,
+        corr_mtx_swap,
+    )
+    corr_cholesky_mtx = rearrange_corr_array(
+        n_variables,
+        iiPDF_w,
+        corr_cholesky_mtx_swap,
+    )
+    corr_mtx_approx_swap = cholesky_to_corr_mtx_approx(
+        n_variables,
+        corr_cholesky_mtx_swap,
+    )
+    corr_mtx_approx = rearrange_corr_array(
+        n_variables,
+        iiPDF_w,
+        corr_mtx_approx_swap,
+    )
 
-    # Diagonal: M[j,j] = product_{i<j} s[j,i]
-    for j in range(1, n):
-        prod = 1.0
-        for i in range(j):
-            prod = prod * s[j, i]
-        M = M.at[j, j].set(prod)
-
-    # First column: M[j,0] = corr[j,0]
-    for j in range(1, n):
-        M = M.at[j, 0].set(C[j, 0])
-
-    # Off-diagonal lower triangle: M[j,i] = corr[j,i] * product_{k<i} s[j,k]
-    for i in range(1, n - 1):
-        for j in range(i + 1, n):
-            prod = 1.0
-            for k in range(i):
-                prod = prod * s[j, k]
-            M = M.at[j, i].set(prod * C[j, i])
-
-    return M
-
-
-def cholesky_to_corr_mtx_approx(corr_cholesky_mtx_t):
-    """Approximate correlation matrix C = L' L'^T from the transposed correlation Cholesky matrix
-    (diagnose_correlations_module.F90:cholesky_to_corr_mtx_approx, ref formula 8)."""
-    M = jnp.asarray(corr_cholesky_mtx_t, dtype=jnp.float64)
-    return M @ M.T
-
-
-def calc_cholesky_corr_mtx_approx(n_variables, iipdf_w, corr_matrix):
-    """Transposed correlation Cholesky matrix and the approximated correlation matrix C=LL'
-    (diagnose_correlations_module.F90:calc_cholesky_corr_mtx_approx, Larson 2011). Swaps w to the first
-    row/col, builds the angle-Cholesky, swaps back; the approximation is built from the swapped Cholesky then
-    swapped back, with the strict upper triangle zeroed. iipdf_w is 1-based. Returns
-    (corr_cholesky_mtx, corr_mtx_approx)."""
-    n = int(n_variables)
-    corr_swap = rearrange_corr_array(n, iipdf_w, corr_matrix)
-    chol_swap = setup_corr_cholesky_mtx(n, corr_swap)
-    corr_cholesky_mtx = rearrange_corr_array(n, iipdf_w, chol_swap)
-    approx_swap = cholesky_to_corr_mtx_approx(chol_swap)
-    corr_mtx_approx = rearrange_corr_array(n, iipdf_w, approx_swap)
-    # Zero the strict upper triangle (row < col) for conformity.
-    rows = jnp.arange(n)[:, None]
-    cols = jnp.arange(n)[None, :]
-    corr_mtx_approx = jnp.where(rows >= cols, corr_mtx_approx, 0.0)
+    # Fortran error-stops in corr_array_assertion_checks here. The JAX port
+    # keeps that as an explicit concrete helper rather than adding host-side
+    # side effects to this jittable routine.
+    # Set lower triangle to zero for conformity
+    rows = jnp.arange(n_variables)[:, None]
+    cols = jnp.arange(n_variables)[None, :]
+    corr_mtx_approx = jnp.where(rows < cols, 0.0, corr_mtx_approx)
     return corr_cholesky_mtx, corr_mtx_approx
+
+
+def setup_corr_cholesky_mtx(n_variables, corr_matrix):
+    """This subroutine calculates the transposed correlation cholesky matrix
+    from the correlation matrix
+
+    References:
+      1 Larson et al. (2011), J. of Geophysical Research, Vol. 116, D00T02
+      2 CLUBB Trac ticket#514
+    """
+    # calculate all necessary square roots
+    s = _safe_corr_sqrt(1.0 - corr_matrix ** 2)
+
+    # calculate transposed correlation cholesky matrix; ref 1 formula 10
+
+    # initialize matrix to zero
+    rows = jnp.arange(n_variables)[:, None]
+    cols = jnp.arange(n_variables)[None, :]
+    # initialize upper triangle and diagonal to one
+    corr_cholesky_mtx_t = jnp.where(rows >= cols, 1.0, 0.0)
+
+    # set diagonal elements
+    for j in range(1, n_variables):
+        diag_value = 1.0
+        for i in range(j):
+            diag_value = diag_value * s[j, i]
+        corr_cholesky_mtx_t = corr_cholesky_mtx_t.at[j, j].set(diag_value)
+
+    # set first row
+    for j in range(1, n_variables):
+        corr_cholesky_mtx_t = corr_cholesky_mtx_t.at[j, 0].set(
+            corr_matrix[j, 0]
+        )
+
+    # set upper triangle
+    for i in range(1, n_variables - 1):
+        for j in range(i + 1, n_variables):
+            upper_value = 1.0
+            for k in range(i):
+                upper_value = upper_value * s[j, k]
+            upper_value = upper_value * corr_matrix[j, i]
+            corr_cholesky_mtx_t = corr_cholesky_mtx_t.at[j, i].set(upper_value)
+
+    return corr_cholesky_mtx_t
+
+
+def cholesky_to_corr_mtx_approx(n_variables, corr_cholesky_mtx_t=None):
+    """This subroutine approximates the correlation matrix from the correlation
+    cholesky matrix
+
+    References:
+      1 Larson et al. (2011), J. of Geophysical Research, Vol. 116, D00T02
+      2 CLUBB Trac ticket#514
+    """
+    if corr_cholesky_mtx_t is None:
+        corr_cholesky_mtx_t = n_variables
+    else:
+        del n_variables
+    return corr_cholesky_mtx_t @ corr_cholesky_mtx_t.T
+
+
+def corr_array_assertion_checks(n_variables, corr_array=None):
+    """Check the correlation matrix elements and diagonal.
+
+    The Fortran routine stops the program on failure; this JAX/Python helper
+    returns ``False`` instead.
+    """
+    if corr_array is None:
+        corr_array = n_variables
+        n_variables = np.asarray(corr_array).shape[0]
+
+    corr_array = np.asarray(corr_array, dtype=np.float64)
+    off_diagonal = corr_array[~np.eye(n_variables, dtype=bool)]
+    off_diagonal_in_range = bool(
+        np.all(np.abs(off_diagonal) <= max_mag_correlation)
+    )
+    diagonal_is_one = bool(
+        np.all(np.abs(np.diagonal(corr_array) - 1.0) <= 1.0e-6)
+    )
+    return off_diagonal_in_range and diagonal_is_one
+
+
+def rearrange_corr_array(pdf_dim, iiPDF_w, corr_array):
+    """Swap the w-correlations to the first row."""
+    w_idx = int(iiPDF_w) - 1
+    corr_array = jnp.asarray(corr_array, dtype=jnp.float64)
+    swap_array = corr_array[:, 0]
+
+    corr_array_swapped = corr_array
+    corr_array_swapped = corr_array_swapped.at[:w_idx + 1, 0].set(
+        corr_array[w_idx, w_idx::-1]
+    )
+    corr_array_swapped = corr_array_swapped.at[w_idx + 1:pdf_dim, 0].set(
+        corr_array[w_idx + 1:pdf_dim, w_idx]
+    )
+    corr_array_swapped = corr_array_swapped.at[w_idx, :w_idx + 1].set(
+        swap_array[w_idx::-1]
+    )
+    corr_array_swapped = corr_array_swapped.at[w_idx + 1:pdf_dim, w_idx].set(
+        swap_array[w_idx + 1:pdf_dim]
+    )
+    return corr_array_swapped

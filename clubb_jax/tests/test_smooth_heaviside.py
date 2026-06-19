@@ -55,7 +55,8 @@ def test_f2py_is_truncated_constants():
         x = rng.uniform(-3 * smth_range, 3 * smth_range, (2, 20))
         ref = np.asarray(clubb_f2py.f2py_smooth_heaviside_peskin(np.asfortranarray(x), smth_range))
         worst_trunc = max(worst_trunc, np.max(np.abs(_trunc_ref(x, smth_range) - ref)))
-        worst_jax = max(worst_jax, np.max(np.abs(np.asarray(smooth_heaviside_peskin(x, smth_range)) - ref)))
+        nz = x.shape[1] if x.ndim == 2 else x.shape[0]; ngrdcol = x.shape[0] if x.ndim == 2 else 1
+        worst_jax = max(worst_jax, np.max(np.abs(np.asarray(smooth_heaviside_peskin(nz, ngrdcol, x, smth_range)) - ref)))
     assert worst_trunc < 1e-15, f"truncated-const ref should reproduce f2py exactly: {worst_trunc:.2e}"
     assert worst_jax < 1e-9, f"JAX (full pi) vs f2py: {worst_jax:.2e}"
     assert worst_jax > 1e-12, "expected a small nonzero diff from the constant-precision improvement"
@@ -66,11 +67,11 @@ def test_f2py_is_truncated_constants():
 def test_full_pi_closed_form_and_endpoints():
     r = 0.6
     x = np.linspace(-1.5 * r, 1.5 * r, 41)
-    got = np.asarray(smooth_heaviside_peskin(x, r))
+    got = np.asarray(smooth_heaviside_peskin(x.shape[0], 1, x, r))
     xr = x / r
     ref = np.where(x < -r, 0.0, np.where(x > r, 1.0, 0.5 * (1.0 + xr + np.sin(np.pi * xr) / np.pi)))
     assert np.max(np.abs(got - ref)) < 1e-14, "JAX should match the full-pi closed form"
-    assert abs(float(np.asarray(smooth_heaviside_peskin(np.array([[0.0]]), r))[0, 0]) - 0.5) < 1e-14
+    assert abs(float(np.asarray(smooth_heaviside_peskin(1, 1, np.array([[0.0]]), r))[0, 0]) - 0.5) < 1e-14
     assert np.all(np.diff(got) >= -1e-14), "not monotone nondecreasing"
     assert got[0] == 0.0 and got[-1] == 1.0, "tails not saturated"
     print("  JAX matches the full-pi closed form + endpoints (H(0)=0.5, saturated, monotone)  PASS")
@@ -78,8 +79,8 @@ def test_full_pi_closed_form_and_endpoints():
 
 def test_differentiable():
     r = 0.6
-    g = np.asarray(jax.grad(lambda x: jnp.sum(smooth_heaviside_peskin(x, r) ** 2))(
-        jnp.asarray(np.linspace(-0.5, 0.5, 11))))
+    x0 = jnp.asarray(np.linspace(-0.5, 0.5, 11))
+    g = np.asarray(jax.grad(lambda x: jnp.sum(smooth_heaviside_peskin(x.shape[0], 1, x, r) ** 2))(x0))
     assert np.isfinite(g).all(), "non-finite grad through smooth_heaviside_peskin"
     print(f"  jax.grad through smooth_heaviside_peskin: finite ({g.size} entries)  PASS")
 

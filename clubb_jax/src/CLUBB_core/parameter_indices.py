@@ -1,108 +1,139 @@
-"""JAX mirror of CLUBB_core/parameter_indices.F90 — the 1-based indices into the tunable-parameter array.
+"""Zero-based JAX mirror of ``src/CLUBB_core/parameter_indices.F90``.
 
-parameter_indices.F90 is a routine-less Fortran module of `integer, parameter :: iC1 = 1, …` enumerating each
-tunable parameter's column in `clubb_params(ngrdcol, nparams)`. These had lived in constants_clubb.py; relocated
-here to their Fortran home (iter 607). constants_clubb.py re-exports them (`from parameter_indices import *`) so
-`from constants_clubb import iC1/ic_K1/…` keeps working. Pure constants → no imports → no circular dependency.
+Description:
+  Since f90/95 lacks enumeration, we're stuck numbering each
+  parameter by hand like this.
 
-NOTE: Fortran uses 1-based indices into clubb_params(ngrdcol, nparams); the Python clubb_params array uses the SAME
-1-based convention (column 0 is unused / padding) so these constants are used directly.
+  Adding new parameters is relatively simple.  First, the
+  parameter should be added in the common block of the parameters
+  module so it can be used in other parts of the code. Each
+  variable needs a unique number in this module, and nparams must
+  be incremented for the new variable.  Next, the params_list
+  variable in module parameters should have new variable added to
+  it.  The subroutines pack_parameters and uppack_parameters will
+  need to have the variable added to their list, but the order
+  doesn't actually matter, since the i variables in here determine
+  where in the params vector the number is placed.
+  Finally, the namelists clubb_params_nl and initspread will need to
+  have the parameter added to them.
+
+Porting deviations:
+- Fortran numbers the tunable parameters from 1 because it indexes
+  ``clubb_params(ngrdcol, nparams)`` with 1-based array subscripts.  The JAX
+  ``clubb_params`` array has shape ``(ngrdcol, nparams)`` with no padding
+  column, so these constants are the corresponding zero-based Python column
+  indices.
+
+IMPORTANT:
+  If you change the order of these parameters, you will need to
+  change the order of params_list as well or the tuner will
+  break!
 """
 
 nparams = 102
 
-ic_K = 37
-ic_K1 = 38
-ic_K2 = 40
-ic_K6 = 42
-ic_K8 = 44
-ic_K9 = 46
-ic_K10 = 74
-ic_K10h = 75
-ithlp2_rad_coef = 76   # parameter_indices.F90 line 121
+iC1 = 0
+iC1b = 1
+iC1c = 2
+iC2rt = 3
+iC2thl = 4
+iC2rtthl = 5
+iC4 = 6
+iC_uu_shr = 7
+iC_uu_buoy = 8
+iC6rt = 9
+iC6rtb = 10
+iC6rtc = 11
+iC6thl = 12
+iC6thlb = 13
+iC6thlc = 14
+iC7 = 15
+iC7b = 16
+iC7c = 17
+iC8 = 18
+iC8b = 19
+iC10 = 20
+iC11 = 21
+iC11b = 22
+iC11c = 23
+iC12 = 24
+iC13 = 25
+iC14 = 26
+iC_wp2_pr_dfsn = 27
+iC_wp3_pr_tp = 28
+iC_wp3_pr_turb = 29
+iC_wp3_pr_dfsn = 30
+iC_wp2_splat = 31
 
-iC1 = 1
-iC1b = 2
-iC1c = 3          # Slope of C1 skewness function (added in later Fortran)
-iC2rt = 4          # C2 for rtp2 dissipation  (was 3 before iC1c was added)
-iC2thl = 5         # C2 for thlp2 dissipation
-iC2rtthl = 6       # C2 for rtpthlp dissipation (was 7)
-iC4 = 7            # Return-to-isotropy in wp2 (was 8; Fortran replaced iC5 with iC_uu_*)
-iC_uu_shr = 8      # Shear term in wp2 pressure (was called iC5 in older Python)
-iC_uu_buoy = 9     # Buoyancy term in wp2 pressure
-iC6rt = 10
-iC6rtb = 11
-iC6rtc = 12
-iC6thl = 13
-iC6thlb = 14
-iC6thlc = 15
-iC7 = 16
-iC7b = 17
-iC7c = 18          # Slope of C7 skewness function (was missing, shifted iC8+)
-iC8 = 19           # (was 18)
-iC8b = 20          # (was 19)
-iC10 = 21          # (was 20)
-iC11 = 22          # (was 21)
-iC11b = 23         # (was 22)
-iC11c = 24         # (was 23)
-iC12 = 25          # (was 24)
-iC13 = 26          # (was 25)
-iC14 = 27          # (was 26)
-iC_wp2_pr_dfsn = 28
-iC_wp3_pr_tp   = 29
-iC_wp3_pr_turb = 30
-iC_wp3_pr_dfsn = 31
-iC_wp2_splat = 32
-iSkw_max_mag   = 79
-iSkw_denom_coef = 73
-imult_coef = 67
-inu1   = 39
-inu2   = 41
-inu6   = 43
-inu8   = 45
-inu9   = 47
-inu10  = 48
-inu_hm = 52
+iC6rt_Lscale0 = 32
+iC6thl_Lscale0 = 33
+iC7_Lscale0 = 34
+iwpxp_L_thresh = 35
 
-igamma_coef = 57
-igamma_coefb = 58
-igamma_coefc = 59
-imu = 60
-ibeta = 61
-ilmin_coef = 62
-iomicron = 63
-izeta_vrnce_rat = 64
-ilambda0_stability_coef = 66
+ic_K = 36
+ic_K1 = 37
+inu1 = 38
+ic_K2 = 39
+inu2 = 40
+ic_K6 = 41
+inu6 = 42
+ic_K8 = 43
+inu8 = 44
+ic_K9 = 45
+inu9 = 46
+inu10 = 47
+ic_K_hm = 48
+ic_K_hmb = 49
+iK_hm_min_coef = 50
+inu_hm = 51
 
-itaumin = 68
-itaumax = 69
-
-iup2_sfc_coef = 78
-
-ixp3_coef_base = 90
-ixp3_coef_slope = 91
-
-iC_invrs_tau_bkgnd          = 80
-iC_invrs_tau_sfc            = 81
-iC_invrs_tau_shear          = 82
-iC_invrs_tau_N2             = 83
-iC_invrs_tau_N2_wp2         = 84
-iC_invrs_tau_N2_xp2         = 85
-iC_invrs_tau_N2_wpxp        = 86
-iC_invrs_tau_N2_clear_wp3   = 87
-iC_invrs_tau_wpxp_Ri        = 88
-iC_invrs_tau_wpxp_N2_thresh = 89
-ialtitude_threshold         = 92
-iwpxp_Ri_exp                = 101
-iz_displace                 = 102
-
-iCx_min = 94
-iCx_max = 95
-iRichardson_num_min = 96
-iRichardson_num_max = 97
-ia3_coef_min = 98
-ia_const = 99
-ibv_efold = 100
-
-iLscale_mu_coef   = 70
-iLscale_pert_coef = 71
+islope_coef_spread_DG_means_w = 52
+ipdf_component_stdev_factor_w = 53
+icoef_spread_DG_means_rt = 54
+icoef_spread_DG_means_thl = 55
+igamma_coef = 56
+igamma_coefb = 57
+igamma_coefc = 58
+imu = 59
+ibeta = 60
+ilmin_coef = 61
+iomicron = 62
+izeta_vrnce_rat = 63
+iupsilon_precip_frac_rat = 64
+ilambda0_stability_coef = 65
+imult_coef = 66
+itaumin = 67
+itaumax = 68
+iLscale_mu_coef = 69
+iLscale_pert_coef = 70
+ialpha_corr = 71
+iSkw_denom_coef = 72
+ic_K10 = 73
+ic_K10h = 74
+ithlp2_rad_coef = 75
+ithlp2_rad_cloud_frac_thresh = 76
+iup2_sfc_coef = 77
+iSkw_max_mag = 78
+iC_invrs_tau_bkgnd = 79
+iC_invrs_tau_sfc = 80
+iC_invrs_tau_shear = 81
+iC_invrs_tau_N2 = 82
+iC_invrs_tau_N2_wp2 = 83
+iC_invrs_tau_N2_xp2 = 84
+iC_invrs_tau_N2_wpxp = 85
+iC_invrs_tau_N2_clear_wp3 = 86
+iC_invrs_tau_wpxp_Ri = 87
+iC_invrs_tau_wpxp_N2_thresh = 88
+ixp3_coef_base = 89
+ixp3_coef_slope = 90
+ialtitude_threshold = 91
+irtp2_clip_coef = 92
+iCx_min = 93
+iCx_max = 94
+iRichardson_num_min = 95
+iRichardson_num_max = 96
+ia3_coef_min = 97
+ia_const = 98
+ibv_efold = 99
+iwpxp_Ri_exp = 100
+iz_displace = 101

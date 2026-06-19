@@ -1,6 +1,6 @@
 """Tests for JAX diffusion LHS operators vs. Fortran oracle expectations.
 
-Verifies diffusion_zt_lhs_jax and diffusion_zm_lhs_jax against:
+Verifies diffusion_zt_lhs and diffusion_zm_lhs against:
   1. Output shape
   2. Boundary conditions (super_top=0, sub_bot=0)
   3. Conservation: weighted column sums = 0 (zero-flux BC property)
@@ -29,13 +29,15 @@ except ImportError:
     print("JAX not available; skipping tests.")
 
 from clubb_jax.src.CLUBB_core.diffusion import (
-    diffusion_zt_lhs_jax, diffusion_zm_lhs_jax,
+    diffusion_zt_lhs, diffusion_zm_lhs,
 )
+from clubb_jax.src.derived_types.grid_class import setup_grid
 # term_dp1_lhs / xp2_xpyp_lhs live in their Fortran home advance_xp2_xpyp_module.py
 # (advance_xp2_xpyp_module.F90), not diffusion.F90 — mirror-refactor iter 228 removed the
 # dead duplicates from diffusion.py.
 from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import (
-    term_dp1_lhs, xp2_xpyp_lhs,
+    term_dp1_lhs as _term_dp1_lhs,
+    xp2_xpyp_lhs as _xp2_xpyp_lhs,
 )
 
 
@@ -45,45 +47,47 @@ from clubb_jax.src.CLUBB_core.advance_xp2_xpyp_module import (
 
 def make_even_grid(nzm=5, deltaz=100.0, zm_init=50.0, ngrdcol=1):
     """Evenly spaced ascending grid matching Fortran ascending convention."""
-    nzt = nzm - 1
-    zm_1d = np.array([zm_init + k * deltaz for k in range(nzm)], dtype=np.float64)
-    zt_1d = 0.5 * (zm_1d[:-1] + zm_1d[1:])
-
-    zm = np.tile(zm_1d, (ngrdcol, 1))
-    zt = np.tile(zt_1d, (ngrdcol, 1))
-
-    invrs_dzt = 1.0 / (zm[:, 1:] - zm[:, :-1])      # (ngrdcol, nzt)
-
-    # invrs_dzm interior: 1/(zt[k]-zt[k-1]) for k=1..nzm-2
-    # boundaries copy adjacent interior (same as test_grid_ops)
-    dzm_int = zt[:, 1:] - zt[:, :-1]                 # (ngrdcol, nzm-2)
-    invrs_dzm_int = 1.0 / dzm_int
-    invrs_dzm = np.concatenate([
-        invrs_dzm_int[:, :1],
-        invrs_dzm_int,
-        invrs_dzm_int[:, -1:],
-    ], axis=1)                                        # (ngrdcol, nzm)
-
-    class Grid:
-        pass
-
-    gr = Grid()
-    gr.nzm, gr.nzt, gr.ngrdcol = nzm, nzt, ngrdcol
-    gr.zm, gr.zt = zm, zt
-    gr.invrs_dzt = invrs_dzt
-    gr.invrs_dzm = invrs_dzm
-    return gr
+    return setup_grid(
+        ngrdcol=ngrdcol,
+        deltaz=deltaz,
+        zm_init=zm_init,
+        zm_top=zm_init + (nzm - 1) * deltaz,
+        grid_type=1,
+    )
 
 
 def _to_jax(gr):
-    class JaxGrid:
-        pass
-    jgr = JaxGrid()
-    for attr in ('nzm', 'nzt', 'ngrdcol'):
-        setattr(jgr, attr, getattr(gr, attr))
-    for attr in ('zm', 'zt', 'invrs_dzt', 'invrs_dzm'):
-        setattr(jgr, attr, jnp.array(getattr(gr, attr), dtype=jnp.float64))
-    return jgr
+    return gr
+
+
+def term_dp1_lhs(Cn, invrs_tau):
+    """Test helper for current explicit term_dp1_lhs."""
+    ngrdcol, nzm = Cn.shape
+    gr = make_even_grid(nzm=nzm, ngrdcol=ngrdcol)
+    return _term_dp1_lhs(nzm, ngrdcol, gr, Cn, invrs_tau)
+
+
+def xp2_xpyp_lhs(ta, ma, diff, dp1, dt=60.0, gamma=1.5):
+    """Test helper for current explicit xp2_xpyp_lhs."""
+    if gamma != 1.5:
+        raise ValueError("current source uses gamma_over_implicit_ts=1.5")
+    ngrdcol, nzm = dp1.shape
+    gr = make_even_grid(nzm=nzm, ngrdcol=ngrdcol)
+    return _xp2_xpyp_lhs(nzm, ngrdcol, dt, gr, ta, ma, diff, dp1)
+
+
+def call_diffusion_zt_lhs(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr):
+    K_zt = jnp.zeros((gr.ngrdcol, gr.nzt), dtype=jnp.float64)
+    return diffusion_zt_lhs(
+        gr.nzm, gr.nzt, gr.ngrdcol, gr, K_zm, K_zt, nu, invrs_rho_ds_zt, rho_ds_zm
+    )
+
+
+def call_diffusion_zm_lhs(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr):
+    K_zm = jnp.zeros((gr.ngrdcol, gr.nzm), dtype=jnp.float64)
+    return diffusion_zm_lhs(
+        gr.nzm, gr.nzt, gr.ngrdcol, gr, K_zt, K_zm, nu, invrs_rho_ds_zm, rho_ds_zt
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,7 +105,7 @@ def test_diffusion_zt_lhs_shape():
     nu = jnp.zeros(ngrdcol)
     invrs_rho_ds_zt = jnp.ones((ngrdcol, nzt))
     rho_ds_zm = jnp.ones((ngrdcol, nzm))
-    lhs = diffusion_zt_lhs_jax(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr)
+    lhs = call_diffusion_zt_lhs(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr)
     assert lhs.shape == (3, ngrdcol, nzt), f"Wrong shape: {lhs.shape}"
     print(f"  shape = {lhs.shape}  PASS")
 
@@ -117,7 +121,7 @@ def test_diffusion_zt_lhs_boundary_zeros():
     nu = 1.0 * jnp.ones(ngrdcol)
     invrs_rho_ds_zt = jnp.ones((ngrdcol, nzt))
     rho_ds_zm = 1.2 * jnp.ones((ngrdcol, nzm))
-    lhs = np.asarray(diffusion_zt_lhs_jax(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr))
+    lhs = np.asarray(call_diffusion_zt_lhs(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr))
     # super at top level (k=nzt-1) must be 0
     assert abs(lhs[0, 0, -1]) < 1e-15, f"super_top = {lhs[0,0,-1]}, expected 0"
     # sub at bottom level (k=0) must be 0
@@ -142,9 +146,9 @@ def test_diffusion_zt_lhs_conservation():
     nu = 0.5 * jnp.ones(ngrdcol)
     invrs_rho_ds_zt = 0.8 * jnp.ones((ngrdcol, nzt))
     rho_ds_zm = 1.25 * jnp.ones((ngrdcol, nzm))
-    lhs = np.asarray(diffusion_zt_lhs_jax(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr_j))
+    lhs = np.asarray(call_diffusion_zt_lhs(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr_j))
     super_d, main_d, sub_d = lhs[0], lhs[1], lhs[2]    # (ngrdcol, nzt)
-    dzt = 1.0 / gr.invrs_dzt                            # (ngrdcol, nzt)
+    dzt = np.asarray(1.0 / gr.invrs_dzt)                 # (ngrdcol, nzt)
 
     # Weighted column sum: col_sum[j] = sum_k{ dzt[k] * lhs_kj }
     col_sum = dzt * main_d
@@ -176,7 +180,7 @@ def test_diffusion_zt_lhs_values():
     nu = jnp.zeros(ngrdcol)
     invrs_rho_ds_zt = jnp.ones((ngrdcol, nzt))
     rho_ds_zm = jnp.ones((ngrdcol, nzm))
-    lhs = np.asarray(diffusion_zt_lhs_jax(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr))
+    lhs = np.asarray(call_diffusion_zt_lhs(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr))
     C = 0.001
     expected_super = np.array([-C, -C, -C,  0.0])
     expected_main  = np.array([ C, 2*C, 2*C, C])
@@ -203,7 +207,7 @@ def test_diffusion_zt_lhs_main_diag_identity():
     nu = jnp.array(rng.uniform(0.0, 0.5, ngrdcol))
     invrs_rho_ds_zt = jnp.array(rng.uniform(0.5, 2.0, (ngrdcol, nzt)))
     rho_ds_zm = jnp.array(rng.uniform(0.8, 1.5, (ngrdcol, nzm)))
-    lhs = np.asarray(diffusion_zt_lhs_jax(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr))
+    lhs = np.asarray(call_diffusion_zt_lhs(K_zm, nu, invrs_rho_ds_zt, rho_ds_zm, gr))
     err = np.max(np.abs(lhs[1] + lhs[0] + lhs[2]))
     print(f"  max |main + super + sub| = {err:.3e}  PASS" if err < 1e-13
           else f"  FAIL err={err}")
@@ -225,7 +229,7 @@ def test_diffusion_zm_lhs_shape():
     nu = jnp.zeros(ngrdcol)
     invrs_rho_ds_zm = jnp.ones((ngrdcol, nzm))
     rho_ds_zt = jnp.ones((ngrdcol, nzt))
-    lhs = diffusion_zm_lhs_jax(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr)
+    lhs = call_diffusion_zm_lhs(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr)
     assert lhs.shape == (3, ngrdcol, nzm), f"Wrong shape: {lhs.shape}"
     print(f"  shape = {lhs.shape}  PASS")
 
@@ -241,7 +245,7 @@ def test_diffusion_zm_lhs_boundary_zeros():
     nu = 0.2 * jnp.ones(ngrdcol)
     invrs_rho_ds_zm = jnp.ones((ngrdcol, nzm))
     rho_ds_zt = 1.1 * jnp.ones((ngrdcol, nzt))
-    lhs = np.asarray(diffusion_zm_lhs_jax(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr))
+    lhs = np.asarray(call_diffusion_zm_lhs(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr))
     assert abs(lhs[0, 0, -1]) < 1e-15, f"super_top = {lhs[0,0,-1]}, expected 0"
     assert abs(lhs[2, 0, 0]) < 1e-15, f"sub_bot = {lhs[2,0,0]}, expected 0"
     print(f"  super_top={lhs[0,0,-1]:.2e}  sub_bot={lhs[2,0,0]:.2e}  PASS")
@@ -266,9 +270,9 @@ def test_diffusion_zm_lhs_conservation():
     nu = 0.3 * jnp.ones(ngrdcol)
     invrs_rho_ds_zm = (1.0 / 1.2) * jnp.ones((ngrdcol, nzm))
     rho_ds_zt = 1.2 * jnp.ones((ngrdcol, nzt))
-    lhs = np.asarray(diffusion_zm_lhs_jax(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr_j))
+    lhs = np.asarray(call_diffusion_zm_lhs(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr_j))
     super_d, main_d, sub_d = lhs[0], lhs[1], lhs[2]   # (ngrdcol, nzm)
-    dzm = 1.0 / gr.invrs_dzm                           # (ngrdcol, nzm)
+    dzm = np.asarray(1.0 / gr.invrs_dzm)                # (ngrdcol, nzm)
 
     # Check conservation for columns j=1..nzm-1 (lower boundary excluded)
     col_sum = dzm * main_d
@@ -301,7 +305,7 @@ def test_diffusion_zm_lhs_values():
     nu = jnp.zeros(ngrdcol)
     invrs_rho_ds_zm = jnp.ones((ngrdcol, nzm))
     rho_ds_zt = jnp.ones((ngrdcol, nzt))
-    lhs = np.asarray(diffusion_zm_lhs_jax(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr))
+    lhs = np.asarray(call_diffusion_zm_lhs(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr))
     C = 0.0001
     expected_super = np.array([-C, -C, -C, -C,  0.0])
     expected_main  = np.array([ C, 2*C, 2*C, 2*C, C])
@@ -330,7 +334,7 @@ def test_diffusion_zm_lhs_main_diag_identity():
     nu = jnp.array(rng.uniform(0.0, 0.5, ngrdcol))
     invrs_rho_ds_zm = jnp.array(rng.uniform(0.5, 2.0, (ngrdcol, nzm)))
     rho_ds_zt = jnp.array(rng.uniform(0.8, 1.5, (ngrdcol, nzt)))
-    lhs = np.asarray(diffusion_zm_lhs_jax(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr))
+    lhs = np.asarray(call_diffusion_zm_lhs(K_zt, nu, invrs_rho_ds_zm, rho_ds_zt, gr))
     err = np.max(np.abs(lhs[1] + lhs[0] + lhs[2]))
     print(f"  max |main + super + sub| = {err:.3e}  PASS" if err < 1e-13
           else f"  FAIL err={err}")
@@ -508,9 +512,6 @@ def test_f2py_oracle():
     except Exception as e:
         print(f"  f2py diffusion oracle: SKIP ({type(e).__name__})")
         return
-    from clubb_jax.src.derived_types.grid_class import setup_grid
-    from clubb_jax.src.CLUBB_core.diffusion import diffusion_zt_lhs_jax, diffusion_zm_lhs_jax
-
     NG, DZ, ZTOP = 2, 40.0, 1200.0
     jgr = setup_grid(ngrdcol=NG, deltaz=DZ, zm_init=0.0, zm_top=ZTOP, grid_type=1)  # stretched grid
     ng, nzm = jgr.zm.shape
@@ -531,13 +532,13 @@ def test_f2py_oracle():
 
     ref_zt = np.asarray(clubb_f2py.f2py_diffusion_zt_lhs(
         np.asfortranarray(K_zm), np.asfortranarray(K_zt), nu, np.asfortranarray(irho_zt), np.asfortranarray(rho_zm)))
-    got_zt = np.asarray(diffusion_zt_lhs_jax(jnp.asarray(K_zm), jnp.asarray(nu), jnp.asarray(irho_zt), jnp.asarray(rho_zm), jgr))
+    got_zt = np.asarray(call_diffusion_zt_lhs(jnp.asarray(K_zm), jnp.asarray(nu), jnp.asarray(irho_zt), jnp.asarray(rho_zm), jgr))
     worst_zt = float(np.max(np.abs(ref_zt - got_zt)))
     assert worst_zt < 1e-12, f"diffusion_zt_lhs f2py mismatch {worst_zt:.2e}"
 
     ref_zm = np.asarray(clubb_f2py.f2py_diffusion_zm_lhs(
         np.asfortranarray(K_zt), np.asfortranarray(K_zm), nu, np.asfortranarray(irho_zm), np.asfortranarray(rho_zt)))
-    got_zm = np.asarray(diffusion_zm_lhs_jax(jnp.asarray(K_zt), jnp.asarray(nu), jnp.asarray(irho_zm), jnp.asarray(rho_zt), jgr))
+    got_zm = np.asarray(call_diffusion_zm_lhs(jnp.asarray(K_zt), jnp.asarray(nu), jnp.asarray(irho_zm), jnp.asarray(rho_zt), jgr))
     worst_zm = float(np.max(np.abs(ref_zm - got_zm)))
     assert worst_zm < 1e-12, f"diffusion_zm_lhs f2py mismatch {worst_zm:.2e}"
     print(f"  f2py diffusion zt/zm LHS: bit-match on stretched grid + varying K, worst {max(worst_zt, worst_zm):.2e}  PASS")
