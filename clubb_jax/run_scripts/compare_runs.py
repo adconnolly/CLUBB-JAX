@@ -25,7 +25,7 @@ JAX_ROOT    = os.path.normpath(os.path.join(RUN_SCRIPTS, "../.."))   # CLUBB-JAX
 CLUBB_ROOT  = os.path.normpath(os.path.join(JAX_ROOT, "clubb_release"))
 PYTHONPATH  = os.pathsep.join([JAX_ROOT, CLUBB_ROOT,
                                 os.path.join(CLUBB_ROOT, "clubb_python_api")])
-DEFAULT_FORTRAN_COMPARE_ROOT = os.path.join(JAX_ROOT, "output_fortran")
+DEFAULT_FORTRAN_COMPARE_ROOT = os.path.join(CLUBB_ROOT, "output")
 DEFAULT_JAX_COMPARE_ROOT = os.path.join(JAX_ROOT, "clubb_jax", "output")
 
 REL_TOL = 1e-6   # flag variables whose max|Δ|/max|ref| exceeds this
@@ -179,7 +179,7 @@ def main():
                              "clubb_release/install/latest/clubb_standalone.")
     parser.add_argument("--fortran-out-root", default=os.environ.get("FORTRAN_OUT_ROOT"),
                         help="Root directory for transient Fortran comparison output. "
-                             "Default: output_fortran under the repo root.")
+                             "Default: clubb_release/output.")
     parser.add_argument("--jax-out-root", default=os.environ.get("JAX_OUT_ROOT"),
                         help="Root directory for transient JAX comparison output. "
                              "Default: clubb_jax/output.")
