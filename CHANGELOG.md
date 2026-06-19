@@ -68,6 +68,25 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
 
 ## Recent work
 
+### 2026-06-19 — JAX-vs-Fortran speed assessment + persistent JIT cache (`main`)
+- **Environment reconstruction.** This checkout arrived with no jax, an empty `clubb_release` submodule, and no
+  compiled oracle. Rebuilt all of it: jax venv (jax 0.10.2 + numpy + netCDF4 + tabulate) at
+  `/burg/home/ac5006/scratch/jaxenv`; `git submodule update --init clubb_release`; compiled the intel `ifx` +
+  f2py oracle (`compile.py -python -precision double` → `install/intel_PRECdouble_PYTHON`). Two build blockers
+  fixed: (1) cmake 3.28 module had a GLIBCXX mismatch → used a pip-wheel cmake; (2) every `ifx` Fortran link
+  failed on `for_alloc_allocatable_handle` because a stale `parallel_studio_xe_2020` ifort runtime shadowed the
+  HPCKit `libifcore` on `LIBRARY_PATH` → prepend `HPCKit/.../compiler/lib/intel64_lin`. The module's
+  netcdf-fortran is ifort-built (ifx can't read its `.mod`), so CMake correctly FetchContent-builds netcdf-fortran
+  with ifx. (`run_bindiff_all.py` needs `tabulate`.)
+- **Comparison runs.** `run_jax_vs_fortran_cases.py` + `run_scm.py -jax`: ARM/30 steps is **bit-faithful** (PASS,
+  0 vars over 1e-7). Speed: **Fortran 2.0 s vs JAX cold 133–147 s** — confirmed compile-dominated (244 XLA
+  compiles via `JAX_LOG_COMPILES`), matching the DESIGN performance finding.
+- **Fix applied (DESIGN Next Steps, step 1).** Enabled JAX's **persistent on-disk compilation cache** at import in
+  `advance_clubb_core_module.py` (default `~/.cache/clubb_jax_jit`; `CLUBB_JAX_NO_JIT_CACHE=1` to disable,
+  `JAX_COMPILATION_CACHE_DIR` to relocate). Cross-process cache hit → **warm 70–78 s (~47% faster)**; numerically
+  transparent (ARM still bit-faithful, grad unaffected — cached executable is byte-identical). The residual ~70 s
+  is tracing+MLIR-lowering of the 244 leaves; the whole-step-jit / `lax.scan` restructuring remains the open lever.
+
 ### 2026-06-19 — `formatting_and_jitting` branch (WIP)
 - **Branch scope:** a formatting / Fortran-comment-copying pass; **JIT-friendly derived types** (`derived_types/`
   ConfigFlags/Grid/pdf_parameter made jit-static); a new **pure-JAX `src/io/` init path**
