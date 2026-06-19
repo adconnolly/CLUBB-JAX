@@ -46,7 +46,7 @@ def test_xm_term_ta_lhs():
     idzt = np.asarray(gr.invrs_dzt)
     rng = np.random.default_rng(51)
     inv_rho_zt = rng.uniform(0.8, 2.0, (_NG, nzt)); rho_zm = rng.uniform(0.5, 1.2, (_NG, nzm))
-    j = np.asarray(xm_term_ta_lhs(jnp.asarray(inv_rho_zt), jnp.asarray(rho_zm), gr))
+    j = np.asarray(xm_term_ta_lhs(nzm, nzt, _NG, gr, jnp.asarray(rho_zm), jnp.asarray(inv_rho_zt)))
     ref = np.zeros((2, _NG, nzt))
     for k in range(nzt):                         # no BC zeroing — full zt array
         ref[0, :, k] = inv_rho_zt[:, k] * idzt[:, k] * rho_zm[:, k + 1]
@@ -60,7 +60,7 @@ def test_wpxp_term_tp_lhs():
     idzm = np.asarray(gr.invrs_dzm)
     rng = np.random.default_rng(52)
     wp2 = rng.uniform(1e-3, 2.0, (_NG, nzm))
-    j = np.asarray(wpxp_term_tp_lhs(jnp.asarray(wp2), gr))
+    j = np.asarray(wpxp_term_tp_lhs(nzm, _NG, gr, jnp.asarray(wp2)))
     ref = np.zeros((2, _NG, nzm))
     for k in range(1, nzm - 1):
         ref[0, :, k] = wp2[:, k] * idzm[:, k]
@@ -77,9 +77,9 @@ def test_wpxp_ac_pr1_bp():
     C6 = rng.uniform(2.0, 5.0, (_NG, nzm)); itau6 = rng.uniform(1e-3, 1e-2, (_NG, nzm))
     thv = rng.uniform(290.0, 320.0, (_NG, nzm)); xpthvp = rng.uniform(-0.1, 0.3, (_NG, nzm))
 
-    jac = np.asarray(wpxp_terms_ac_pr2_lhs(jnp.asarray(C7), jnp.asarray(wm_zt), gr))
-    jp1 = np.asarray(wpxp_term_pr1_lhs(jnp.asarray(C6), jnp.asarray(itau6)))
-    jbp = np.asarray(wpxp_terms_bp_pr3_rhs(jnp.asarray(C7), jnp.asarray(thv), jnp.asarray(xpthvp)))
+    jac = np.asarray(wpxp_terms_ac_pr2_lhs(nzm, nzt, _NG, gr, jnp.asarray(C7), jnp.asarray(wm_zt), jnp.asarray(gr.invrs_dzm)))
+    jp1 = np.asarray(wpxp_term_pr1_lhs(nzm, _NG, gr, jnp.asarray(C6), jnp.asarray(C6), jnp.asarray(C7), jnp.asarray(itau6), False)[0])
+    jbp = np.asarray(wpxp_terms_bp_pr3_rhs(nzm, _NG, gr, jnp.asarray(C7), jnp.asarray(thv), jnp.asarray(xpthvp)))
     rac = np.zeros((_NG, nzm)); rp1 = np.zeros((_NG, nzm)); rbp = np.zeros((_NG, nzm))
     for k in range(1, nzm - 1):
         rac[:, k] = (1.0 - C7[:, k]) * idzm[:, k] * (wm_zt[:, k] - wm_zt[:, k - 1])

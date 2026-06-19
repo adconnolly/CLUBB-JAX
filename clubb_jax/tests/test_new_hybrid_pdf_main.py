@@ -23,6 +23,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.new_hybrid_pdf_main import new_hybrid_pdf_driver
+from clubb_jax.src.CLUBB_core.pdf_params import init_pdf_implicit_coefs_terms_api
 
 NG, NZ, SD = 2, 6, 1
 
@@ -78,6 +79,7 @@ def test_f2py_oracle():
             a['up2'], a['vp2'], a['Skw'], a['wprtp'], a['wpthlp'], a['upwp'], a['vpwp'],
             a['gamma_Skw_fnc'], a['slope_coef_spread_DG_means_w'], a['pdf_component_stdev_factor_w'],
             a['Skrt'], a['Skthl'], a['Sku'], a['Skv'],
+            init_pdf_implicit_coefs_terms_api(nz=NZ, ngrdcol=NG, sclr_dim=SD),
             s['sclrm'], s['sclrp2'], s['wpsclrp'], s['Sksclr'])
         for fi, key in zip(f, _ORDER):
             gi = np.asarray(g[key])
@@ -96,7 +98,8 @@ def test_sigma_sqd_w_and_grad():
         a['wm'], a['rtm'], a['thlm'], a['um'], a['vm'], a['wp2'], a['rtp2'], a['thlp2'],
         a['up2'], a['vp2'], a['Skw'], a['wprtp'], a['wpthlp'], a['upwp'], a['vpwp'],
         a['gamma_Skw_fnc'], a['slope_coef_spread_DG_means_w'], a['pdf_component_stdev_factor_w'],
-        a['Skrt'], a['Skthl'], a['Sku'], a['Skv'])
+        a['Skrt'], a['Skthl'], a['Sku'], a['Skv'],
+        init_pdf_implicit_coefs_terms_api(nz=NZ, ngrdcol=NG, sclr_dim=0))
     # sigma_sqd_w must lie in (0,1) (since F_w in (0,1]) and mixt_frac must be valid.
     ssw = np.asarray(g['sigma_sqd_w'])
     assert np.all(ssw >= 0.0) and np.all(ssw < 1.0), "sigma_sqd_w out of [0,1)"
@@ -108,8 +111,9 @@ def test_sigma_sqd_w_and_grad():
             a['wm'], a['rtm'], a['thlm'], a['um'], a['vm'], a['wp2'], a['rtp2'], a['thlp2'],
             a['up2'], a['vp2'], Skw, a['wprtp'], a['wpthlp'], a['upwp'], a['vpwp'],
             a['gamma_Skw_fnc'], a['slope_coef_spread_DG_means_w'], a['pdf_component_stdev_factor_w'],
-            a['Skrt'], a['Skthl'], a['Sku'], a['Skv'])
-        return sum(jnp.sum(v ** 2) for v in out.values())
+            a['Skrt'], a['Skthl'], a['Sku'], a['Skv'],
+            init_pdf_implicit_coefs_terms_api(nz=NZ, ngrdcol=NG, sclr_dim=0))
+        return sum(jnp.sum(v ** 2) for k, v in out.items() if k != "pdf_implicit_coefs_terms")
     grad = np.asarray(jax.grad(loss)(jnp.asarray(a['Skw'])))
     assert np.isfinite(grad).all(), "non-finite grad through new_hybrid_pdf_driver"
     print(f"  jax.grad through new_hybrid_pdf_driver: finite ({grad.size} entries)  PASS")

@@ -18,6 +18,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.new_pdf_main import calc_F_x_zeta_x_setter, new_pdf_driver
+from clubb_jax.src.CLUBB_core.pdf_params import init_pdf_implicit_coefs_terms_api
 
 NG, NZ = 2, 6
 _SLOPE, _STDEV_FACTOR, _LAMBDA = 1.4, 1.2, 0.5
@@ -96,8 +97,11 @@ def test_driver_f2py():
         rtpthlp = rng.uniform(-1e-4, 1e-4, (ng, nz))
         f = clubb_f2py.f2py_new_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, wprtp, wpthlp, rtpthlp,
                                            params, Skrt.copy(), Skthl.copy())
-        g = new_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, wprtp, wpthlp, rtpthlp, params, Skrt, Skthl)
-        for fi, gi in zip(f, g):
+        g = new_pdf_driver(wm, rtm, thlm, wp2, rtp2, thlp2, Skw, wprtp, wpthlp, rtpthlp, params, Skrt, Skthl,
+                           init_pdf_implicit_coefs_terms_api(nz=nz, ngrdcol=ng, sclr_dim=0))
+        # f is a tuple of f2py outputs; g is a dict; compare in order (skip pdf_implicit_coefs_terms)
+        g_vals = [v for k, v in g.items() if k != "pdf_implicit_coefs_terms"]
+        for fi, gi in zip(f, g_vals):
             worst = max(worst, np.max(np.abs(np.asarray(gi) - np.asarray(fi))))
     assert worst < 1e-11, f"new_pdf_driver f2py mismatch {worst:.2e}"
     print(f"  f2py new_pdf_driver: bit-match (15 PDF-param outputs incl. clipped Skrt/Skthl), worst {worst:.2e}  PASS")
@@ -114,8 +118,10 @@ def test_driver_differentiable():
              rtpthlp=rng.uniform(-1e-4, 1e-4, (ng, nz)), Skrt=rng.uniform(-1, 1, (ng, nz)), Skthl=rng.uniform(-1, 1, (ng, nz)))
     def loss(Skw):
         outs = new_pdf_driver(a['wm'], a['rtm'], a['thlm'], a['wp2'], a['rtp2'], a['thlp2'], Skw,
-                              a['wprtp'], a['wpthlp'], a['rtpthlp'], params, a['Skrt'], a['Skthl'])
-        return sum(jnp.sum(o ** 2) for o in outs)
+                              a['wprtp'], a['wpthlp'], a['rtpthlp'], params, a['Skrt'], a['Skthl'],
+                              init_pdf_implicit_coefs_terms_api(nz=nz, ngrdcol=ng, sclr_dim=0))
+        # outs is a dict; sum over the JAX-array values (exclude pdf_implicit_coefs_terms namedtuple)
+        return sum(jnp.sum(v ** 2) for k, v in outs.items() if k != "pdf_implicit_coefs_terms")
     g = np.asarray(jax.grad(loss)(jnp.asarray(rng.uniform(-2, 2, (ng, nz)))))
     assert np.isfinite(g).all(), "non-finite grad through new_pdf_driver"
     print(f"  jax.grad through new_pdf_driver: finite ({g.size} entries)  PASS")

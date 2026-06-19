@@ -26,9 +26,19 @@ import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.clip_explicit import clip_variance, clip_rcm
 from clubb_jax.src.derived_types.grid_class import setup_grid
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
 CLIP_RTP2 = 1
+
+
+def _empty_stats(nzm, ngrdcol):
+    return JaxStats.empty(
+        l_sample=False,
+        names=(),
+        ncol=ngrdcol,
+        max_nlev=nzm,
+    )
 
 
 def test_f2py_oracle():
@@ -54,7 +64,9 @@ def test_f2py_oracle():
     xp2 = rng.uniform(-0.5, 2.0, (ng, nzm))
     threshold_lo = np.full((ng, nzm), 1e-3)
     ref = np.asarray(clubb_f2py.f2py_clip_variance(CLIP_RTP2, 60.0, threshold_lo, np.asfortranarray(xp2.copy())))
-    got = np.asarray(clip_variance(xp2, threshold_lo))
+    stats = _empty_stats(nzm, ng)
+    got, _ = clip_variance(nzm, ng, jgr, CLIP_RTP2, 60.0, threshold_lo, stats, xp2)
+    got = np.asarray(got)
     worst = np.max(np.abs(got - ref))
     assert worst < 1e-12, f"clip_variance f2py mismatch {worst:.2e}"
     print(f"  f2py clip_variance: bit-match, worst {worst:.2e}  PASS")
@@ -62,9 +74,12 @@ def test_f2py_oracle():
 
 def test_floor_and_boundary():
     nzm = 9
+    jgr = setup_grid(ngrdcol=1, deltaz=40.0, zm_init=0.0, zm_top=320.0, grid_type=1)
     xp2 = np.array([[-0.1, 0.5, 1e-4, 2.0, 0.0, 1.0, -0.2, 0.3, 5.0]])
     thr = np.full((1, nzm), 1e-3)
-    got = np.asarray(clip_variance(xp2, thr))
+    stats = _empty_stats(nzm, 1)
+    got, _ = clip_variance(nzm, 1, jgr, CLIP_RTP2, 60.0, thr, stats, xp2)
+    got = np.asarray(got)
     # Levels 0..nzm-2 floored; top level nzm-1 untouched.
     expect = np.maximum(xp2, thr)
     expect[:, -1] = xp2[:, -1]
@@ -73,9 +88,15 @@ def test_floor_and_boundary():
 
 
 def test_differentiable():
-    xp2 = jnp.asarray(np.random.default_rng(1).uniform(-0.5, 2.0, (2, 8)))
-    thr = jnp.full((2, 8), 1e-3)
-    g = np.asarray(jax.grad(lambda x: jnp.sum(clip_variance(x, thr) ** 2))(xp2))
+    nzm = 8
+    jgr = setup_grid(ngrdcol=2, deltaz=40.0, zm_init=0.0, zm_top=280.0, grid_type=1)
+    xp2 = jnp.asarray(np.random.default_rng(1).uniform(-0.5, 2.0, (2, nzm)))
+    thr = jnp.full((2, nzm), 1e-3)
+    stats = _empty_stats(nzm, 2)
+    def loss(x):
+        out, _ = clip_variance(nzm, 2, jgr, CLIP_RTP2, 60.0, thr, stats, x)
+        return jnp.sum(out ** 2)
+    g = np.asarray(jax.grad(loss)(xp2))
     assert np.isfinite(g).all(), "non-finite grad through clip_variance"
     print(f"  jax.grad through clip_variance: finite ({g.size} entries)  PASS")
 
@@ -93,7 +114,7 @@ def test_clip_rcm_f2py():
     for _ in range(20):
         ng, nzt = 2, 10
         rcm = rng.uniform(-0.1, 2e-3, (ng, nzt)); rtm = rng.uniform(0.0, 2e-3, (ng, nzt))
-        cj = np.asarray(clip_rcm(jnp.asarray(rcm), jnp.asarray(rtm)))
+        cj = np.asarray(clip_rcm(nzt, ng, jnp.asarray(rtm), " ", jnp.asarray(rcm)))
         cf = np.asarray(clubb_f2py.f2py_clip_rcm(rtm, " ", rcm.copy()))
         worst = max(worst, float(np.max(np.abs(cj - cf))))
     assert worst < 1e-13, f"clip_rcm f2py mismatch {worst:.2e}"

@@ -33,6 +33,7 @@ _KW = dict(
     varnce_w_i=0.25, chi_i=1.0e-4, stdev_chi_i=8.0e-4, stdev_eta_i=1.2e-3,
     corr_w_chi_i=0.0, corr_chi_eta_i=0.4, crt_i=1.6, cthl_i=-0.02,
     rc_i=5.0e-5, cloud_frac_i=0.35,
+    iiPDF_type=1,  # iiPDF_ADG1 = 1
 )
 
 

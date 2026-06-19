@@ -53,7 +53,7 @@ def test_f2py_oracle():
         xp2 = rng.uniform(0.0, 2.0, (NG, NZ))
         xp3 = rng.uniform(-1.0, 1.0, (NG, NZ))
         ref = np.asarray(clubb_f2py.f2py_skx_func(xp2, xp3, _X_TOL, params))
-        got = np.asarray(Skx_func(xp2, xp3, _X_TOL, params))
+        got = np.asarray(Skx_func(NZ, NG, xp2, xp3, _X_TOL, params))
         worst = max(worst, np.max(np.abs(got - ref)))
     assert worst < 1e-11, f"Skx_func f2py mismatch {worst:.2e}"
     print(f"  f2py Skx_func: bit-match over 10 configs, worst {worst:.2e}  PASS")
@@ -62,12 +62,13 @@ def test_f2py_oracle():
 def test_closed_form():
     params = _params()
     xp2 = np.array([[0.5, 1.0]]); xp3 = np.array([[0.2, -0.3]])
-    got = np.asarray(Skx_func(xp2, xp3, _X_TOL, params))
+    nz = xp2.shape[1]; ngrdcol = xp2.shape[0]
+    got = np.asarray(Skx_func(nz, ngrdcol, xp2, xp3, _X_TOL, params))
     denom = _DENOM_COEF * _X_TOL ** 2
     ref = xp3 * (xp2 + denom) ** (-1.5)
     assert np.max(np.abs(got - ref)) < 1e-12, "closed-form mismatch"
     # xp3 = 0 -> Skx = 0.
-    z = np.asarray(Skx_func(xp2, np.zeros_like(xp3), _X_TOL, params))
+    z = np.asarray(Skx_func(nz, ngrdcol, xp2, np.zeros_like(xp3), _X_TOL, params))
     assert np.all(z == 0.0), "xp3=0 should give Skx=0"
     print("  closed-form identity + xp3=0 limit  PASS")
 
@@ -76,7 +77,7 @@ def test_differentiable():
     params = _params()
     xp2 = jnp.asarray(np.random.default_rng(1).uniform(0.1, 2.0, (NG, NZ)))
     def loss(xp3):
-        return jnp.sum(Skx_func(xp2, xp3, _X_TOL, params) ** 2)
+        return jnp.sum(Skx_func(NZ, NG, xp2, xp3, _X_TOL, params) ** 2)
     g = np.asarray(jax.grad(loss)(jnp.asarray(np.random.default_rng(2).uniform(-1, 1, (NG, NZ)))))
     assert np.isfinite(g).all(), "non-finite grad through Skx_func"
     print(f"  jax.grad through Skx_func: finite ({g.size} entries)  PASS")
@@ -100,12 +101,12 @@ def test_LG_2005_ansatz_f2py():
     for _ in range(30):
         Skw = rng.uniform(-3, 3, (NG, NZ)); wpxp = rng.uniform(-1, 1, (NG, NZ))
         wp2 = rng.uniform(1e-2, 2, (NG, NZ)); xp2 = rng.uniform(1e-4, 1, (NG, NZ)); ssw = rng.uniform(0, 0.6, (NG, NZ))
-        jl = np.asarray(LG_2005_ansatz(jnp.asarray(Skw), jnp.asarray(wpxp), jnp.asarray(wp2), jnp.asarray(xp2),
-                                       jnp.asarray(ssw), jnp.asarray(beta)[:, None], _X_TOL))
+        jl = np.asarray(LG_2005_ansatz(NZ, NG, jnp.asarray(Skw), jnp.asarray(wpxp), jnp.asarray(wp2), jnp.asarray(xp2),
+                                       jnp.asarray(beta)[:, None], jnp.asarray(ssw), _X_TOL))
         fl = np.asarray(clubb_f2py.f2py_lg_2005_ansatz(Skw, wpxp, wp2, xp2, beta, ssw, _X_TOL))
         w_lg = max(w_lg, float(np.max(np.abs(jl - fl) / np.maximum(np.abs(fl), 1.0))))
-        jx = np.asarray(xp3_LG_2005_ansatz(jnp.asarray(Skw), jnp.asarray(wpxp), jnp.asarray(wp2), jnp.asarray(xp2),
-                                           jnp.asarray(ssw), jnp.asarray(beta)[:, None], jnp.asarray(params), _X_TOL))
+        jx = np.asarray(xp3_LG_2005_ansatz(NZ, NG, jnp.asarray(Skw), jnp.asarray(wpxp), jnp.asarray(wp2), jnp.asarray(xp2),
+                                           jnp.asarray(ssw), jnp.asarray(params), _X_TOL))
         fx = np.asarray(clubb_f2py.f2py_xp3_lg_2005_ansatz(Skw, wpxp, wp2, xp2, ssw, params, _X_TOL))
         w_xp3 = max(w_xp3, float(np.max(np.abs(jx - fx) / np.maximum(np.abs(fx), 1.0))))
     assert w_lg < 1e-9, f"LG_2005_ansatz f2py rel mismatch {w_lg:.2e}"

@@ -36,6 +36,8 @@ from clubb_jax.src.CLUBB_core.mixing_length import (
 from clubb_jax.src.CLUBB_core.parameters_tunable import init_clubb_params
 from clubb_jax.src.derived_types.grid_class import setup_grid
 from clubb_jax.src.CLUBB_core.saturation import SATURATION_FLATAU
+from clubb_jax.src.CLUBB_core.err_info import ErrInfo
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 
 _TUNABLE_PARAMS = os.path.join(_ROOT, "clubb_release", "input", "tunable_parameters", "tunable_parameters.in")
 
@@ -53,7 +55,7 @@ def test_set_Lscale_max_f2py():
     for l_impl in (0, 1):
         for _ in range(10):
             dx = rng.uniform(100.0, 5e5, 3); dy = rng.uniform(100.0, 5e5, 3)
-            j = np.asarray(set_Lscale_max(l_impl, dx, dy, 3))
+            j = np.asarray(set_Lscale_max(3, bool(l_impl), dx, dy))
             f = np.asarray(clubb_f2py.f2py_set_lscale_max(l_impl, dx, dy))
             worst = max(worst, float(np.max(np.abs(j - f))))
     assert worst < 1e-12, f"set_Lscale_max f2py mismatch {worst:.2e}"
@@ -82,6 +84,8 @@ def test_calc_Lscale_directly_f2py():
         print(f"  f2py calc_Lscale_directly oracle: SKIP ({type(e).__name__})")
         return
     nzt = nzm - 1
+    err_info = ErrInfo.initialized(ngrdcol=ng)
+    stats = JaxStats.empty(l_sample=False, names=(), ncol=ng, max_nlev=nzm)
     worst_rel = 0.0
     for s in range(6):
         rng = np.random.default_rng(s)
@@ -90,14 +94,26 @@ def test_calc_Lscale_directly_f2py():
         em = rng.uniform(1e-2, 1.0, (ng, nzm)); p = np.sort(rng.uniform(6e4, 1e5, (ng, nzt)), axis=1)[:, ::-1].copy()
         thv_ds = thvm.copy(); Lmax = np.full(ng, 1e5); lmin = 20.0
         npar = max(imu, 100); cp = np.zeros((ng, npar)); cp[:, imu] = rng.uniform(0.4, 1.0, ng); mu = cp[:, imu]
-        jr = calc_Lscale_directly(jnp.asarray(thvm), jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(em),
-            jnp.asarray(Lmax), jnp.asarray(p), jnp.asarray(exner), jnp.asarray(thv_ds), jnp.asarray(cp),
-            lmin, SATURATION_FLATAU, False, jgr)
         z = np.zeros((ng, nzt))
+        # New signature: (ngrdcol, nzm, nzt, gr, l_implemented, p_in_Pa, exner, rtm, thlm, thvm, newmu,
+        #                 rtp2_zt, thlp2_zt, rtpthlp_zt, pdf_params, em, thv_ds_zt, Lscale_max, lmin,
+        #                 clubb_params, saturation_formula, l_Lscale_plume_centered, stats, err_info)
+        jr = calc_Lscale_directly(
+            ng, nzm, nzt, jgr, False,
+            jnp.asarray(p), jnp.asarray(exner), jnp.asarray(rtm), jnp.asarray(thlm), jnp.asarray(thvm),
+            jnp.asarray(mu),
+            jnp.asarray(z), jnp.asarray(z), jnp.asarray(z),  # rtp2_zt, thlp2_zt, rtpthlp_zt (del-ed)
+            None,                                               # pdf_params (del-ed)
+            jnp.asarray(em), jnp.asarray(thv_ds),
+            jnp.asarray(Lmax), lmin, jnp.asarray(cp),
+            SATURATION_FLATAU, False,
+            stats, err_info,
+        )
+        # New return: (err_info, Lscale, Lscale_up, Lscale_down, stats) — indices 1,2,3 are Lscale outputs
         fr = clubb_f2py.f2py_calc_lscale_directly(0, p, exner, rtm, thlm, thvm, mu, z, z, z, em, thv_ds,
             Lmax, lmin, cp, SATURATION_FLATAU, 0)
         for i in range(3):
-            a = np.asarray(jr[i]); b = np.asarray(fr[i])
+            a = np.asarray(jr[i + 1]); b = np.asarray(fr[i])
             worst_rel = max(worst_rel, float(np.max(np.abs(a - b) / np.maximum(np.abs(b), 1.0))))
     # Parcel-ascent iteration carries ~1e-13 relative FP accumulation vs Fortran (not bit-exact); strict bound 1e-9.
     assert worst_rel < 1e-9, f"calc_Lscale_directly f2py rel mismatch {worst_rel:.2e}"
@@ -117,22 +133,38 @@ def test_diagnose_Lscale_from_tau_f2py():
         return
     nzt = nzm - 1
     cp = np.asarray(init_clubb_params(ng, filename=_TUNABLE_PARAMS))   # realistic defaults (well-conditioned tau)
+    err_info = ErrInfo.initialized(ngrdcol=ng)
+    stats = JaxStats.empty(l_sample=False, names=(), ncol=ng, max_nlev=nzm)
     worst = 0.0
     for s in range(4):
         rng = np.random.default_rng(s)
         upwp = rng.uniform(-0.1, 0.1, ng); vpwp = rng.uniform(-0.1, 0.1, ng)
         ddzt = rng.uniform(0.0, 1e-3, (ng, nzm)); isf = rng.uniform(0.0, 0.3, (ng, nzt))
-        em = rng.uniform(1e-2, 1.0, (ng, nzm)); sqem = np.sqrt(rng.uniform(1e-2, 1.0, (ng, nzt)))
+        em = rng.uniform(1e-2, 1.0, (ng, nzm))
         sfce = np.zeros(ng); Lmax = np.full(ng, 1e5)
         Ri = rng.uniform(-1.0, 5.0, (ng, nzm)); bvs = rng.uniform(-1e-3, 1e-2, (ng, nzm))
-        jr = diagnose_Lscale_from_tau(jnp.asarray(upwp), jnp.asarray(vpwp), jnp.asarray(ddzt), jnp.asarray(isf),
-            jnp.asarray(em), jnp.asarray(sqem), 0.01, 900.0, jnp.asarray(sfce), jnp.asarray(Lmax),
-            jnp.asarray(cp), jnp.asarray(Ri), jnp.asarray(bvs), False, False, jgr)
+        # New JAX signature: (nzm, nzt, ngrdcol, gr, upwp_sfc, vpwp_sfc, ddzt_umvm_sqd, ice_supersat_frac,
+        #                 em, ufmin, tau_const, sfc_elevation, Lscale_max, clubb_params, stats,
+        #                 l_e3sm_config, l_smooth_Heaviside_tau_wpxp, brunt_vaisala_freq_sqd_smth, Ri_zm, err_info)
+        # sqem removed from JAX: now computed internally as sqrt(zm2zt(em)).
+        # Pass the same consistent sqem to the f2py oracle so both use the same em_zt.
+        from clubb_jax.src.CLUBB_core.grid_class import zm2zt as _zm2zt
+        em_zt = np.asarray(_zm2zt(nzm, nzt, ng, jgr, jnp.asarray(em), 1e-6))
+        sqem = np.sqrt(em_zt)
+        jr = diagnose_Lscale_from_tau(
+            nzm, nzt, ng, jgr,
+            jnp.asarray(upwp), jnp.asarray(vpwp), jnp.asarray(ddzt), jnp.asarray(isf),
+            jnp.asarray(em), 0.01, 900.0, jnp.asarray(sfce), jnp.asarray(Lmax),
+            jnp.asarray(cp), stats, False, False, jnp.asarray(bvs), jnp.asarray(Ri),
+            err_info,
+        )
         fr = clubb_f2py.f2py_diagnose_lscale_from_tau(upwp, vpwp, ddzt, isf, em, sqem, 0.01, 900.0, sfce, Lmax,
             cp, 0, 0, bvs, Ri)
         assert len(fr) == 19, f"unexpected f2py output count {len(fr)}"
+        # New return: (err_info, invrs_tau_zt, invrs_tau_zm, ..., Lscale_down, stats) — 21 items
+        # f2py returns 19 outputs (indices 0-18); JAX outputs are at jr[1:20] (skip err_info at jr[0], stats at jr[20])
         for i in range(19):
-            a = np.asarray(jr[i]); b = np.asarray(fr[i])
+            a = np.asarray(jr[i + 1]); b = np.asarray(fr[i])
             worst = max(worst, float(np.max(np.abs(a - b) / np.maximum(np.abs(b), 1e-3))))
     assert worst < 1e-9, f"diagnose_Lscale_from_tau f2py rel mismatch {worst:.2e}"
     print(f"  f2py diagnose_Lscale_from_tau (19 tau/Lscale outputs, 4 seeds): rel-match, worst {worst:.2e}  PASS")

@@ -30,11 +30,21 @@ from clubb_jax.src.CLUBB_core.precipitation_fraction import component_precip_fra
 
 _NG, _NZT = 2, 10
 _TOL = 1.0e-3
+# New signature: component_precip_frac_specify(hydromet_dim, hydromet_tol,
+#   upsilon_precip_frac_rat, hydromet, precip_frac, mixt_frac, precip_frac_tol)
+# hydromet shape: (ng, nzt, hydromet_dim); hydromet_tol shape: (hydromet_dim,)
+# precip_frac_tol shape: (ng,) — gets [:, None] inside the function
+_HYDROMET_DIM = 1
+_HYDROMET_TOL = np.array([1.0e-6])   # shape (hydromet_dim,)
 
 
 def _call(pf, mf, upsilon):
-    tol = np.full((_NG, 1), _TOL)
-    return component_precip_frac_specify(jnp.asarray(pf), jnp.asarray(mf), jnp.asarray(tol), float(upsilon))
+    # Build hydromet values large enough that has_hydromet = True everywhere.
+    hydromet = np.ones((_NG, _NZT, _HYDROMET_DIM)) * 1.0e-3
+    precip_frac_tol = np.full((_NG,), _TOL)   # shape (ng,); gets [:, None] inside
+    return component_precip_frac_specify(
+        _HYDROMET_DIM, _HYDROMET_TOL, float(upsilon),
+        hydromet, jnp.asarray(pf), jnp.asarray(mf), jnp.asarray(precip_frac_tol))
 
 
 def test_conservation_general_branch_no_clip():
@@ -87,8 +97,12 @@ def test_grad_finite():
     rng = np.random.default_rng(99)
     mf = jnp.asarray(rng.uniform(0.4, 0.8, (_NG, _NZT)))
     pf0 = jnp.asarray(mf * rng.uniform(0.2, 0.9, (_NG, _NZT)))
-    tol = jnp.asarray(np.full((_NG, 1), _TOL))
-    g = jax.grad(lambda p: jnp.sum(sum(x ** 2 for x in component_precip_frac_specify(p, mf, tol, 0.55))))(pf0)
+    hydromet = jnp.asarray(np.ones((_NG, _NZT, _HYDROMET_DIM)) * 1.0e-3)
+    precip_frac_tol = jnp.asarray(np.full((_NG,), _TOL))
+    g = jax.grad(lambda p: jnp.sum(sum(
+        x ** 2 for x in component_precip_frac_specify(
+            _HYDROMET_DIM, _HYDROMET_TOL, 0.55, hydromet, p, mf, precip_frac_tol)
+    )))(pf0)
     assert np.all(np.isfinite(np.asarray(g))), "non-finite grad wrt pf"
     print("  jax.grad(component_precip_frac_specify) wrt pf finite  PASS")
 

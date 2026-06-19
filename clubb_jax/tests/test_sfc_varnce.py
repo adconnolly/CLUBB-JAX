@@ -24,6 +24,9 @@ import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.sfc_varnce_module import calc_sfc_varnce
 from clubb_jax.src.derived_types.grid_class import setup_grid
+from clubb_jax.src.CLUBB_core.sclr_idx import SclrIdx
+from clubb_jax.src.CLUBB_core.err_info import ErrInfo
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 
 _NG, _DZ, _ZTOP = 2, 40.0, 1200.0
 
@@ -50,7 +53,14 @@ def test_f2py_oracle():
         print(f"  f2py calc_sfc_varnce oracle: SKIP ({type(e).__name__})")
         return
     nzt = nzm - 1
-    zm_sfc = np.asarray(jgr.zm)[:, 0]; sfce = np.zeros(ng)
+    sfce = np.zeros(ng)
+    # Build lightweight dummy objects needed by the new signature.
+    sclr_idx = SclrIdx(iisclr_rt=-1, iisclr_thl=-1, iisclr_CO2=-1,
+                       iiedsclr_rt=-1, iiedsclr_thl=-1, iiedsclr_CO2=-1)
+    err_info = ErrInfo.initialized(ngrdcol=ng)
+    stats = JaxStats.empty(l_sample=False, names=(), ncol=ng, max_nlev=nzm)
+    dt = 60.0
+    sclr_dim = 0
     rng = np.random.default_rng(2)
     worst = 0.0
     for _ in range(20):
@@ -61,10 +71,24 @@ def test_f2py_oracle():
         wp2 = rng.uniform(1e-2, 1, (ng, nzm)); up2 = rng.uniform(1e-2, 1, (ng, nzm)); vp2 = rng.uniform(1e-2, 1, (ng, nzm))
         thlp2 = rng.uniform(1e-3, 1, (ng, nzm)); rtp2 = rng.uniform(1e-7, 1e-5, (ng, nzm))
         rtpthlp = rng.uniform(-1e-3, 1e-3, (ng, nzm))
-        jr = calc_sfc_varnce(jnp.asarray(upwp), jnp.asarray(vpwp), jnp.asarray(wpthlp), jnp.asarray(wprtp),
-            jnp.asarray(splat), jnp.asarray(tau), T0, jnp.asarray(up2c), jnp.asarray(ac), jnp.asarray(wp2),
-            jnp.asarray(up2), jnp.asarray(vp2), jnp.asarray(thlp2), jnp.asarray(rtp2), jnp.asarray(rtpthlp),
-            jnp.asarray(zm_sfc), jnp.asarray(sfce))
+        um = np.zeros((ng, nzt)); vm = np.zeros((ng, nzt)); lsu = np.ones((ng, nzt))
+        wsp = np.zeros((ng, max(sclr_dim, 1)))
+        sclrp2 = jnp.zeros((ng, nzm, max(sclr_dim, 1)))
+        sclrprtp = jnp.zeros((ng, nzm, max(sclr_dim, 1)))
+        sclrpthlp = jnp.zeros((ng, nzm, max(sclr_dim, 1)))
+        jr = calc_sfc_varnce(
+            nzm, nzt, ng, sclr_dim, sclr_idx,
+            jgr, dt, jnp.asarray(sfce),
+            jnp.asarray(upwp), jnp.asarray(vpwp), jnp.asarray(wpthlp), jnp.asarray(wprtp),
+            jnp.asarray(um), jnp.asarray(vm), jnp.asarray(lsu), jnp.asarray(wsp),
+            jnp.asarray(splat), jnp.asarray(tau),
+            False, T0, jnp.asarray(up2c), jnp.asarray(ac),
+            stats,
+            jnp.asarray(wp2), jnp.asarray(up2), jnp.asarray(vp2),
+            jnp.asarray(thlp2), jnp.asarray(rtp2), jnp.asarray(rtpthlp),
+            sclrp2, sclrprtp, sclrpthlp,
+            err_info,
+        )
         sd = 1; um = np.zeros((ng, nzt)); vm = np.zeros((ng, nzt)); lsu = np.ones((ng, nzt))
         wsp = np.zeros((ng, sd)); s2 = np.zeros((ng, nzm, sd))
         fr = clubb_f2py.f2py_calc_sfc_varnce(sd, 60.0, sfce, upwp, vpwp, wpthlp, wprtp, um, vm, lsu, wsp, splat,

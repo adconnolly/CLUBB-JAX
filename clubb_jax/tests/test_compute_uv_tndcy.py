@@ -27,9 +27,31 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_jax.src.CLUBB_core.advance_windm_edsclrm_module import compute_uv_tndcy
+from clubb_jax.src.CLUBB_core.advance_windm_edsclrm_module import (
+    compute_uv_tndcy, windm_edsclrm_um, windm_edsclrm_vm,
+)
+from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 
 _NG, _NZT = 2, 8
+
+
+def _empty_stats():
+    return JaxStats.empty(l_sample=False, names=(), ncol=_NG, max_nlev=_NZT)
+
+
+def _compute_uv_tndcy(fcor, ug, vg, um, vm, um_f, vm_f):
+    """Convenience wrapper: two per-component calls → (um_tndcy, vm_tndcy).
+
+    New signature: compute_uv_tndcy(nzt, ngrdcol, solve_type,
+                                    fcor, perp_wind_m, perp_wind_g,
+                                    xm_forcing, l_implemented, stats)
+    For um: perp_wind_m=vm, perp_wind_g=vg
+    For vm: perp_wind_m=um, perp_wind_g=ug
+    """
+    stats = _empty_stats()
+    um_tndcy, _s = compute_uv_tndcy(_NZT, _NG, windm_edsclrm_um, fcor, vm, vg, um_f, False, stats)
+    vm_tndcy, _s = compute_uv_tndcy(_NZT, _NG, windm_edsclrm_vm, fcor, um, ug, vm_f, False, stats)
+    return um_tndcy, vm_tndcy
 
 
 def _inputs(rng):
@@ -46,8 +68,8 @@ def _inputs(rng):
 def test_matches_f90_sign_convention():
     rng = np.random.default_rng(543)
     fcor, ug, vg, um, vm, um_f, vm_f = _inputs(rng)
-    um_t, vm_t = compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
-                                  jnp.asarray(um), jnp.asarray(vm), jnp.asarray(um_f), jnp.asarray(vm_f))
+    um_t, vm_t = _compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
+                                   jnp.asarray(um), jnp.asarray(vm), jnp.asarray(um_f), jnp.asarray(vm_f))
     f = fcor[:, None]
     # Independent transcription of the F90 per-component formula (windm_edsclrm_um / _vm):
     ref_um = -f * vg + f * vm + um_f       # xm_gf(=−fcor·vg) + xm_cf(=+fcor·vm) + forcing
@@ -64,8 +86,8 @@ def test_geostrophic_balance():
     fcor = rng.uniform(0.5e-4, 1.5e-4, (_NG,))
     ug = rng.uniform(-10.0, 10.0, (_NG, _NZT)); vg = rng.uniform(-10.0, 10.0, (_NG, _NZT))
     zero = np.zeros((_NG, _NZT))
-    um_t, vm_t = compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
-                                  jnp.asarray(ug), jnp.asarray(vg), jnp.asarray(zero), jnp.asarray(zero))
+    um_t, vm_t = _compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
+                                   jnp.asarray(ug), jnp.asarray(vg), jnp.asarray(zero), jnp.asarray(zero))
     assert np.max(np.abs(np.asarray(um_t))) < 1e-18 and np.max(np.abs(np.asarray(vm_t))) < 1e-18, \
         "tendency nonzero at geostrophic balance (um=ug, vm=vg, no forcing)"
     print("  geostrophic balance: zero tendency when (um,vm)==(ug,vg) and no forcing  PASS")
@@ -75,14 +97,14 @@ def test_forcing_additive_and_grad():
     rng = np.random.default_rng(99)
     fcor, ug, vg, um, vm, um_f, vm_f = _inputs(rng)
     # Forcing enters additively: tndcy(forcing) − tndcy(0) == forcing.
-    a_um, a_vm = compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
-                                  jnp.asarray(um), jnp.asarray(vm), jnp.asarray(um_f), jnp.asarray(vm_f))
+    a_um, a_vm = _compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
+                                   jnp.asarray(um), jnp.asarray(vm), jnp.asarray(um_f), jnp.asarray(vm_f))
     z = np.zeros((_NG, _NZT))
-    b_um, b_vm = compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
-                                  jnp.asarray(um), jnp.asarray(vm), jnp.asarray(z), jnp.asarray(z))
+    b_um, b_vm = _compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
+                                   jnp.asarray(um), jnp.asarray(vm), jnp.asarray(z), jnp.asarray(z))
     assert np.allclose(np.asarray(a_um) - np.asarray(b_um), um_f, atol=1e-15) and \
            np.allclose(np.asarray(a_vm) - np.asarray(b_vm), vm_f, atol=1e-15), "forcing not additive"
-    g = jax.grad(lambda u: jnp.sum(compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
+    g = jax.grad(lambda u: jnp.sum(_compute_uv_tndcy(jnp.asarray(fcor), jnp.asarray(ug), jnp.asarray(vg),
                 u, jnp.asarray(vm), jnp.asarray(um_f), jnp.asarray(vm_f))[0] ** 2))(jnp.asarray(um))
     assert np.all(np.isfinite(np.asarray(g))), "non-finite grad wrt um"
     print("  forcing additive + finite jax.grad wrt um  PASS")

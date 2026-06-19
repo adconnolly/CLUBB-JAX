@@ -1011,10 +1011,10 @@ def set_sfc_value_of_flux_profiles(
                     wpsclrp_sfc[:, sclr]
                 )
 
+        # wpedsclrp is a local variable that is not saved from
+        # timestep to timestep. Set it to 0 and overwrite the surface.
+        wpedsclrp = jnp.zeros_like(wpedsclrp)
         if edsclr_dim > 0:
-            # wpedsclrp is a local variable that is not saved from
-            # timestep to timestep. Set it to 0 and overwrite the surface.
-            wpedsclrp = jnp.zeros_like(wpedsclrp)
             for edsclr in range(edsclr_dim):
                 wpedsclrp = jnp.asarray(wpedsclrp).at[:, k_lb, edsclr].set(
                     wpedsclrp_sfc[:, edsclr]
@@ -1031,10 +1031,10 @@ def set_sfc_value_of_flux_profiles(
             for sclr in range(sclr_dim):
                 wpsclrp = jnp.asarray(wpsclrp).at[:, k_lb, sclr].set(zero)
 
+        # wpedsclrp is a local variable that is not saved from
+        # timestep to timestep. Set it to 0 and overwrite the surface.
+        wpedsclrp = jnp.zeros_like(wpedsclrp)
         if edsclr_dim > 0:
-            # wpedsclrp is a local variable that is not saved from
-            # timestep to timestep. Set it to 0 and overwrite the surface.
-            wpedsclrp = jnp.zeros_like(wpedsclrp)
             for edsclr in range(edsclr_dim):
                 wpedsclrp = jnp.asarray(wpedsclrp).at[:, k_lb, edsclr].set(zero)
 

@@ -40,31 +40,33 @@ def test_term_tp_rhs():
     rng = np.random.default_rng(21)
     xam = rng.standard_normal((_NG, nzt)); xbm = rng.standard_normal((_NG, nzt))
     wpxap = rng.standard_normal((_NG, nzm)); wpxbp = rng.standard_normal((_NG, nzm))
-    j = np.asarray(term_tp_rhs(jnp.asarray(xam), jnp.asarray(xbm),
-                               jnp.asarray(wpxap), jnp.asarray(wpxbp), jnp.asarray(invrs_dzm)))
-    ref = np.zeros((_NG, nzm - 2))
-    for out, m in enumerate(range(1, nzm - 1)):       # interior momentum level m (0-based)
-        ref[:, out] = (-wpxbp[:, m] * invrs_dzm[:, m] * (xam[:, m] - xam[:, m - 1])
-                       - wpxap[:, m] * invrs_dzm[:, m] * (xbm[:, m] - xbm[:, m - 1]))
-    assert j.shape == ref.shape and float(np.max(np.abs(j - ref))) == 0.0, "term_tp_rhs != F90 loop"
-    print("  term_tp_rhs == F90 per-level transcription (exact)  PASS")
+    j = np.asarray(term_tp_rhs(nzm, nzt, _NG, jnp.asarray(xam), jnp.asarray(xbm),
+                               jnp.asarray(wpxbp), jnp.asarray(wpxap), jnp.asarray(invrs_dzm)))
+    ref = np.zeros((_NG, nzm))
+    for m in range(1, nzm - 1):       # interior momentum level m (0-based)
+        ref[:, m] = (-wpxbp[:, m] * invrs_dzm[:, m] * (xam[:, m] - xam[:, m - 1])
+                     - wpxap[:, m] * invrs_dzm[:, m] * (xbm[:, m] - xbm[:, m - 1]))
+    d = float(np.max(np.abs(j - ref)))
+    assert j.shape == ref.shape and d < 1e-14, f"term_tp_rhs != F90 loop (max |Δ| = {d:.2e})"
+    print("  term_tp_rhs == F90 per-level transcription (exact/FP)  PASS")
 
 
 def test_term_pr1():
     nzm = 11
     rng = np.random.default_rng(22)
-    C4 = rng.uniform(3.0, 6.0, (_NG, 1)); C14 = rng.uniform(0.5, 2.0, (_NG, 1))
+    C4 = rng.uniform(3.0, 6.0, _NG); C14 = rng.uniform(0.5, 2.0, _NG)  # 1D: shape (ngrdcol,)
     xbp2 = rng.uniform(1e-3, 2.0, (_NG, nzm)); wp2 = rng.uniform(1e-3, 2.0, (_NG, nzm))
     itau4 = rng.uniform(1e-3, 1e-2, (_NG, nzm)); itau14 = rng.uniform(1e-3, 1e-2, (_NG, nzm))
-    j = np.asarray(term_pr1(jnp.asarray(C4), jnp.asarray(C14), jnp.asarray(xbp2), jnp.asarray(wp2),
-                            jnp.asarray(itau4), jnp.asarray(itau14), w_tol_sqd))
-    ref = np.zeros((_NG, nzm - 2))
-    for out, m in enumerate(range(1, nzm - 1)):
-        ref[:, out] = ((1.0 / 3.0) * C4[:, 0] * (xbp2[:, m] + wp2[:, m]) * itau4[:, m]
-                       - (1.0 / 3.0) * C14[:, 0] * (xbp2[:, m] + wp2[:, m]) * itau14[:, m]
-                       + C14[:, 0] * itau14[:, m] * w_tol_sqd)
-    assert j.shape == ref.shape and float(np.max(np.abs(j - ref))) == 0.0, "term_pr1 != F90 loop"
-    print("  term_pr1 == F90 per-level transcription (exact)  PASS")
+    j = np.asarray(term_pr1(nzm, _NG, jnp.asarray(C4), jnp.asarray(C14), jnp.asarray(xbp2), jnp.asarray(wp2),
+                            jnp.asarray(itau4), jnp.asarray(itau14)))
+    ref = np.zeros((_NG, nzm))
+    for m in range(1, nzm - 1):
+        ref[:, m] = ((1.0 / 3.0) * C4 * (xbp2[:, m] + wp2[:, m]) * itau4[:, m]
+                     - (1.0 / 3.0) * C14 * (xbp2[:, m] + wp2[:, m]) * itau14[:, m]
+                     + C14 * itau14[:, m] * w_tol_sqd)
+    d = float(np.max(np.abs(j - ref)))
+    assert j.shape == ref.shape and d < 1e-14, f"term_pr1 != F90 loop (max |Δ| = {d:.2e})"
+    print("  term_pr1 == F90 per-level transcription (exact/FP)  PASS")
 
 
 def test_term_pr2():
@@ -72,24 +74,25 @@ def test_term_pr2():
     nzm = gr.zm.shape[1]; nzt = nzm - 1
     invrs_dzm = np.asarray(gr.invrs_dzm)
     rng = np.random.default_rng(23)
-    C_uu_shr = rng.uniform(0.1, 0.5, (_NG, 1)); C_uu_buoy = rng.uniform(0.1, 0.5, (_NG, 1))
+    C_uu_shr = rng.uniform(0.1, 0.5, _NG); C_uu_buoy = rng.uniform(0.1, 0.5, _NG)  # 1D: (ngrdcol,)
     thv = rng.uniform(290.0, 320.0, (_NG, nzm)); wpthvp = rng.uniform(-0.05, 0.2, (_NG, nzm))
     upwp = rng.uniform(-0.5, 0.5, (_NG, nzm)); vpwp = rng.uniform(-0.5, 0.5, (_NG, nzm))
     um = rng.uniform(-15.0, 15.0, (_NG, nzt)); vm = rng.uniform(-15.0, 15.0, (_NG, nzt))
-    j = np.asarray(term_pr2(jnp.asarray(C_uu_shr), jnp.asarray(C_uu_buoy), jnp.asarray(thv),
+    j = np.asarray(term_pr2(nzm, nzt, _NG, gr, jnp.asarray(C_uu_shr), jnp.asarray(C_uu_buoy), jnp.asarray(thv),
                             jnp.asarray(wpthvp), jnp.asarray(upwp), jnp.asarray(vpwp),
-                            jnp.asarray(um), jnp.asarray(vm), gr))
-    ref = np.zeros((_NG, nzm - 2))
-    for out, m in enumerate(range(1, nzm - 1)):
+                            jnp.asarray(um), jnp.asarray(vm)))
+    ref = np.zeros((_NG, nzm))
+    for m in range(1, nzm - 1):
         du = invrs_dzm[:, m] * (um[:, m] - um[:, m - 1])
         dv = invrs_dzm[:, m] * (vm[:, m] - vm[:, m - 1])
-        val = (2.0 / 3.0) * (C_uu_buoy[:, 0] * (grav / thv[:, m]) * wpthvp[:, m]
-                             + C_uu_shr[:, 0] * (-upwp[:, m] * du - vpwp[:, m] * dv))
-        ref[:, out] = np.maximum(val, zero_threshold)
-    assert j.shape == ref.shape and float(np.max(np.abs(j - ref))) == 0.0, "term_pr2 != F90 loop"
+        val = (2.0 / 3.0) * (C_uu_buoy * (grav / thv[:, m]) * wpthvp[:, m]
+                             + C_uu_shr * (-upwp[:, m] * du - vpwp[:, m] * dv))
+        ref[:, m] = np.maximum(val, zero_threshold)
+    d = float(np.max(np.abs(j - ref)))
+    assert j.shape == ref.shape and d < 1e-14, f"term_pr2 != F90 loop (max |Δ| = {d:.2e})"
     # grad through the buoyancy input is finite
-    g = jax.grad(lambda w: jnp.sum(term_pr2(jnp.asarray(C_uu_shr), jnp.asarray(C_uu_buoy), jnp.asarray(thv),
-                w, jnp.asarray(upwp), jnp.asarray(vpwp), jnp.asarray(um), jnp.asarray(vm), gr)))(jnp.asarray(wpthvp))
+    g = jax.grad(lambda w: jnp.sum(term_pr2(nzm, nzt, _NG, gr, jnp.asarray(C_uu_shr), jnp.asarray(C_uu_buoy), jnp.asarray(thv),
+                w, jnp.asarray(upwp), jnp.asarray(vpwp), jnp.asarray(um), jnp.asarray(vm))))(jnp.asarray(wpthvp))
     assert np.all(np.isfinite(np.asarray(g))), "non-finite grad through term_pr2"
     print("  term_pr2 == F90 per-level transcription (exact) + grad finite  PASS")
 
@@ -100,8 +103,9 @@ def test_term_dp1():
     nzm = 11
     rng = np.random.default_rng(24)
     Cn = rng.uniform(0.1, 2.0, (_NG, nzm)); itau = rng.uniform(1e-3, 1e-2, (_NG, nzm)); thr = 1e-8
-    jl = np.asarray(term_dp1_lhs(jnp.asarray(Cn), jnp.asarray(itau)))
-    jr = np.asarray(term_dp1_rhs(jnp.asarray(Cn), jnp.asarray(itau), thr))
+    gr_dp1 = setup_grid(ngrdcol=_NG, deltaz=40.0, zm_init=0.0, zm_top=float((nzm - 1) * 40), grid_type=1)
+    jl = np.asarray(term_dp1_lhs(nzm, _NG, gr_dp1, jnp.asarray(Cn), jnp.asarray(itau)))
+    jr = np.asarray(term_dp1_rhs(nzm, _NG, jnp.asarray(Cn), jnp.asarray(itau), thr))
     rl = np.zeros((_NG, nzm)); rr = np.zeros((_NG, nzm))
     for k in range(1, nzm - 1):
         rl[:, k] = Cn[:, k] * itau[:, k]

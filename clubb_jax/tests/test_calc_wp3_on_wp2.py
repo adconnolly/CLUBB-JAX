@@ -66,7 +66,7 @@ def test_f2py_oracle():
         # occasionally force the clip to fire (tiny wp2 → |ratio| > 1000)
         if _ % 3 == 0:
             wp2[:, ::4] = 1e-7
-        jm, jz = calc_wp3_on_wp2(jnp.asarray(wp2), jnp.asarray(wp3), jgr)
+        jm, jz = calc_wp3_on_wp2(nzm, nzt, ng, jgr, jnp.asarray(wp2), jnp.asarray(wp3))
         wp2_zt = np.maximum(zm2zt(wp2), w_tol_sqd)
         ratio = np.clip(wp3 / np.maximum(wp2_zt, w_tol_sqd), -1000.0, 1000.0)
         m_ref = zt2zm(ratio)

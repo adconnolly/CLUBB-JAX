@@ -55,12 +55,15 @@ def _inputs(rng, gr):
 
 def test_lhs_matches_f90_assembly():
     gr = setup_grid(_NG, _DZ, _DZ, _DZ * (_NZT + 1))
+    nzm = gr.nzm; nzt = gr.nzt
     rng = np.random.default_rng(544)
     dt = 60.0
     lhs_diff, lhs_ma_zt, invrs_rho_ds_zt, rho_ds_zm, u_star_sqd, wind_speed, invrs_dzt = _inputs(rng, gr)
-    got = np.asarray(windm_edsclrm_lhs(jnp.asarray(lhs_diff), jnp.asarray(lhs_ma_zt), dt,
-                                       jnp.asarray(invrs_rho_ds_zt), jnp.asarray(rho_ds_zm),
-                                       jnp.asarray(u_star_sqd), jnp.asarray(wind_speed), gr, 0, 0))
+    got = np.asarray(windm_edsclrm_lhs(nzm, nzt, _NG, gr, dt,
+                                       jnp.asarray(lhs_ma_zt), jnp.asarray(lhs_diff),
+                                       jnp.asarray(wind_speed), jnp.asarray(u_star_sqd),
+                                       jnp.asarray(rho_ds_zm), jnp.asarray(invrs_rho_ds_zt),
+                                       False, True))
     ref = _ref(lhs_diff, lhs_ma_zt, dt, invrs_rho_ds_zt, rho_ds_zm, u_star_sqd, wind_speed, invrs_dzt)
     worst = float(np.max(np.abs(got - ref)))
     assert worst < 1e-13, f"windm_edsclrm_lhs mismatch vs F90 assembly {worst:.2e}"
@@ -69,21 +72,26 @@ def test_lhs_matches_f90_assembly():
 
 def test_surface_term_localized_and_cn_scaling():
     gr = setup_grid(_NG, _DZ, _DZ, _DZ * (_NZT + 1))
+    nzm = gr.nzm; nzt = gr.nzt
     rng = np.random.default_rng(11)
     dt = 60.0
     lhs_diff, lhs_ma_zt, invrs_rho_ds_zt, rho_ds_zm, u_star_sqd, wind_speed, invrs_dzt = _inputs(rng, gr)
-    args = (jnp.asarray(lhs_diff), jnp.asarray(lhs_ma_zt), dt, jnp.asarray(invrs_rho_ds_zt),
-            jnp.asarray(rho_ds_zm), jnp.asarray(u_star_sqd), jnp.asarray(wind_speed), gr, 0, 0)
+    # args order: nzm, nzt, ngrdcol, gr, dt, lhs_ma_zt, lhs_diff, wind_speed, u_star_sqd, rho_ds_zm, invrs_rho_ds_zt, l_implemented, l_imp_sfc_momentum_flux
+    args = (nzm, nzt, _NG, gr, dt, jnp.asarray(lhs_ma_zt), jnp.asarray(lhs_diff),
+            jnp.asarray(wind_speed), jnp.asarray(u_star_sqd),
+            jnp.asarray(rho_ds_zm), jnp.asarray(invrs_rho_ds_zt), False, True)
     base = np.asarray(windm_edsclrm_lhs(*args))
     # Zero u_star → surface term vanishes; the ONLY change must be band[1] at k=0.
-    args_no_sfc = list(args); args_no_sfc[5] = jnp.zeros((_NG,))
+    # u_star_sqd is at position 8 in the args tuple
+    args_no_sfc = list(args); args_no_sfc[8] = jnp.zeros((_NG,))
     no_sfc = np.asarray(windm_edsclrm_lhs(*args_no_sfc))
     diff = base - no_sfc
     mask = np.zeros_like(diff, dtype=bool); mask[1, :, 0] = True
     assert np.max(np.abs(diff[~mask])) < 1e-18, "surface term leaked outside the diagonal/lower-boundary entry"
     assert np.all(np.abs(diff[1, :, 0]) > 0), "surface term missing at the lower boundary"
     # Crank-Nicholson: doubling lhs_diff doubles the diffusion contribution (LHS minus the diff-independent parts).
-    args2 = list(args); args2[0] = jnp.asarray(2.0 * lhs_diff)
+    # lhs_diff is at position 6 in the args tuple
+    args2 = list(args); args2[6] = jnp.asarray(2.0 * lhs_diff)
     dbl = np.asarray(windm_edsclrm_lhs(*args2))
     assert np.allclose(dbl - base, 0.5 * lhs_diff, atol=1e-13), "Crank-Nicholson 0.5 factor not linear in lhs_diff"
     print("  surface term localized to diag@lower-boundary; CN 0.5·diff scales linearly  PASS")

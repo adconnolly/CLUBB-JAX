@@ -81,12 +81,12 @@ def test_against_transcription():
         )
         ref = _ref(k_lb, ng, nzm, sclr_dim, edsclr_dim, c["l_host"], c["l_lin"], sfc, prof)
         jout = set_sfc_value_of_flux_profiles(
-            sclr_dim, edsclr_dim, gr, c["l_host"], c["l_lin"],
+            nzm, ng, sclr_dim, edsclr_dim, gr, c["l_host"], c["l_lin"],
             sfc["wpthlp"], sfc["wprtp"], sfc["upwp"], sfc["vpwp"], sfc["upwp_pert"], sfc["vpwp_pert"],
             sfc["wpsclrp"], sfc["wpedsclrp"],
             prof["wpthlp"], prof["wprtp"], prof["upwp"], prof["vpwp"],
             prof["upwp_pert"], prof["vpwp_pert"], prof["wpsclrp"], prof["wpedsclrp"],
-            ng, nzm)
+        )
         names = ("wpthlp", "wprtp", "upwp", "vpwp", "upwp_pert", "vpwp_pert", "wpsclrp", "wpedsclrp")
         for nm, jv in zip(names, jout):
             rv = ref[nm]

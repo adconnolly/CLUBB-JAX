@@ -72,7 +72,8 @@ def convert_pressure_sounding_to_z(snd: dict, p_sfc: float, zm_init: float,
         raise ValueError(f"convert_pressure_sounding_to_z: invalid theta_type {snd['theta_type']!r}")
 
     thv_ds = theta * (1.0 + ep2 * (rtm - rcm)) ** kappa
-    thvm = np.asarray(calculate_thvm(jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
+    nlevs = len(thlm)
+    thvm = np.asarray(calculate_thvm(nlevs, 1, jnp.asarray(thlm), jnp.asarray(rtm), jnp.asarray(rcm),
                                          jnp.asarray(exner), jnp.asarray(thv_ds)))
     z = np.asarray(inverse_hydrostatic(float(p_sfc), float(zm_init), thvm, exner))
 
