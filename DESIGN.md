@@ -315,6 +315,57 @@ bit-faithful frontier is at 20 cases, and the name/file mirror is converged. The
 workflow that built the port is retired. Most work now is **refactoring, simplification, differentiability, and
 working under the numerical-accuracy standard**.
 
+**★ `formatting_and_jitting` branch — status, performance finding, and next-step queue (2026-06-19).**
+This branch (a formatting/Fortran-comment pass + JIT-friendly derived types + a new pure-JAX `src/io/` init path —
+`namelist.py`/`sounding.py`/`surface.py`/`grid_file.py` + `derived_types/converters.py`, removing `clubb_api`
+usage *except for stats*) is **WIP**. Verified state and the queue:
+
+- **Physics (faithfulness gate).** **12/20 DEFAULT_CASES bit-PASS** (arm, bomex, wangara, atex, gabls2,
+  gabls3_night, fire, neutral, cobra, dycoms2_rf02_nd, dycoms2_rf01_fixed_sst, jun25_altocu). dycoms2_rf01 runs all
+  30 steps fine **standalone** — its `compare_cases` "crash" (rc=1 @ iter 29) was node resource-contention from
+  running `compare_cases` (501-level case) and the 165-file unit suite at once, **not** a code bug; never run two
+  heavy JAX suites concurrently. **7 cases fail-loud** on features the new init path has not rewired yet:
+  Morrison microphysics (mpace_a, clex9_nov02, clex9_oct14), `l_cloud_sed` (atex_long, dycoms2_rf02_so),
+  `l_soil_veg` (gabls3), sponge damping (ekman). *Env note:* `clubb_release/install/latest` had gone dangling
+  (its scratch target `mpace_dbg` was purged) → repoint to `install/intel_PRECdouble_PYTHON`.
+
+- **Performance finding (the dominant cost; assessed via `JAX_LOG_COMPILES`).** Runs are slow because of
+  **first-call JIT compilation**, and the architecture maximizes compile cost without amortizing it. (a) **No
+  top-level jit** — `advance_clubb_core` and the timestep loop (`for itime_idx in range(n_steps)`) are plain
+  Python; only ~23 *leaf* functions are jitted, so the glue runs **eager** → hundreds of standalone primitive
+  pjit dispatches (probe saw **169** tiny op-compiles: `jit(multiply)`/`add`/`_where`/`squeeze`/…). (b) **Heavy
+  leaf compiles**: `advance_xm_wpxp` ~3.9 s trace, `advance_xp2_xpyp` ~1.5 s (a **58-array-argument** signature),
+  `calc_turb_adv_range` ~1.2 s, `advance_wp2_wp3` ~0.7 s — plus MLIR + XLA on top; **first-step compile runs into
+  minutes** and grows with grid size (dycoms 501 levels ≈ 290 s). (c) **Re-tracing / cache misses**: `clip_covar`
+  ×5, `stats_finalize_xp2_xpyp_terms` ×5, `monotonic_turbulent_flux_limit` ×4, `pos_definite_variances` ×4
+  (varying static args / multiple call sites). (d) **numpy↔jax round-trips at every call site** (`np.asarray`
+  back to `state`) force a device sync per kernel and block cross-function fusion. Compiles **do NOT recur per
+  step** (steps 2..N hit cache) → it is a **one-time** cost a 3–30-step run never recoups. **Fix direction:** jit
+  the whole timestep (`advance_clubb_core` end-to-end), ideally drive the loop with `lax.scan`, and stabilize the
+  static-arg keys to stop the re-traces — the same whole-step compilation efficient whole-driver `jax.grad` needs.
+
+- **Unit-test status (165 files; 118 passing at branch start).** A signature-drift pass updated **35** stale
+  tests to the refactor's new JIT-friendly signatures (leading `nzm/nzt/ngrdcol/gr`, reordered args,
+  `static_argnums` → arrays in static slots raised `unhashable type`). Two surfaced small **src** fixes (applied):
+  `set_sfc_value_of_flux_profiles` now zeros `wpedsclrp` **unconditionally** (matches the Fortran whole-array
+  assignment; the refactor had guarded it under `edsclr_dim>0`), and the `fill_holes_sliding_window` grad test
+  uses **forward-mode** `jacfwd` (reverse-mode through its dynamic-bound `fori_loop` is unsupported — bounds are
+  traced, not static, in the live `fill_holes_vertical` dispatcher). *Caveat:* the 35 are verified individually;
+  the aggregate clean-suite re-run was aborted, not yet confirmed green together.
+
+- **12 unit tests still failing — the next-step queue** (none are signature drift):
+  - *Structural-audit guards (6) — update allowlists/guards for the legit structural changes:*
+    `test_no_dead_imports` + `test_standalone_jax` (src now references `clubb_python` via stats → the "100% JAX"
+    guards trip — decide: drop the stats `clubb_python` use, or carve a documented exception), `test_mirror_audit`
+    (new `io/` + `converters.py`/`err_info_codes.py` files don't mirror a `.F90` → add to `_JAX_ONLY_FILES`/
+    `_RENAMES`), `test_routine_placement` (a routine moved off its mirror file), `test_no_dead_functions`
+    (uncalled public fns), `test_param_names` (param-index constants drifted — verify vs the f2py oracle).
+  - *Genuine numerical / grad / oracle (6) — need real investigation:* `test_differentiability` (reverse-mode
+    through a dynamic-bound `while_loop`/`fori_loop`), `test_kk_rico_oracle` (grad NaN; KK oracle), `test_morrison_rates`
+    (`ImportError: morrison_hm_metadata` — tied to the unwired Morrison subsystem), `test_gabls3_night_stability`
+    (fm1/fh1 mismatch vs F90, 2.6e-7), `test_transform_pdf_chi_eta_component` (Monte-Carlo variance assertion),
+    `test_saturation` (`saturation_formula=2` should-raise decision).
+
 The genuinely-remaining unported `.F90` are all impractical/out-of-scope (no oracle or zero validated payoff):
 - **COAMPS microphysics** (`coamps_microphys_driver`) — 7000-line alternative scheme the gated config never uses;
   the Fortran itself fatal-errors on `l_predict_Nc=F` → no oracle.

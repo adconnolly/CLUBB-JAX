@@ -68,6 +68,22 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
 
 ## Recent work
 
+### 2026-06-19 — `formatting_and_jitting` branch (WIP)
+- **Branch scope:** a formatting / Fortran-comment-copying pass; **JIT-friendly derived types** (`derived_types/`
+  ConfigFlags/Grid/pdf_parameter made jit-static); a new **pure-JAX `src/io/` init path**
+  (`namelist.py`/`sounding.py`/`surface.py`/`grid_file.py` + `derived_types/converters.py`); reintroduced the JAX
+  `prescribe_forcings`; **removed `clubb_api` usage except for stats**; shrank stats buffers (memory/runtime win).
+- **Status:** 12/20 DEFAULT_CASES bit-PASS; 7 cases fail-loud on features the new init path hasn't rewired
+  (Morrison microphysics, `l_cloud_sed`, `l_soil_veg`, sponge); dycoms2_rf01 runs fine standalone (its
+  `compare_cases` "crash" was node contention, not a bug). **Whole-step jit is NOT done** — only ~23 leaf
+  functions are jitted while `advance_clubb_core`/the timestep loop stay eager, so first-call JIT compilation
+  dominates runtime (full analysis + fix direction in DESIGN.md "Remaining Work → `formatting_and_jitting`").
+- **This session:** fixed **35** signature-drift unit tests (refactor added leading `nzm/nzt/ngrdcol/gr` args,
+  reordered args, `static_argnums`) + 2 src fixes (`set_sfc_value_of_flux_profiles` zeros `wpedsclrp`
+  unconditionally; `Input_fields/sounding.py` stale `calculate_thvm` call). **12 tests still failing** — 6
+  structural-audit guards (new `io/` files + the stats-`clubb_python` keep trip the mirror/100%-JAX guards) and 6
+  genuine numerical/grad/oracle (see DESIGN.md next-step queue).
+
 ### 2026-06-08 — Documentation condensation
 - Reviewed + corrected `TRANSLATION_STATUS.md` against the live repo and condensed it (392 → 218 lines): dropped
   the per-iteration narrative, replaced the stale "Total 202 / ported 128" headline with the current
