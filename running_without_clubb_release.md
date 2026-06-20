@@ -93,15 +93,24 @@ entry point.
    `advance_clubb_to_end.py:12`, `clubb_case_initalization.py:8`, `Radiation/radiation.py:15`. `test_standalone_jax.py`
    /`test_no_dead_imports.py` already assert the JAX driver references no `clubb_python`; they will gate this.
 
-### The one real gap — stats metadata
+### The stats-metadata "gap" — already closed for this build
 
-The Fortran per-variable metadata (grid `zt`/`zm`, units, long-name for ~800 stats variables) is **hardcoded across
-`stats_init_zt.F90` / `stats_init_zm.F90` / …**, not in the stats `.in` file. `StatsWriter._parse_registry`
-(`stats_writer.py:44`) expects an **enriched** registry of the form `entry(N) = "name|grid|units|long_name"` — which
-the stock `clubb_release/input/stats/standard_stats.in` does **not** provide (it only lists enabled names). So a
-prerequisite is generating that enriched registry once (e.g., dump `get_stats_var_meta` for every variable from a
-single Fortran run, or transcribe the `stats_init_*` tables) and shipping it under `clubb_jax/`. Until then the
-pure-Python writer can only emit variables whose metadata is captured in the registry it is handed.
+The pure-Python writer needs per-variable grid (`zt`/`zm`), units, and long-name. In upstream CLUBB those live
+hardcoded across `stats_init_*.F90`, but **this build's `clubb_release/input/stats/standard_stats.in` is already in
+the enriched form** `entry(N) = "name | grid | units | long_name"` (825 entries), which is exactly what
+`StatsWriter._parse_registry` (`stats_writer.py:44`) parses. So no metadata regeneration is needed — the same file
+the Fortran `init_stats` reads feeds the Python writer directly.
+
+### Implemented (2026-06-19)
+
+Steps 1-6 above are done on the `jit-cache-and-f2py-decoupling` branch — the standalone path
+(`clubb_standalone` → `init_clubb_case` → `advance_clubb_to_end`) now runs with **`clubb_python`/`clubb_f2py` hard
+import-blocked** and stays **bit-faithful** to the Fortran oracle (arm: 789 vars, 0 over threshold). Changes:
+`StatsWriter` gained `update_budget` + Fortran-exact `l_in_budget` guards on begin/finalize; `JaxStats` gained
+`from_writer`/`to_writer` (and its `clubb_api` import is now lazy); `init_clubb_case` builds a `StatsWriter` into
+`state['stats_writer']`; the per-step replay, radiation, forcings, and converters route to the writer / pure-Python
+mirrors. **Still f2py-coupled:** the `clubb_driver.py` `run_clubb` entry (step 7, err_info) — not on the standalone
+path; and removing the `clubb_release/input/` *data files* (the second dependency above) is untouched.
 
 ---
 

@@ -12,7 +12,6 @@ excluded; those schemes are handled by the Fortran driver.
 import math
 import numpy as np
 
-from clubb_python import clubb_api
 from clubb_jax.src.CLUBB_core.calendar import (
     compute_current_date,
     gregorian2julian_day,
@@ -56,7 +55,7 @@ def advance_radiation(state: dict, time_current: float, l_sample: bool = False):
         )
 
     if l_sample:
-        clubb_api.stats_update("radht", state['radht'])
+        state['stats_writer'].update("radht", state['radht'])
 
 
 def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bool = False):
@@ -124,11 +123,11 @@ def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bo
     state['radht_LW'] = radht_lw
 
     if l_sample:
-        clubb_api.stats_update("Frad", frad_total)
-        clubb_api.stats_update("Frad_SW", frad_sw)
-        clubb_api.stats_update("Frad_LW", frad_lw)
-        clubb_api.stats_update("radht_SW", radht_sw)
-        clubb_api.stats_update("radht_LW", radht_lw)
+        state['stats_writer'].update("Frad", frad_total)
+        state['stats_writer'].update("Frad_SW", frad_sw)
+        state['stats_writer'].update("Frad_LW", frad_lw)
+        state['stats_writer'].update("radht_SW", radht_sw)
+        state['stats_writer'].update("radht_LW", radht_lw)
 
 
 def _simple_rad_lw(
@@ -193,7 +192,7 @@ def _simple_rad_lw(
             )
 
         if l_sample:
-            clubb_api.stats_update("z_inversion", z_i)
+            state['stats_writer'].update("z_inversion", z_i)
 
     # Radiative heating rate on thermodynamic levels.
     radht_lw = (
