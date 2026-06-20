@@ -24,8 +24,6 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from clubb_python import clubb_api
-
 OP_NONE = 0
 OP_UPDATE = 1
 OP_BEGIN_BUDGET = 2
@@ -148,6 +146,7 @@ class JaxStats:
         max_events: int | None = None,
     ):
         """Create bridge metadata from the active Fortran-backed stats registry."""
+        from clubb_python import clubb_api
         cfg = clubb_api.get_stats_config()
         l_enabled = bool(cfg[0])
         nvars = int(cfg[2]) if l_enabled else 0
@@ -168,6 +167,34 @@ class JaxStats:
         return cls.empty(
             l_sample=l_sample,
             names=tuple(names),
+            ncol=int(ngrdcol),
+            max_nlev=max_nlev,
+            max_events=max_events,
+        )
+
+    @classmethod
+    def from_writer(
+        cls,
+        stats_writer,
+        *,
+        ngrdcol: int,
+        nzm: int,
+        nzt: int,
+        max_events: int | None = None,
+    ):
+        """Create bridge metadata from the pure-Python :class:`StatsWriter`.
+
+        f2py-free analogue of :meth:`from_api`: the enabled-variable set and the
+        sample flag come from the writer's parsed registry instead of the
+        Fortran ``get_stats_config``/``get_stats_var_meta`` calls.
+        """
+        names = tuple(stats_writer.registry.keys())
+        max_nlev = max(int(nzm), int(nzt), 1)
+        if max_events is None:
+            max_events = max(1, EVENTS_PER_STATS_VARIABLE * len(names))
+        return cls.empty(
+            l_sample=bool(stats_writer.l_sample),
+            names=names,
             ncol=int(ngrdcol),
             max_nlev=max_nlev,
             max_events=max_events,
@@ -383,8 +410,73 @@ class JaxStats:
             overflow=new_overflow,
         )
 
+    def _replay(self):
+        """Decode recorded events into (op_code, name, values, icol, level, l_count_sample) tuples.
+
+        Shared by :meth:`to_api` (Fortran) and :meth:`to_writer` (pure-Python) so the
+        two back-ends apply byte-identical payloads in identical order.
+        """
+        if bool(np.asarray(self.overflow)):
+            raise RuntimeError(
+                f"JaxStats event log overflowed max_events={self.max_events}."
+            )
+
+        count = int(np.asarray(self.count))
+        op = np.asarray(self.op)
+        var_id = np.asarray(self.var_id)
+        rank = np.asarray(self.rank)
+        nlev = np.asarray(self.nlev)
+        icol = np.asarray(self.icol)
+        level = np.asarray(self.level)
+        l_count_sample = np.asarray(self.l_count_sample)
+        payload_scalar = np.asarray(self.payload_scalar)
+        payload_1d = np.asarray(self.payload_1d)
+        payload_2d = np.asarray(self.payload_2d)
+
+        for i in range(count):
+            op_code = int(op[i])
+            if op_code == OP_NONE:
+                continue
+            name = self.names[int(var_id[i])]
+            rank_i = int(rank[i])
+            nlev_i = int(nlev[i])
+            icol_arg = None if int(icol[i]) == NO_INDEX else int(icol[i])
+            level_arg = None if int(level[i]) == NO_INDEX else int(level[i])
+            if rank_i == RANK_SCALAR:
+                values = float(payload_scalar[i])
+            elif rank_i == RANK_1D:
+                values = payload_1d[i, :nlev_i]
+            elif rank_i == RANK_2D:
+                values = payload_2d[i, :, :nlev_i]
+            else:
+                raise RuntimeError(f"Invalid JaxStats payload rank {rank_i}.")
+            yield op_code, name, values, icol_arg, level_arg, bool(l_count_sample[i])
+
+    def to_writer(self, stats_writer):
+        """Replay recorded events to the pure-Python :class:`StatsWriter` (no f2py).
+
+        Maps the recorded ops onto the writer's methods with the same semantics the
+        Fortran-backed API applies: per-column scalar updates route to ``update_col``;
+        budget ops are guarded by the writer's active-budget state.
+        """
+        for op_code, name, values, icol_arg, level_arg, l_count_sample in self._replay():
+            if op_code == OP_UPDATE:
+                if icol_arg is not None and np.ndim(values) == 0:
+                    stats_writer.update_col(name, float(values), icol=icol_arg)
+                else:
+                    stats_writer.update(name, values)
+            elif op_code == OP_BEGIN_BUDGET:
+                stats_writer.begin_budget(name, values)
+            elif op_code == OP_UPDATE_BUDGET:
+                stats_writer.update_budget(name, values)
+            elif op_code == OP_FINALIZE_BUDGET:
+                stats_writer.finalize_budget(name, values, l_count_sample=l_count_sample)
+            else:
+                raise RuntimeError(f"Invalid JaxStats op code {op_code}.")
+
     def to_api(self):
         """Replay recorded events to the existing CLUBB stats API."""
+        from clubb_python import clubb_api
         if bool(np.asarray(self.overflow)):
             raise RuntimeError(
                 f"JaxStats event log overflowed max_events={self.max_events}."

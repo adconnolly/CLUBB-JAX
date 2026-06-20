@@ -68,6 +68,23 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
 
 ## Recent work
 
+### 2026-06-19 — Eliminate f2py from the standalone JAX path (stats decoupling)
+- **What:** the standalone driver (`clubb_standalone` → `init_clubb_case` → `advance_clubb_to_end`) now runs with
+  **`clubb_python`/`clubb_f2py` hard import-blocked**. The last f2py tie was the **stats subsystem**; it now uses the
+  pure-Python `src/io/stats_writer.py::StatsWriter` (which parses the already-enriched `standard_stats.in`
+  `name|grid|units|long_name` registry — no metadata regeneration needed).
+- **Changes:** `StatsWriter` gained `update_budget` + Fortran-exact `l_in_budget` guards on begin/update/finalize
+  (mirroring `stats_netcdf.F90`); `JaxStats` gained `from_writer`/`to_writer` and made its `clubb_api` import lazy;
+  `init_clubb_case` builds `state['stats_writer']`; per-step replay, `Radiation/radiation.py`, `prescribe_forcings`,
+  and `derived_types/converters.py` (now optional-import) route to the writer / pure-Python mirrors.
+- **Latent bug fixed:** the driver passed a **0-based** step index to the stats sampler while the Fortran standalone
+  loops `do itime = 1, ifinal` (**1-based**) — invisible when `stats_tout==stats_tsamp` (a record/step) but it shifts
+  every multi-sample averaging window. Exposed by gabls2 (`tout=600`, `tsamp=60` → 10-sample average). Now passes
+  1-based `itime`.
+- **Validation:** f2py-blocked run completes end-to-end; **arm, bomex, fire, wangara, gabls2 all bit-faithful** to
+  the Fortran oracle (0 vars over threshold). *Still f2py-coupled (out of scope here):* the `clubb_driver.py`
+  `run_clubb` entry (err_info), and the `clubb_release/input/` data files. See `running_without_clubb_release.md`.
+
 ### 2026-06-19 — JAX-vs-Fortran speed assessment + persistent JIT cache (`main`)
 - **Environment reconstruction.** This checkout arrived with no jax, an empty `clubb_release` submodule, and no
   compiled oracle. Rebuilt all of it: jax venv (jax 0.10.2 + numpy + netCDF4 + tabulate) at

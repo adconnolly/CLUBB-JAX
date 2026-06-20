@@ -169,9 +169,11 @@ class StatsWriter:
     # ------------------------------------------------------------------
 
     def begin_timestep(self, itime: int) -> Tuple[bool, bool]:
-        """Determine sampling flags and reset accumulators for itime (0-based).
+        """Determine sampling flags and reset accumulators for itime (1-based).
 
-        Returns (l_sample, l_last_sample) as booleans.
+        Mirrors stats_begin_timestep_api in stats_netcdf.F90, which the Fortran
+        driver calls with the 1-based loop index ``do itime = 1, ifinal``. Callers
+        must therefore pass a 1-based step index. Returns (l_sample, l_last_sample).
         """
         if not self.enabled:
             self.l_sample = False
@@ -183,9 +185,8 @@ class StatsWriter:
         # Fortran: mod(itime, stats_nout) == 0
         self.l_last_sample = (itime % self.stats_nout == 0)
 
-        # Reset buffers at the start of each output window
-        # Fortran: mod(itime - 1, stats_nout) == 0  (for itime>=0, -1 mod N wraps)
-        if (itime - 1) % self.stats_nout == 0 or itime == 0:
+        # Reset buffers at the start of each output window (Fortran: mod(itime-1, nout) == 0).
+        if (itime - 1) % self.stats_nout == 0:
             for name in self._buffer:
                 self._buffer[name][:] = 0.0
                 self._nsamples[name][:] = 0
@@ -233,10 +234,16 @@ class StatsWriter:
         self._nsamples[name][icol, 0] += 1
 
     def begin_budget(self, name: str, val_before: np.ndarray) -> None:
-        """Start a budget window by subtracting the current state from the buffer."""
+        """Start a budget window by subtracting the current state from the buffer.
+
+        Mirrors stats_begin_budget in stats_netcdf.F90: a second begin without an
+        intervening finalize is a no-op (the Fortran warns and returns).
+        """
         if not self.l_sample:
             return
         if name not in self._buffer:
+            return
+        if name in self._in_budget:      # "stats budget begin twice" → no-op
             return
         val = np.asarray(val_before, dtype=np.float64)
         buf = self._buffer[name]
@@ -249,16 +256,41 @@ class StatsWriter:
                 buf[:, 0] -= val[:, 0]
         self._in_budget.add(name)
 
+    def update_budget(self, name: str, value: np.ndarray) -> None:
+        """Add an intermediate budget contribution (mirrors stats_update_budget).
+
+        No-op unless the variable is inside an active begin/finalize window, and
+        never increments the sample counter — exactly the Fortran semantics.
+        """
+        if not self.l_sample:
+            return
+        if name not in self._buffer:
+            return
+        if name not in self._in_budget:  # "stats budget update without begin" → no-op
+            return
+        val = np.asarray(value, dtype=np.float64)
+        buf = self._buffer[name]
+        if buf.ndim == 2 and buf.shape[1] > 1:
+            buf[:, :] += val
+        else:
+            if val.ndim <= 1:
+                buf[:, 0] += val.ravel()[0] if val.ndim == 0 else val
+            else:
+                buf[:, 0] += val[:, 0]
+
     def finalize_budget(self, name: str, val_after: np.ndarray,
                         l_count_sample: bool = True) -> None:
         """Close a budget window by adding the final state and optionally counting the sample.
 
         l_count_sample=False mirrors Fortran's stats_finalize_budget(..., l_count_sample=.false.)
-        which adds to the buffer but does NOT increment the sample counter.
+        which adds to the buffer but does NOT increment the sample counter. A finalize without a
+        matching begin is a no-op (the Fortran warns and returns).
         """
         if not self.l_sample:
             return
         if name not in self._buffer:
+            return
+        if name not in self._in_budget:  # "stats budget finalize without begin" → no-op
             return
         val = np.asarray(val_after, dtype=np.float64)
         buf = self._buffer[name]

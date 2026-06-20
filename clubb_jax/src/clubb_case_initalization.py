@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 
 # Stats API
-from clubb_python import clubb_api
 from clubb_jax.src.CLUBB_core.config_flags import ConfigFlags
 from clubb_jax.src.CLUBB_core.grid_class import setup_grid as py_setup_grid
 from clubb_jax.src.CLUBB_core.sclr_idx import SclrIdx
@@ -14,7 +13,6 @@ from clubb_jax.src.CLUBB_core.pdf_params import (
     init_pdf_params as init_pdf_params_py,
 )
 from clubb_jax.src.CLUBB_core.err_info import ErrInfo
-from clubb_jax.src.derived_types.converters import err_info_from_api, err_info_to_api
 from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
 from clubb_jax.src.CLUBB_core.error_code import set_debug_level as set_jax_debug_level
 from clubb_jax.src.CLUBB_core.grid_class import zt2zm
@@ -31,6 +29,7 @@ from clubb_jax.src.Input_fields.hydrostatic_module import hydrostatic
 
 # I/O
 from clubb_jax.src.io.grid_file import read_grid_file
+from clubb_jax.src.io.stats_writer import StatsWriter
 from clubb_jax.src.io.namelist import read_namelist
 from clubb_jax.src.io.sounding import (
     read_sounding,
@@ -793,38 +792,33 @@ def init_clubb_case(namelist_path: str) -> dict:
         output_dir_path = repo_root / "output"
     stats_output_path = output_dir_path / f"{stats_prefix}_stats.nc"
 
+    stats_writer = None
     if l_stats:
         if not stats_registry_path.exists():
             raise FileNotFoundError(f"Stats registry file not found: {stats_registry_path}")
         stats_output_path.parent.mkdir(parents=True, exist_ok=True)
-        err_info = err_info_from_api(
-            clubb_api.init_stats(
-                registry_path=str(stats_registry_path),
-                output_path=str(stats_output_path),
-                ncol=ngrdcol,
-                stats_tsamp=float(cfg['stats_tsamp']),
-                stats_tout=float(cfg['stats_tout']),
-                dt_main=float(dt_main),
-                day_in=int(cfg['day']),
-                month_in=int(cfg['month']),
-                year_in=int(cfg['year']),
-                time_initial=float(time_initial),
-                nzt=nzt,
-                zt=gr.zt[0, :],
-                nzm=nzm,
-                zm=gr.zm[0, :],
-                clubb_params=clubb_params,
-                param_names=get_param_names(),
-                err_info=err_info_to_api(err_info),
-                sclr_dim=sclr_dim,
-                edsclr_dim=edsclr_dim,
-            )
+        # Pure-Python stats engine (replaces the Fortran clubb_api.init_stats); no f2py.
+        stats_writer = StatsWriter(
+            registry_path=str(stats_registry_path),
+            output_path=str(stats_output_path),
+            nzt=nzt,
+            nzm=nzm,
+            ngrdcol=ngrdcol,
+            zt=np.asarray(gr.zt[0, :]),
+            zm=np.asarray(gr.zm[0, :]),
+            stats_tsamp=float(cfg['stats_tsamp']),
+            stats_tout=float(cfg['stats_tout']),
+            dt_main=float(dt_main),
+            day=int(cfg['day']),
+            month=int(cfg['month']),
+            year=int(cfg['year']),
+            time_initial=float(time_initial),
+            clubb_params_vals=np.asarray(clubb_params),
+            param_names=get_param_names(),
+            sclr_dim=sclr_dim,
+            edsclr_dim=edsclr_dim,
         )
-        err = np.asarray(err_info.err_code_or_default())
-        if np.any(err != 0):
-            raise RuntimeError(f"stats_init failed with err_code={err}")
-        stats_enabled = bool(clubb_api.get_stats_config()[0])
-        if not stats_enabled:
+        if not stats_writer.enabled:
             raise RuntimeError("stats_init completed but stats are not enabled")
 
     # ── 14. Zero PDF params ─────────────────────────────────────────────
@@ -842,6 +836,7 @@ def init_clubb_case(namelist_path: str) -> dict:
         dt_main=dt_main, dt_rad=dt_rad,
         time_initial=time_initial, time_final=time_final,
         ifinal=ifinal, l_stats=l_stats,
+        stats_writer=stats_writer,
         stats_nsamp=stats_nsamp, stats_nout=stats_nout,
         stats_registry_path=str(stats_registry_path),
         stats_output_path=str(stats_output_path),
@@ -972,8 +967,6 @@ def init_clubb_case(namelist_path: str) -> dict:
 
 def clean_up_clubb(state: dict):
     """Clean up stats state."""
-    if state['l_stats']:
-        state['err_info'] = err_info_from_api(
-            clubb_api.finalize_stats(err_info=err_info_to_api(state['err_info']))
-        )
+    if state['l_stats'] and state.get('stats_writer') is not None:
+        state['stats_writer'].finalize()
     print("CLUBB cleanup complete.")

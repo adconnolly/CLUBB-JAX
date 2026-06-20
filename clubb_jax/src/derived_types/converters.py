@@ -5,14 +5,26 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 
-from clubb_python.derived_types.err_info import ErrInfo as ApiErrInfo
-from clubb_python.derived_types.grid_class import Grid as ApiGrid
-from clubb_python.derived_types.nu_vert_res_dep import NuVertResDep as ApiNuVertResDep
-from clubb_python.derived_types.pdf_params import (
-    implicit_coefs_terms as ApiImplicitCoefsTerms,
-    pdf_parameter as ApiPdfParameter,
-)
-from clubb_python.derived_types.sclr_idx import SclrIdx as ApiSclrIdx
+# The Fortran-backed `clubb_python` API derived types are only needed by the
+# `*_to_api` direction and the `isinstance(x, Api*)` guards. The pure-JAX driver
+# never produces those types, so make the import optional: when `clubb_python`
+# (f2py) is unbuilt, bind the names to a sentinel class. `isinstance(jax_obj,
+# _MissingApiType)` is correctly False, so every `*_from_api` normalizer still
+# works; only the unused `*_to_api` constructors would raise if ever called.
+try:
+    from clubb_python.derived_types.err_info import ErrInfo as ApiErrInfo
+    from clubb_python.derived_types.grid_class import Grid as ApiGrid
+    from clubb_python.derived_types.nu_vert_res_dep import NuVertResDep as ApiNuVertResDep
+    from clubb_python.derived_types.pdf_params import (
+        implicit_coefs_terms as ApiImplicitCoefsTerms,
+        pdf_parameter as ApiPdfParameter,
+    )
+    from clubb_python.derived_types.sclr_idx import SclrIdx as ApiSclrIdx
+except ImportError:  # f2py / clubb_python not built — pure-JAX path only
+    class _MissingApiType:
+        """Sentinel for an unavailable clubb_python API type (no f2py build)."""
+    ApiErrInfo = ApiGrid = ApiNuVertResDep = _MissingApiType
+    ApiImplicitCoefsTerms = ApiPdfParameter = ApiSclrIdx = _MissingApiType
 
 from clubb_jax.src.CLUBB_core.err_info import ErrInfo
 from clubb_jax.src.CLUBB_core.grid_class import Grid

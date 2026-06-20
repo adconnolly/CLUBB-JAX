@@ -9,7 +9,6 @@ import gc
 
 import numpy as np
 
-from clubb_python import clubb_api
 from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
 from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
@@ -19,10 +18,7 @@ from clubb_jax.src.Benchmark_cases.prescribe_forcings import (
     prescribe_forcings_generic,
 )
 from clubb_jax.src.Microphys.microphys_driver import calc_microphys_scheme_tendcies
-from clubb_jax.src.derived_types.converters import (
-    err_info_from_api,
-    err_info_to_api,
-)
+from clubb_jax.src.derived_types.converters import err_info_from_api
 
 
 def _err_code_summary(err_info) -> str:
@@ -98,7 +94,7 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         state['l_sample'] = l_sample
         _advance_clubb_core(state)
         if l_stats:
-            state['_jax_stats'].to_api()
+            state['_jax_stats'].to_writer(state['stats_writer'])
 
         # ── Radiation ───────────────────────────────────────────────────
         l_rad_itime = (itime % rad_interval == 0) or (itime == 1)
@@ -154,11 +150,15 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
 def _begin_timestep_stats(state: dict, itime_idx: int) -> tuple[bool, bool]:
     """Begin stats collection and create the JAX stats bridge for core updates."""
     if state['l_stats']:
-        clubb_api.stats_begin_timestep(itime_idx)
-        stats_cfg = clubb_api.get_stats_config()
-        l_sample = bool(stats_cfg[7])
-        l_last_sample = bool(stats_cfg[8])
-        state['_jax_stats'] = JaxStats.from_api(
+        sw = state['stats_writer']
+        # Fortran clubb_driver.F90 runs `do itime = 1, ifinal` and passes that 1-based
+        # index to stats_begin_timestep_api, so its sampling/output windows key off
+        # 1-based steps. Match it (itime_idx is 0-based) — invisible when
+        # stats_tout==stats_tsamp (a record every step) but it shifts every averaging
+        # window when stats_tout spans multiple samples (e.g. gabls2: tout=600, tsamp=60).
+        l_sample, l_last_sample = sw.begin_timestep(itime_idx + 1)
+        state['_jax_stats'] = JaxStats.from_writer(
+            sw,
             ngrdcol=state['ngrdcol'],
             nzm=state['nzm'],
             nzt=state['nzt'],
@@ -176,14 +176,9 @@ def _begin_timestep_stats(state: dict, itime_idx: int) -> tuple[bool, bool]:
 
 
 def _end_timestep_stats(state: dict, time_current: float) -> None:
-    """Finalize a sampled stats timestep through the Fortran-backed API."""
+    """Finalize a sampled stats timestep through the pure-Python StatsWriter (no f2py)."""
     stats_time = float(time_current + state['cfg']['stats_tout'])
-    state['err_info'] = err_info_from_api(
-        clubb_api.stats_end_timestep(
-            stats_time,
-            err_info=err_info_to_api(state['err_info']),
-        )
-    )
+    state['stats_writer'].end_timestep(stats_time)
 
 
 def _update_driver_stats(state: dict, time_current: float) -> None:
@@ -199,34 +194,34 @@ def _update_driver_stats(state: dict, time_current: float) -> None:
     )
     if micro_pending:
         zero = state['Nc_in_cloud'] * 0.0
-        clubb_api.stats_update("Ncm", zero)
-        clubb_api.stats_update("Nc_in_cloud", zero)
+        state['stats_writer'].update("Ncm", zero)
+        state['stats_writer'].update("Nc_in_cloud", zero)
     else:
         state['Ncm'] = state['Nc_in_cloud'] * state['cloud_frac']
-        clubb_api.stats_update("Ncm", state['Ncm'])
-        clubb_api.stats_update("Nc_in_cloud", state['Nc_in_cloud'])
+        state['stats_writer'].update("Ncm", state['Ncm'])
+        state['stats_writer'].update("Nc_in_cloud", state['Nc_in_cloud'])
 
     if state.get('_morr_rcm_mc') is not None:
-        clubb_api.stats_update("rcm_mc", state['_morr_rcm_mc'])
-        clubb_api.stats_update("rvm_mc", state['_morr_rvm_mc'])
-        clubb_api.stats_update("thlm_mc", state['_morr_thlm_mc'])
-        clubb_api.stats_update("rtm_mc", state['_morr_rcm_mc'] + state['_morr_rvm_mc'])
+        state['stats_writer'].update("rcm_mc", state['_morr_rcm_mc'])
+        state['stats_writer'].update("rvm_mc", state['_morr_rvm_mc'])
+        state['stats_writer'].update("thlm_mc", state['_morr_thlm_mc'])
+        state['stats_writer'].update("rtm_mc", state['_morr_rcm_mc'] + state['_morr_rvm_mc'])
 
     for field in ('wprtp_mc', 'wpthlp_mc', 'rtp2_mc', 'thlp2_mc', 'rtpthlp_mc'):
         value = state.get('_kk_' + field)
         if value is not None:
-            clubb_api.stats_update(field, value)
+            state['stats_writer'].update(field, value)
 
     if state.get('hm_metadata') is not None and state.get('hydromet') is not None:
         hm_metadata = state['hm_metadata']
         hydromet = np.asarray(state['hydromet'])
-        clubb_api.stats_update("rrm", hydromet[..., int(hm_metadata.iirr)])
-        clubb_api.stats_update("Nrm", hydromet[..., int(hm_metadata.iiNr)])
+        state['stats_writer'].update("rrm", hydromet[..., int(hm_metadata.iirr)])
+        state['stats_writer'].update("Nrm", hydromet[..., int(hm_metadata.iiNr)])
         if state.get('_kk_rrm_mc') is not None:
-            clubb_api.stats_update("rrm_mc", state['_kk_rrm_mc'])
-            clubb_api.stats_update("Nrm_mc", state['_kk_Nrm_mc'])
+            state['stats_writer'].update("rrm_mc", state['_kk_rrm_mc'])
+            state['stats_writer'].update("Nrm_mc", state['_kk_Nrm_mc'])
         if state.get('_kk_precip_frac') is not None:
-            clubb_api.stats_update("precip_frac", state['_kk_precip_frac'])
+            state['stats_writer'].update("precip_frac", state['_kk_precip_frac'])
 
 
 def _calculate_thvm(state: dict):
@@ -282,8 +277,8 @@ def _cloud_drop_sed(state: dict, l_sample: bool = False):
     state['rcm_mc'] = rcm_mc
     state['thlm_mc'] = thlm_mc
     if l_sample:
-        clubb_api.stats_update("sed_rcm", rcm_mc)
-        clubb_api.stats_update("Fcsed", fcsed)
+        state['stats_writer'].update("sed_rcm", rcm_mc)
+        state['stats_writer'].update("Fcsed", fcsed)
 
 
 def _advance_clubb_core(state: dict):
