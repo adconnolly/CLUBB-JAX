@@ -21,8 +21,11 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import numpy as np
 
 from clubb_jax.src.CLUBB_core.clubb_constants import (
+    Cp,
+    Lv,
     eps,
     global_fill,
     num_hf_draw_points,
@@ -398,7 +401,23 @@ def fill_holes_wp2_from_horz_tke(
 
 __all__ = [
     "fill_holes_global",
+    "fill_holes_hydromet_clip_jax",
     "fill_holes_sliding_window",
     "fill_holes_vertical",
     "fill_holes_wp2_from_horz_tke",
 ]
+
+
+def fill_holes_hydromet_clip_jax(hm, num, hm_tol, rvm_mc, thlm_mc, exner, dt):
+    """Clip a non-frozen (rain) precipitating hydrometeor mass `hm` <= `hm_tol` to 0, returning the removed mass
+    to vapor (rvm_mc) with a latent cooling on thlm (mirrors fill_holes.F90:fill_holes_driver_api, lines
+    2444-2476); the partner number `num` is zeroed (clip_hydromet_conc_mvr, <rx>=0). Concrete-numpy path
+    (the KK step runs concrete). Returns (hm, num, rvm_mc, thlm_mc)."""
+    below = hm <= hm_tol
+    removed = np.where(below, hm, 0.0)                      # removed rr mass [kg/kg]
+    hm = np.where(below, 0.0, hm)
+    num = np.where(below, 0.0, num)
+    exner = np.asarray(exner, np.float64)
+    rvm_mc = np.asarray(rvm_mc, np.float64) + removed / dt
+    thlm_mc = np.asarray(thlm_mc, np.float64) - (Lv / Cp) * removed / (exner * dt)
+    return hm, num, rvm_mc, thlm_mc

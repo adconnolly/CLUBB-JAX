@@ -87,7 +87,7 @@ def advance_morrison_microphysics(state: dict):
     clubb_params = jnp.asarray(g('clubb_params'))
     w_tol = float(state.get('w_tol', 2.0e-3))
     wp2 = jnp.asarray(g('wp2'))
-    Skw_zm = Skx_func(wp2, zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(g('wp3'))), w_tol, clubb_params)
+    Skw_zm = Skx_func(gr.nzm, gr.ngrdcol, wp2, zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(g('wp3'))), w_tol, clubb_params)
     Kh_zm = jnp.asarray(g('Kh_zm'))
     hm_tol = np.asarray(hmm.hydromet_tol).reshape(-1)
     # ★ The overall hydrometeor variance is hydrometp2 = ((ratio_ip+1)/precip_frac − 1)·hm²
@@ -143,7 +143,9 @@ def advance_morrison_microphysics(state: dict):
         adv = advance_one_hydrometeor(
             dt, hm, jnp.asarray(out[key]), K_hm, nu_hm, wm_zt,
             zero_zm, zero_zm, zero_zm, rho_ds_zm, invrs_rho_ds_zt, gr, w_above, l_sed=False)
-        adv = fill_holes_vertical(adv, rho_ds_zt, dzt, 0.0, 0, nzt - 1, fh_type)
+        adv = fill_holes_vertical(
+            gr.nzt, gr.ngrdcol, 0.0, 0, nzt - 1,
+            dzt, rho_ds_zt, gr.grid_dir_indx, fh_type, adv)
         new_hm[..., idx] = np.maximum(np.asarray(adv), 0.0)
     state['hydromet'] = new_hm
     state['Ncm'] = np.maximum(Ncm + out['Ncm_mc'] * dt, 0.0)

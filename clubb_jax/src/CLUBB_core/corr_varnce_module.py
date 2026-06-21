@@ -750,6 +750,15 @@ def init_pdf_hydromet_arrays(
     return hm_metadata
 
 
+def morrison_hm_metadata(host_dx=1.0e6, host_dy=1.0e6):
+    """Hydrometeor metadata for the Morrison 2-moment scheme: 8 fields rain/ice/snow/graupel ×
+    (mass, number) at array indices rr=0, Nr=1, ri=2, Ni=3, rs=4, Ns=5, rg=6, Ng=7. Bulk scheme →
+    no hydrometeor PDF (pdf_dim=4)."""
+    return init_pdf_hydromet_arrays(
+        hydromet_dim=8, iirr=0, iiNr=1, iiri=2, iiNi=3, iirs=4, iiNs=5, iirg=6, iiNg=7,
+        host_dx=host_dx, host_dy=host_dy)
+
+
 def kk_hm_metadata():
     """Return the warm-rain KK hydrometeor metadata used by the RICO-style setup."""
     hm_metadata = init_pdf_hydromet_arrays(
