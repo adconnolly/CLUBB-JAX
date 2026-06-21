@@ -112,6 +112,7 @@ def _advance_simplified_radiation(state: dict, time_current: float, l_sample: bo
         kappa=float(cfg.get('kappa', 0.0)),
         l_rad_above_cloud=bool(cfg.get('l_rad_above_cloud', False)),
         l_sample=l_sample,
+        stats_writer=state.get('stats_writer'),
     )
 
     frad_total = frad_sw + frad_lw
@@ -143,6 +144,7 @@ def _simple_rad_lw(
     kappa: float,
     l_rad_above_cloud: bool,
     l_sample: bool,
+    stats_writer=None,
 ):
     """Port of simple_rad from simple_rad_module.F90.
 
@@ -191,8 +193,8 @@ def _simple_rad_lw(
                 * (0.25 * (dz_pos ** (4.0 / 3.0)) + z_i_broad * (dz_pos ** (1.0 / 3.0)))
             )
 
-        if l_sample:
-            state['stats_writer'].update("z_inversion", z_i)
+        if l_sample and stats_writer is not None:
+            stats_writer.update("z_inversion", z_i)
 
     # Radiative heating rate on thermodynamic levels.
     radht_lw = (
