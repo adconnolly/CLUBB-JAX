@@ -377,6 +377,39 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
             "(only 0 / no adaptation is implemented)."
         )
 
+    # --- Unported closure/numerics flag paths (kept in sync with clubb_driver._check_unsupported_features) ---
+    # These select alternate closure/numerics branches the JAX does not implement (it is bit-faithful to the
+    # default path, so the alternate path is genuinely absent). No case_setup sets any of them. Fail loud rather
+    # than silently run the default — a flag-variant sweep (compare_flag_variants.py) showed l_vert_avg_closure=true
+    # otherwise ran and diverged from Fortran on bomex instead of being rejected.
+    for _flag, _what in (
+        ('l_C2_cloud_frac', 'cloud-fraction-weighted C2 closure coefficient'),
+        ('l_Lscale_plume_centered', 'plume-centered mixing-length (Lscale) computation'),
+        ('l_do_expldiff_rtm_thlm', 'explicit diffusion of rtm/thlm'),
+        ('l_godunov_upwind_wpxp_ta', 'Godunov-upwind wpxp turbulent advection'),
+        ('l_ho_trad_coriolis', 'higher-order traditional Coriolis terms'),
+        ('l_partial_upwind_wp3', 'partial-upwind wp3 turbulent advection'),
+        ('l_stability_correct_Kh_N2_zm', 'N^2 stability correction to Kh on zm'),
+        ('l_vert_avg_closure', 'vertically-averaged (rather than pointwise) PDF closure'),
+        ('l_standard_term_ta', 'standard wp3 turbulent-advection discretization (the JAX uses the ADG1 form)'),
+        ('l_use_tke_in_wp2_wp3_K_dfsn', 'TKE in the wp2/wp3 eddy-diffusion (K) term'),
+        ('l_crank_nich_diff', 'Crank-Nicolson diffusion in the wp2/wp3 solve'),
+        ('l_add_dycore_grid', 'host dycore-grid remap (a host-coupling feature)'),
+    ):
+        if bool(getattr(flags, _flag, False)) or bool(cfg.get(_flag, False)):
+            errors.append(f"{_flag} = true is not supported (the {_what} path is not ported).")
+
+    # Default-TRUE flags whose FALSE branch the JAX does not implement (it hardcodes the default).
+    for _flag, _why in (
+        ('l_use_C7_Richardson', 'the JAX hardcodes C7 = Cx_fnc_Richardson; the Skw-damped-C7 path is not ported'),
+        ('l_diag_Lscale_from_tau', 'the JAX hardcodes C6 = const; the Lscale-damped-C6 path is not ported'),
+        ('l_use_precip_frac', 'the JAX always uses precipitation fractions; the false path is not ported'),
+        ('l_use_tke_in_wp3_pr_turb_term', 'the JAX uses the TKE form of the wp3 pr_turb term; the false form is not ported'),
+        ('l_damp_wp3_Skw_squared', 'the JAX hardcodes the Skw^2-damped wp3 pr1 term; the false branch is not ported'),
+    ):
+        if getattr(flags, _flag, cfg.get(_flag, True)) is False:
+            errors.append(f"{_flag} = false is not supported ({_why}).")
+
     if errors:
         msg = "Python driver does not support the following enabled features:\n"
         msg += "\n".join(f"  - {e}" for e in errors)
