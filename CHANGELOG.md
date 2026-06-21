@@ -68,6 +68,22 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
 
 ## Recent work
 
+### 2026-06-20 — Microphysics import repair + config-flag variant sweep vs Fortran
+- **Microphysics repair (independent of f2py).** rico (KK) and mpace_a (Morrison) couldn't run at all — the
+  formatting/JIT refactor (5d77cd2) deleted `fill_holes_hydromet_clip_jax` and `morrison_hm_metadata` but left
+  their callers, then the surviving callers of `Skx_func` and `fill_holes_vertical` still used the old arg order
+  (arrays landing in jit static slots). Restored both functions and updated the KK/Morrison call sites to the
+  current `(nz, ngrdcol, ...)` signatures. All 14 faithful cases now init + run 3 steps f2py-blocked, thlm finite.
+- **Flag-variant verification harness.** Added `run_scripts/compare_flag_variants.py`: flips one config flag to a
+  non-default value, runs JAX and Fortran with that flags file, diffs, classifies MATCH / DIFF / JAX_FAIL_LOUD.
+  Swept 16 closure flags × {bomex, fire, gabls3_night} (cumulus / stratocumulus / stable): **the 10 genuinely-ported
+  alternate paths are bit-faithful to Fortran in every regime; 0 DIFF.**
+- **Guard fix the sweep found.** `l_vert_avg_closure=true` had diverged on bomex (123 vars) — the JAX has no code
+  for it (vertically-averaged closure unported), and the standalone init path had drifted off `clubb_driver`'s
+  unported-flag guard, so it silently ran the default closure. Mirrored `clubb_driver`'s unported closure/numerics
+  guards into `clubb_case_initalization._check_unsupported_features`; the 6 unported swept flags now fail-loud in
+  all three regimes, default cases unaffected.
+
 ### 2026-06-19 — Eliminate f2py from the standalone JAX path (stats decoupling)
 - **What:** the standalone driver (`clubb_standalone` → `init_clubb_case` → `advance_clubb_to_end`) now runs with
   **`clubb_python`/`clubb_f2py` hard import-blocked**. The last f2py tie was the **stats subsystem**; it now uses the
