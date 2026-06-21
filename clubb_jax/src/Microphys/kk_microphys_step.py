@@ -201,7 +201,7 @@ def advance_kk_microphysics(state: dict):
     w_tol = float(state.get('w_tol', 2.0e-3))
     wp2 = jnp.asarray(np.asarray(state['wp2'], np.float64))            # (ng, nzm)
     wp3_zm = zt2zm(gr.nzm, gr.nzt, gr.ngrdcol, gr, jnp.asarray(np.asarray(state['wp3'], np.float64)))
-    Skw_zm = Skx_func(wp2, wp3_zm, w_tol, clubb_params)            # (ng, nzm)
+    Skw_zm = Skx_func(gr.nzm, gr.ngrdcol, wp2, wp3_zm, w_tol, clubb_params)  # (ng, nzm)
     Kh_zm = jnp.asarray(np.asarray(state['Kh_zm'], np.float64))
     wm_zt = jnp.asarray(np.asarray(state['wm_zt'], np.float64))
     rho_ds_zm = jnp.asarray(np.asarray(state['rho_ds_zm'], np.float64))
@@ -235,9 +235,10 @@ def advance_kk_microphysics(state: dict):
         # below tol, diverging rrm at the cloud edge); full zt range begin=1..nzt (0-based 0..nzt-1). With
         # threshold 0 the call is a no-op when there are no negatives (matching the Fortran's `any(<0)` guard).
         dz = np.asarray(gr.dzt, np.float64)
-        out = fill_holes_vertical(out, np.asarray(state['rho_ds_zt'], np.float64), dz,
-                                      0.0, 0, np.asarray(hm).shape[-1] - 1,
-                                      int(state['flags'].fill_holes_type))
+        out = fill_holes_vertical(
+            gr.nzt, gr.ngrdcol, 0.0, 0, np.asarray(hm).shape[-1] - 1,
+            dz, np.asarray(state['rho_ds_zt'], np.float64), gr.grid_dir_indx,
+            int(state['flags'].fill_holes_type), out)
         return np.asarray(out, np.float64)
 
     rrm_new = _advance_hm(jnp.asarray(rrm), jnp.asarray(rrm_mc), rr_ratio,
