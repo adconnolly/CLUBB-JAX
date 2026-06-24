@@ -13,8 +13,8 @@ Quick-start
 2.  Run under Nsight Systems (captures a .nsys-rep file you can open in the GUI):
         nsys profile \
             --trace=cuda,nvtx \
-            --output profiling/arm_profile \
-            python clubb_jax/run_scripts/profile_nvtx.py arm --max-iters 5
+            --output profiling/reports/arm_profile \
+            python profiling/profile_nvtx.py arm --max-iters 5
 
 3.  Or generate a SQLite report for CLI analysis:
         nsys stats profiling/arm_profile.nsys-rep
@@ -40,10 +40,11 @@ import argparse
 import os
 import sys
 
-# ── path setup (mirrors run_scm.py) ──────────────────────────────────────────
-RUN_SCRIPTS = os.path.dirname(os.path.abspath(__file__))
-JAX_ROOT    = os.path.normpath(os.path.join(RUN_SCRIPTS, "../.."))
-CLUBB_ROOT  = os.path.normpath(os.path.join(JAX_ROOT, "clubb_release"))
+# ── path setup ───────────────────────────────────────────────────────────────
+# profiling/ sits directly under the repo root (CLUBB-JAX/), one level up.
+PROFILING_DIR = os.path.dirname(os.path.abspath(__file__))
+JAX_ROOT      = os.path.normpath(os.path.join(PROFILING_DIR, ".."))
+CLUBB_ROOT    = os.path.normpath(os.path.join(JAX_ROOT, "clubb_release"))
 for p in [JAX_ROOT, CLUBB_ROOT, os.path.join(CLUBB_ROOT, "clubb_python_api")]:
     if p not in sys.path:
         sys.path.insert(0, p)
