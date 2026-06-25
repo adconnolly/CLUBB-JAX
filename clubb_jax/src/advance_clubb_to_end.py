@@ -30,6 +30,17 @@ def _bench_precision() -> str:
         return "unknown"
 
 
+def _bench_sync(state: dict) -> None:
+    """Force a device sync (phase-timing only) by blocking on representative state
+    arrays. No-op on numpy (eager path) arrays."""
+    try:
+        import jax
+        jax.block_until_ready([state[k] for k in ("thlm", "rtm", "wp2", "wprtp")
+                               if state.get(k) is not None])
+    except Exception:
+        pass
+
+
 def _bench_peak_device_mem() -> int | None:
     """Peak device-memory bytes in use (GPU only; None on CPU / if unavailable)."""
     try:
@@ -44,7 +55,6 @@ def _bench_peak_device_mem() -> int | None:
 
 from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
-from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.Benchmark_cases.prescribe_forcings import (
     prescribe_forcings_arm,
@@ -96,6 +106,12 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
     # separate compile cost from throughput across backends/grid sizes.
     _bench = bool(_os.environ.get("CLUBB_JAX_BENCH"))
     _step_times = [] if _bench else None
+    # CLUBB_JAX_BENCH_PHASES=1 additionally attributes each step to pre-core glue
+    # (thvm+forcings) / core / post (radiation+micro+stats) by forcing a device
+    # sync at each phase boundary. The syncs perturb the absolute total slightly
+    # but reveal where the per-step wall time goes once the core is jitted.
+    _phases = bool(_os.environ.get("CLUBB_JAX_BENCH_PHASES"))
+    _t_pre, _t_core, _t_post = ([], [], []) if _phases else (None, None, None)
 
     for itime_idx in range(n_steps):
         if _bench:
@@ -106,10 +122,11 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         # ── Stats: begin timestep ───────────────────────────────────────
         l_sample, l_last_sample = _begin_timestep_stats(state, itime_idx)
 
-        # ── Compute thvm ────────────────────────────────────────────────
-        _calculate_thvm(state)
-
+        if _phases:
+            _tp = _perf_counter()
         # ── Prescribe forcings (case-specific) ──────────────────────────
+        # (thvm is recomputed inside advance_clubb_core from the same inputs, so
+        # the driver no longer computes a separate, never-read state['thvm'].)
         _prescribe_forcings(state, itime, l_sample=l_sample)
 
         # ── Add microphysical/radiative tendencies to forcings ─────────
@@ -134,11 +151,15 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         # ── Radiation contribution to thlp2 ─────────────────────────────
         _calculate_thlp2_rad(state)
 
+        if _phases:
+            _bench_sync(state); _t_pre.append(_perf_counter() - _tp); _tc = _perf_counter()
         # ── Advance CLUBB core ──────────────────────────────────────────
         state['l_sample'] = l_sample
         _advance_clubb_core(state)
         if l_stats:
             state['_jax_stats'].to_writer(state['stats_writer'])
+        if _phases:
+            _bench_sync(state); _t_core.append(_perf_counter() - _tc); _to = _perf_counter()
 
         # ── Radiation ───────────────────────────────────────────────────
         l_rad_itime = (itime % rad_interval == 0) or (itime == 1)
@@ -169,6 +190,9 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         # ── Stats: end timestep ─────────────────────────────────────────
         if l_last_sample:
             _end_timestep_stats(state, time_current)
+
+        if _phases:
+            _bench_sync(state); _t_post.append(_perf_counter() - _to)
 
         # ── Update time ─────────────────────────────────────────────────
         time_current = time_initial + itime * dt_main
@@ -206,6 +230,13 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
             "t_steady_min_s": min(_steady),
             "t_loop_total_s": sum(_step_times),
         }
+        if _phases and len(_t_core) > 1:
+            _mean = lambda xs: sum(xs[1:]) / len(xs[1:])  # drop step-1 compile
+            _summary["phase_steady_s"] = {
+                "pre_core_glue": _mean(_t_pre),
+                "core": _mean(_t_core),
+                "post_core": _mean(_t_post),
+            }
         print("BENCH_JSON " + _json.dumps(_summary))
 
 
@@ -284,19 +315,6 @@ def _update_driver_stats(state: dict, time_current: float) -> None:
             state['stats_writer'].update("Nrm_mc", state['_kk_Nrm_mc'])
         if state.get('_kk_precip_frac') is not None:
             state['stats_writer'].update("precip_frac", state['_kk_precip_frac'])
-
-
-def _calculate_thvm(state: dict):
-    """Update virtual potential temperature diagnostic."""
-    state['thvm'] = calculate_thvm(
-        nzt=state['nzt'],
-        ngrdcol=state['ngrdcol'],
-        thlm=state['thlm'],
-        rtm=state['rtm'],
-        rcm=state['rcm'],
-        exner=state['exner'],
-        thv_ds_zt=state['thv_ds_zt'],
-    )
 
 
 def _calculate_thlp2_rad(state: dict):

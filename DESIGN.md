@@ -373,23 +373,23 @@ state and the queue:
 
   | ngrdcol | JAX-GPU | JAX-CPU | Fortran |
   |--------:|--------:|--------:|--------:|
-  |       1 |    72.3 |     8.3 |     0.6 |
-  |       8 |    70.0 |    15.3 |     1.9 |
-  |      64 |    71.3 |    63.4 |    16.8 |
-  |     256 |   101.2 |   110.5 |    94.2 |
-  |    1024 |   113.2 |   335.2 |   529.0 |
+  |       1 |    66.5 |     8.2 |     0.6 |
+  |      64 |    75.7 |    41.5 |    16.8 |
+  |     256 |    82.9 |    86.5 |    95.7 |
+  |    1024 |    87.3 |   355.2 |   531.4 |
 
-  **JAX-GPU per-step is nearly flat** (72→113 ms over a 1024× workload increase — launch-latency/fixed-overhead
+  (Numbers refreshed 2026-06-25 after the thvm dead-code removal in Step 5, which cut the redundant per-step
+  compute that scaled with the grid — JAX-GPU dropped ~15–20% at ngrdcol≥256, JAX-CPU ~25–35% at ngrdcol 64–256.)
+  **JAX-GPU per-step is nearly flat** (66→87 ms over a 1024× workload increase — launch-latency/fixed-overhead
   bound), so its **throughput scales almost linearly with the column count**, while Fortran (serial column loop)
   and JAX-CPU grow roughly linearly. Crossovers: **JAX-GPU overtakes JAX-CPU at ngrdcol≈256 and Fortran at
-  ngrdcol≈256–1024**; at 1024 columns **JAX-GPU is 4.7× faster than Fortran and 3.0× faster than JAX-CPU**
-  (9 060 vs 1 940 vs 3 060 columns/s). The first-step compile (~25–35 s on GPU, in the table's `wall`−`steady·n`)
+  ngrdcol≈256**; at 1024 columns **JAX-GPU is 6.1× faster than Fortran and 4.1× faster than JAX-CPU**
+  (11 700 vs 1 930 vs 2 880 columns/s). The first-step compile (~5–35 s on GPU, in the table's `wall`−`steady·n`)
   is a one-time cost amortized by the persistent cache across processes and by any multi-step run; it does NOT
   recur per step. Takeaway: for single-column / few-column short runs Fortran wins on absolute latency; for
   ensemble/batch workloads (many columns — exactly the ML/autodiff use case) **JAX-GPU is the fastest backend and
-  the only differentiable one.** Remaining levers: the per-step eager glue (forcings/radiation/microphysics and
-  the host transfer of outputs still run outside the core jit), and driving the timestep loop with `lax.scan` to
-  fold the Python loop + remaining round-trips into the device.
+  the only differentiable one.** Remaining levers (see Step 5 profiling): the GPU core's kernel-launch floor
+  (parallel vertical solver) and the per-step eager glue / `lax.scan` over timesteps.
 
   **Step 4 (2026-06-25) — single/double precision toggle.** Where Fortran picks precision at compile time
   (`-precision single|double`), JAX picks it at process start via the global `jax_enable_x64` flag (must be set
@@ -413,6 +413,38 @@ state and the queue:
   of fp32 peak), and CLUBB's step is dominated by many small ops (tridiagonal solves, elementwise, scans) — it is
   launch/overhead-bound, not FLOP-bound, so fp32's throughput edge never engages and the extra type conversions
   cost a little. The robust f32 benefit is **capacity**: ~2× more columns per GPU. Double remains the default.
+
+  **★ Step 5 (2026-06-25) — per-step phase profiling (where the time actually goes).** Added opt-in phase timing
+  (`CLUBB_JAX_BENCH_PHASES=1`; `block_until_ready` at each boundary) splitting the step into pre-core glue
+  (forcings) / jitted core / post-core (radiation+micro+stats). ARM, steady ms/step, **post-thvm-cleanup** (below).
+  *Caveat:* the boundary syncs serialize work that the plain async benchmark overlaps, so these **totals run higher
+  than the Step-3 plain-bench table** (CPU especially) — read this table for the *proportional split*, not absolutes:
+
+  | backend | ngrdcol | total | pre-glue | core | post |
+  |---------|--------:|------:|---------:|-----:|-----:|
+  | GPU     |       1 |    65 |       11 |   52 |  ~0  |
+  | GPU     |     256 |    79 |       15 |   60 |  ~0  |
+  | GPU     |    1024 |    81 |       19 |   58 |  ~0  |
+  | CPU     |       1 |    10 |        5 |    3 |  ~0  |
+  | CPU     |     256 |    87 |       15 |   71 |  ~0  |
+
+  **The jitted core dominates the GPU step (~55 ms) and is nearly flat in ngrdcol** — so it is **kernel-launch
+  bound, not FLOP-bound**. The clincher: the *same* core runs in **3 ms on CPU at ngrdcol=1** vs ~52 ms on GPU, so
+  that time is almost entirely the launch latency of the many small sequential kernels XLA emits (the vertical
+  Thomas/penta solver sweeps are a serial dependency chain in z, ~hundreds of tiny kernels). post-core is
+  negligible (ARM runs no active radiation/micro stats-off). The pre-core **glue** (forcings) is host-bound
+  (`prescribe_forcings`'s device↔host round-trips + per-step `zt2zm`/surface-scheme leaf dispatches).
+
+  **Frontier this reframes:** (1) the small-ngrdcol GPU floor is the core's *kernel count* — the real lever is a
+  **parallel vertical solver** (cyclic reduction / PCR instead of serial Thomas; FLOPs are free here since we're
+  launch-bound) and/or `lax.scan`-ing the trajectory so launches pipeline; (2) the **glue** is a secondary,
+  more tractable win (keep forcings on-device, precompute grid-fixed pieces). At large ngrdcol the core stays flat
+  while CPU/Fortran grow, so the GPU win there already holds.
+
+  **Cleanup (dead code).** The driver computed `state['thvm']` every step, but it is read nowhere — the core
+  recomputes `thvm` internally from the same inputs and never received the driver's copy (a port vestige; the
+  Fortran passes thvm into the core). Removed the per-step `_calculate_thvm` call, the helper, and its import;
+  ARM stays bit-faithful (`compare_runs` Result[bit] PASS).
 
 - **Unit-test status (165 files; 118 passing at branch start).** A signature-drift pass updated **35** stale
   tests to the refactor's new JIT-friendly signatures (leading `nzm/nzt/ngrdcol/gr`, reordered args,

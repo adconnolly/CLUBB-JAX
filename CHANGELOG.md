@@ -191,3 +191,24 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
   across ngrdcol 1–1024 (70→90 ms f64 vs 92→103 ms f32) but uses ~½ the device memory (503→273 MiB at 1024).
   CLUBB's step is launch/overhead-bound (many small tridiagonal solves + elementwise, no large GEMMs), so the
   V100S fp32 throughput edge never engages; the benefit is ~2× column capacity per GPU. Double stays the default.
+
+### 2026-06-25 — Per-step phase profiling + dead-code (thvm) removal (`optimize_performance`)
+- **Profiled where the per-step time goes** (opt-in `CLUBB_JAX_BENCH_PHASES=1` in `advance_clubb_to_end`;
+  `block_until_ready` at pre-core/core/post boundaries; phase-timed totals run high — see methodology note). ARM
+  steady ms/step (post-cleanup) — GPU: glue 11/15/19 + **core 52/60/58** + post ~0 at ngrdcol 1/256/1024; CPU: glue
+  5/15 + **core 3/71** + post ~0 at 1/256. **The jitted core dominates the GPU step (~55 ms) and is flat in ngrdcol
+  → kernel-launch bound, not FLOP-bound** (proof: the same core is 3 ms on CPU at ngrdcol=1 vs ~52 ms GPU — the gap
+  is launch latency of the many small serial vertical-solver kernels). The pre-core glue is host-bound forcings
+  (device↔host round-trips + per-step `zt2zm`/surface dispatches).
+- **Reframed frontier:** small-ngrdcol GPU floor = core *kernel count* → real lever is a **parallel vertical
+  solver** (cyclic reduction vs serial Thomas; FLOPs are free when launch-bound) and/or `lax.scan` over timesteps;
+  the glue is a secondary, tractable win (on-device forcings). Large-ngrdcol GPU win already holds.
+- **Dead code removed (and a real win at scale).** The driver computed `state['thvm']` every step but it is read
+  nowhere (the core recomputes thvm internally and never received the driver's copy — a port vestige). Removed the
+  per-step `_calculate_thvm` call + helper + import; ARM stays **bit-faithful** (`compare_runs` Result[bit] PASS,
+  0 prognostic failures). Plain-bench effect (the redundant compute scaled with the grid): **JAX-GPU 101→83 ms at
+  256 cols, 113→87 at 1024; JAX-CPU 63→42 at 64, 110→87 at 256**; ~0 at ngrdcol=1 (async dispatch already hid it).
+  Refreshed the DESIGN scaling table — **GPU now 6.1× faster than Fortran at 1024 cols** (was 4.7×).
+- **Methodology note:** the `BENCH_PHASES` `block_until_ready` boundaries *serialize* work the plain async bench
+  overlaps, so phase-timed totals overstate absolutes (thvm looked like 26 ms/step under phase timing but cost ~0
+  at ngrdcol=1 in async plain-bench). Use phase timing for the *proportional* split, plain bench for absolutes.
