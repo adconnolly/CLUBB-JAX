@@ -149,3 +149,29 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
   above (full detail remains in git).
 - Proposed a condensed `CLAUDE.md` in `CLAUDE_PROPOSAL.md` for review (fixes stale refs: `generic_forcings.py` →
   `prescribe_forcings.py`, `radiation.py` → `radiation_module.py`, test-file count).
+
+### 2026-06-24 — GPU enablement + whole-step JIT + CPU/GPU/Fortran scaling
+- **Whole-step JIT (the open performance lever, closed).** Wrapped `advance_clubb_core` in one `jax.jit`
+  (`advance_clubb_core_jit`; driver uses it on non-sampled steps, opt out `CLUBB_JAX_NO_WHOLE_STEP_JIT=1` —
+  sampled steps stay eager since fusing the per-step `stats.update()` writes balloons the compile to minutes;
+  `l_sample` gates only diagnostics, not physics, so stats-off jit ≡ the proven bit-faithful stats-on path).
+  XLA now fuses the ~23 leaves into a single dispatch/step instead of hundreds of eager primitive pjits with a host
+  round-trip between each. Static args = the shape/branch scalars (`nzm/nzt/ngrdcol`, `*_dim`, `l_implemented`, `clubb_config_flags`
+  — an unregistered NamedTuple whose fields must stay static); everything else is a traced array or registered
+  pytree (`gr`/`JaxStats`/`pdf_*`/`err_info`/`nu_vert_res_dep`/`sclr_idx`). **Validated: bit-faithful** (`compare_runs
+  arm` Result[bit] PASS, 0 prognostic failures, Tier-C PASS) and **grad-transparent** (grad probe identical
+  eager-vs-jit; only blocker is the pre-existing `fill_holes_sliding_window` dynamic-`fori_loop` reverse-mode
+  limit). Per-step at matched stats: **GPU 2727 → 408 ms/step (6.7×)** at ngrdcol=1.
+- **GPU enabled.** Installed CUDA-12 jaxlib (`jax-cuda12-plugin`/`pjrt` 0.10.2) into the jaxenv; the cluster's
+  system `cuda12.8` on `LD_LIBRARY_PATH` shadows the bundled cuSPARSE (→ silent CPU fallback) so `jaxenv.sh` strips
+  `cuda*` from `LD_LIBRARY_PATH`. 1× Tesla V100S exposed by SLURM (`--gres=gpu`).
+- **Scaling documented** (`benchmark_backends.py`; env-gated `CLUBB_JAX_BENCH=1` per-step timing in
+  `advance_clubb_to_end`; Fortran from its `CLUBB-TIMER`). ARM steady ms/step, stats off, sweeping the column
+  axis `-multicol`: ngrdcol 1/8/64/256/1024 → **GPU** 72/70/71/101/113, **CPU** 8/15/63/110/335, **Fortran**
+  0.6/1.9/17/94/529. **GPU per-step is nearly flat** (single-kernel, launch-latency bound) so its throughput
+  scales ~linearly with column count, while Fortran (serial column loop) and JAX-CPU grow ~linearly. **JAX-GPU
+  overtakes JAX-CPU at ngrdcol≈256 and Fortran at ngrdcol≈256–1024; at 1024 columns JAX-GPU is 4.7× faster than
+  Fortran and 3.0× faster than JAX-CPU.** For 1-few-column short runs Fortran still wins on absolute latency; for
+  ensemble/batch (the ML/autodiff use case) JAX-GPU is the fastest *and* the only differentiable backend. Full
+  table + analysis in DESIGN.md "Performance, GPU, and …". Open levers: the per-step eager glue
+  (forcings/radiation/microphysics + output host-transfer outside the core jit) and `lax.scan` over the timestep.

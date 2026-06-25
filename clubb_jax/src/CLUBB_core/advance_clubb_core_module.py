@@ -982,6 +982,38 @@ def advance_clubb_core(
     return _result_tuple()
 
 
+# ── Whole-step JIT (the open performance lever) ──────────────────────────────
+# advance_clubb_core orchestrates ~23 jitted leaves eagerly; each leaf is a
+# separate XLA dispatch and the glue between them runs as standalone primitive
+# pjits, so a single timestep fires hundreds of tiny kernels with a host
+# round-trip between each (per-step steady cost ~1.3 s CPU / ~2.7 s GPU at
+# ngrdcol=1 — GPU is WORSE because launch latency dominates a tiny grid). Since
+# the whole driver step is already reverse-mode `jax.grad`-traceable (the
+# differentiability gate), the entire routine traces cleanly; wrapping it in one
+# jax.jit fuses every leaf into a single compiled program → one dispatch/step.
+#
+# Static args are the pure-Python scalars/flags that determine array shapes
+# (nzm/nzt/ngrdcol, the *_dim) or drive Python branches (l_implemented and
+# clubb_config_flags — a plain NamedTuple whose bool/int fields JAX would
+# otherwise trace into tracers and break every `if` on them). Everything else is
+# a traced array or a registered pytree (gr, stats, pdf_*, err_info,
+# nu_vert_res_dep; sclr_idx flattens entirely to aux_data so its int indices stay
+# static even as a traced arg). l_mix_rat_hm arrives as a `[False]` numpy array
+# (unhashable → cannot be static) and is only threaded into leaves that consume
+# it as a traced array, never branched on here. stats.l_sample lives in the
+# JaxStats aux_data, so the stats branches specialize per compile (≤2 variants).
+_ADVANCE_CORE_STATIC = (
+    "nzm", "nzt", "ngrdcol", "l_implemented",
+    "hydromet_dim", "sclr_dim", "edsclr_dim",
+    "clubb_config_flags",
+)
+
+advance_clubb_core_jit = jax.jit(
+    advance_clubb_core,
+    static_argnames=_ADVANCE_CORE_STATIC,
+)
+
+
 def set_sfc_value_of_flux_profiles(
     nzm,
     ngrdcol,

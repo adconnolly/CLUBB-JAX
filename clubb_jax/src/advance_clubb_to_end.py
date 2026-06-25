@@ -6,8 +6,19 @@ radiation and microphysics, and accumulates stats. Split out from the previous m
 """
 
 import gc
+import os as _os
+from time import perf_counter as _perf_counter
 
 import numpy as np
+
+
+def _bench_backend() -> str:
+    """Report the active JAX backend for benchmark labelling (cpu/gpu)."""
+    try:
+        import jax
+        return jax.default_backend()
+    except Exception:
+        return "unknown"
 
 from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
@@ -55,7 +66,18 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
     _GC_INTERVAL = 10          # force a cyclic-GC pass every N sampled steps (Iter325 OOM fix)
     _samples_since_gc = 0
 
+    # ── Optional per-step wall-clock instrumentation (CLUBB_JAX_BENCH=1) ──────
+    # The per-step numpy round-trip in _advance_clubb_core forces a device sync,
+    # so a perf_counter delta around the loop body is an accurate per-step wall
+    # time without an extra block_until_ready. Step 1 carries the one-time JIT
+    # compile; steps 2..N are steady state. Used by benchmark_backends.py to
+    # separate compile cost from throughput across backends/grid sizes.
+    _bench = bool(_os.environ.get("CLUBB_JAX_BENCH"))
+    _step_times = [] if _bench else None
+
     for itime_idx in range(n_steps):
+        if _bench:
+            _t_step0 = _perf_counter()
         itime = itime_idx + 1
         time_current = time_initial + (itime - 1) * dt_main
 
@@ -142,9 +164,25 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
                 gc.collect()
                 _samples_since_gc = 0
 
+        if _bench:
+            _step_times.append(_perf_counter() - _t_step0)
+
         if l_stdout:
             print(f"iteration: {itime:8d} / {ifinal:8d}"
                   f" -- time = {time_current:10.1f} / {state['time_final']:10.1f}")
+
+    if _bench and _step_times:
+        import json as _json
+        _steady = _step_times[1:] if len(_step_times) > 1 else _step_times
+        _summary = {
+            "backend": _bench_backend(),
+            "n_steps": len(_step_times),
+            "t_step1_s": _step_times[0],
+            "t_steady_mean_s": sum(_steady) / len(_steady),
+            "t_steady_min_s": min(_steady),
+            "t_loop_total_s": sum(_step_times),
+        }
+        print("BENCH_JSON " + _json.dumps(_summary))
 
 
 def _begin_timestep_stats(state: dict, itime_idx: int) -> tuple[bool, bool]:
@@ -281,9 +319,26 @@ def _cloud_drop_sed(state: dict, l_sample: bool = False):
         state['stats_writer'].update("Fcsed", fcsed)
 
 
+# Whole-step JIT toggle: default ON (one fused dispatch/step); opt out with
+# CLUBB_JAX_NO_WHOLE_STEP_JIT=1 to fall back to eager leaf-by-leaf orchestration.
+#
+# The jit is applied ONLY on non-sampled steps (l_sample=False) — the
+# performance-critical path (production/inference, jax.grad, and any stats-off
+# run). On a sampled step the routine fuses the hundreds of per-step
+# stats.update() writes into the program too, which balloons the single XLA
+# compile to minutes; sampled steps are diagnostic and rare, so they stay eager.
+# The physics is identical jit-vs-eager (compare_runs arm bit-PASS on both), so
+# the per-step-stats validation gate (compare_cases) is unaffected.
+_WHOLE_STEP_JIT = not _os.environ.get("CLUBB_JAX_NO_WHOLE_STEP_JIT")
+
+
 def _advance_clubb_core(state: dict):
     """Advance the CLUBB core using the JAX translated core."""
-    result = advance_clubb_core_module.advance_clubb_core(
+    _use_jit = _WHOLE_STEP_JIT and not state.get('l_sample', False)
+    _core = (advance_clubb_core_module.advance_clubb_core_jit
+             if _use_jit
+             else advance_clubb_core_module.advance_clubb_core)
+    result = _core(
         gr=state['gr'],
         nzm=state['nzm'],
         nzt=state['nzt'],
