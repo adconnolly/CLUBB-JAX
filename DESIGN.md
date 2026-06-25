@@ -11,6 +11,14 @@ and no f2py oracle to port against; the driver fail-loud rejects the flag). Per-
 `TRANSLATION_STATUS.md`. The Fortran remains essential as (a) the compiled comparison oracle and (b) the
 porting reference.
 
+**Performance & GPU (2026-06-24/25).** The timestep is **whole-step jitted** (`advance_clubb_core_jit`, one fused
+dispatch/step on the stats-off path), runs on **GPU** (CUDA-12 jaxlib; `source clubb_jax/run_scripts/jaxenv.sh`),
+and takes a **single/double precision toggle** (`CLUBB_JAX_PRECISION`, default double = bit-faithful). The GPU
+per-step is launch-bound and ~flat in column count, so **JAX-GPU beats Fortran for batched columns — 6.1× at
+ngrdcol=1024** (it loses at 1–few columns, where Fortran's single-thread latency wins). Full CPU/GPU/Fortran
+scaling, the profiling that pins the GPU floor (~1600 fixed kernels), and the remaining lever (`lax.scan` over
+timesteps) are in the **Performance, GPU, and …** section below.
+
 ---
 
 ## Repository Structure
