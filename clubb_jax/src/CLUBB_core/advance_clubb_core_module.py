@@ -24,7 +24,8 @@ Porting deviations:
 
 import jax
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 # ── Persistent JIT compilation cache ────────────────────────────────────────
 # The closure advance compiles ~244 XLA kernels on the first timestep (≈130 s

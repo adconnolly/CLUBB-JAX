@@ -13,7 +13,8 @@ import math
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 from clubb_jax.src.CLUBB_core.constants_clubb import (
     Cp as _CP, Lv as _LV, kappa as _KAPPA, p0 as _P0,

@@ -391,6 +391,29 @@ state and the queue:
   the host transfer of outputs still run outside the core jit), and driving the timestep loop with `lax.scan` to
   fold the Python loop + remaining round-trips into the device.
 
+  **Step 4 (2026-06-25) — single/double precision toggle.** Where Fortran picks precision at compile time
+  (`-precision single|double`), JAX picks it at process start via the global `jax_enable_x64` flag (must be set
+  before the first op). `src/CLUBB_core/clubb_precision.py::configure_jax_precision()` centralizes that decision, gated on
+  `CLUBB_JAX_PRECISION` (default `double`); all 54 modules call it instead of hard-coding `jax_enable_x64=True`,
+  so the precision is consistent process-wide. `double` is byte-identical to before (arm `compare_runs`
+  Result[bit] PASS post-refactor). `single` (float32) runs and stays finite; vs double after 10 arm steps it
+  diverges at float32 level — ~1e-7 on means (`thlm`,`rtm`), ~1e-5–1e-4 on second moments/fluxes (`wp2`,`wprtp`) —
+  so it is **not** bit-faithful (expected) and is for performance/memory exploration, not the gate.
+
+  **Finding — float32 is a memory win, NOT a speed win for CLUBB (V100S, ARM):**
+
+  | ngrdcol | f64 ms | f32 ms | f64 peak MiB | f32 peak MiB |
+  |--------:|-------:|-------:|-------------:|-------------:|
+  |       1 |     70 |     92 |          1.5 |          0.5 |
+  |      64 |     95 |    120 |           32 |           16 |
+  |     256 |     94 |    106 |          126 |           64 |
+  |    1024 |     90 |    103 |          503 |          273 |
+
+  float32 is ~10–30 % **slower** across the sweep but uses ~½ the device memory. The V100S has strong fp64 (1:2
+  of fp32 peak), and CLUBB's step is dominated by many small ops (tridiagonal solves, elementwise, scans) — it is
+  launch/overhead-bound, not FLOP-bound, so fp32's throughput edge never engages and the extra type conversions
+  cost a little. The robust f32 benefit is **capacity**: ~2× more columns per GPU. Double remains the default.
+
 - **Unit-test status (165 files; 118 passing at branch start).** A signature-drift pass updated **35** stale
   tests to the refactor's new JIT-friendly signatures (leading `nzm/nzt/ngrdcol/gr`, reordered args,
   `static_argnums` → arrays in static slots raised `unhashable type`). Two surfaced small **src** fixes (applied):

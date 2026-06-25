@@ -21,7 +21,8 @@ import numpy as np
 
 import jax
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 import jax.numpy as jnp
 
 OP_NONE = 0

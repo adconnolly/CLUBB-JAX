@@ -175,3 +175,19 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
   ensemble/batch (the ML/autodiff use case) JAX-GPU is the fastest *and* the only differentiable backend. Full
   table + analysis in DESIGN.md "Performance, GPU, and …". Open levers: the per-step eager glue
   (forcings/radiation/microphysics + output host-transfer outside the core jit) and `lax.scan` over the timestep.
+
+### 2026-06-25 — Single/double precision toggle + float32 GPU benchmark (`precision-flag`)
+- **Precision toggle.** New `src/CLUBB_core/clubb_precision.py::configure_jax_precision()` centralizes the JAX `jax_enable_x64`
+  decision (the analog of Fortran's compile-time `-precision single|double`), gated on env `CLUBB_JAX_PRECISION`
+  (default `double`). Replaced the 54 hard-coded `jax.config.update("jax_enable_x64", True)` sites with a call to
+  it, so precision is consistent process-wide (an inconsistent per-module setting would let the last import win).
+  `double` is **byte-identical** to before — arm `compare_runs` Result[bit] PASS post-refactor (0 prognostic
+  failures, Tier-C PASS). `single` runs and stays finite; vs double after 10 arm steps it diverges at float32 level
+  (~1e-7 means, ~1e-5–1e-4 second moments/fluxes) → not bit-faithful (expected), for perf/memory exploration only.
+- **Benchmark gains precision + GPU memory.** `benchmark_backends.py` takes `--precision double single`; BENCH_JSON
+  now reports `precision` and `peak_mem_bytes` (`jax.devices()[0].memory_stats()`), and a second table prints peak
+  GPU memory.
+- **Finding: float32 is a MEMORY win, not a speed win for CLUBB (V100S, ARM).** f32 is ~10–30% *slower* than f64
+  across ngrdcol 1–1024 (70→90 ms f64 vs 92→103 ms f32) but uses ~½ the device memory (503→273 MiB at 1024).
+  CLUBB's step is launch/overhead-bound (many small tridiagonal solves + elementwise, no large GEMMs), so the
+  V100S fp32 throughput edge never engages; the benefit is ~2× column capacity per GPU. Double stays the default.

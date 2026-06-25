@@ -4,7 +4,8 @@ form the final clear/all-sky single-scattering albedos (capped at 0.999999) — 
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 
 def comscp2(tg, fwcld, fwclr, tccld1, tcclr1):

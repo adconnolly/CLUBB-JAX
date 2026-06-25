@@ -19,7 +19,8 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 
 # Grad-safe sqrt(max(x,0)); the Fortran uses sqrt directly.

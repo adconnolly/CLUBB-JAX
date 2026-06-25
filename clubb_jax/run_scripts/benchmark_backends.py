@@ -49,9 +49,11 @@ def _base_env() -> dict:
     return env
 
 
-def run_jax(case: str, ngrdcol: int, steps: int, gpu: bool) -> dict:
+def run_jax(case: str, ngrdcol: int, steps: int, gpu: bool,
+            precision: str = "double") -> dict:
     """Run one JAX case; return the parsed BENCH_JSON dict (+ wall time)."""
     env = _base_env()
+    env["CLUBB_JAX_PRECISION"] = precision
     if gpu:
         env.pop("JAX_PLATFORMS", None)
     else:
@@ -100,6 +102,22 @@ def run_fortran(case: str, ngrdcol: int, steps: int) -> dict:
             "t_steady_mean_s": t_total / max(steps, 1)}
 
 
+def _configs(backends, precisions):
+    """Expand (backend × precision) into labeled run configs.
+
+    JAX backends run once per precision (label `jax-gpu/f32`); Fortran runs once
+    at its compiled precision (label `fortran`)."""
+    out = []
+    for be in backends:
+        if be == "fortran":
+            out.append(("fortran", be, None))
+        else:
+            for prec in precisions:
+                tag = {"double": "f64", "single": "f32"}.get(prec, prec)
+                out.append((f"{be}/{tag}", be, prec))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -110,19 +128,27 @@ def main():
     ap.add_argument("--backends", nargs="+",
                     default=["jax-gpu", "jax-cpu", "fortran"],
                     choices=["jax-gpu", "jax-cpu", "fortran"])
+    ap.add_argument("--precision", nargs="+", default=["double"],
+                    choices=["double", "single"],
+                    help="float precision(s) for the JAX backends (Fortran uses "
+                         "its compiled precision)")
     ap.add_argument("--out", default=str(RESULTS_DIR / "backend_benchmark.json"))
     args = ap.parse_args()
 
+    configs = _configs(args.backends, args.precision)
+    labels = [c[0] for c in configs]
+
     results = []
     for nc in args.ngrdcol:
-        for be in args.backends:
-            print(f"[bench] {args.case} ngrdcol={nc} backend={be} ...",
-                  flush=True)
+        for label, be, prec in configs:
+            print(f"[bench] {args.case} ngrdcol={nc} {label} ...", flush=True)
             if be == "fortran":
                 r = run_fortran(args.case, nc, args.steps)
             else:
-                r = run_jax(args.case, nc, args.steps, gpu=(be == "jax-gpu"))
-            r.update({"case": args.case, "ngrdcol": nc, "backend": be})
+                r = run_jax(args.case, nc, args.steps,
+                            gpu=(be == "jax-gpu"), precision=prec)
+            r.update({"case": args.case, "ngrdcol": nc, "backend": be,
+                      "label": label, "precision": prec or "compiled"})
             results.append(r)
             if r.get("error"):
                 print(f"    ERROR: {r.get('tail','')[:300]}", flush=True)
@@ -130,8 +156,10 @@ def main():
                 steady = r.get("t_steady_mean_s", float("nan"))
                 comp = r.get("t_step1_s")
                 comp_s = f" compile(step1)={comp:.1f}s" if comp else ""
+                mem = r.get("peak_mem_bytes")
+                mem_s = f" peakmem={mem/2**20:.0f}MiB" if mem else ""
                 print(f"    steady={steady*1e3:.1f} ms/step wall={r['wall_s']:.1f}s"
-                      f"{comp_s}", flush=True)
+                      f"{comp_s}{mem_s}", flush=True)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
@@ -139,25 +167,27 @@ def main():
                   indent=2)
     print(f"\n[bench] wrote {args.out}")
 
-    # Markdown summary: steady ms/step per backend × ngrdcol
-    _print_table(results, args.ngrdcol, args.backends)
+    _print_table(results, args.ngrdcol, labels, "t_steady_mean_s", 1e3,
+                 "Steady-state ms/step (lower is better)")
+    # Peak device memory only meaningful for GPU configs.
+    if any("gpu" in l for l in labels):
+        _print_table(results, args.ngrdcol,
+                     [l for l in labels if "gpu" in l],
+                     "peak_mem_bytes", 1 / 2**20,
+                     "Peak GPU memory (MiB)")
 
 
-def _print_table(results, ngrdcols, backends):
-    by = {(r["ngrdcol"], r["backend"]): r for r in results}
-    print("\n### Steady-state ms/step (lower is better)\n")
-    hdr = "| ngrdcol | " + " | ".join(backends) + " |"
-    sep = "|" + "---|" * (len(backends) + 1)
-    print(hdr)
-    print(sep)
+def _print_table(results, ngrdcols, labels, key, scale, title):
+    by = {(r["ngrdcol"], r["label"]): r for r in results}
+    print(f"\n### {title}\n")
+    print("| ngrdcol | " + " | ".join(labels) + " |")
+    print("|" + "---|" * (len(labels) + 1))
     for nc in ngrdcols:
         cells = []
-        for be in backends:
-            r = by.get((nc, be))
-            if r and not r.get("error"):
-                cells.append(f"{r.get('t_steady_mean_s', float('nan'))*1e3:.1f}")
-            else:
-                cells.append("ERR")
+        for lab in labels:
+            r = by.get((nc, lab))
+            val = r.get(key) if r and not r.get("error") else None
+            cells.append(f"{val*scale:.1f}" if val else "—")
         print(f"| {nc} | " + " | ".join(cells) + " |")
 
 

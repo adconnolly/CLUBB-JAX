@@ -20,6 +20,28 @@ def _bench_backend() -> str:
     except Exception:
         return "unknown"
 
+
+def _bench_precision() -> str:
+    """Report float precision (single/double) from the active x64 setting."""
+    try:
+        import jax
+        return "double" if jax.config.jax_enable_x64 else "single"
+    except Exception:
+        return "unknown"
+
+
+def _bench_peak_device_mem() -> int | None:
+    """Peak device-memory bytes in use (GPU only; None on CPU / if unavailable)."""
+    try:
+        import jax
+        stats = jax.devices()[0].memory_stats()
+        if stats is None:
+            return None
+        # 'peak_bytes_in_use' is the high-water mark across the process.
+        return int(stats.get("peak_bytes_in_use") or stats.get("bytes_in_use") or 0)
+    except Exception:
+        return None
+
 from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
 from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
@@ -176,6 +198,8 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         _steady = _step_times[1:] if len(_step_times) > 1 else _step_times
         _summary = {
             "backend": _bench_backend(),
+            "precision": _bench_precision(),
+            "peak_mem_bytes": _bench_peak_device_mem(),
             "n_steps": len(_step_times),
             "t_step1_s": _step_times[0],
             "t_steady_mean_s": sum(_steady) / len(_steady),

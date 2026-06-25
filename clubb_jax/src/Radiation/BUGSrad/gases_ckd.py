@@ -12,7 +12,8 @@ coefficient tables (hk*, c*h2o, c10ch4, …) are a separate (table-transcription
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 from clubb_jax.src.Radiation.BUGSrad.bugsrad_physconst import (
     MOLAR_VOLUME, GRAVITY, MW_H2O, MW_O3, MW_DRY_AIR)
