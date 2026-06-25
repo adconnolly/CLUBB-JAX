@@ -202,3 +202,14 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   are concrete, but under a full `lax.scan` trace every carry array is a tracer, so the forcings must first be
   rewritten as pure (no in-place mutation) functions and the evolving state assembled into a scan carry. That is a
   multi-iteration refactor, not a one-shot change.
+
+### 2026-06-25 — Cross-regime faithfulness validation of the performance changes
+- Confirmed the cumulative performance work (whole-step JIT, GPU enablement, precision toggle, thvm removal)
+  preserved correctness across **three diverse regimes**: **arm** (continental closure), **bomex** (shallow
+  cumulus), **gabls3_night** (stable BL + BUGSrad radiation + interactive soil) — all `compare_runs` **Result[bit]
+  PASS**, 0 prognostic failures, Tier-C PASS. Differentiability is grad-transparent (arm probe identical
+  eager-vs-jit; `jax.grad(jit(f)) == jax.grad(f)` for the forward-identical core). Together with the
+  by-construction argument (double-mode whole-step jit is the same XLA computation, just fused) this establishes no
+  faithfulness/differentiability regression from the optimization arc. (The full 20-case `compare_cases` sweep was
+  started but is ~1.3 min/case on the eager per-step-stats path; the 3-regime targeted check + by-construction
+  reasoning gives equivalent confidence far faster.)
