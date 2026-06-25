@@ -84,7 +84,7 @@ transfers — useful for a quick text comparison across runs.
 
 ---
 
-## What to look for (GPU gaps 101)
+## What to look for (GPU gaps)
 
 A "GPU gap" is time the device spends idle between kernel launches.  Common
 causes in JAX workloads:
