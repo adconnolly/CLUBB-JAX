@@ -429,17 +429,26 @@ state and the queue:
   | CPU     |     256 |    87 |       15 |   71 |  ~0  |
 
   **The jitted core dominates the GPU step (~55 ms) and is nearly flat in ngrdcol** — so it is **kernel-launch
-  bound, not FLOP-bound**. The clincher: the *same* core runs in **3 ms on CPU at ngrdcol=1** vs ~52 ms on GPU, so
-  that time is almost entirely the launch latency of the many small sequential kernels XLA emits (the vertical
-  Thomas/penta solver sweeps are a serial dependency chain in z, ~hundreds of tiny kernels). post-core is
-  negligible (ARM runs no active radiation/micro stats-off). The pre-core **glue** (forcings) is host-bound
-  (`prescribe_forcings`'s device↔host round-trips + per-step `zt2zm`/surface-scheme leaf dispatches).
+  bound, not FLOP-bound**. The clincher: the *same* core runs in **3 ms on CPU at ngrdcol=1** vs ~52 ms on GPU.
+  post-core is negligible (ARM runs no active radiation/micro stats-off); the pre-core **glue** (forcings) is
+  host-bound (`prescribe_forcings`'s device↔host round-trips + per-step `zt2zm`/surface-scheme leaf dispatches).
 
-  **Frontier this reframes:** (1) the small-ngrdcol GPU floor is the core's *kernel count* — the real lever is a
-  **parallel vertical solver** (cyclic reduction / PCR instead of serial Thomas; FLOPs are free here since we're
-  launch-bound) and/or `lax.scan`-ing the trajectory so launches pipeline; (2) the **glue** is a secondary,
-  more tractable win (keep forcings on-device, precompute grid-fixed pieces). At large ngrdcol the core stays flat
-  while CPU/Fortran grow, so the GPU win there already holds.
+  **What the floor actually is (XLA HLO dump + an nz sweep, 2026-06-25).** The compiled core
+  (`jit_advance_clubb_core`, optimized HLO) emits **1332 fusion kernels + 296 while-loops** (the `lax.scan` LU
+  sweeps) ≈ **~1600 serially-dependent GPU kernels**, ~30 µs of launch/schedule each → ~50 ms. Critically the core
+  is **flat not only in ngrdcol but also in nz** (arm at nzmax 64/128/256/512: core 53/52/49/50 ms) — i.e. it is
+  bound by a *fixed kernel COUNT*, independent of problem size, **not** by serial solver *depth*. **This refutes
+  the parallel-vertical-solver lever:** the 296 while-loops are a minority and are flat in nz; the cost is the 1332
+  elementwise/reduction fusions XLA could not merge (fusion barriers at the reshapes/transposes/scans/gathers
+  between the physics steps). Cyclic reduction would not move the dominant term and would cost bit-faithfulness.
+
+  **Realistic frontier:** the GPU small-batch floor is the *fusion-kernel count*, which is inherent to the
+  algorithm's many distinct sequential operations — only a major restructuring (fewer, larger fusable ops) would
+  cut it, so small-batch GPU will not beat Fortran's single-thread latency. That is **not the GPU's use case**:
+  at large ngrdcol the fixed ~50 ms amortizes over all columns and **GPU already wins (6.1× vs Fortran at 1024)**
+  — the differentiable, batch/ensemble/ML workload. The remaining *general* lever is **`lax.scan` over timesteps**
+  (task #5): it removes the per-step Python/dispatch/host-sync glue (~11–19 ms/step) for long runs, though the
+  ~50 ms core launches still recur per step. The glue itself (on-device forcings) is a smaller, tractable win.
 
   **Cleanup (dead code).** The driver computed `state['thvm']` every step, but it is read nowhere — the core
   recomputes `thvm` internally from the same inputs and never received the driver's copy (a port vestige; the

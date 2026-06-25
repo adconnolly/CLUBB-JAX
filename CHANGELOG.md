@@ -212,3 +212,19 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
 - **Methodology note:** the `BENCH_PHASES` `block_until_ready` boundaries *serialize* work the plain async bench
   overlaps, so phase-timed totals overstate absolutes (thvm looked like 26 ms/step under phase timing but cost ~0
   at ngrdcol=1 in async plain-bench). Use phase timing for the *proportional* split, plain bench for absolutes.
+
+### 2026-06-25 — Characterized the GPU core floor (kernel-count, not solver-depth) — solver-rewrite refuted
+- **nz sweep + HLO dump pinpoint the GPU floor.** Varied arm's vertical resolution (`-nzmax` 64/128/256/512) at
+  ngrdcol=1: the core phase time is **flat in nz** (53/52/49/50 ms) just as it is flat in ngrdcol → the core is
+  bound by a **fixed kernel COUNT**, not by serial solver depth or FLOPs. The XLA HLO dump confirms
+  `jit_advance_clubb_core` emits **1332 fusion kernels + 296 while-loops (the lax.scan LU sweeps) ≈ ~1600
+  serially-dependent GPU kernels** (~30 µs launch/schedule each ≈ 50 ms).
+- **Refutes the parallel-vertical-solver lever (closed task #9).** The 296 while-loops are a minority and flat in
+  nz; the dominant cost is the 1332 elementwise/reduction fusions XLA can't merge (barriers at the
+  reshape/transpose/scan/gather boundaries between physics steps). Cyclic reduction/PCR would not move the
+  dominant term and would forfeit bit-faithfulness — not worth it.
+- **Conclusion.** The GPU small-batch floor is inherent to the algorithm's many distinct sequential ops (only a
+  major restructuring would cut the fusion count), so small-batch GPU won't beat Fortran's single-thread latency —
+  but that is not the GPU's use case: at large ngrdcol the fixed ~50 ms amortizes and GPU already wins (6.1× vs
+  Fortran at 1024). The remaining general lever is `lax.scan` over timesteps (removes the ~11–19 ms/step
+  Python/dispatch/host glue for long runs; the ~50 ms core launches still recur per step). DESIGN frontier updated.
