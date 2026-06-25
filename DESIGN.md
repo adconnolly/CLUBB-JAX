@@ -447,8 +447,14 @@ state and the queue:
   cut it, so small-batch GPU will not beat Fortran's single-thread latency. That is **not the GPU's use case**:
   at large ngrdcol the fixed ~50 ms amortizes over all columns and **GPU already wins (6.1× vs Fortran at 1024)**
   — the differentiable, batch/ensemble/ML workload. The remaining *general* lever is **`lax.scan` over timesteps**
-  (task #5): it removes the per-step Python/dispatch/host-sync glue (~11–19 ms/step) for long runs, though the
-  ~50 ms core launches still recur per step. The glue itself (on-device forcings) is a smaller, tractable win.
+  (task #5): it removes the per-step Python/dispatch/host-sync glue (~11–19 ms/step) for long runs and enables
+  memory-efficient multi-step `jax.grad`, though the ~50 ms core launches still recur per step. **Blocker (the
+  reason it is multi-iteration, not one-shot):** the case forcings reset arrays via numpy *in-place* mutation
+  (`state['rtm_forcing'][:] = 0.0`) and the surface scheme (`arm_sfclyr`) is state-dependent. These work today
+  only because the arrays are concrete (under one-step `jax.grad` only the perturbed input's dependents are
+  tracers); under a full `lax.scan` trace **every carry array is a tracer**, so the in-place resets fail. `lax.scan`
+  therefore first requires rewriting the forcings as pure (no in-place mutation) functions and assembling the
+  evolving state into a scan carry — a sizeable, must-stay-bit-faithful refactor.
 
   **Cleanup (dead code).** The driver computed `state['thvm']` every step, but it is read nowhere — the core
   recomputes `thvm` internally from the same inputs and never received the driver's copy (a port vestige; the
