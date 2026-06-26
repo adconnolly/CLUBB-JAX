@@ -164,8 +164,8 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   physics. **Bit-faithful** (`compare_runs arm` Result[bit] PASS) + **grad-transparent**. ~6.7× per-step at
   ngrdcol=1, matched stats.
 - **GPU enabled** — CUDA-12 jaxlib (`jax-cuda12-plugin`/`pjrt` 0.10.2) in the jaxenv; the cluster `cuda12.8` on
-  `LD_LIBRARY_PATH` shadows the bundled cuSPARSE (silent CPU fallback) so `run_scripts/jaxenv.sh` strips `cuda*`.
-  1× Tesla V100S via SLURM.
+  `LD_LIBRARY_PATH` shadows the bundled cuSPARSE (silent CPU fallback) so the env loader strips `cuda*` (tracked
+  template `jaxenv.sh.example` → copy to a git-ignored `jaxenv.sh`, set `_JAXENV`, `source`). 1× Tesla V100S via SLURM.
 - **Precision toggle** — `CLUBB_core/clubb_precision.py::configure_jax_precision()` (analog of Fortran
   `-precision`), env `CLUBB_JAX_PRECISION` (default `double`), replacing the 54 hard-coded `jax_enable_x64=True`
   sites. `double` byte-identical (still bit-faithful); `single` runs/finite but diverges at float32 level (not

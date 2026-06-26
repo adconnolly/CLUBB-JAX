@@ -12,7 +12,8 @@ and no f2py oracle to port against; the driver fail-loud rejects the flag). Per-
 porting reference.
 
 **Performance & GPU (2026-06-24/25).** The timestep is **whole-step jitted** (`advance_clubb_core_jit`, one fused
-dispatch/step on the stats-off path), runs on **GPU** (CUDA-12 jaxlib; `source clubb_jax/run_scripts/jaxenv.sh`),
+dispatch/step on the stats-off path), runs on **GPU** (CUDA-12 jaxlib; `cp jaxenv.sh.example jaxenv.sh`, set
+`_JAXENV`, `source jaxenv.sh`),
 and takes a **single/double precision toggle** (`CLUBB_JAX_PRECISION`, default double = bit-faithful). The GPU
 per-step is launch-bound and ~flat in column count, so **JAX-GPU beats Fortran for batched columns — 6.1× at
 ngrdcol=1024** (it loses at 1–few columns, where Fortran's single-thread latency wins). Full CPU/GPU/Fortran
@@ -371,7 +372,8 @@ state and the queue:
 
   **★ Step 3 (2026-06-24) — GPU enablement + scaling.** Installed CUDA-12 jaxlib into the jaxenv
   (`jax-cuda12-plugin`/`pjrt` 0.10.2; the cluster's system `cuda12.8` on `LD_LIBRARY_PATH` shadows the bundled
-  cuSPARSE → strip `cuda*` from `LD_LIBRARY_PATH`, codified in `run_scripts/jaxenv.sh`). CLUBB is a single-column
+  cuSPARSE → strip `cuda*` from `LD_LIBRARY_PATH`, codified in the tracked `jaxenv.sh.example` template — copy to a
+  git-ignored `jaxenv.sh`, set `_JAXENV`, and `source` it). CLUBB is a single-column
   model, so the GPU's data-parallel axis is the column count `ngrdcol` (`run_scm.py -multicol N`). Benchmark:
   `run_scripts/benchmark_backends.py` (env-gated `CLUBB_JAX_BENCH=1` per-step timing in `advance_clubb_to_end`,
   separating step-1 compile from steady state; Fortran timing from its own `CLUBB-TIMER time_total`).

@@ -1,0 +1,29 @@
+#!/bin/bash
+# Template for the CLUBB-JAX JAX-env loader.
+#
+#   cp jaxenv.sh.example jaxenv.sh      # then edit _JAXENV below for your install
+#   source jaxenv.sh                    # GPU (default backend = gpu)
+#   CLUBB_JAX_CPU=1 source jaxenv.sh    # force CPU backend
+#
+# `jaxenv.sh` itself is git-ignored (machine-specific). This template is tracked.
+#
+# What it does: puts the CLUBB-JAX python env (jax 0.10.2) on PATH, then strips
+# every `cuda*` entry from LD_LIBRARY_PATH. The pip-installed CUDA libs
+# (jax-cuda12-plugin) get shadowed by a cluster's system CUDA dirs (e.g. cuda12.8
+# ships an incompatible cuSPARSE → "Unable to load cuSPARSE" → silent CPU
+# fallback), so we let jaxlib dlopen its own bundled libs instead.
+#
+# Idempotent; safe to source repeatedly.
+
+# EDIT: absolute path to your jax virtualenv (the one containing bin/python and
+# the jax-cuda12-plugin install).
+_JAXENV=/path/to/your/jaxenv
+
+export PATH="$_JAXENV/bin:$PATH"
+export LD_LIBRARY_PATH="$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v -i 'cuda' | paste -sd:)"
+
+if [ -n "$CLUBB_JAX_CPU" ]; then
+    export JAX_PLATFORMS=cpu
+else
+    unset JAX_PLATFORMS
+fi

@@ -12,13 +12,15 @@ a device sync, so the deltas are accurate). The Fortran timing is the wall time
 of the standalone subprocess (init is negligible for Fortran).
 
 Backend selection is by environment, so this script must run under the jaxenv
-python with the GPU libs reachable (``source clubb_jax/run_scripts/jaxenv.sh``):
+python with the GPU libs reachable. Set that up once from the repo root via the
+tracked template (``cp jaxenv.sh.example jaxenv.sh``, edit ``_JAXENV``), then
+``source jaxenv.sh``:
   * jax-gpu : default (GPU backend)
   * jax-cpu : JAX_PLATFORMS=cpu
   * fortran : run_scm.py -legacy
 
 Example:
-  source clubb_jax/run_scripts/jaxenv.sh
+  source jaxenv.sh
   python clubb_jax/run_scripts/benchmark_backends.py \
       --case arm --steps 12 --ngrdcol 1 8 64 256 \
       --backends jax-gpu jax-cpu fortran
