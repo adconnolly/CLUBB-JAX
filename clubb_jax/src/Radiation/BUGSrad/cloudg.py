@@ -15,7 +15,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 _PI = float(np.pi)   # float64 π (REFACTOR A3: was the float32 value of π for bit-faithfulness)
 _EPS = 1.0e-5

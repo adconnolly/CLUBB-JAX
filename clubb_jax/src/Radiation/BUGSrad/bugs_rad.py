@@ -18,7 +18,8 @@ Heating rate (K/s): `rate[l] = -heat_fac·(Fnet[l] − Fnet[l+1])/dpl[l]`, `heat
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 from clubb_jax.src.Radiation.BUGSrad.bugs_lwr import bugs_lwr
 from clubb_jax.src.Radiation.BUGSrad.bugs_swr import bugs_swr

@@ -48,7 +48,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 _SQRT2 = jnp.sqrt(2.0)
 _SQRT_PI = jnp.sqrt(jnp.pi)

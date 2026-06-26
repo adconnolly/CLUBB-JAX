@@ -251,7 +251,8 @@ Porting deviations:
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 
 def calc_coef_wp4_implicit(mixt_frac, F_w, coef_sigma_w_1_sqd, coef_sigma_w_2_sqd):

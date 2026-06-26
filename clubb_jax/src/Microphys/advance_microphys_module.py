@@ -22,7 +22,8 @@ the stored budget term is `-sed_diff_lhs · <hm>` (3-point stencil with the adva
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 
 def sed_centered_diff_lhs(V_hm, rho_ds_zm, invrs_rho_ds_zt, invrs_dzt, w_above):

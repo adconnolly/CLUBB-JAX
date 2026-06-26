@@ -14,7 +14,8 @@ JAX trace; the positive-definite path remains differentiable.
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 _ITERMAX = 10      # matrix_operations.F90:137
 _D_COEF = 0.1      # matrix_operations.F90:139

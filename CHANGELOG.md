@@ -149,3 +149,79 @@ field layouts) is directly pinned. Converged to a single deliberately-deferred r
   above (full detail remains in git).
 - Proposed a condensed `CLAUDE.md` in `CLAUDE_PROPOSAL.md` for review (fixes stale refs: `generic_forcings.py` →
   `prescribe_forcings.py`, `radiation.py` → `radiation_module.py`, test-file count).
+
+### 2026-06-24/25 — Performance & GPU optimization arc (whole-step JIT → GPU → precision → profiling)
+Condensed from five iterations on `main`/`optimize_performance`/`precision-flag`. Full per-step detail in
+DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58a3d19`, `368abba`, `c5631e0`,
+`c33b0a2`).
+
+- **Whole-step JIT** — wrapped `advance_clubb_core` in one `jax.jit` (`advance_clubb_core_jit`), fusing the ~23
+  eager leaves into a single dispatch/step instead of hundreds of primitive pjits with a host round-trip between
+  each. Static args = the shape/branch scalars (`nzm/nzt/ngrdcol`, `*_dim`, `l_implemented`, `clubb_config_flags`
+  — an unregistered NamedTuple whose fields must stay static); everything else is a traced array or registered
+  pytree. Gated to non-sampled steps (`CLUBB_JAX_NO_WHOLE_STEP_JIT=1` to disable): fusing the per-step stats
+  writes balloons the compile, and `l_sample` gates only diagnostics, so stats-off jit ≡ the bit-faithful stats-on
+  physics. **Bit-faithful** (`compare_runs arm` Result[bit] PASS) + **grad-transparent**. ~6.7× per-step at
+  ngrdcol=1, matched stats.
+- **GPU enabled** — CUDA-12 jaxlib (`jax-cuda12-plugin`/`pjrt` 0.10.2) in the jaxenv; the cluster `cuda12.8` on
+  `LD_LIBRARY_PATH` shadows the bundled cuSPARSE (silent CPU fallback) so the env loader strips `cuda*` (tracked
+  template `jaxenv.sh.example` → copy to a git-ignored `jaxenv.sh`, set `_JAXENV`, `source`). 1× Tesla V100S via SLURM.
+- **Precision toggle** — `CLUBB_core/clubb_precision.py::configure_jax_precision()` (analog of Fortran
+  `-precision`), env `CLUBB_JAX_PRECISION` (default `double`), replacing the 54 hard-coded `jax_enable_x64=True`
+  sites. `double` byte-identical (still bit-faithful); `single` runs/finite but diverges at float32 level (not
+  bit-faithful, expected). **Finding: float32 is a memory win, not a speed win** — ~10–30% *slower* on the V100S
+  (CLUBB is launch/overhead-bound, no large GEMMs) but ~½ the device memory (≈2× column capacity).
+- **Dead code:** removed the per-step `_calculate_thvm` (the driver computed `state['thvm']`, read nowhere — the
+  core recomputes it; a port vestige). Bit-faithful; sped the plain bench at scale (the redundant compute scaled
+  with the grid).
+- **Profiling pinned the GPU floor** (`CLUBB_JAX_BENCH_PHASES=1` phase split + nz sweep + XLA HLO dump): the
+  jitted **core dominates the GPU step (~55 ms) and is flat in BOTH ngrdcol and nz** → bound by a *fixed kernel
+  count* (HLO: **1332 fusion kernels + 296 lax.scan while-loops ≈ ~1600 serial GPU kernels**), not solver depth or
+  FLOPs (the same core is 3 ms on CPU at ngrdcol=1). **Refutes a parallel vertical solver** (the while-loops are a
+  flat-in-nz minority; the 1332 elementwise/reduction fusions dominate). The small-batch GPU floor is inherent to
+  the algorithm's many sequential ops; it is not the GPU's use case.
+
+- **Scaling (ARM, steady ms/step, stats off, double; post-thvm-cleanup):**
+
+  | ngrdcol | JAX-GPU | JAX-CPU | Fortran |
+  |--------:|--------:|--------:|--------:|
+  |       1 |    66.5 |     8.2 |     0.6 |
+  |      64 |    75.7 |    41.5 |    16.8 |
+  |     256 |    82.9 |    86.5 |    95.7 |
+  |    1024 |    87.3 |   355.2 |   531.4 |
+
+  GPU per-step ~flat (launch-bound) → throughput scales ~linearly with columns; CPU/Fortran grow ~linearly.
+  **JAX-GPU overtakes both at ngrdcol≈256; at 1024 it is 6.1× faster than Fortran and 4.1× faster than JAX-CPU.**
+  Short 1-few-column runs: Fortran wins on latency. Batch/ensemble (the ML/autodiff use case): **JAX-GPU is the
+  fastest and the only differentiable backend.**
+
+- **Remaining lever — `lax.scan` over timesteps** (would remove the ~11–19 ms/step Python/dispatch/host glue for
+  long runs + enable memory-efficient multi-step `jax.grad`; the ~50 ms core launches still recur per step).
+  **Blocker (scoped this iteration):** the case forcings reset arrays via numpy *in-place* mutation
+  (`state['rtm_forcing'][:] = 0.0`) and `arm_sfclyr` is state-dependent — both work today only because the arrays
+  are concrete, but under a full `lax.scan` trace every carry array is a tracer, so the forcings must first be
+  rewritten as pure (no in-place mutation) functions and the evolving state assembled into a scan carry. That is a
+  multi-iteration refactor, not a one-shot change.
+
+### 2026-06-25 — Cross-regime faithfulness validation of the performance changes
+- Confirmed the cumulative performance work (whole-step JIT, GPU enablement, precision toggle, thvm removal)
+  preserved correctness across **three diverse regimes**: **arm** (continental closure), **bomex** (shallow
+  cumulus), **gabls3_night** (stable BL + BUGSrad radiation + interactive soil) — all `compare_runs` **Result[bit]
+  PASS**, 0 prognostic failures, Tier-C PASS. Differentiability is grad-transparent (arm probe identical
+  eager-vs-jit; `jax.grad(jit(f)) == jax.grad(f)` for the forward-identical core). Together with the
+  by-construction argument (double-mode whole-step jit is the same XLA computation, just fused) this establishes no
+  faithfulness/differentiability regression from the optimization arc. (The full 20-case `compare_cases` sweep was
+  started but is ~1.3 min/case on the eager per-step-stats path; the 3-regime targeted check + by-construction
+  reasoning gives equivalent confidence far faster.)
+
+### 2026-06-26 — Performance campaign closed (accepted as practical optimum)
+- **Decision (user):** accept the current state as the practical performance optimum; stop the optimization loop.
+  The implementation is **jittable** (whole-step JIT), **differentiable** (grad-transparent, validated),
+  **faithful** (arm/bomex/gabls3_night bit-faithful + by construction), GPU-accelerated (**6.1× vs Fortran at
+  ngrdcol=1024**), and the **CPU/GPU/Fortran scaling is documented** (DESIGN "Performance, GPU, …" + SCALING.md).
+- **Deferred (documented future work, poor near-term ROI):** `lax.scan` over timesteps — the only remaining lever.
+  It would remove the ~11–19 ms/step Python/dispatch/host glue on long runs (~20%) and enable memory-efficient
+  multi-step `jax.grad`, but NOT the dominant ~50 ms GPU core (a proven inherent kernel-launch floor), and it
+  requires rewriting the forcings from numpy in-place resets to pure functions + a scan carry (a sizeable,
+  bit-faithfulness-risking refactor). Tracked in task #5 / DESIGN frontier. The batch/ensemble use case — where
+  the differentiable GPU port already beats Fortran — does not need it.

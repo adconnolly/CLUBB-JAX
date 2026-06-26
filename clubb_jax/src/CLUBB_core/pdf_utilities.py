@@ -37,7 +37,8 @@ See tests/test_pdf_utilities.py. All functions are jnp and differentiable.
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 # constants_clubb.F90 (pdf_utilities.F90 `use constants_clubb`)
 from clubb_jax.src.CLUBB_core.clubb_constants import (

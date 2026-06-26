@@ -15,3 +15,12 @@ __pycache__/
 
 # Fortran unit output files
 fort.*
+
+# Benchmark/comparison output trees (large .nc + logs; regenerate via run_scripts)
+jax_driver_test_results/
+
+# SLURM job logs
+slurm-*.out
+
+# Machine-specific JAX env loader (untracked; edit _JAXENV for your install)
+/jaxenv.sh

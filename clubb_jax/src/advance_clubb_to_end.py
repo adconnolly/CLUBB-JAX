@@ -6,12 +6,55 @@ radiation and microphysics, and accumulates stats. Split out from the previous m
 """
 
 import gc
+import os as _os
+from time import perf_counter as _perf_counter
 
 import numpy as np
 
+
+def _bench_backend() -> str:
+    """Report the active JAX backend for benchmark labelling (cpu/gpu)."""
+    try:
+        import jax
+        return jax.default_backend()
+    except Exception:
+        return "unknown"
+
+
+def _bench_precision() -> str:
+    """Report float precision (single/double) from the active x64 setting."""
+    try:
+        import jax
+        return "double" if jax.config.jax_enable_x64 else "single"
+    except Exception:
+        return "unknown"
+
+
+def _bench_sync(state: dict) -> None:
+    """Force a device sync (phase-timing only) by blocking on representative state
+    arrays. No-op on numpy (eager path) arrays."""
+    try:
+        import jax
+        jax.block_until_ready([state[k] for k in ("thlm", "rtm", "wp2", "wprtp")
+                               if state.get(k) is not None])
+    except Exception:
+        pass
+
+
+def _bench_peak_device_mem() -> int | None:
+    """Peak device-memory bytes in use (GPU only; None on CPU / if unavailable)."""
+    try:
+        import jax
+        stats = jax.devices()[0].memory_stats()
+        if stats is None:
+            return None
+        # 'peak_bytes_in_use' is the high-water mark across the process.
+        return int(stats.get("peak_bytes_in_use") or stats.get("bytes_in_use") or 0)
+    except Exception:
+        return None
+
 from clubb_jax.src.CLUBB_core import advance_clubb_core_module
 from clubb_jax.src.CLUBB_core.advance_helper_module import calculate_thlp2_rad
-from clubb_jax.src.CLUBB_core.calc_pressure import calculate_thvm
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.Benchmark_cases.prescribe_forcings import (
     prescribe_forcings_arm,
@@ -55,17 +98,35 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
     _GC_INTERVAL = 10          # force a cyclic-GC pass every N sampled steps (Iter325 OOM fix)
     _samples_since_gc = 0
 
+    # ── Optional per-step wall-clock instrumentation (CLUBB_JAX_BENCH=1) ──────
+    # The per-step numpy round-trip in _advance_clubb_core forces a device sync,
+    # so a perf_counter delta around the loop body is an accurate per-step wall
+    # time without an extra block_until_ready. Step 1 carries the one-time JIT
+    # compile; steps 2..N are steady state. Used by benchmark_backends.py to
+    # separate compile cost from throughput across backends/grid sizes.
+    _bench = bool(_os.environ.get("CLUBB_JAX_BENCH"))
+    _step_times = [] if _bench else None
+    # CLUBB_JAX_BENCH_PHASES=1 additionally attributes each step to pre-core glue
+    # (thvm+forcings) / core / post (radiation+micro+stats) by forcing a device
+    # sync at each phase boundary. The syncs perturb the absolute total slightly
+    # but reveal where the per-step wall time goes once the core is jitted.
+    _phases = bool(_os.environ.get("CLUBB_JAX_BENCH_PHASES"))
+    _t_pre, _t_core, _t_post = ([], [], []) if _phases else (None, None, None)
+
     for itime_idx in range(n_steps):
+        if _bench:
+            _t_step0 = _perf_counter()
         itime = itime_idx + 1
         time_current = time_initial + (itime - 1) * dt_main
 
         # ── Stats: begin timestep ───────────────────────────────────────
         l_sample, l_last_sample = _begin_timestep_stats(state, itime_idx)
 
-        # ── Compute thvm ────────────────────────────────────────────────
-        _calculate_thvm(state)
-
+        if _phases:
+            _tp = _perf_counter()
         # ── Prescribe forcings (case-specific) ──────────────────────────
+        # (thvm is recomputed inside advance_clubb_core from the same inputs, so
+        # the driver no longer computes a separate, never-read state['thvm'].)
         _prescribe_forcings(state, itime, l_sample=l_sample)
 
         # ── Add microphysical/radiative tendencies to forcings ─────────
@@ -90,11 +151,15 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         # ── Radiation contribution to thlp2 ─────────────────────────────
         _calculate_thlp2_rad(state)
 
+        if _phases:
+            _bench_sync(state); _t_pre.append(_perf_counter() - _tp); _tc = _perf_counter()
         # ── Advance CLUBB core ──────────────────────────────────────────
         state['l_sample'] = l_sample
         _advance_clubb_core(state)
         if l_stats:
             state['_jax_stats'].to_writer(state['stats_writer'])
+        if _phases:
+            _bench_sync(state); _t_core.append(_perf_counter() - _tc); _to = _perf_counter()
 
         # ── Radiation ───────────────────────────────────────────────────
         l_rad_itime = (itime % rad_interval == 0) or (itime == 1)
@@ -126,6 +191,9 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
         if l_last_sample:
             _end_timestep_stats(state, time_current)
 
+        if _phases:
+            _bench_sync(state); _t_post.append(_perf_counter() - _to)
+
         # ── Update time ─────────────────────────────────────────────────
         time_current = time_initial + itime * dt_main
 
@@ -142,9 +210,34 @@ def advance_clubb_to_end(state: dict, l_stdout: bool = True, max_steps: int | No
                 gc.collect()
                 _samples_since_gc = 0
 
+        if _bench:
+            _step_times.append(_perf_counter() - _t_step0)
+
         if l_stdout:
             print(f"iteration: {itime:8d} / {ifinal:8d}"
                   f" -- time = {time_current:10.1f} / {state['time_final']:10.1f}")
+
+    if _bench and _step_times:
+        import json as _json
+        _steady = _step_times[1:] if len(_step_times) > 1 else _step_times
+        _summary = {
+            "backend": _bench_backend(),
+            "precision": _bench_precision(),
+            "peak_mem_bytes": _bench_peak_device_mem(),
+            "n_steps": len(_step_times),
+            "t_step1_s": _step_times[0],
+            "t_steady_mean_s": sum(_steady) / len(_steady),
+            "t_steady_min_s": min(_steady),
+            "t_loop_total_s": sum(_step_times),
+        }
+        if _phases and len(_t_core) > 1:
+            _mean = lambda xs: sum(xs[1:]) / len(xs[1:])  # drop step-1 compile
+            _summary["phase_steady_s"] = {
+                "pre_core_glue": _mean(_t_pre),
+                "core": _mean(_t_core),
+                "post_core": _mean(_t_post),
+            }
+        print("BENCH_JSON " + _json.dumps(_summary))
 
 
 def _begin_timestep_stats(state: dict, itime_idx: int) -> tuple[bool, bool]:
@@ -224,19 +317,6 @@ def _update_driver_stats(state: dict, time_current: float) -> None:
             state['stats_writer'].update("precip_frac", state['_kk_precip_frac'])
 
 
-def _calculate_thvm(state: dict):
-    """Update virtual potential temperature diagnostic."""
-    state['thvm'] = calculate_thvm(
-        nzt=state['nzt'],
-        ngrdcol=state['ngrdcol'],
-        thlm=state['thlm'],
-        rtm=state['rtm'],
-        rcm=state['rcm'],
-        exner=state['exner'],
-        thv_ds_zt=state['thv_ds_zt'],
-    )
-
-
 def _calculate_thlp2_rad(state: dict):
     """Apply radiation contribution to thlp2 forcing when enabled."""
     if not state['l_calc_thlp2_rad']:
@@ -281,9 +361,26 @@ def _cloud_drop_sed(state: dict, l_sample: bool = False):
         state['stats_writer'].update("Fcsed", fcsed)
 
 
+# Whole-step JIT toggle: default ON (one fused dispatch/step); opt out with
+# CLUBB_JAX_NO_WHOLE_STEP_JIT=1 to fall back to eager leaf-by-leaf orchestration.
+#
+# The jit is applied ONLY on non-sampled steps (l_sample=False) — the
+# performance-critical path (production/inference, jax.grad, and any stats-off
+# run). On a sampled step the routine fuses the hundreds of per-step
+# stats.update() writes into the program too, which balloons the single XLA
+# compile to minutes; sampled steps are diagnostic and rare, so they stay eager.
+# The physics is identical jit-vs-eager (compare_runs arm bit-PASS on both), so
+# the per-step-stats validation gate (compare_cases) is unaffected.
+_WHOLE_STEP_JIT = not _os.environ.get("CLUBB_JAX_NO_WHOLE_STEP_JIT")
+
+
 def _advance_clubb_core(state: dict):
     """Advance the CLUBB core using the JAX translated core."""
-    result = advance_clubb_core_module.advance_clubb_core(
+    _use_jit = _WHOLE_STEP_JIT and not state.get('l_sample', False)
+    _core = (advance_clubb_core_module.advance_clubb_core_jit
+             if _use_jit
+             else advance_clubb_core_module.advance_clubb_core)
+    result = _core(
         gr=state['gr'],
         nzm=state['nzm'],
         nzt=state['nzt'],

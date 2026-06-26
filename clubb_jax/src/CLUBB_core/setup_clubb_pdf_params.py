@@ -76,7 +76,8 @@ from clubb_jax.src.CLUBB_core.pdf_utilities import (
 from clubb_jax.src.CLUBB_core.matrix_operations import Cholesky_factor
 from clubb_jax.src.CLUBB_core.precipitation_fraction import precip_fraction
 
-jax.config.update("jax_enable_x64", True)
+from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
+configure_jax_precision()
 
 _MU_HM_MIN_COEF = 0.01   # setup_clubb_pdf_params.F90:2176
 
