@@ -213,3 +213,15 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   faithfulness/differentiability regression from the optimization arc. (The full 20-case `compare_cases` sweep was
   started but is ~1.3 min/case on the eager per-step-stats path; the 3-regime targeted check + by-construction
   reasoning gives equivalent confidence far faster.)
+
+### 2026-06-26 — Performance campaign closed (accepted as practical optimum)
+- **Decision (user):** accept the current state as the practical performance optimum; stop the optimization loop.
+  The implementation is **jittable** (whole-step JIT), **differentiable** (grad-transparent, validated),
+  **faithful** (arm/bomex/gabls3_night bit-faithful + by construction), GPU-accelerated (**6.1× vs Fortran at
+  ngrdcol=1024**), and the **CPU/GPU/Fortran scaling is documented** (DESIGN "Performance, GPU, …" + SCALING.md).
+- **Deferred (documented future work, poor near-term ROI):** `lax.scan` over timesteps — the only remaining lever.
+  It would remove the ~11–19 ms/step Python/dispatch/host glue on long runs (~20%) and enable memory-efficient
+  multi-step `jax.grad`, but NOT the dominant ~50 ms GPU core (a proven inherent kernel-launch floor), and it
+  requires rewriting the forcings from numpy in-place resets to pure functions + a scan carry (a sizeable,
+  bit-faithfulness-risking refactor). Tracked in task #5 / DESIGN frontier. The batch/ensemble use case — where
+  the differentiable GPU port already beats Fortran — does not need it.
