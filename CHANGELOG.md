@@ -225,3 +225,37 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   requires rewriting the forcings from numpy in-place resets to pure functions + a scan carry (a sizeable,
   bit-faithfulness-risking refactor). Tracked in task #5 / DESIGN frontier. The batch/ensemble use case — where
   the differentiable GPU port already beats Fortran — does not need it.
+
+### 2026-06-26 — JAX is the default driver; new `-cpu`/`-gpu` backend & device-count flags
+- **`run_scm.py` now runs JAX by default** (the model this repo is). The `-jax` flag is **removed**; the no-flag
+  default branch is the JAX standalone driver. The compiled Fortran oracle — previously the no-flag default — is now
+  selected explicitly with **`-fortran`** (= `install/latest/clubb_standalone`), `-legacy` (= `bin/`), or `-exe PATH`.
+  Updated all in-repo callers: dropped `-jax` from compare_cases/compare_runs/validate_case/update_golden and the JAX
+  side of benchmark_backends/compare_flag_variants/run_jax_vs_fortran_cases; added `-fortran` to the bare-default
+  Fortran side of the latter three; updated test_invariants/test_full_timestep_grad and two debug docstrings. Mirrored
+  the same change into the untracked profiling copy `nvtx_run_scm.py`. (`clubb_release/` is the upstream submodule and
+  was left untouched.)
+- **New `-cpu [N]` / `-gpu [N]` flags** (mutually exclusive; JAX runs only) select the JAX compute backend and cap
+  device use, via `run_scm.py::apply_jax_device_flags`: `-cpu` sets `JAX_PLATFORMS=cpu` and, when N>0, pins the
+  process to N cores with `os.sched_setaffinity` (inherited by the child); `-gpu` clears `JAX_PLATFORMS` and, when
+  N>0, sets `CUDA_VISIBLE_DEVICES=0..N-1`. Bare `-cpu`/`-gpu` uses all devices; neither follows the environment.
+- **Why a flag was needed / what "implicit parallelism" is (now documented in DESIGN "Backend & device control").**
+  The JAX driver runs through XLA, whose CPU backend executes every op on an Eigen thread pool sized to the logical-
+  core count — so even `ngrdcol=1` spreads each kernel across **all** cores with no code-level threading (measured
+  ~2080 % CPU). Verified empirically that jaxlib 0.10.2 **ignores** `XLA_FLAGS` eigen/host-device knobs and
+  `OMP_NUM_THREADS` (~2300 % regardless); only OS CPU affinity caps it (4 cores → ~337 %, 8 → ~644 %, linear) — hence
+  the `sched_setaffinity` approach. Trade-offs of capping (longer wall time vs freeing cores / avoiding the two-runs
+  OOM hazard; near-free at small ngrdcol since the step is launch-bound, 1:1 throughput cost at large ngrdcol; GPU is
+  single-device today so `-gpu N>1` only restricts visibility) are written up in the same DESIGN section.
+- **Validated end-to-end:** default JAX run with `-cpu 4` pins to 4 cores and completes (arm, 2 steps); `-gpu 1`
+  sets `CUDA_VISIBLE_DEVICES=0` and completes; `-jax` now errors (unrecognized); `-cpu`+`-fortran` is rejected.
+
+### 2026-06-26 — Added OPTIONS.md (full flag + env-var reference)
+- New top-level **`OPTIONS.md`** catalogues every user-facing knob: all `run_scm.py` flags (grouped: driver
+  selection, `-cpu`/`-gpu` backend control, case files, grid, time stepping, output/stats, `-multicol`, overrides/
+  debug) and every environment variable (`CLUBB_JAX_PRECISION`, `CLUBB_JAX_NO_WHOLE_STEP_JIT`,
+  `CLUBB_JAX_NO_JIT_CACHE`, `JAX_COMPILATION_CACHE_DIR`, `JAX_PLATFORMS`, `CLUBB_JAX_CPU`, `CUDA_VISIBLE_DEVICES`,
+  `CLUBB_JAX_BENCH`, `CLUBB_JAX_BENCH_PHASES`, `JAX_LOG_COMPILES`, `JAX_DISABLE_JIT`), plus a section on the
+  comparison/test scripts (`compare_runs`/`compare_cases`/`compare_grad`/`benchmark_backends`/`run_all_tests` flags +
+  `FORTRAN_EXE`/`FORTRAN_OUT_ROOT`/`JAX_OUT_ROOT`). Env-var semantics confirmed by grepping the actual
+  `os.environ` reads. CLAUDE.md and DESIGN.md now point to it.

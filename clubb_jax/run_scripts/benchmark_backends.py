@@ -63,7 +63,9 @@ def run_jax(case: str, ngrdcol: int, steps: int, gpu: bool,
     # -stats none → no per-step sampling, so l_sample is constant False and the
     # whole-step jit compiles exactly one variant; measures pure compute
     # throughput (the production/inference path).
-    cmd = [sys.executable, str(RUN_SCM), case, "-jax",
+    # JAX is the default driver; -cpu/-gpu selects the backend.
+    cmd = [sys.executable, str(RUN_SCM), case,
+           ("-gpu" if gpu else "-cpu"),
            "-max_iters", str(steps), "-multicol", str(ngrdcol), "-stats", "none"]
     t0 = time.time()
     p = subprocess.run(cmd, cwd=str(JAX_ROOT), env=env,
@@ -82,9 +84,10 @@ def run_jax(case: str, ngrdcol: int, steps: int, gpu: bool,
 def run_fortran(case: str, ngrdcol: int, steps: int) -> dict:
     """Run one Fortran case; wall-time the subprocess (init is negligible)."""
     env = os.environ.copy()
-    # No backend flag → run_scm uses install/latest/clubb_standalone (the
-    # compiled intel oracle); -legacy points at bin/ which is not populated.
-    cmd = [sys.executable, str(RUN_SCM), case,
+    # -fortran → run_scm uses install/latest/clubb_standalone (the compiled intel
+    # oracle); -legacy points at bin/ which is not populated. (JAX is now the no-flag
+    # default, so the oracle must be selected explicitly.)
+    cmd = [sys.executable, str(RUN_SCM), case, "-fortran",
            "-max_iters", str(steps), "-multicol", str(ngrdcol), "-stats", "none"]
     t0 = time.time()
     p = subprocess.run(cmd, cwd=str(JAX_ROOT), env=env,

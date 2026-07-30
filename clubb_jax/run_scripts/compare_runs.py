@@ -219,7 +219,7 @@ def main():
 
     print(f"\n=== Step 2: JAX hybrid run ({niters} iters) ===")
     t0 = time.time()
-    rc = run(scm + [case, "-jax",
+    rc = run(scm + [case,   # JAX is the default driver
                     "-max_iters", str(niters),
                     "-out_dir", outdir_j] + tout_args,
              env=env_jax)

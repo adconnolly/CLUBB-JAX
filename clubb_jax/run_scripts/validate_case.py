@@ -37,7 +37,7 @@ def _run_jax_only(case: str, niters: int) -> str | None:
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([JAX_ROOT, CLUBB_ROOT,
                                          os.path.join(CLUBB_ROOT, "clubb_python_api")])
-    cmd = [sys.executable, os.path.join(RUN_SCRIPTS, "run_scm.py"), case, "-jax",
+    cmd = [sys.executable, os.path.join(RUN_SCRIPTS, "run_scm.py"), case,  # JAX = default
            "-max_iters", str(niters), "-out_dir", out]
     rc = subprocess.run(cmd, env=env).returncode
     p = os.path.join(out, f"{case}_stats.nc")

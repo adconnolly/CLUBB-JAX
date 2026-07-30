@@ -50,7 +50,7 @@ def baseline_case(case: str, max_iters: int, seed_from: str | None) -> bool:
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(
             [G.JAX_ROOT, G.JAX_ROOT + "/clubb_release", G.JAX_ROOT + "/clubb_release/clubb_python_api"])
-        cmd = [sys.executable, os.path.join(G.RUN_SCRIPTS, "run_scm.py"), case, "-jax",
+        cmd = [sys.executable, os.path.join(G.RUN_SCRIPTS, "run_scm.py"), case,  # JAX = default
                "-max_iters", str(max_iters), "-out_dir", dest_dir]
         rc = subprocess.run(cmd, env=env).returncode
         if rc != 0 or not os.path.isfile(dest):
