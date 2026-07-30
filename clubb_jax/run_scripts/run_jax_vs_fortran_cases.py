@@ -123,8 +123,8 @@ def _run_case(
     if max_iters is not None:
         common_args += ["-max_iters", str(max_iters)]
 
-    jax_cmd = [sys.executable, *common_args, "-jax", "-out_dir", str(jax_out), case]
-    f90_cmd = [sys.executable, *common_args, "-out_dir", str(f90_out), case]
+    jax_cmd = [sys.executable, *common_args, "-out_dir", str(jax_out), case]  # JAX = default
+    f90_cmd = [sys.executable, *common_args, "-fortran", "-out_dir", str(f90_out), case]
 
     jax_log = results_root / f"{case}_run_jax.log"
     f90_log = results_root / f"{case}_run_fortran.log"

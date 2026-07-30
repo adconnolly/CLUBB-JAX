@@ -17,6 +17,10 @@ Per-file Fortran↔JAX port status lives in `TRANSLATION_STATUS.md` (kept curren
 
 ## Running tests
 
+> Every run-script flag and environment variable (precision, JIT, backend, caching, benchmarking) is catalogued in
+> **`OPTIONS.md`**.
+
+
 Correctness is a **tiered standard** (DESIGN.md "Correctness standard"), not pure bit-matching. The dual goal is
 **faithful** (vs the Fortran oracle, within the chaos horizon) **and differentiable** (whole-driver `jax.grad`), so
 there are two gates:
@@ -35,8 +39,9 @@ python clubb_jax/run_scripts/compare_grad.py                                  # 
 python clubb_jax/run_scripts/compare_runs.py --case arm --max-iters 30
 python clubb_jax/run_scripts/diagnose_divergence.py arm   # onset: bit-faithful / FP-growth (chaos) / JUMP@N (term/threshold bug)
 
-# Quick smoke test — JAX driver, no Fortran (~20s; writes clubb_jax/output/<case>_stats.nc):
-python clubb_jax/run_scripts/run_scm.py arm -jax -max_iters 3
+# Quick smoke test — JAX driver (the default; no flag needed), no Fortran
+# (~20s; writes clubb_jax/output/<case>_stats.nc). Add -cpu N / -gpu N to pick the backend:
+python clubb_jax/run_scripts/run_scm.py arm -max_iters 3
 
 # Unit tests — whole suite in one command (exit 0 iff all green; oracle-less tests SKIP cleanly):
 python clubb_jax/run_scripts/run_all_tests.py             # ~165 files (bugsrad/standalone are slow)
@@ -47,8 +52,10 @@ python clubb_jax/tests/test_solver.py                     # …or a single file 
 python clubb_jax/run_scripts/mirror_audit.py
 ```
 
-`compare_*`, `compare_grad.py`, and `run_scm.py -jax` require the compiled `clubb_release/` artifacts (Fortran
-binary + f2py `.so`). Unit tests need only JAX (f2py-oracle tests SKIP when it is unbuilt).
+`compare_*`, `compare_grad.py`, and the default `run_scm.py` (JAX) require the compiled `clubb_release/` artifacts
+(Fortran binary + f2py `.so`). Unit tests need only JAX (f2py-oracle tests SKIP when it is unbuilt). The JAX driver
+is the no-flag default; select the compiled Fortran oracle with `-fortran` (or `-legacy`/`-exe`), and pick the JAX
+compute backend with `-cpu [N]` / `-gpu [N]` (DESIGN.md "Backend & device control").
 
 **Operational note:** long backgrounded runs write logs to a `tasks/` tmpfs that intermittently reports ENOSPC (a
 quota artifact) and silently truncates output. For a long `compare_*` / `run_all_tests` run, launch it detached

@@ -11,10 +11,13 @@ and no f2py oracle to port against; the driver fail-loud rejects the flag). Per-
 `TRANSLATION_STATUS.md`. The Fortran remains essential as (a) the compiled comparison oracle and (b) the
 porting reference.
 
-**Performance & GPU (2026-06-24/25).** The timestep is **whole-step jitted** (`advance_clubb_core_jit`, one fused
+**Performance & GPU (2026-06-24/26).** The timestep is **whole-step jitted** (`advance_clubb_core_jit`, one fused
 dispatch/step on the stats-off path), runs on **GPU** (CUDA-12 jaxlib; `cp jaxenv.sh.example jaxenv.sh`, set
 `_JAXENV`, `source jaxenv.sh`),
-and takes a **single/double precision toggle** (`CLUBB_JAX_PRECISION`, default double = bit-faithful). The GPU
+and takes a **single/double precision toggle** (`CLUBB_JAX_PRECISION`, default double = bit-faithful). **`run_scm.py`
+runs JAX by default** (the `-jax` flag is retired; `-fortran`/`-legacy`/`-exe` select the oracle), and **`-cpu [N]` /
+`-gpu [N]`** pick the JAX compute backend and cap how many cores/GPUs it uses — see "Backend & device control" (Step 6)
+for why XLA's intra-op pool grabs every core by default and the trade-offs of capping. The GPU
 per-step is launch-bound and ~flat in column count, so **JAX-GPU beats Fortran for batched columns — 6.1× at
 ngrdcol=1024** (it loses at 1–few columns, where Fortran's single-thread latency wins). Full CPU/GPU/Fortran
 scaling, the profiling that pins the GPU floor (~1600 fixed kernels), and the remaining lever (`lax.scan` over
@@ -53,13 +56,17 @@ no dependency on any custom branch.
 
 ## How to Test
 
+> All run-script flags and environment variables are catalogued in **`OPTIONS.md`**.
+
+
 **Prerequisites:** `clubb_release/bin/clubb_standalone` and `clubb_release/clubb_python_api/*.so` must be present
 (compiled artifacts, not in git). The regression tests need `clubb_python_api` (for the Fortran comparison run and
 non-ARM `prescribe_forcings`). The JAX driver itself has zero module-level Fortran imports — ARM runs need no oracle.
 
 ```bash
-# Quick smoke test — JAX driver, no Fortran (~20s; writes clubb_jax/output/arm_stats.nc):
-python clubb_jax/run_scripts/run_scm.py arm -jax -max_iters 3
+# Quick smoke test — JAX driver (the no-flag default), no Fortran (~20s; writes
+# clubb_jax/output/arm_stats.nc). Add -cpu N / -gpu N to choose the backend + device cap:
+python clubb_jax/run_scripts/run_scm.py arm -max_iters 3
 
 # Faithfulness gate — Fortran-vs-JAX regression (one pass/fail line per case):
 python clubb_jax/run_scripts/compare_cases.py --max-iters 30                  # 20 bit-faithful DEFAULT_CASES
@@ -85,12 +92,17 @@ python clubb_jax/run_scripts/mirror_audit.py
 **Unit-test convention.** Any f2py-oracle import in a test MUST be guarded (try/except ImportError → SKIP) so the
 JAX-only assertions still run when `clubb_f2py` is unbuilt — the suite is then a clean gate in any environment.
 
+**Driver-selection convention.** The **JAX driver is the no-flag default** (`run_scm.py <case>` runs JAX); the old
+explicit `-jax` flag is retired. Select the compiled Fortran oracle with `-fortran` (= `install/latest`, the old
+no-flag default), `-legacy` (= `bin/`), or `-exe <path>`; `-python` runs the f2py Python driver. `-cpu [N]` /
+`-gpu [N]` choose the JAX compute backend and cap device use (see "Backend & device control" below).
+
 **Output-directory convention.** JAX and Fortran (oracle) stats live in SEPARATE trees so a JAX run can never
-clobber an oracle: `run_scm.py <case> -jax` → `clubb_jax/output/<case>_stats.nc`; `-legacy` (Fortran) →
-`clubb_release/output/<case>_stats.nc` (the oracle home the rate/stats tests read); `-out_dir <dir>` overrides.
-`compare_runs.py` keeps each side in its own subdir (`clubb_release/output/<case>_compare_fort/`,
+clobber an oracle: the default `run_scm.py <case>` (JAX) → `clubb_jax/output/<case>_stats.nc`; `-fortran`/`-legacy`
+(Fortran) → `clubb_release/output/<case>_stats.nc` (the oracle home the rate/stats tests read); `-out_dir <dir>`
+overrides. `compare_runs.py` keeps each side in its own subdir (`clubb_release/output/<case>_compare_fort/`,
 `clubb_jax/output/<case>_compare_jax/`); `diagnose_divergence.py` reads those. Regenerate a clobbered oracle with
-`-legacy`.
+`-fortran`.
 
 **Operational note.** Long runs auto-backgrounded by the harness write logs to a `tasks/` tmpfs that intermittently
 reports ENOSPC (a quota artifact) and silently truncates output. For a long `compare_*` / `run_all_tests` run,
@@ -470,6 +482,40 @@ state and the queue:
   recomputes `thvm` internally from the same inputs and never received the driver's copy (a port vestige; the
   Fortran passes thvm into the core). Removed the per-step `_calculate_thvm` call, the helper, and its import;
   ARM stays bit-faithful (`compare_runs` Result[bit] PASS).
+
+  **★ Step 6 (2026-06-26) — JAX is the default driver + backend/device-count flags.** `run_scm.py` now runs the
+  **JAX driver by default** (no flag); the old `-jax` flag is retired. The compiled Fortran oracle is selected
+  explicitly (`-fortran` = `install/latest`, the old no-flag default; `-legacy` = `bin/`; `-exe PATH`). Two new
+  mutually-exclusive flags pick the JAX compute backend and cap device use: **`-cpu [N]`** and **`-gpu [N]`**
+  (implemented in `run_scm.py::apply_jax_device_flags`, which mutates the child's `run_env` / process affinity
+  before the subprocess launches).
+
+  **Backend & device control — the implicit parallelism, and why the cap works the way it does.** The JAX driver
+  executes through **XLA**, whose **CPU backend runs every array op on an Eigen thread pool sized to the machine's
+  logical-core count** — so even a *single-column* (`ngrdcol=1`) run spreads each elementwise map, reduction, matmul,
+  and the batched tridiagonal LU sweeps across **all** cores, with no threading anywhere in the CLUBB Python code.
+  That is the "why are all 32 CPUs busy" effect: it is XLA's *intra-op* parallelism, not data-parallelism over
+  columns (the column axis `-multicol` is an *additional* parallel axis on top). Measured on this node: a bare CPU
+  JAX run pegs ~20 of 32 cores (~2080 % CPU). **The usual knobs do not cap it** — in jaxlib 0.10.2 the CPU runtime
+  *ignores* `XLA_FLAGS=--xla_cpu_multi_thread_eigen=…`, `--xla_force_host_platform_device_count`, and
+  `OMP_NUM_THREADS` (all verified ~2300 % regardless). The one reliable lever is **OS CPU affinity**, so `-cpu N`
+  calls `os.sched_setaffinity` on the parent (inherited by the child JAX process) to pin it to the first `N`
+  available cores — verified linear: 4 cores → ~337 %, 8 → ~644 %. `-gpu N` sets `CUDA_VISIBLE_DEVICES=0..N-1`;
+  `-cpu`/`-gpu` also set/clear `JAX_PLATFORMS` to force the platform. Bare `-cpu`/`-gpu` selects the backend but
+  uses all devices; with neither flag the backend follows the environment (`jaxenv.sh`).
+
+  **Trade-offs of capping below the available cores/GPUs.** Fewer CPU cores → *longer per-step wall time* (the work
+  is split over fewer threads), but with real upsides: (1) it frees cores for other jobs and, critically, lets two
+  JAX runs **coexist without the OOM/contention** that DESIGN warns about ("never run two heavy JAX suites
+  concurrently" — an unpinned run grabbing all cores is exactly that hazard); (2) CLUBB's step is **launch/overhead-
+  bound, not FLOP-bound** (the GPU floor is the ~1600 fixed fusion kernels; the CPU step at `ngrdcol=1` is a few ms),
+  so at small column counts the marginal core buys little — the parallel-dispatch overhead can even make a handful of
+  cores *more* efficient per-core and timing more deterministic. The cost of capping grows with the data-parallel
+  workload: at **large `ngrdcol`** the column axis is genuinely parallel and throughput scales with cores, so capping
+  there trades throughput 1:1 for the freed cores — set `-cpu N` to share a node, leave it uncapped to maximize a
+  solo batch run. For **GPU**, the driver currently runs on a **single device** (no `pmap`/sharding across GPUs yet),
+  so `-gpu N>1` does **not** speed anything up — it only restricts visibility to coexist with other GPU jobs (pin to
+  `-gpu 1`); multi-GPU column sharding is future work alongside the `lax.scan`-over-timesteps lever.
 
 - **Unit-test status (165 files; 118 passing at branch start).** A signature-drift pass updated **35** stale
   tests to the refactor's new JIT-friendly signatures (leading `nzm/nzt/ngrdcol/gr`, reordered args,

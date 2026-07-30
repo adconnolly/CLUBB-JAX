@@ -2,7 +2,7 @@
 
 DEFINITIVE localiser for the rico grid_type=2 divergence. Workflow:
   1. Capture rico's matched step-1 advance_xm_wpxp inputs + raw JAX output (eager):
-       XMWP_CAP=1 JAX_DISABLE_JIT=1 python clubb_jax/run_scripts/run_scm.py rico -jax -max_iters 1
+       XMWP_CAP=1 JAX_DISABLE_JIT=1 python clubb_jax/run_scripts/run_scm.py rico -max_iters 1
      (writes .tmp_claude/xmwp_in.npz and .tmp_claude/xmwp_out.npz; the capture hooks in
       advance_clubb_core_module.py are gated on $XMWP_CAP, no-op otherwise.)
   2. Run this script: it builds the Fortran grid+UDTs, calls the f2py .so with the SAME

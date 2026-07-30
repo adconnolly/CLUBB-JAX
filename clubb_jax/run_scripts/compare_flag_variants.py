@@ -106,11 +106,11 @@ def one_variant(flag: str, value: str, case: str, iters: int, thresh: float, wor
     common = [sys.executable, RUN_SCM, "-stats", STATS, "-multicol", HR_SPEC,
               "-debug", "0", "-flags", flags_file, "-max_iters", str(iters)]
     t0 = time.time()
-    jax_rc = run([*common, "-jax", "-out_dir", jax_out, case], vdir / "jax.log")
+    jax_rc = run([*common, "-out_dir", jax_out, case], vdir / "jax.log")  # JAX = default
     if jax_rc != 0:
         return {"flag": flag, "value": value, "status": "JAX_FAIL_LOUD",
                 "elapsed": time.time() - t0, "note": tail(vdir / "jax.log")}
-    f90_rc = run([*common, "-out_dir", f90_out, case], vdir / "fort.log")
+    f90_rc = run([*common, "-fortran", "-out_dir", f90_out, case], vdir / "fort.log")
     if f90_rc != 0:
         return {"flag": flag, "value": value, "status": "FORTRAN_FAIL",
                 "elapsed": time.time() - t0, "note": tail(vdir / "fort.log")}

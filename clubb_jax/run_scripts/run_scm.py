@@ -14,9 +14,10 @@ JAX_ROOT    = os.path.normpath(os.path.join(RUN_SCRIPTS, "../.."))   # CLUBB-JAX
 CLUBB_ROOT  = os.path.normpath(os.path.join(JAX_ROOT, "clubb_release"))
 
 # Output convention: JAX-produced stats live under clubb_jax/output/, the Fortran
-# oracle under clubb_release/output/. Defaulting -jax to its OWN directory means a
-# bare `-jax` run can no longer clobber the stored Fortran oracle
-# (clubb_release/output/<case>_stats.nc) — see DESIGN.md "Oracle-protection convention".
+# oracle under clubb_release/output/. The JAX driver is the DEFAULT (no executable
+# flag); it defaults to its OWN directory so a bare JAX run can never clobber the
+# stored Fortran oracle (clubb_release/output/<case>_stats.nc) — see DESIGN.md
+# "Oracle-protection convention". Run the oracle with -fortran / -legacy / -exe.
 DEFAULT_OUTPUT_DIR     = os.path.join(CLUBB_ROOT, "output")          # Fortran / legacy / exe
 DEFAULT_JAX_OUTPUT_DIR = os.path.join(JAX_ROOT, "clubb_jax", "output")  # JAX driver
 
@@ -290,7 +291,19 @@ def setup_files_and_aggregate(args, output_dir):
         if existing_pythonpath:
             pythonpath_entries.append(existing_pythonpath)
         run_env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
-    elif args.jax:
+    elif args.fortran or args.driver_test:
+        # The compiled Fortran oracle from install/latest (the last compiled binary).
+        # This was the old no-flag default; the no-flag default is now the JAX driver,
+        # so the oracle is selected explicitly with -fortran (or -driver_test).
+        if args.driver_test:
+            executable  = os.path.join(CLUBB_ROOT, f"install/latest/clubb_driver_test")
+        else:
+            executable  = os.path.join(CLUBB_ROOT, f"install/latest/clubb_standalone")
+        if not os.path.isfile(executable):
+            sys.exit(f"{executable} not found (did you re-compile?)")
+        run_cmd = [executable]
+    else:
+        # DEFAULT: the JAX standalone driver (the model this repo is). No flag needed.
         jax_driver = os.path.join(JAX_ROOT, "clubb_jax", "src", "clubb_standalone.py")
         if not os.path.isfile(jax_driver):
             sys.exit(f"JAX standalone driver not found: {jax_driver}")
@@ -308,19 +321,6 @@ def setup_files_and_aggregate(args, output_dir):
         if existing_pythonpath:
             pythonpath_entries.append(existing_pythonpath)
         run_env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
-    else:
-        # Find the executable based on compiler by default
-        # (install/COMPILER/clubb_standalone), otherwise
-        # default to (install/lastest/clubb_standalone) which points to the last one compiled
-        #compiler    = os.path.basename(os.environ["FC"]) if "FC" in os.environ else "latest"
-
-        if args.driver_test:
-            executable  = os.path.join(CLUBB_ROOT, f"install/latest/clubb_driver_test")
-        else:
-            executable  = os.path.join(CLUBB_ROOT, f"install/latest/clubb_standalone")
-        if not os.path.isfile(executable):
-            sys.exit(f"{executable} not found (did you re-compile?)")
-        run_cmd = [executable]
 
     print(f" - using executable: {executable}")
 
@@ -340,7 +340,7 @@ def setup_files_and_aggregate(args, output_dir):
         ("-flags", flags_file),
         ("-silhs_params", silhs_params_file),
     ]
-    if not (args.python or args.jax):
+    if not (args.python or args.is_jax):
         files_to_validate.append(("-exe", executable))
     if not disable_stats:
         files_to_validate.append(("-stats", stats_file))
@@ -455,6 +455,45 @@ def edit_namelist(args, clubb_input_namelist, model_file, output_dir):
         f.write(clubb_in)
 
 
+def apply_jax_device_flags(args, run_env):
+    """Translate -cpu/-gpu into JAX backend env vars + a CPU-core affinity cap.
+
+    Why this is needed: the JAX driver runs through XLA, whose CPU backend executes
+    every array op on an Eigen thread pool sized to the machine's logical core count.
+    So even a single-column run spreads each elementwise / reduction / tridiagonal-solve
+    kernel across ALL cores with no code-level threading — that is the "implicit
+    parallelism" a bare run exhibits. In jaxlib 0.10.2 the XLA_FLAGS / OMP_NUM_THREADS
+    knobs are ignored by the CPU runtime, so the only reliable cap is OS CPU affinity
+    (os.sched_setaffinity), applied here on the parent and inherited by the child JAX
+    process. The GPU backend runs on a single device today, so -gpu N only restricts
+    visibility (CUDA_VISIBLE_DEVICES); it does not yet shard columns across GPUs.
+    See DESIGN.md "Backend & device control" for the trade-offs.
+    """
+    if args.cpu is not None:
+        run_env["JAX_PLATFORMS"] = "cpu"
+        if args.cpu and args.cpu > 0 and hasattr(os, "sched_getaffinity"):
+            avail = sorted(os.sched_getaffinity(0))
+            n = min(args.cpu, len(avail))
+            if args.cpu > len(avail):
+                print(f"WARNING: requested -cpu {args.cpu} but only {len(avail)} core(s) "
+                      f"available; using {n}.")
+            cores = set(avail[:n])
+            os.sched_setaffinity(0, cores)   # inherited by the child JAX process
+            print(f" - JAX backend: cpu, pinned to {n} core(s): {sorted(cores)}")
+        else:
+            navail = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else "all"
+            print(f" - JAX backend: cpu, using all {navail} available core(s)")
+    elif args.gpu is not None:
+        run_env.pop("JAX_PLATFORMS", None)   # force GPU (override any env cpu setting)
+        if args.gpu and args.gpu > 0:
+            visible = ",".join(str(i) for i in range(args.gpu))
+            run_env["CUDA_VISIBLE_DEVICES"] = visible
+            print(f" - JAX backend: gpu, CUDA_VISIBLE_DEVICES={visible} "
+                  f"(driver uses a single device; >1 GPU is not yet sharded)")
+        else:
+            print(" - JAX backend: gpu, using all visible GPU(s)")
+
+
 def main():
 
     parser = argparse.ArgumentParser( description="Run the standalone CLUBB model")
@@ -509,8 +548,12 @@ def main():
     parser.add_argument("-python", action="store_true",
         help="Run the Python standalone driver (python -m clubb_python_driver.clubb_standalone)")
 
-    parser.add_argument("-jax", action="store_true",
-        help="Run the JAX standalone driver (python -m clubb_jax.src.clubb_standalone)")
+    # The JAX standalone driver is the DEFAULT (run with no executable-selector flag);
+    # the old explicit `-jax` flag is retired. To run the compiled Fortran oracle
+    # instead, use -fortran (install/latest), -legacy (bin/), or -exe PATH.
+    parser.add_argument("-fortran", action="store_true",
+        help="Run the compiled Fortran oracle (install/latest/clubb_standalone).\n"
+             "Was the old no-flag default; the no-flag default is now the JAX driver.")
 
     # The old method of compile clubb resulted in the executable "clubb/bin/clubb_standalone"
     # this option causes that to be the prefered executable, unless -exe is specified
@@ -520,10 +563,29 @@ def main():
         help="Runs the legacy compiled version of clubb_standalone (with compile.bash)"
     )
 
+    # JAX compute-backend selection + device-count cap (JAX runs only; mutually
+    # exclusive). The optional integer caps how many devices are used:
+    #   -cpu N  → JAX_PLATFORMS=cpu and pin the process to N cores (sched_setaffinity)
+    #   -gpu N  → GPU backend with CUDA_VISIBLE_DEVICES limited to N GPUs
+    # Bare -cpu / -gpu selects the backend but uses all available devices. With
+    # neither flag the backend follows the environment (e.g. jaxenv.sh).
+    backend_group = parser.add_mutually_exclusive_group()
+    backend_group.add_argument("-cpu", nargs="?", type=int, const=0, default=None,
+        metavar="N",
+        help="Run JAX on CPU. Optional N caps the run to N CPU cores (default: all).\n"
+             "See DESIGN.md 'Backend & device control' for why JAX uses every core "
+             "by default and the trade-offs of capping.")
+    backend_group.add_argument("-gpu", nargs="?", type=int, const=0, default=None,
+        metavar="N",
+        help="Run JAX on GPU. Optional N limits to N visible GPUs (default: all).\n"
+             "Note: the driver currently runs on a single device; >1 GPU does not "
+             "yet shard columns.")
+
     # Allow a custom output directory to be used for all generated files.
     parser.add_argument("-out_dir", metavar="[DIR]",
         help="Output directory for results.\n"
-             "Default: clubb_jax/output/ for -jax, clubb_release/output/ otherwise.")
+             "Default: clubb_jax/output/ for the JAX driver, clubb_release/output/ "
+             "for the Fortran oracle.")
 
     # Runtime options
     parser.add_argument("-debug", metavar="[NUM]",
@@ -558,9 +620,18 @@ def main():
 
     # Error check
     ndefined = (sum(bool(x) for x in
-                        [args.exe, args.legacy, args.driver_test, args.python, args.jax]))
+                        [args.exe, args.legacy, args.driver_test, args.python, args.fortran]))
     if ndefined > 1:
-        parser.error("Only one of -exe, -legacy, -driver_test, -python, or -jax may be specified.")
+        parser.error("Only one of -exe, -legacy, -driver_test, -python, or -fortran may be specified.")
+
+    # JAX is the default driver: no executable-selector flag means run JAX.
+    args.is_jax = (ndefined == 0)
+
+    # -cpu/-gpu configure the JAX compute backend; they are meaningless for a
+    # Fortran/Python run.
+    if (args.cpu is not None or args.gpu is not None) and not args.is_jax:
+        parser.error("-cpu/-gpu select the JAX compute backend and cannot be combined "
+                     "with -exe/-legacy/-driver_test/-python/-fortran.")
     # Validate grid options
     if args.zt_grid and args.zm_grid:
         sys.exit(f"\n\033[91mERROR: Cannot specify both a ZT grid and a ZM grid\033[0m")
@@ -568,11 +639,12 @@ def main():
         print("\n\033[93mWARNING: Specifying --nzmax will have no effect without "
                 "specifying a --zm_grid or --zt_grid\033[0m")
 
-    # -jax defaults to clubb_jax/output/ (its own dir), everything else to
-    # clubb_release/output/ (the Fortran oracle home). -out_dir overrides either.
+    # The default JAX driver writes to clubb_jax/output/ (its own dir); the Fortran
+    # oracle (-fortran/-legacy/-exe) writes to clubb_release/output/ (the oracle home).
+    # -out_dir overrides either.
     if args.out_dir:
         output_dir = os.path.abspath(args.out_dir)
-    elif args.jax:
+    elif args.is_jax:
         output_dir = os.path.abspath(DEFAULT_JAX_OUTPUT_DIR)
     else:
         output_dir = os.path.abspath(DEFAULT_OUTPUT_DIR)
@@ -584,6 +656,10 @@ def main():
 
     # Step 2: edit clubb_input_namelist based on input specifications
     edit_namelist(args, clubb_input_namelist, model_file, output_dir)
+
+    # Step 2b: apply -cpu/-gpu backend + device-count selection (JAX runs only).
+    if args.is_jax:
+        apply_jax_device_flags(args, run_env)
 
     # Step 3: run model
     print(f"=================== Running {args.case_name} ===================")

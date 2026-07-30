@@ -39,7 +39,7 @@ def _ensure_fixture():
     env["PYTHONPATH"] = os.pathsep.join([_JAX_ROOT, _JAX_ROOT + "/clubb_release",
                                          _JAX_ROOT + "/clubb_release/clubb_python_api"])
     try:
-        subprocess.run([sys.executable, os.path.join(_RUN, "run_scm.py"), "arm", "-jax",
+        subprocess.run([sys.executable, os.path.join(_RUN, "run_scm.py"), "arm",  # JAX = default
                         "-max_iters", "1"], env=env, check=True, timeout=600,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:

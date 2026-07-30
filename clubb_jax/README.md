@@ -54,14 +54,16 @@ same relative path.
 From the repository root:
 
 ```bash
-# Run ARM in pure JAX for 30 steps:
-python clubb_jax/run_scripts/run_scm.py arm -jax -max_iters 30
+# Run ARM in pure JAX for 30 steps (JAX is the default driver — no flag needed):
+python clubb_jax/run_scripts/run_scm.py arm -max_iters 30
+# ...optionally pick the JAX backend / device count: -cpu 8 (8 cores) or -gpu 1
 ```
 
-`-jax` writes stats to **`clubb_jax/output/<case>_stats.nc`** (the Fortran oracle lives
-separately in `clubb_release/output/`, so a JAX run never clobbers it). Drop `-jax` to run
-the compiled Fortran instead. By default the run script uses
-`clubb_release/install/latest/clubb_standalone`; pass `-exe <path>` to use a specific build.
+The default JAX driver writes stats to **`clubb_jax/output/<case>_stats.nc`** (the Fortran oracle
+lives separately in `clubb_release/output/`, so a JAX run never clobbers it). Select the compiled
+Fortran oracle instead with `-fortran` (= `clubb_release/install/latest/clubb_standalone`), or
+`-legacy` / `-exe <path>` for a specific build. `-cpu [N]` / `-gpu [N]` choose the JAX compute
+backend and cap how many cores / GPUs it uses (see DESIGN.md "Backend & device control").
 
 You can also invoke the driver module directly on an already-aggregated namelist:
 

@@ -9,7 +9,7 @@ CRITICAL HARNESS NOTE: the JAX `low_lev_effect`/`high_lev_effect` are 0-BASED le
 Fortran f2py uses them as 1-BASED array indices → **must pass `lle+1, hle+1`**. Without the +1 the
 f2py mfl fires spuriously (thl xm off by 0.9) — a harness artifact, not a JAX bug.
 
-Run after:  MFLCAP=1 JAX_DISABLE_JIT=1 run_scm.py rico -jax -max_iters 1
+Run after:  MFLCAP=1 JAX_DISABLE_JIT=1 run_scm.py rico -max_iters 1
 """
 import sys, numpy as np
 from pathlib import Path

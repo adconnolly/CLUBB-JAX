@@ -39,7 +39,7 @@ def _find_or_make_stats():
             return p
     # Generate a short run.
     out = os.path.join(_JAX_ROOT, "clubb_jax/output/arm_invariants_tmp")
-    cmd = [sys.executable, os.path.join(_RUN, "run_scm.py"), "arm", "-jax",
+    cmd = [sys.executable, os.path.join(_RUN, "run_scm.py"), "arm",  # JAX = default
            "-max_iters", "3", "-out_dir", out]
     try:
         subprocess.run(cmd, check=True, timeout=600)

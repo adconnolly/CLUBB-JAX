@@ -48,7 +48,7 @@ def smoke_case(case: str, max_iters: int = 3, timeout: int = 120) -> dict:
     through `max_iters` steps, or which unported feature blocks it.
     """
     cmd = [sys.executable, os.path.join(RUN_SCRIPTS, "run_scm.py"),
-           case, "-jax", "-max_iters", str(max_iters)]
+           case, "-max_iters", str(max_iters)]   # JAX is the default driver
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
