@@ -37,6 +37,12 @@ advance_clubb_to_end(state, l_stdout=False, max_steps=3)
 base = np.asarray(state['clubb_params'], dtype=np.float64)
 theta_def = jnp.asarray(base[0, IDX])                      # defaults
 
+# Tune in LOG space: theta = theta_def * exp(u), u unconstrained (starts at 0).
+# Keeps coeffs positive and puts the 5 different-scale coeffs on a common
+# (multiplicative) footing, which conditions Adam far better than raw space.
+def theta_of(u):
+    return theta_def * jnp.exp(u)
+
 def forward(theta):
     """Return dict of final-time profiles after N steps for coeff vector theta."""
     s = dict(state)
@@ -54,8 +60,8 @@ target = jax.tree_util.tree_map(lambda a: jax.lax.stop_gradient(a), forward(thet
 # per-field normalizer: std of the target field (so heterogeneous units compare)
 norm = {k: float(jnp.std(v)) + 1e-30 for k, v in target.items()}
 
-def loss(theta):
-    pred = forward(theta)
+def loss(u):
+    pred = forward(theta_of(u))
     total = 0.0
     for grp, keys in FIELDS.items():
         g = 0.0
@@ -69,21 +75,23 @@ def loss(theta):
 # per-step advance_clubb_core_jit still accelerates the physics kernels.
 val_and_grad = jax.value_and_grad(loss)
 
-# --- Adam (hand-rolled; no optax dependency) -------------------------------
-theta = theta_def
-m = jnp.zeros_like(theta); v = jnp.zeros_like(theta)
-lr, b1, b2, epsA = 0.05, 0.9, 0.999, 1e-8
-print(f"case={CASE} N={N} iters={NIT}")
-print("theta_true/theta_def:", dict(zip(NAMES, np.asarray(theta_true / theta_def))))
+# --- Adam (hand-rolled; no optax dependency) with lr decay -----------------
+u = jnp.zeros(len(IDX))
+m = jnp.zeros_like(u); v = jnp.zeros_like(u)
+lr0, b1, b2, epsA = 0.08, 0.9, 0.999, 1e-8
+u_true = np.log(np.asarray(theta_true / theta_def))   # target in u-space
+print(f"case={CASE} N={N} iters={NIT}  (log-space, lr0={lr0} decay)")
+print("target theta/def:", dict(zip(NAMES, np.round(np.asarray(theta_true / theta_def), 3))))
 for it in range(1, NIT + 1):
-    L, g = val_and_grad(theta)
+    L, g = val_and_grad(u)
+    lr = lr0 * (0.5 ** (it / 25.0))            # halve every 25 iters
     m = b1 * m + (1 - b1) * g
     v = b2 * v + (1 - b2) * g * g
     mh = m / (1 - b1 ** it); vh = v / (1 - b2 ** it)
-    theta = theta - lr * mh / (jnp.sqrt(vh) + epsA)
+    u = u - lr * mh / (jnp.sqrt(vh) + epsA)
     if it == 1 or it % 5 == 0 or it == NIT:
-        err = np.asarray(theta / theta_true - 1.0)
-        print(f"  it{it:3d}  loss={float(L):.4e}  |theta/true-1|_max={np.max(np.abs(err[:4])):.3e} "
-              f"theta={np.asarray(theta)}")
-print("\nfinal theta   :", dict(zip(NAMES, np.asarray(theta))))
-print("target theta  :", dict(zip(NAMES, np.asarray(theta_true))))
+        th = np.asarray(theta_of(u)); err = th / np.asarray(theta_true) - 1.0
+        print(f"  it{it:3d} loss={float(L):.3e} "
+              f"err%=[" + " ".join(f"{n}:{100*e:+5.1f}" for n, e in zip(NAMES, err)) + "]")
+print("\nfinal  theta:", dict(zip(NAMES, np.round(np.asarray(theta_of(u)), 4))))
+print("target theta:", dict(zip(NAMES, np.round(np.asarray(theta_true), 4))))
