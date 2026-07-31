@@ -41,6 +41,7 @@ from clubb_jax.src.CLUBB_core.clubb_constants import (
     zero,
 )
 from clubb_jax.src.CLUBB_core.error_code import clubb_at_least_debug_level
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow, _safe_sqrt
 from clubb_jax.src.CLUBB_core.jax_stats_bridge import JaxStats
 from clubb_jax.src.CLUBB_core import ErrInfo, Grid, SclrIdx
 
@@ -164,31 +165,36 @@ def calc_sfc_varnce(
     else:
 
         # Compute ustar^2
-        ustar2 = jnp.sqrt(upwp_sfc * upwp_sfc + vpwp_sfc * vpwp_sfc)
+        ustar2 = _safe_sqrt(upwp_sfc * upwp_sfc + vpwp_sfc * vpwp_sfc)
 
         # Compute wstar following Andre et al., 1976
+        # _safe_pow (max(x,0)**p) keeps a finite reverse-mode gradient where the
+        # buoyancy flux is <= 0 (bare max(x,0)**(1/3) has an inf cotangent at the
+        # clip, which NaNs grads w.r.t. upstream params). Forward-identical.
         if not l_vary_convect_depth:
-            wstar = (
+            wstar = _safe_pow(
                 one / T0
                 * grav
                 * jnp.maximum(wpthlp[:, gr.k_lb_zm], zero)
-                * z_const
-            ) ** one_third
+                * z_const,
+                one_third,
+            )
         else:
-            wstar = (
+            wstar = _safe_pow(
                 one / T0
                 * grav
                 * jnp.maximum(wpthlp[:, gr.k_lb_zm], zero)
                 * 0.2
-                * depth_pos_wpthlp
-            ) ** one_third
+                * depth_pos_wpthlp,
+                one_third,
+            )
         wstar = jnp.where(wpthlp[:, gr.k_lb_zm] > zero, wstar, zero)
 
         # Surface friction velocity following Andre et al. 1978
         if not l_vary_convect_depth:
-            uf = jnp.sqrt(ustar2 + 0.3 * wstar * wstar)
+            uf = _safe_sqrt(ustar2 + 0.3 * wstar * wstar)
         else:
-            uf = jnp.sqrt(ustar2 + wstar * wstar)
+            uf = _safe_sqrt(ustar2 + wstar * wstar)
 
         uf = jnp.maximum(ufmin, uf)
 
@@ -222,7 +228,7 @@ def calc_sfc_varnce(
             )
             rtpthlp_sfc = (
                 max_mag_correlation_flux
-                * jnp.sqrt(thlp2_sfc * rtp2_sfc)
+                * _safe_sqrt(thlp2_sfc * rtp2_sfc)
             )
 
         thlp2_sfc = jnp.maximum(thl_tol ** 2, thlp2_sfc)

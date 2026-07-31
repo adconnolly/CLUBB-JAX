@@ -73,14 +73,13 @@ def compute_gamma_Skw(nz: int, ngrdcol: int, Skw, clubb_params, l_gamma_Skw: boo
 
     #----------------------------- Begin Code ------------------------------
     if l_gamma_Skw:
-        varying = gamma_coefb + (gamma_coef - gamma_coefb) * jnp.exp(
+        # Smooth form: bit-identical to the original `l_varying` where at
+        # gamma_coef == gamma_coefb (the varying expression reduces to gamma_coef
+        # there), but keeps the correct Skw-dependent gradient w.r.t. gamma_coef
+        # instead of the constant-branch gradient the where produced.
+        gamma_Skw_fnc = gamma_coefb + (gamma_coef - gamma_coefb) * jnp.exp(
             -one_half * (Skw / gamma_coefc) ** 2
         )
-        l_varying = (
-            jnp.abs(gamma_coef - gamma_coefb)
-            > jnp.abs(gamma_coef + gamma_coefb) * eps / 2.0
-        )
-        gamma_Skw_fnc = jnp.where(l_varying, varying, gamma_coef)
     else:
         gamma_Skw_fnc = gamma_coef + jnp.zeros_like(Skw)
 
