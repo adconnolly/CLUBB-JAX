@@ -54,9 +54,19 @@ def forward(theta):
     advance_clubb_to_end(s, l_stdout=False, max_steps=N)
     return {k: _aj(s[k]).ravel() for grp in FIELDS.values() for k in grp}
 
-# --- build a synthetic target from perturbed coefficients ------------------
-theta_true = theta_def * jnp.asarray([1.15, 1.20, 0.85, 1.10, 1.0])  # mult_coef inert
-target = jax.tree_util.tree_map(lambda a: jax.lax.stop_gradient(a), forward(theta_true))
+# --- target: real obs netCDF (--obs / 4th arg) or synthetic recovery -------
+OBS = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("OBS")
+if OBS:
+    # Real observations: mean-state fields only (VARANAL has no turbulence).
+    from clubb_jax.run_scripts.obs_target import load_obs_target
+    FIELDS = {"mean": ["thlm", "rtm", "um", "vm"]}
+    tgt = load_obs_target(OBS, state, time_target_s=N * float(state['dt_main']))
+    target = {k: jnp.asarray(v).ravel() for k, v in tgt.items()}
+    theta_true = None
+    print(f"OBS target: {OBS}")
+else:
+    theta_true = theta_def * jnp.asarray([1.15, 1.20, 0.85, 1.10, 1.0])  # mult_coef inert
+    target = jax.tree_util.tree_map(lambda a: jax.lax.stop_gradient(a), forward(theta_true))
 # per-field normalizer: std of the target field (so heterogeneous units compare)
 norm = {k: float(jnp.std(v)) + 1e-30 for k, v in target.items()}
 
@@ -79,9 +89,9 @@ val_and_grad = jax.value_and_grad(loss)
 u = jnp.zeros(len(IDX))
 m = jnp.zeros_like(u); v = jnp.zeros_like(u)
 lr0, b1, b2, epsA = 0.08, 0.9, 0.999, 1e-8
-u_true = np.log(np.asarray(theta_true / theta_def))   # target in u-space
-print(f"case={CASE} N={N} iters={NIT}  (log-space, lr0={lr0} decay)")
-print("target theta/def:", dict(zip(NAMES, np.round(np.asarray(theta_true / theta_def), 3))))
+print(f"case={CASE} N={N} iters={NIT}  (log-space, lr0={lr0} decay)  mode={'OBS' if OBS else 'synthetic-recovery'}")
+if theta_true is not None:
+    print("target theta/def:", dict(zip(NAMES, np.round(np.asarray(theta_true / theta_def), 3))))
 for it in range(1, NIT + 1):
     L, g = val_and_grad(u)
     lr = lr0 * (0.5 ** (it / 25.0))            # halve every 25 iters
@@ -90,8 +100,14 @@ for it in range(1, NIT + 1):
     mh = m / (1 - b1 ** it); vh = v / (1 - b2 ** it)
     u = u - lr * mh / (jnp.sqrt(vh) + epsA)
     if it == 1 or it % 5 == 0 or it == NIT:
-        th = np.asarray(theta_of(u)); err = th / np.asarray(theta_true) - 1.0
-        print(f"  it{it:3d} loss={float(L):.3e} "
-              f"err%=[" + " ".join(f"{n}:{100*e:+5.1f}" for n, e in zip(NAMES, err)) + "]")
+        th = np.asarray(theta_of(u))
+        if theta_true is not None:
+            err = th / np.asarray(theta_true) - 1.0
+            print(f"  it{it:3d} loss={float(L):.3e} "
+                  f"err%=[" + " ".join(f"{n}:{100*e:+5.1f}" for n, e in zip(NAMES, err)) + "]")
+        else:  # real obs: no ground truth — report loss + coeff/default ratios
+            print(f"  it{it:3d} loss={float(L):.3e} "
+                  f"theta/def=[" + " ".join(f"{n}:{r:.3f}" for n, r in zip(NAMES, th / np.asarray(theta_def))) + "]")
 print("\nfinal  theta:", dict(zip(NAMES, np.round(np.asarray(theta_of(u)), 4))))
-print("target theta:", dict(zip(NAMES, np.round(np.asarray(theta_true), 4))))
+if theta_true is not None:
+    print("target theta:", dict(zip(NAMES, np.round(np.asarray(theta_true), 4))))
