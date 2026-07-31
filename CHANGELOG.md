@@ -278,3 +278,17 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   = genuine JAX↔Fortran FP divergence, within the tiered "faithful" standard.
 - Env note: the machine-specific `jaxenv` was wiped; rebuilt a CPU venv (jax 0.10.2 + netCDF4 + ninja/cmake) off
   anaconda3-2023.09. COMBLE case files + the two-driver `comble` branches are uncommitted (submodule + JAX src).
+
+### 2026-07-31 — tune-to-obs: differentiable core hardened for coefficient gradients (branch tune-to-obs)
+- **De-risk found the whole-driver `jax.grad` w.r.t. tunable coefficients was broken** (NaN for c_K/gamma_coef,
+  detached zero for C1/C11) through a multi-step trajectory — a pre-existing gap (stock `probe_driver_grad` fails on
+  `thlm` at 1 step too; `um`/momentum path was fine). Coeffs enter via a traced `state['clubb_params']` array
+  (`clubb_params[:, i<name>]`), so no plumbing was needed — only the singular/detaching ops.
+- **Four root-cause fixes, all forward-bit-identical at default params** (arm stays `Result[bit]` PASS vs Fortran,
+  0 prognostic failures): `sfc_varnce_module` `_safe_sqrt`×3 + `_safe_pow` (wstar cube-root); `fill_holes`
+  `fill_holes_wp2_from_horz_tke` safe division denominator; `advance_wp2_wp3_module` drop the `C1_varying`/
+  `C11_varying` compute-shortcut where (it zeroed dC1/dC11 at C==Cb) for the smooth Skw form; `Skx_module` same for
+  `gamma_coef`. Result: `probe_coeff_grad.py` (new) shows all 5 coeffs finite + FD-correct through 30 steps
+  (worst rel 8e-3, C11 FD-step noise).
+- **Route-around:** grad uses `fill_holes_type=global_fill` (1); the default `sliding_window` (2) has a
+  non-differentiable dynamic-bound `fori_loop` — a separate follow-up. Next: the Adam tuning loop + obs target.
