@@ -625,6 +625,18 @@ def prescribe_forcings_generic(state: dict, time_current: float,
             thlm_bot, rtm_bot, z_bot, ubar, state['p_sfc'], T_sfc_val,
             state['flags'].saturation_formula)
 
+    elif runtype == 'comble':
+        # COMBLE 13 Mar 2020 marine cold-air outbreak: ocean bulk fluxes from the
+        # prescribed SST (sfctype=1), via the generic cloud_feedback bulk routine
+        # (mirrors the comble branch in prescribe_forcings.F90).
+        l_compute_momentum_flux = True
+        l_set_sclr = True
+        T_sfc_val = _interp_sfc_t_sfc(state, time_current)
+        T_sfc = np.full(ngrdcol, T_sfc_val)
+        wpthlp_sfc, wprtp_sfc, ustar = cloud_feedback_sfclyr(
+            thlm_bot, rtm_bot, z_bot, ubar, state['p_sfc'], T_sfc_val,
+            state['flags'].saturation_formula)
+
     elif runtype == 'astex_a209':
         l_compute_momentum_flux = True
         l_set_sclr = True

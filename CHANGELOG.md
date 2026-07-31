@@ -259,3 +259,22 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   comparison/test scripts (`compare_runs`/`compare_cases`/`compare_grad`/`benchmark_backends`/`run_all_tests` flags +
   `FORTRAN_EXE`/`FORTRAN_OUT_ROOT`/`JAX_OUT_ROOT`). Env-var semantics confirmed by grepping the actual
   `os.environ` reads. CLAUDE.md and DESIGN.md now point to it.
+
+### 2026-07-30 — New case: COMBLE (marine cold-air outbreak), added to both drivers + compared
+- **Added `comble` as a genuinely new case** (13 Mar 2020 Norwegian Sea cold-air outbreak, from the ARM COMBLE-MIP
+  DEPHY-SCM forcing V2.4 — not one of the existing benchmarks). Converter `make_comble_case.py` translates the DEPHY
+  netCDF → `comble_{sounding,forcings,sfc,model}.in`: geostrophic `ug/vg` forcing (time+height), no subsidence/adv
+  tendencies (`forc_wap=forc_wa=0`), SST time series (247→279 K) driving `sfctype=1` ocean bulk fluxes, Morrison
+  mixed-phase (fixed Nc=20 cm⁻³, like mpace_a), 74.5 °N, 50 m grid to 6 km.
+- **Both drivers now dispatch `comble`.** Surface fluxes routed to the generic bulk-ocean routine
+  `cloud_feedback_sfclyr` (sfctype=1) via a new `comble` branch in **both** `prescribe_forcings.F90` (surface select)
+  and `prescribe_forcings.py`; large-scale forcing goes through the generic `l_t_dependent` file path. Note the two
+  runtype selects: the LS-forcing select (1) is skipped when `l_t_dependent .and. .not. l_ignore_forcings`, so only
+  the surface select needed a branch; the TKE-init select default (`em=em_min`) is used on both sides. The Fortran
+  oracle was **incrementally recompiled** with Intel `ifx` (ninja, LD_LIBRARY_PATH `libimf`/`libifcore` fix).
+- **JAX vs Fortran agree** (in-process `clubb_driver.run_clubb`, morrison-capable path — NOT the standalone
+  `run_scm.py`, whose `clubb_case_initalization` init supports only microphys `none`). After 20 steps: max|Δthlm|=8e-4 K
+  over 248–286 K, |Δrtm|=6e-8, |Δwp2|=3e-4 over 0–0.16; rcm/cloud_frac exactly 0 (pre-cloud spin-up). Nonzero-but-tiny
+  = genuine JAX↔Fortran FP divergence, within the tiered "faithful" standard.
+- Env note: the machine-specific `jaxenv` was wiped; rebuilt a CPU venv (jax 0.10.2 + netCDF4 + ninja/cmake) off
+  anaconda3-2023.09. COMBLE case files + the two-driver `comble` branches are uncommitted (submodule + JAX src).
