@@ -25,6 +25,8 @@ from clubb_jax.src.CLUBB_core.clubb_precision import configure_jax_precision
 configure_jax_precision()
 import jax.numpy as jnp
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
+
 from clubb_jax.src.CLUBB_core.advance_helper_module import (
     calc_Ri_zm,
     smooth_heaviside_peskin,
@@ -1445,9 +1447,12 @@ def diagnose_Lscale_from_tau(
             brunt_vaisala_freq_sqd_smth,
             1.0e-4 * min_max_smth_mag,
         )
-        brunt_freq_pos = jnp.sqrt(brunt_vaisala_freq_clipped)
+        # _safe_sqrt: the clipped N^2 is exactly 0 in unstable layers (common in
+        # deep convection), where bare sqrt has an inf reverse-mode cotangent that
+        # NaNs grads w.r.t. the tuning coeffs. Forward-identical.
+        brunt_freq_pos = _safe_sqrt(brunt_vaisala_freq_clipped)
     else:
-        brunt_freq_pos = jnp.sqrt(
+        brunt_freq_pos = _safe_sqrt(
             jnp.maximum(zero_threshold, brunt_vaisala_freq_sqd_smth)
         )
 
