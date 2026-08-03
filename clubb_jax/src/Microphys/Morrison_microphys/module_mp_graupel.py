@@ -18,6 +18,8 @@ sedimentation + the CLUBB interface ARE all mirrored.
 """
 import jax.numpy as jnp
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow, _safe_sqrt
+
 # ── POLYSVP — saturation vapor pressure, Flatau et al. 1992 Table 4 (RHS column) ──────
 # module_mp_graupel.F90:5423. Distinct from the CLUBB-core saturation.py Flatau fit
 # (Morrison uses its own "V1.7" coefficients).
@@ -301,7 +303,7 @@ def _gamma_slope(q, n, cons, lammin, lammax, d=_M_D):
     q = jnp.asarray(q, dtype=jnp.float64); n = jnp.asarray(n, dtype=jnp.float64)
     on = q >= _M_QSMALL
     q_s = jnp.where(on, q, 1.0)
-    lam = (cons * n / q_s) ** (1.0 / d)
+    lam = _safe_pow(cons * n / q_s, 1.0 / d)   # base 0 in clear air (n=0): safe fractional power
     n0 = n * lam
     lo = lam < lammin; hi = lam > lammax
     lam_c = jnp.where(lo, lammin, jnp.where(hi, lammax, lam))
@@ -345,7 +347,9 @@ def cloud_slope(qc, nc, rho, dofix_pgam=False, pgam_fixed=5.0):
         pgam = 1.0 / (pgam ** 2) - 1.0
         pgam = jnp.clip(pgam, 2.0, 10.0)
     qc_s = jnp.where(on, qc, 1.0)
-    lamc = (_M_CONS26 * nc * gamma(pgam + 4.0) / (qc_s * gamma(pgam + 1.0))) ** (1.0 / 3.0)
+    # _safe_pow: the base is 0 in clear air (nc=0), where bare **(1/3) has an inf
+    # reverse-mode cotangent that NaNs grads. Forward-identical (base >= 0).
+    lamc = _safe_pow(_M_CONS26 * nc * gamma(pgam + 4.0) / (qc_s * gamma(pgam + 1.0)), 1.0 / 3.0)
     lammin = (pgam + 1.0) / 60.0e-6
     lammax = (pgam + 1.0) / 1.0e-6
     lamc = jnp.clip(lamc, lammin, lammax)
@@ -1296,7 +1300,7 @@ def _sizefix_exp_number(q, n, cons, lammin, lammax):
     (module_mp_graupel.F90:1881 rain / 1966 snow / 1991 graupel / 2816 ice). N=LAM_clamped³·q/cons."""
     q = jnp.asarray(q, dtype=jnp.float64); n = jnp.asarray(n, dtype=jnp.float64)
     on = q >= _M_QSMALL
-    lam = jnp.where(on, (cons * n / jnp.where(on, q, 1.0)) ** (1.0 / 3.0), 0.0)
+    lam = jnp.where(on, _safe_pow(cons * n / jnp.where(on, q, 1.0), 1.0 / 3.0), 0.0)
     oob = on & ((lam > lammax) | (lam < lammin))
     lam_c = jnp.clip(lam, lammin, lammax)
     return jnp.where(oob, lam_c ** 3 * q / cons, n)
@@ -1315,7 +1319,7 @@ def _sizefix_cloud_number(qc, nc, rho, dofix_pgam=False, pgam_fixed=5.0):
         pgam = jnp.clip(1.0 / (pgam ** 2) - 1.0, 2.0, 10.0)
     g1, g4 = gamma(pgam + 1.0), gamma(pgam + 4.0)
     qc_s = jnp.where(on, qc, 1.0)
-    lamc = (_M_CONS26 * nc * g4 / (qc_s * g1)) ** (1.0 / 3.0)
+    lamc = _safe_pow(_M_CONS26 * nc * g4 / (qc_s * g1), 1.0 / 3.0)
     lammin, lammax = (pgam + 1.0) / 60.0e-6, (pgam + 1.0) / 1.0e-6
     oob = on & ((lamc > lammax) | (lamc < lammin))
     lamc_c = jnp.clip(lamc, lammin, lammax)
