@@ -449,13 +449,13 @@ def prescribe_forcings_generic(state: dict, time_current: float,
     l_ignore_forcings = state.get('l_ignore_forcings', False)
 
     # ── 1. Zero all forcing arrays ──────────────────────────────────────────
-    state['thlm_forcing'][:] = 0.0
-    state['rtm_forcing'][:] = 0.0
-    state['wprtp_forcing'][:] = 0.0
-    state['wpthlp_forcing'][:] = 0.0
-    state['rtp2_forcing'][:] = 0.0
-    state['thlp2_forcing'][:] = 0.0
-    state['rtpthlp_forcing'][:] = 0.0
+    # _iset (not in-place `[:] = 0.0`) so this is trace-safe: under a jax.grad
+    # trace a forcing array can be a tracer (e.g. l_calc_thlp2_rad routes a
+    # radiative thlp2 forcing through the traced state), which in-place item
+    # assignment can't mutate. Concrete path still mutates in place (bit-identical).
+    for _fk in ('thlm_forcing', 'rtm_forcing', 'wprtp_forcing', 'wpthlp_forcing',
+                'rtp2_forcing', 'thlp2_forcing', 'rtpthlp_forcing'):
+        state[_fk] = _iset(state[_fk], np.s_[:], 0.0)
 
     # ── 2. Large-scale tendencies ───────────────────────────────────────────
     if runtype == 'mpace_a':
