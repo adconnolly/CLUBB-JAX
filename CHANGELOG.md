@@ -292,3 +292,20 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   (worst rel 8e-3, C11 FD-step noise).
 - **Route-around:** grad uses `fill_holes_type=global_fill` (1); the default `sliding_window` (2) has a
   non-differentiable dynamic-bound `fori_loop` — a separate follow-up. Next: the Adam tuning loop + obs target.
+
+### 2026-08-03 — tune-to-obs: end-to-end tuning to REAL ARM VARANAL observations (mc3e)
+- **Real-obs pipeline complete.** `tune_coeffs.py --obs` + `obs_target.py` (loads ARM VARANAL netCDF observed
+  T/q/u/v onto the model grid; round-trips to ~1e-16). Downloaded the MC3E VARANAL (`sgp180iopsndgv3varanaC1.c1`,
+  2011-04-22 IOP, public ARM FTP order) — the obs and the CLUBB `mc3e` case share the exact start time. The tuner
+  runs end-to-end on the real obs: loads, forward loss finite (4.79e-2), grad flows, Adam updates (no NaN/crash).
+- **BUGSrad now runs in the JAX driver.** It was ported (Radiation/BUGSrad/) but unreachable: `advance_clubb_to_end`
+  used the limited `radiation.py`. Repointed to `radiation_module.advance_clubb_radiation`
+  (none/simplified/simplified_bomex/bugsrad + soil_veg). arm stays `Result[bit]` PASS; mc3e runs faithful radiation.
+  SILHS stays disabled (unported); mc3e config: morrison + bugsrad, `lh_microphys_type=disabled`.
+- **Deep-convection grad hardening (mc3e, all forward-bit-identical, arm unaffected):** `_iset` (not in-place) for
+  the generic forcing resets (trace-safe when `l_calc_thlp2_rad` routes a traced thlp2 forcing); `_safe_sqrt` for
+  the wp2/wp3-splat N² (`advance_helper_module`) and the mixing-length Brunt-Väisälä sqrt (`mixing_length`) — both
+  `sqrt(clipped N²)` that hit 0 in unstable layers (inf cotangent). mc3e grad now finite 5/5.
+- **Caveat:** over a short deep-convection window the mean-profile loss is nearly flat in the coeff directions
+  (forcing/IC-dominated), so coeffs drift (c_K→2.7×) with tiny loss change — needs box constraints + longer horizon
+  + regularization for meaningful science. The pipeline/faithfulness is the deliverable here.
