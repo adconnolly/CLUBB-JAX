@@ -46,6 +46,7 @@ configure_jax_precision()
 import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.T_in_K_module import thlm2T_in_K
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_sqrt
 from clubb_jax.src.CLUBB_core.clubb_constants import (
     Cp,
     Lv,
@@ -576,9 +577,10 @@ def wp23_term_splat_lhs(
         rho_ds_zm,
         below_grnd_val,
     )
-    brunt_vaisala_freq_splat_clipped = jnp.sqrt(
-        jnp.maximum(0.0, brunt_vaisala_freq_sqd_splat)
-    )
+    # _safe_sqrt (finite grad at the clip): in deep convection N^2 <= 0 is common,
+    # where bare sqrt(max(0,N^2)) has an inf reverse-mode cotangent (div-by-0) that
+    # NaNs grads w.r.t. upstream coeffs. Forward-identical to sqrt(max(0,N^2)).
+    brunt_vaisala_freq_splat_clipped = _safe_sqrt(brunt_vaisala_freq_sqd_splat)
     brunt_vaisala_freq_splat_smooth = zm2zt2zm(
         nzm, nzt, ngrdcol, gr, brunt_vaisala_freq_splat_clipped
     )
