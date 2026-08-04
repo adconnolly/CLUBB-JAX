@@ -177,6 +177,17 @@ together. Next step is a DIRECTION decision (see below), likely: enable Morrison
 (warm, l_ice=.false.) on dycoms2 — the textbook Sc drizzle-vs-Nc case.
 tune_coeffs.py has `WARMUP=<steps>` (default 3) + absolute obs time `(WARMUP+N)*dt`.
 
+**mpace_a no-cloud DEBUG — concluded (2026-08-04): faithful, not a bug.**
+The Fortran oracle run fresh for 360 steps (`clubb_release/output/mpace_a_stats.nc`,
+nt=36 = 6 h) gives **rcm_max=9.86e-12, cf_max=8.5e-7** — negligible cloud, matching
+JAX's rcm=0. So JAX is faithful; mpace_**a** is the dry/clear MPACE period
+(rt peaks ~3.2 g/kg), NOT the cloudy one. The classic cloudy MPACE is mpace_**b**
+(Klein et al. 2009, LWP~100 g/m²), but its case setup uses
+`microphys_scheme="coamps"` — an UNPORTED scheme — and has no runnable .in here.
+Implication for Nc tuning: getting a cloudy + Morrison case needs config work —
+either mpace_b's (moist) sounding/forcing driven with Morrison instead of COAMPS,
+or Morrison enabled on the already-cloudy dycoms2_rf01 (warm Sc, l_ice=.false.).
+
 **Historical note — real Nc tuning was blocked on a cloudy target.** mc3e synthetic-recovery
 (MORR=1, N=25) gives a FLAT loss (8.6e-7, Nc stays at 1.0, target 1.5) — no cloud
 in the window → Nc has no leverage on thlm/rtm. Same rcm=0 in mpace_a. So the
