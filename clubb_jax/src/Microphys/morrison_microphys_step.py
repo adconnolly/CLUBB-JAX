@@ -9,6 +9,7 @@ The hydrometeor *_mc already include sedimentation (folded in as (field_final-fi
 Iter204 form), so the Morrison sedimentation velocity for the CLUBB transport is zero.
 """
 import numpy as np
+import jax.numpy as jnp
 
 from clubb_jax.src.CLUBB_core.tracer_numpy import _is_tracer_arg  # REFACTOR B5: detect a jax.grad trace
 from clubb_jax.src.Microphys.morrison_microphys_module import morrison_microphys_driver
@@ -22,14 +23,16 @@ def advance_morrison_microphysics(state: dict):
     is an explicit Euler integration by the *_mc; the full CLUBB hydrometeor transport (advection +
     eddy diffusion, with zero sedimentation velocity) is layered on subsequently.
     """
-    # Detach-under-trace (REFACTOR B5): Morrison runs AFTER the core, storing _morr_*_mc for the NEXT step's
-    # forcings — dead for a single-step gradient. Skip under a jax.grad trace (exact for single-step; detached
-    # forcing for multi-step), same as KK microphysics / BUGSrad radiation.
-    if _is_tracer_arg([state['thlm'], state['rcm'], state['cloud_frac']]):
-        return
+    # Under a jax.grad trace, run the driver DIFFERENTIABLY (jnp inputs) so Morrison
+    # parameters (Nc_in_cloud → Ncm) flow into the *_mc tendencies that feed the next
+    # step's thlm/rtm forcing, and RETURN before the hydrometeor transport (it does not
+    # feed thlm/rtm at first order). Concrete path is byte-identical (np). tune-to-obs.
+    under_trace = _is_tracer_arg([state['thlm'], state['rcm'], state['cloud_frac'],
+                                  state['Nc_in_cloud']])   # Nc_in_cloud: the tunable Morrison param
 
     hmm = state['hm_metadata']
-    g = lambda k: np.asarray(state[k], np.float64)
+    g = (lambda k: jnp.asarray(state[k], jnp.float64)) if under_trace \
+        else (lambda k: np.asarray(state[k], np.float64))
     hydromet = g('hydromet')                      # (ngrdcol, nzt, 8)
     iirr, iiNr, iiri, iiNi = int(hmm.iirr), int(hmm.iiNr), int(hmm.iiri), int(hmm.iiNi)
     iirs, iiNs, iirg, iiNg = int(hmm.iirs), int(hmm.iiNs), int(hmm.iirg), int(hmm.iiNg)
@@ -51,12 +54,16 @@ def advance_morrison_microphysics(state: dict):
     out = morrison_microphys_driver(
         rcm, Ncm, pick(iirr), pick(iiNr), pick(iiri), pick(iiNi), pick(iirs), pick(iiNs),
         pick(iirg), pick(iiNg), thlm, rvm, T_in_K, exner, pres, rho, cf, dzq, dt)
-    out = {k: np.asarray(v, np.float64) for k, v in out.items()}
+    if not under_trace:
+        out = {k: np.asarray(v, np.float64) for k, v in out.items()}
 
     # store the mean-field tendencies for the next step's forcings (rtm += rcm_mc, thlm += thlm_mc)
     state['_morr_rcm_mc'] = out['rcm_mc']
     state['_morr_thlm_mc'] = out['thlm_mc']
     state['_morr_rvm_mc'] = out['rvm_mc']
+
+    if under_trace:
+        return   # skip the (non-thlm/rtm) hydrometeor transport under a grad trace
 
     # Advance each hydrometeor by the CLUBB transport — the implicit solve (mean advection wm_zt +
     # eddy diffusion K_hm+nu_hm), seeded by the microphysics+sedimentation source *_mc (Fortran
@@ -67,7 +74,6 @@ def advance_morrison_microphysics(state: dict):
     # the bulk scheme has precip_frac≤0 → pf=1 → hydrometp2 = ratio·hm² (ratio=1.25 for rr/Nr,
     # corr_varnce slope=0/intrcpt=1.25), so K_hm is LARGE (NOT 0 — the Iter239 K_hm=0 was wrong; the
     # stored rrp2=0 ≠ this internal hydrometp2). This is what sustains the cloud-top rain.
-    import jax.numpy as jnp
     from clubb_jax.src.Microphys.advance_microphys_module import advance_one_hydrometeor, calculate_K_hm
     from clubb_jax.src.CLUBB_core.fill_holes import fill_holes_vertical
     from clubb_jax.src.CLUBB_core.grid_class import zt2zm

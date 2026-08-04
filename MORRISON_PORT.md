@@ -90,7 +90,28 @@ precip is ACTIVE (advance more steps, or a rainier case) so FD is non-zero.
 
 ---
 
-## Phase 2 — run Morrison under trace (wrapper)
+## Phase 2 — run Morrison under trace (wrapper)  🟡 IN PROGRESS
+
+**Wrapper wired** (commit after this): `morrison_microphys_step.py` now runs the
+driver under trace (`under_trace` includes `Nc_in_cloud`; jnp inputs; stores
+`_morr_*_mc` jnp; skips transport under trace). Concrete path byte-identical.
+
+**OPEN — the trajectory grad w.r.t. `Nc_in_cloud` is DETACHED** (analytic 0, but
+FD=1.30 through ~6-8 mc3e steps; probe `clubb_jax/tests/probe_nc_traj_grad.py`).
+Nc reaches thlm via TWO routes, both computing `_mc` tendencies applied to the
+next step's forcing (advance_clubb_to_end.py:133-142):
+  1. `_cloud_drop_sed` (advance_clubb_to_end.py:179 → cloud_sed_module.py) —
+     `ncm = Nc_in_cloud*cloud_frac`, jnp, stores state['rcm_mc']/['thlm_mc'].
+  2. Morrison dispatch (microphys_driver.py → morrison_microphys_step) —
+     stores `_morr_*_mc` (gated by `time_current >= microphys_start_time`).
+Both look jnp-clean, yet the gradient is a HARD 0 → a `np.asarray`/`stop_gradient`
+detaches the Nc→`_mc`→forcing→thlm path somewhere. NEXT: isolate — grad of
+`sum(state['rcm_mc'])` after ONE step w.r.t. Nc (does route 1 flow?), then
+`sum(state['_morr_thlm_mc'])` (route 2). Find the np conversion on whichever is
+cut. Likely candidates: how `state['Ncm']` / `Nc_in_cloud` is set before the
+microphys phase, or a detach in the forcing carry between steps.
+
+### Wiring reference (for reading)
 
 `clubb_jax/src/Microphys/morrison_microphys_step.py` currently **returns early
 under a jax.grad trace** (line ~28, `if _is_tracer_arg([...]): return`). Replace
