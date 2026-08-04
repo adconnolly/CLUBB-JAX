@@ -96,20 +96,22 @@ precip is ACTIVE (advance more steps, or a rainier case) so FD is non-zero.
 driver under trace (`under_trace` includes `Nc_in_cloud`; jnp inputs; stores
 `_morr_*_mc` jnp; skips transport under trace). Concrete path byte-identical.
 
-**OPEN — the trajectory grad w.r.t. `Nc_in_cloud` is DETACHED** (analytic 0, but
-FD=1.30 through ~6-8 mc3e steps; probe `clubb_jax/tests/probe_nc_traj_grad.py`).
-Nc reaches thlm via TWO routes, both computing `_mc` tendencies applied to the
-next step's forcing (advance_clubb_to_end.py:133-142):
-  1. `_cloud_drop_sed` (advance_clubb_to_end.py:179 → cloud_sed_module.py) —
-     `ncm = Nc_in_cloud*cloud_frac`, jnp, stores state['rcm_mc']/['thlm_mc'].
-  2. Morrison dispatch (microphys_driver.py → morrison_microphys_step) —
-     stores `_morr_*_mc` (gated by `time_current >= microphys_start_time`).
-Both look jnp-clean, yet the gradient is a HARD 0 → a `np.asarray`/`stop_gradient`
-detaches the Nc→`_mc`→forcing→thlm path somewhere. NEXT: isolate — grad of
-`sum(state['rcm_mc'])` after ONE step w.r.t. Nc (does route 1 flow?), then
-`sum(state['_morr_thlm_mc'])` (route 2). Find the np conversion on whichever is
-cut. Likely candidates: how `state['Ncm']` / `Nc_in_cloud` is set before the
-microphys phase, or a detach in the forcing carry between steps.
+**NOT a detach — mc3e has NO CLOUD.** `probe_nc_route.py` shows `rcm_max=0`,
+`cloud_frac_max=0` after 30 mc3e steps → `ncm = Nc_in_cloud*cloud_frac = 0`, so
+the grad is CORRECTLY ~0 (Nc has no effect with no cloud). Both routes give 0 for
+the right reason. The earlier "FD=1.30" (probe_nc_traj_grad.py) is FP noise on the
+~1e7 stratospheric `thlm²` loss (relative ~1e-10), not a real Nc effect. The
+wrapper (Phase 2) is CORRECT — no fix needed.
+
+**REAL blocker — need a cloudy state to exercise/tune Nc.** mc3e from t=0 (00:00
+GMT, pre-convective) forms no mean cloud water in the JAX run over the tested
+window. NEXT: (a) confirm the wrapper gives a finite, FD-correct trajectory grad
+on a genuine CLOUD case — `mpace_a` (Arctic stratus, morrison; needs its JAX
+working namelist: SILHS off + simplified rad, like the mc3e setup) — the driver
+probe already gives rel 8.8e-7 with forced cloud, so this should pass; then (b)
+for MC3E obs tuning, find a cloudy window (advance to the convective part of the
+IOP, or a rainier mc3e period) — or switch the Nc-tuning demo to mpace_a and its
+obs. Use a TROPOSPHERIC / normalized loss (not full-column thlm²) so FD isn't noise.
 
 ### Wiring reference (for reading)
 
