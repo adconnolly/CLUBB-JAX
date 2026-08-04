@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _iset
 from clubb_jax.src.CLUBB_core.saturation import sat_mixrat_liq
 from clubb_jax.src.Benchmark_cases.sfc_flux import (
     compute_wpthlp_sfc, compute_wprtp_sfc,
@@ -20,9 +21,13 @@ from clubb_jax.src.Benchmark_cases.sfc_flux import (
 
 def dycoms2_rf01_tndcy(state: dict) -> None:
     """DYCOMS-II RF01 large-scale tendencies (dycoms2_rf01.F90:dycoms2_rf01_tndcy): zero thlm/rtm forcing;
-    the subsidence wm is set at init and left unchanged (the Fortran tndcy does not touch wm)."""
-    state['thlm_forcing'][:] = 0.0
-    state['rtm_forcing'][:] = 0.0
+    the subsidence wm is set at init and left unchanged (the Fortran tndcy does not touch wm).
+
+    Tracer-transparent (_iset): under a jax.grad trace thlm_forcing/rtm_forcing carry the Morrison
+    *_mc tendency (a jnp tracer) from the prior step, so a raw ``[:] =`` in-place set fails; _iset
+    reassigns immutably under trace and mutates in place (bit-identical) on the concrete path."""
+    state['thlm_forcing'] = _iset(state['thlm_forcing'], np.s_[:], 0.0)
+    state['rtm_forcing'] = _iset(state['rtm_forcing'], np.s_[:], 0.0)
 
 
 def dycoms2_rf01_sfclyr(state: dict, time_current: float, ngrdcol: int,

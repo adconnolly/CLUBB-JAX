@@ -62,7 +62,9 @@ def load_obs_target(obs_path, state, time_target_s, varmap=None):
     if np.nanmax(q) > 1.0:      # g/kg -> kg/kg
         q = q / 1000.0
     theta = T * (P0 / lev_pa) ** KAPPA          # potential temp [K]
-    rt = q / (1.0 - q)                          # water vapor mixing ratio [kg/kg]
+    # ARM VARANAL `q` IS the water-vapor mixing ratio, so rt = q directly.
+    # (A specific-humidity source would instead need rt = q/(1-q).)
+    rt = q
 
     # obs pressure decreases with height; np.interp needs ascending x, so flip.
     p_model = np.asarray(state["p_in_Pa"]).ravel()   # (nzt,) Pa, top->? ensure order
