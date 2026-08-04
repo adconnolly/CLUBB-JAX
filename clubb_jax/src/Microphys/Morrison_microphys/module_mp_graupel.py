@@ -16,7 +16,9 @@ ported — they compute a radar-reflectivity (dBZ) DIAGNOSTIC for the WRF post-p
 coupling (they don't feed any prognostic tendency) and no oracle path. The prognostic microphysics rates +
 sedimentation + the CLUBB interface ARE all mirrored.
 """
+import jax
 import jax.numpy as jnp
+from jax.scipy.special import digamma as _digamma
 
 from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow, _safe_sqrt
 
@@ -175,10 +177,15 @@ _GAMMA_C = (-1.910444077728e-3, 8.4171387781295e-4, -5.952379913043012e-4,
 _GAMMA_NMAX = 11   # INT(Y)-1 for Y<12 is at most 10
 
 
+@jax.custom_jvp
 def gamma(x):
     """Complete gamma function Γ(x), faithful to module_mp_graupel.F90:GAMMA (Cody).
     Array-capable; all argument-range branches masked with jnp.where. Negative integers
     (poles) and overflow return XINF=3.4e38, as in the Fortran.
+
+    custom_jvp: the Cody rational approx (floor/where/sin branches) has a NaN reverse-mode
+    gradient; supply the analytic Γ'(x)=Γ(x)·ψ(x) instead (forward value unchanged). Valid
+    for the x>0 args Morrison uses (pgam+k); ψ has poles at x<=0 which Morrison never hits.
     """
     x = jnp.asarray(x, dtype=jnp.float64)
 
@@ -234,6 +241,13 @@ def gamma(x):
     res = jnp.where(fact != 1.0, fact / res, res)
     res = jnp.where(neg_singular, _GAMMA_XINF, res)
     return res
+
+
+@gamma.defjvp
+def _gamma_jvp(primals, tangents):
+    (x,), (dx,) = primals, tangents
+    y = gamma(x)
+    return y, y * _digamma(x) * dx
 
 
 # ── Warm-rain process rates (Khairoutdinov-Kogan 2000 bulk, IRAIN=0 default) ──────────
