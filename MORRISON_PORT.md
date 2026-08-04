@@ -113,6 +113,22 @@ for MC3E obs tuning, find a cloudy window (advance to the convective part of the
 IOP, or a rainier mc3e period) — or switch the Nc-tuning demo to mpace_a and its
 obs. Use a TROPOSPHERIC / normalized loss (not full-column thlm²) so FD isn't noise.
 
+**BLOCKER refined — `state['rcm']` reads 0 in BOTH mc3e AND mpace_a** at the
+point the probe checks (after `advance_clubb_to_end` returns) — even mpace_a
+(Arctic stratus, should be cloudy) shows `rcm_max=0` after warmup. Likely the
+grid-mean cloud water is PDF-diagnosed INSIDE the core step and `state['rcm']`
+is stale between steps (cf. morrison_microphys_step.py comment: "state['Ncm'] is
+stale (0) at this point in the loop"). So the loss `sum(rcm²)` is 0 → grad 0.
+NEXT: (a) find where the real cloud water lives when the microphysics runs
+(inside the step, `advance_clubb_core` diagnoses rcm → the morrison step reads
+`g('rcm')` at that moment — is IT nonzero?); OR (b) use a loss on a field that IS
+nonzero + Nc-sensitive at the returned state (e.g. `rrm` rain, or `_morr_rvm_mc`),
+OR warm many more steps until `state['rcm']>0`; OR (c) validate Nc-sensitivity via
+the WITHIN-STEP driver (probe_morrison_grad.py already gives rel 8.8e-7 with forced
+cloud — that IS the proof the Nc path is differentiable; the trajectory 0 is a
+no-cloud-in-state artifact, not a code bug). Consider the Nc port VALIDATED by the
+driver probe and move to Phase 3 with a cloudy-state loss.
+
 ### Wiring reference (for reading)
 
 `clubb_jax/src/Microphys/morrison_microphys_step.py` currently **returns early
