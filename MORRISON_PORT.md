@@ -155,7 +155,16 @@ loss + Adam. It runs end-to-end under trace (no error, grad computed, Adam steps
 **The Morrison port is functionally COMPLETE**: driver differentiable (Phase 1,
 rel 8.8e-7), wrapper runs under trace (Phase 2), tuning mode built (Phase 3).
 
-**But real Nc tuning is blocked on a cloudy target.** mc3e synthetic-recovery
+**No-cloud investigation (RESOLVED):** `state['rcm']` is NOT stale — the core
+writes it back every step (advance_clubb_to_end.py result-tuple ~L542) and the
+microphysics reads it fresh. The `rcm=0` is REAL: mc3e from t0 (2011-04-22 00:00
+UTC) is pre-convective. `probe_mc3e_cloud_timeline.py` shows cloud develops on
+day 2: first cloud ~step 240 (20 h), and by **step 400 (33 h) cf_max=60%,
+rcm=1e-5, rain forming**. So warm to the cloudy period, then tune. tune_coeffs.py
+now has `WARMUP=<steps>` (default 3) and uses ABSOLUTE obs time `(WARMUP+N)*dt`.
+Run: `MORR=1 WARMUP=400 tune_coeffs.py mc3e <N> <iters> [obs.nc]`.
+
+**Historical note — real Nc tuning was blocked on a cloudy target.** mc3e synthetic-recovery
 (MORR=1, N=25) gives a FLAT loss (8.6e-7, Nc stays at 1.0, target 1.5) — no cloud
 in the window → Nc has no leverage on thlm/rtm. Same rcm=0 in mpace_a. So the
 open item is NOT code — it is finding a state where the JAX run has active cloud:

@@ -33,7 +33,8 @@ def _aj(x): return x if isinstance(x, jax.core.Tracer) else jnp.asarray(x)
 state = init_clubb_case(f"{REPO}/clubb_jax/output/{CASE}_compare_jax/{CASE}.in")
 state['l_stats'] = False; state['stats_writer'] = None
 state['flags'] = state['flags']._replace(fill_holes_type=1)  # differentiable global fill
-advance_clubb_to_end(state, l_stdout=False, max_steps=3)
+WARMUP = int(os.environ.get("WARMUP", 3))   # warm to a cloudy state (e.g. mc3e needs ~400 steps)
+advance_clubb_to_end(state, l_stdout=False, max_steps=WARMUP)
 base = np.asarray(state['clubb_params'], dtype=np.float64)
 # --morrison / MORR=1: tune the Morrison cloud-droplet number Nc_in_cloud
 # (single log-scale param) instead of the 5 CLUBB closure coeffs.
@@ -67,7 +68,8 @@ if OBS:
     # Real observations: mean-state fields only (VARANAL has no turbulence).
     from clubb_jax.run_scripts.obs_target import load_obs_target
     FIELDS = {"mean": ["thlm", "rtm", "um", "vm"]}
-    tgt = load_obs_target(OBS, state, time_target_s=N * float(state['dt_main']))
+    # absolute model time at the loss point = (warmup + N) steps from t0
+    tgt = load_obs_target(OBS, state, time_target_s=(WARMUP + N) * float(state['dt_main']))
     target = {k: jnp.asarray(v).ravel() for k, v in tgt.items()}
     theta_true = None
     print(f"OBS target: {OBS}")
