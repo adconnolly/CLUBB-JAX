@@ -204,6 +204,7 @@ _JAX_ONLY_FILES = {
     # per-step microphysics wiring (mirror the clubb_driver call SEQUENCE, not a single Fortran file)
     "morrison_microphys_step": "per-step Morrison wiring (mirrors the driver call sequence)",
     "kk_microphys_step": "per-step KK wiring (mirrors the driver call sequence)",
+    "coamps_microphys_step": "per-step COAMPS wiring (mirrors the driver call sequence)",
     "kk_microphys_driver": "JAX KK orchestration driver (composes the ported KK pieces)",
     # JAX differentiable replacement for Parabolic.f90's Algorithm-850 D_v (a different algorithm, not a port)
     "parabolic_cylinder": "JAX differentiable D_v(z) replacement for Parabolic.f90 (DLMF series, not a port)",

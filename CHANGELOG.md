@@ -309,3 +309,31 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
 - **Caveat:** over a short deep-convection window the mean-profile loss is nearly flat in the coeff directions
   (forcing/IC-dominated), so coeffs drift (c_K→2.7×) with tiny loss change — needs box constraints + longer horizon
   + regularization for meaningful science. The pipeline/faithfulness is the deliverable here.
+- **COAMPS microphysics port — BOOTSTRAP (2026-08-04).** Started the COAMPS (NRL Rutledge & Hobbs bulk mixed-phase)
+  microphysics port so the cloudy MPACE-B case can run its native scheme in the JAX driver. Created the JAX mirror
+  `clubb_jax/src/Microphys/COAMPS_microphys/` (gamma/slope/esat_new/esatv/esati/qsatvi leaf utilities PORTED +
+  verified; `adjtq.py` is a documented no-op STUB with the full ~40-routine call graph) + `coamps_microphys_driver_module.py`
+  (top-level CLUBB<->COAMPS flow ported and running) + JAX-only `coamps_microphys_step.py`. Wired the dispatch
+  (`microphys_driver.py` `elif scheme=='coamps'`, `clubb_driver.py` supports 'coamps' with Morrison's 8-field
+  hydromet metadata, `prescribe_forcings.py` mpace_b = zero LS forcing + generic sens_ht surface). MPACE-B now
+  **inits and runs 20 steps stably via the driver path** with all `*_mc` tendencies = 0 (adjtq stubbed). Finding:
+  unlike clear mpace_a, **mpace_b is genuinely cloudy** (rcm_max≈5.4e-4 from the PDF closure) — the right target for
+  a future cloudy microphysics/tuning demo. No oracle (COAMPS is compiled-out + fatal-errors on l_predict_Nc=F) →
+  validate vs source logic + conservation. Runbook + file-by-file checklist + next steps in `COAMPS_PORT.md`.
+- **dycoms2 + WARM Morrison — cloudy Nc-leverage case for tuning (2026-08-04).** Created `dycoms2_morr`
+  (`clubb_jax/output/dycoms2_morr_compare_jax/dycoms2_morr.in`, copy of dycoms2_rf01 with
+  `microphys_scheme="morrison"`, `l_ice_microphys=.false.`, mpace_a-style hmp2/aerosol block; `runtype`
+  kept `dycoms2_rf01` so sounding/forcing files resolve). Morrison hydromet+Nc arrays are triggered purely by
+  the namelist scheme. Driver-path run (init_clubb_case+advance_clubb_to_end, warm 90): **cloud persists**
+  (rcm_max 3.5e-4, no NaN), **warm-rain autoconversion fires** (rrm 1.7e-6, Nrm>0), Ncm=8.8e7. **Nc leverage is
+  strong and physical**: Nc×0.3 → sum|rrm| +727% / rcm −1.1%; Nc×3 → rrm −86% / rcm +0.23% — the drizzle-vs-Nc
+  leverage mc3e/mpace_a lacked (they never cloud). Fixed `Benchmark_cases/dycoms2_rf01.py:dycoms2_rf01_tndcy`
+  in-place forcing reset → `_iset` (trace-safe; the Morrison *_mc makes thlm/rtm_forcing a tracer; concrete
+  path bit-identical). **Tuner (`tune_coeffs.py` MORR mode) loss is now Nc-sensitive** (~3e-5, not the flat
+  8.6e-7 mc3e floor) and Adam recovers the synthetic Nc×1.5 target (err% −27.9→−6.1 by it5, ends θ≈1.73) at N=2.
+  **Blocker for longer trajectories: a PRE-EXISTING core reverse-mode NaN.** Multi-step grad is finite at K≤2 but
+  NaN at K≥4 — and **plain dycoms2_rf01 (microphys none) grad w.r.t. c_K also NaNs at K=6**, so it is a CLUBB-core
+  (mixing_length Richardson Ri=N²/S² divide-by-shear `ddzt_umvm_sqd`) differentiability gap, not Morrison. The
+  single-step compare_grad gate stays green; the dycoms2 multi-step Lscale/Ri path needs a `_safe_` guard to
+  enable long-horizon tuning. Morrison rate/sed/conservation tests all PASS (only the known pre-existing
+  `test_morrison_hm_metadata` pdf_dim==4 assertion fails).
