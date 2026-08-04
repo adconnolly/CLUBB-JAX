@@ -26,7 +26,12 @@ conventions). The safe-op toolkit is `clubb_jax/src/CLUBB_core/tracer_numpy.py`.
 
 ---
 
-## Phase 1 — harden the driver gradient (the loop)
+## Phase 1 — harden the driver gradient (the loop)  ✅ DONE (2026-08-03)
+Driver grad w.r.t. Ncm is finite + FD-correct (rel 8.8e-7) at an active-precip
+state. Fixes: slope `_safe_pow` (commits `3aa842e`-style) + gamma `custom_jvp`
+(`7e7a206`). The probe now forces active cloud+precip (it must — step-4 mc3e has
+none, so FD=0/grad=0 is a false "clean"). If more NaNs appear at other operating
+points, resume this loop; otherwise Phase 1 is complete → go to Phase 2.
 
 **Probe (the iteration driver):**
 ```bash

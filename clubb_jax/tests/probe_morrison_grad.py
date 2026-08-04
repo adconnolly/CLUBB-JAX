@@ -19,9 +19,18 @@ state['flags'] = state['flags']._replace(fill_holes_type=1)
 advance_clubb_to_end(state, l_stdout=False, max_steps=4)
 
 hmm = state['hm_metadata']; g = lambda k: np.asarray(state[k], np.float64)
-hydromet = g('hydromet'); pick = lambda i: jnp.asarray(hydromet[..., int(i)])
+hydromet = g('hydromet').copy()
+# ACTIVE-PRECIP injection: step-4 mc3e has ~no rain/ice/snow, so process rates &
+# fall speeds are inactive (grad=0, FD=0). Seed each species so those paths run
+# and their gradient singular ops (if any) surface.
+for _nm, _q, _n in (('iirr', 5e-4, 5e3), ('iiri', 1e-5, 1e3), ('iirs', 1e-4, 1e2)):
+    hydromet[..., int(getattr(hmm, _nm))] += _q
+    hydromet[..., int(getattr(hmm, _nm.replace('iir', 'iiN')))] += _n
+pick = lambda i: jnp.asarray(hydromet[..., int(i)])
 rcm = jnp.asarray(g('rcm')); thlm = jnp.asarray(g('thlm')); cf = jnp.asarray(g('cloud_frac'))
 Nc_in_cloud = jnp.asarray(g('Nc_in_cloud'))
+# Force active cloud so autoconversion (KK, ∝Nc) runs → Nc has forward effect.
+rcm = jnp.maximum(rcm, 3.0e-4); cf = jnp.maximum(cf, 0.5)
 rvm = jnp.asarray(g('rtm')) - rcm
 exner = jnp.asarray(g('exner')); rho = jnp.asarray(g('rho')); pres = jnp.asarray(g('p_in_Pa'))
 from clubb_jax.src.CLUBB_core.clubb_constants import Lv, Cp
