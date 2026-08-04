@@ -35,21 +35,28 @@ state['l_stats'] = False; state['stats_writer'] = None
 state['flags'] = state['flags']._replace(fill_holes_type=1)  # differentiable global fill
 advance_clubb_to_end(state, l_stdout=False, max_steps=3)
 base = np.asarray(state['clubb_params'], dtype=np.float64)
-theta_def = jnp.asarray(base[0, IDX])                      # defaults
+# --morrison / MORR=1: tune the Morrison cloud-droplet number Nc_in_cloud
+# (single log-scale param) instead of the 5 CLUBB closure coeffs.
+MORR = bool(os.environ.get("MORR"))
+if MORR:
+    NAMES[:] = ["Nc_in_cloud"]; IDX[:] = [0]
+    nc0 = np.asarray(state['Nc_in_cloud'], np.float64)
+theta_def = jnp.asarray([1.0]) if MORR else jnp.asarray(base[0, IDX])   # defaults
 
 # Tune in LOG space: theta = theta_def * exp(u), u unconstrained (starts at 0).
-# Keeps coeffs positive and puts the 5 different-scale coeffs on a common
-# (multiplicative) footing, which conditions Adam far better than raw space.
 def theta_of(u):
     return theta_def * jnp.exp(u)
 
 def forward(theta):
-    """Return dict of final-time profiles after N steps for coeff vector theta."""
+    """Return dict of final-time profiles after N steps for the param vector theta."""
     s = dict(state)
-    p = jnp.asarray(base)
-    for j, idx in enumerate(IDX):
-        p = p.at[:, idx].set(theta[j])
-    s['clubb_params'] = p
+    if MORR:
+        s['Nc_in_cloud'] = jnp.asarray(nc0) * theta[0]   # theta[0]=exp(u): multiplicative Nc scale
+    else:
+        p = jnp.asarray(base)
+        for j, idx in enumerate(IDX):
+            p = p.at[:, idx].set(theta[j])
+        s['clubb_params'] = p
     s['l_stats'] = False; s['stats_writer'] = None
     advance_clubb_to_end(s, l_stdout=False, max_steps=N)
     return {k: _aj(s[k]).ravel() for grp in FIELDS.values() for k in grp}
@@ -65,7 +72,8 @@ if OBS:
     theta_true = None
     print(f"OBS target: {OBS}")
 else:
-    theta_true = theta_def * jnp.asarray([1.15, 1.20, 0.85, 1.10, 1.0])  # mult_coef inert
+    theta_true = jnp.asarray([1.5]) if MORR else \
+        theta_def * jnp.asarray([1.15, 1.20, 0.85, 1.10, 1.0])  # MORR: Nc*1.5; else per-coeff
     target = jax.tree_util.tree_map(lambda a: jax.lax.stop_gradient(a), forward(theta_true))
 # per-field normalizer: std of the target field (so heterogeneous units compare)
 norm = {k: float(jnp.std(v)) + 1e-30 for k, v in target.items()}

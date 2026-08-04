@@ -146,7 +146,25 @@ should now flow through the full trajectory (finite + FD-correct).
 
 ---
 
-## Phase 3 — tune Morrison params to obs
+## Phase 3 — tune Morrison params to obs  ✅ MACHINERY DONE (blocked on cloud)
+
+`tune_coeffs.py` has a `--morrison` / `MORR=1` mode: tunes `Nc_in_cloud` as a
+single log-scale param (`s['Nc_in_cloud'] = nc0 * exp(u)`), same normalized-obs
+loss + Adam. It runs end-to-end under trace (no error, grad computed, Adam steps).
+
+**The Morrison port is functionally COMPLETE**: driver differentiable (Phase 1,
+rel 8.8e-7), wrapper runs under trace (Phase 2), tuning mode built (Phase 3).
+
+**But real Nc tuning is blocked on a cloudy target.** mc3e synthetic-recovery
+(MORR=1, N=25) gives a FLAT loss (8.6e-7, Nc stays at 1.0, target 1.5) — no cloud
+in the window → Nc has no leverage on thlm/rtm. Same rcm=0 in mpace_a. So the
+open item is NOT code — it is finding a state where the JAX run has active cloud:
+either debug why these runs form no mean cloud water (config? a stale `state['rcm']`
+between steps? genuinely subsaturated windows?), or advance to a cloudy period /
+pick a reliably-cloudy case with obs. That is a case/data decision, not a port
+task. Original Phase-3 detail below.
+
+
 
 Expose `Nc_in_cloud` (and optionally `C_evap`) as traceable inputs; extend
 `tune_coeffs.py` with a `--morrison` mode that injects `state['Nc_in_cloud']`
