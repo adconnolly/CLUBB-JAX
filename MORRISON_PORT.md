@@ -155,14 +155,27 @@ loss + Adam. It runs end-to-end under trace (no error, grad computed, Adam steps
 **The Morrison port is functionally COMPLETE**: driver differentiable (Phase 1,
 rel 8.8e-7), wrapper runs under trace (Phase 2), tuning mode built (Phase 3).
 
-**No-cloud investigation (RESOLVED):** `state['rcm']` is NOT stale — the core
-writes it back every step (advance_clubb_to_end.py result-tuple ~L542) and the
-microphysics reads it fresh. The `rcm=0` is REAL: mc3e from t0 (2011-04-22 00:00
-UTC) is pre-convective. `probe_mc3e_cloud_timeline.py` shows cloud develops on
-day 2: first cloud ~step 240 (20 h), and by **step 400 (33 h) cf_max=60%,
-rcm=1e-5, rain forming**. So warm to the cloudy period, then tune. tune_coeffs.py
-now has `WARMUP=<steps>` (default 3) and uses ABSOLUTE obs time `(WARMUP+N)*dt`.
-Run: `MORR=1 WARMUP=400 tune_coeffs.py mc3e <N> <iters> [obs.nc]`.
+**No-cloud investigation (RESOLVED 2026-08-04) — needs a different case.**
+Key correction: the earlier "cloud on day 2, step ~340" claim was a **probe
+artifact**. `advance_clubb_to_end` computes `time_current = time_initial +
+(itime-1)*dt` from the *local* step index (L21), so calling it repeatedly in
+chunks **restarts the forcing clock at t0** — `probe_mc3e_cloud_timeline.py` just
+re-applied the earliest forcing 20× and accumulated fake "cloud". A single proper
+`max_steps=450` call gives **rcm=0** (both fill types → `global_fill` is NOT the
+cause). Diagnosis of the real state:
+- **mc3e**: forcing IS applied (thlm_f ~9e-4 K/s), but the BL barely moves over
+  10 h and slightly *dries* (Δrtm<0) → stays subsaturated → never clouds. No
+  reachable cloudy window. Wrong case for Nc tuning.
+- **mpace_a** (morrison-configured): rcm=0 through 6 h — and rcm=0 even with
+  microphysics DISABLED, so it's the CLUBB **PDF closure** finding no saturation,
+  NOT a Morrison bug. The case doesn't cloud in the JAX run.
+- **dycoms2_rf01**: robustly cloudy (rcm=4.5e-4 at init, warm nocturnal Sc) — but
+  `microphys_scheme="none"`. No Morrison → no Nc.
+So the Nc gradient is proven differentiable (probe_morrison_grad rel 8.8e-7 with
+*forced* cloud), but no currently-configured case gives natural cloud + Morrison
+together. Next step is a DIRECTION decision (see below), likely: enable Morrison
+(warm, l_ice=.false.) on dycoms2 — the textbook Sc drizzle-vs-Nc case.
+tune_coeffs.py has `WARMUP=<steps>` (default 3) + absolute obs time `(WARMUP+N)*dt`.
 
 **Historical note — real Nc tuning was blocked on a cloudy target.** mc3e synthetic-recovery
 (MORR=1, N=25) gives a FLAT loss (8.6e-7, Nc stays at 1.0, target 1.5) — no cloud
