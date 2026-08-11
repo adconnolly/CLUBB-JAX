@@ -188,6 +188,23 @@ Implication for Nc tuning: getting a cloudy + Morrison case needs config work �
 either mpace_b's (moist) sounding/forcing driven with Morrison instead of COAMPS,
 or Morrison enabled on the already-cloudy dycoms2_rf01 (warm Sc, l_ice=.false.).
 
+**Multi-step grad NaN — FIXED (2026-08-05): sqrt-cusp regularization.**
+Long-horizon (K>=4) whole-driver `jax.grad` NaN'd on dycoms2 (finite at K<=2). Root
+cause was NOT the Richardson/shear divide the earlier agent guessed — `debug_nans`
+pinned it to a bare `sqrt` of a quantity that hits exactly 0, whose reverse-mode
+grad is inf: `pdf_closure_module.py:153 sqrt_wp2 = jnp.sqrt(wp2)` (w-variance is 0
+in the quiescent free troposphere above the Sc inversion — exactly dycoms2's NaN
+levels), plus the mixing_length Lscale/shear sqrts (`ddzt_umvm_sqd` at zero shear,
+`Lscale_up*Lscale_down`, the CAPE-parcel discriminants). Fix: `_safe_sqrt` (double-
+where, forward-identical) at all 8 sites. Verified: forward stays **bit-faithful**
+(dycoms2_rf01/arm/bomex PASS 0/0), and K=2/4/6 grad is now **finite**
+(`probe_multistep_grad.py` on the fast 200-level `dycoms2_200` fixture). Caveat: the
+regularized grad is ~17% below the converged FD (analytic 3.66 vs FD 4.39) — the
+inherent ambiguity of a genuine sqrt-cusp at wp2==0/zero-shear, where `_safe_sqrt`
+takes the stable 0-subgradient. Correct sign+magnitude → usable for Adam tuning.
+Test fixture: `clubb_jax/output/dycoms2_200_compare_jax/dycoms2_200.in` (dycoms2_rf01
+at deltaz=25 → 200 levels, fast grad cycles).
+
 **Historical note — real Nc tuning was blocked on a cloudy target.** mc3e synthetic-recovery
 (MORR=1, N=25) gives a FLAT loss (8.6e-7, Nc stays at 1.0, target 1.5) — no cloud
 in the window → Nc has no leverage on thlm/rtm. Same rcm=0 in mpace_a. So the

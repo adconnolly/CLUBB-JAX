@@ -631,7 +631,7 @@ def _compute_lscale_up_col(
         # since dCAPE_dz_j_minus_1 = 0.0
         dCAPE_safe = jnp.where(jnp.abs(dCAPE_dz_k_plus_1) > 0.0, dCAPE_dz_k_plus_1, 1.0)
         frac_first = (
-            -jnp.sqrt(jnp.maximum(zero_threshold, -two * tke_i[k] * dzm[k + 1] * dCAPE_dz_k_plus_1))
+            -_safe_sqrt(-two * tke_i[k] * dzm[k + 1] * dCAPE_dz_k_plus_1)
             / dCAPE_safe
         )
 
@@ -683,7 +683,7 @@ def _compute_lscale_up_col(
         discriminant = dCAPE_exit_prev**2 - two * tke_exit * invrs_dzm[j] * dCAPE_diff
         frac_quadratic = (
             -dCAPE_exit_prev * invrs_dCAPE_diff * dzm[j]
-            - jnp.sqrt(jnp.maximum(zero_threshold, discriminant)) * invrs_dCAPE_diff * dzm[j]
+            - _safe_sqrt(discriminant) * invrs_dCAPE_diff * dzm[j]
         )
         frac_exhausted = jnp.where(linear_case, frac_linear, frac_quadratic)
         frac_exhausted = jnp.where(exited_early, frac_exhausted, zero)
@@ -748,7 +748,7 @@ def _compute_lscale_down_col(
         # since dCAPE_dz_j_plus_1 = 0.0
         dCAPE_safe = jnp.where(jnp.abs(dCAPE_dz_k_minus_1) > 0.0, dCAPE_dz_k_minus_1, 1.0)
         frac_first = (
-            jnp.sqrt(jnp.maximum(zero_threshold, two * tke_i[k] * dzm[k] * dCAPE_dz_k_minus_1))
+            _safe_sqrt(two * tke_i[k] * dzm[k] * dCAPE_dz_k_minus_1)
             / dCAPE_safe
         )
 
@@ -804,7 +804,7 @@ def _compute_lscale_down_col(
         discriminant = dCAPE_exit_plus1**2 + two * tke_exit * invrs_dzm[j + 1] * dCAPE_diff
         frac_quadratic = (
             -dCAPE_exit_plus1 * invrs_dCAPE_diff * dzm[j + 1]
-            + jnp.sqrt(jnp.maximum(zero_threshold, discriminant)) * invrs_dCAPE_diff * dzm[j + 1]
+            + _safe_sqrt(discriminant) * invrs_dCAPE_diff * dzm[j + 1]
         )
         frac_exhausted = jnp.where(linear_case, frac_linear, frac_quadratic)
         frac_exhausted = jnp.where(exited_early, frac_exhausted, zero)
@@ -1246,7 +1246,10 @@ def compute_mixing_length(
     # When L is small, turbulence is strongly damped
     # Use a geometric mean to determine final Lscale so that L tends to become small
     # if either Lscale_up or Lscale_down becomes small.
-    Lscale = jnp.sqrt(jnp.maximum(zero_threshold, Lscale_up * Lscale_down))
+    # _safe_sqrt: forward-identical to sqrt(max(0, Lscale_up*Lscale_down)) but finite grad
+    # at the zero-product clip (this final Lscale feeds every tendency, so its inf grad at
+    # zero poisons multi-step jax.grad).
+    Lscale = _safe_sqrt(Lscale_up * Lscale_down)
     # Set the value of Lscale at the upper and lower boundaries.
     Lscale = Lscale.at[:, gr.k_ub_zt].set(Lscale[:, gr.k_ub_zt - gr.grid_dir_indx])
     # Vince Larson limited Lscale to allow host
@@ -1408,7 +1411,10 @@ def diagnose_Lscale_from_tau(
         + jnp.zeros((ngrdcol, nzm))
     )
 
-    norm_ddzt_umvm = jnp.sqrt(ddzt_umvm_sqd)
+    # _safe_sqrt: ddzt_umvm_sqd is a sum of squares (>=0), so this is forward-identical
+    # to jnp.sqrt, but at zero shear (ddzt_umvm_sqd==0, common in quiescent layers) the
+    # bare sqrt has an inf reverse-mode gradient — the NaN that killed multi-step jax.grad.
+    norm_ddzt_umvm = _safe_sqrt(ddzt_umvm_sqd)
     smooth_norm_ddzt_umvm = zm2zt2zm(nzm, nzt, ngrdcol, gr, norm_ddzt_umvm)
 
     invrs_tau_shear_smooth = (
