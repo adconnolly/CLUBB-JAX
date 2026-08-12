@@ -205,6 +205,25 @@ takes the stable 0-subgradient. Correct sign+magnitude → usable for Adam tunin
 Test fixture: `clubb_jax/output/dycoms2_200_compare_jax/dycoms2_200.in` (dycoms2_rf01
 at deltaz=25 → 200 levels, fast grad cycles).
 
+**Long-horizon Nc tuning — WORKING end-to-end (2026-08-06).** On the cloudy
+`dycoms2_morr` case (warm Morrison) the Nc gradient is finite at K=6/12 (after the
+sqrt-cusp fix) and gradient descent RECOVERS a perturbed target: synthetic Nc×1.5,
+N=12-step trajectory, Adam → err −30% → −3.3% by it10 (θ=1.45 vs 1.5), completing
+cleanly. Two robustness fixes were needed to get a full run:
+1. **Sedimentation `fori_loop` → static Python unroll** (`module_mp_graupel.py`
+   `_sediment`). The fori_loop lowers to a `scan` whose reverse-mode transpose hits a
+   jaxlib-0.10.2 XLA CPU codegen bug ("failed to materialize symbols") mid-tuning.
+   Unrolling (nstep is a small concrete int) is numerically identical — all
+   rate/sed/conservation tests in `test_morrison_rates.py` still PASS — and plain
+   reverse-mode differentiable. (`MORR_FIXED_NSTEP` env also added to pin nstep and
+   avoid recompile churn; leave unset for the CFL-faithful default.)
+2. **nan-gradient guard in the Adam loop** (`tune_coeffs.py`): near the exact minimum
+   (and if Nc overshoots into a microphysics cusp) the grad goes non-finite; skip
+   those updates (hold u) instead of blowing up. `LR0` env added for lr control.
+Fast fixtures: `dycoms2_morr_200` (200-level warm-Morrison, cloudy rcm 4.5e-4) and
+`dycoms2_200`. Run: `MORR=1 WARMUP=3 MORR_FIXED_NSTEP=4 LR0=0.05 tune_coeffs.py
+dycoms2_morr_200 12 15`.
+
 **Historical note — real Nc tuning was blocked on a cloudy target.** mc3e synthetic-recovery
 (MORR=1, N=25) gives a FLAT loss (8.6e-7, Nc stays at 1.0, target 1.5) — no cloud
 in the window → Nc has no leverage on thlm/rtm. Same rcm=0 in mpace_a. So the

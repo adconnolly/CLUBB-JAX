@@ -98,12 +98,18 @@ val_and_grad = jax.value_and_grad(loss)
 # --- Adam (hand-rolled; no optax dependency) with lr decay -----------------
 u = jnp.zeros(len(IDX))
 m = jnp.zeros_like(u); v = jnp.zeros_like(u)
-lr0, b1, b2, epsA = 0.08, 0.9, 0.999, 1e-8
+lr0, b1, b2, epsA = float(os.environ.get("LR0", 0.08)), 0.9, 0.999, 1e-8
 print(f"case={CASE} N={N} iters={NIT}  (log-space, lr0={lr0} decay)  mode={'OBS' if OBS else 'synthetic-recovery'}")
 if theta_true is not None:
     print("target theta/def:", dict(zip(NAMES, np.round(np.asarray(theta_true / theta_def), 3))))
 for it in range(1, NIT + 1):
     L, g = val_and_grad(u)
+    # Skip non-finite gradients: a specific operating point (e.g. Nc pushed past the
+    # target) can hit a microphysics/PDF cusp with a NaN/inf grad; applying it would
+    # blow u to nan. Holding u at its last good value keeps the descent robust.
+    if not bool(jnp.all(jnp.isfinite(g))):
+        print(f"  it{it:3d} loss={float(L):.3e}  (skipped: non-finite grad)", flush=True)
+        continue
     lr = lr0 * (0.5 ** (it / 25.0))            # halve every 25 iters
     m = b1 * m + (1 - b1) * g
     v = b2 * v + (1 - b2) * g * g

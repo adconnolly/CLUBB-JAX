@@ -817,7 +817,15 @@ def _sediment(dum0, fr, dzq, dt, nstep):
         top = (-falout[..., -1] / dzq[..., -1])[..., None]
         tend = jnp.concatenate([interior, top], axis=-1)
         return d + tend * dt / nstep
-    return lax.fori_loop(0, nstep, _body, dum0)
+    # Static Python unroll (nstep is a concrete int) instead of lax.fori_loop: the fori_loop
+    # lowers to a scan whose reverse-mode transpose hits a jaxlib 0.10.2 XLA CPU codegen bug
+    # ("failed to materialize symbols") during gradient-based tuning. Unrolling is numerically
+    # identical and plain reverse-mode differentiable; nstep is small (CFL sub-steps) so the
+    # graph stays modest. _body is index-independent, so the loop var is unused.
+    d = dum0
+    for _ in range(nstep):
+        d = _body(0, d)
+    return d
 
 
 def rain_sedimentation(qr, nr, rho, dzq, dt):
@@ -830,7 +838,14 @@ def rain_sedimentation(qr, nr, rho, dzq, dt):
     fmr = _fall_speed_propagate(umr)
     fnr = _fall_speed_propagate(unr)
     rgvm = jnp.maximum(jnp.max(fmr * dt / dzq), jnp.max(fnr * dt / dzq))
-    nstep = int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
+    # nstep (sedimentation sub-steps) is a data-dependent Python int (materialized, not traced)
+    # so the fori_loop below lowers to a reverse-differentiable scan, not a non-diff while_loop.
+    # The cost: during gradient-based tuning, as fall speeds shift nstep changes and the backward
+    # RECOMPILES each new value — repeated CPU JIT compiles that eventually fail ("failed to
+    # materialize symbols"). MORR_FIXED_NSTEP pins it to one value → a single compile, no churn
+    # (self-consistent for synthetic recovery; leave unset for the CFL-faithful default path).
+    _fixed_nstep = int(__import__("os").environ.get("MORR_FIXED_NSTEP", "0"))
+    nstep = _fixed_nstep if _fixed_nstep > 0 else int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
     qr_f = _sediment(qr * rho, fmr, dzq, dt, nstep) / rho
     nr_f = _sediment(nr * rho, fnr, dzq, dt, nstep) / rho
     return (qr_f - qr) / dt, (nr_f - nr) / dt
@@ -1286,7 +1301,14 @@ def morrison_sedimentation(qr, nr, qi, ni, qs, ns, rho, dzq, dt, qc=None, nc=Non
         falls += [fmc, fnc]
     speeds = [_fall_speed_propagate(f) for f in falls]
     rgvm = jnp.max(jnp.stack([jnp.max(f * dt / dzq) for f in speeds]))
-    nstep = int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
+    # nstep (sedimentation sub-steps) is a data-dependent Python int (materialized, not traced)
+    # so the fori_loop below lowers to a reverse-differentiable scan, not a non-diff while_loop.
+    # The cost: during gradient-based tuning, as fall speeds shift nstep changes and the backward
+    # RECOMPILES each new value — repeated CPU JIT compiles that eventually fail ("failed to
+    # materialize symbols"). MORR_FIXED_NSTEP pins it to one value → a single compile, no churn
+    # (self-consistent for synthetic recovery; leave unset for the CFL-faithful default path).
+    _fixed_nstep = int(__import__("os").environ.get("MORR_FIXED_NSTEP", "0"))
+    nstep = _fixed_nstep if _fixed_nstep > 0 else int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
 
     def sed(q, fall):
         return (_sediment(q * rho, fall, dzq, dt, nstep) / rho - q) / dt
