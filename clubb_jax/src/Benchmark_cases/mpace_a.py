@@ -17,6 +17,8 @@ import os
 
 import numpy as np
 
+from clubb_jax.src.CLUBB_core.tracer_numpy import _iset  # trace-safe in-place assignment
+
 from clubb_jax.src.CLUBB_core.interpolation import zlinterp_fnc, linear_interp_factor
 
 _MPACE_A_NTIMES = 139
@@ -78,14 +80,16 @@ def mpace_a_tndcy(state: dict, time_current: float) -> None:
     dqdt, vertq = col('dqdt'), col('vertq')
     um_g, vm_g = col('um_obs'), col('vm_obs')
     exner_fac = (p_sfc / p_in_Pa) ** (Rd / Cp)
-    state['thlm_forcing'][:] = (dTdt + vertT) * exner_fac / sec_per_hr
-    state['rtm_forcing'][:] = (dqdt + vertq) / g_per_kg / sec_per_hr
-    state['wm_zt'][:] = 0.0
-    state['wm_zm'][:] = 0.0
+    # _iset (not in-place [:] =): trace-safe when a forcing array is a tracer under
+    # jax.grad (the generic forcing reset promotes them to jnp). Concrete: in-place.
+    state['thlm_forcing'] = _iset(state['thlm_forcing'], np.s_[:], (dTdt + vertT) * exner_fac / sec_per_hr)
+    state['rtm_forcing'] = _iset(state['rtm_forcing'], np.s_[:], (dqdt + vertq) / g_per_kg / sec_per_hr)
+    state['wm_zt'] = _iset(state['wm_zt'], np.s_[:], 0.0)
+    state['wm_zm'] = _iset(state['wm_zm'], np.s_[:], 0.0)
     if 'um_ref' in state:
-        state['um_ref'][:] = um_g
+        state['um_ref'] = _iset(state['um_ref'], np.s_[:], um_g)
     if 'vm_ref' in state:
-        state['vm_ref'][:] = vm_g
+        state['vm_ref'] = _iset(state['vm_ref'], np.s_[:], vm_g)
 
 
 def mpace_a_sfclyr(state: dict, time_current: float, ngrdcol: int, rho_sfc) -> tuple:

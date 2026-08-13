@@ -223,29 +223,27 @@ def advance_wp2_wp3(
         C11b = clubb_params[:, iC11b]
         C11c = clubb_params[:, iC11c]
         C11c_safe = jnp.where(jnp.abs(C11c) > zero, C11c, one)
-        C11_varying = jnp.abs(C11 - C11b) > jnp.abs(C11 + C11b) * eps / two
         # Calculate C_{1} and C_{11} as functions of skewness of w.
-        # The if..then here is only for computational efficiency -dschanen 2 Sept 08
-        C11_Skw_fnc = jnp.where(
-            C11_varying[:, None],
+        # NB: the original `C11_varying` where (a compute shortcut that selects the
+        # constant C11b branch when C11 == C11b) zeroed the reverse-mode gradient
+        # w.r.t. C11 at C11 == C11b. The smooth form below is bit-identical there
+        # (the varying expression == C11b when C11 == C11b) but differentiable.
+        C11_Skw_fnc = (
             C11b[:, None]
             + (C11 - C11b)[:, None]
-            * jnp.exp(-one_half * (Skw_zt / C11c_safe[:, None]) ** 2),
-            C11b[:, None],
+            * jnp.exp(-one_half * (Skw_zt / C11c_safe[:, None]) ** 2)
         )
 
     C1 = clubb_params[:, iC1]
     C1b = clubb_params[:, iC1b]
     C1c = clubb_params[:, iC1c]
     C1c_safe = jnp.where(jnp.abs(C1c) > zero, C1c, one)
-    C1_varying = jnp.abs(C1 - C1b) > jnp.abs(C1 + C1b) * eps / two
-    # The if..then here is only for computational efficiency -dschanen 2 Sept 08
-    C1_Skw_fnc = jnp.where(
-        C1_varying[:, None],
+    # Smooth form (see the C11 note above): bit-identical to the original
+    # `C1_varying` where at C1 == C1b, but keeps a nonzero gradient w.r.t. C1 there.
+    C1_Skw_fnc = (
         C1b[:, None]
         + (C1 - C1b)[:, None]
-        * jnp.exp(-one_half * (Skw_zm / C1c_safe[:, None]) ** 2),
-        C1b[:, None],
+        * jnp.exp(-one_half * (Skw_zm / C1c_safe[:, None]) ** 2)
     )
 
     if l_damp_wp2_using_em:

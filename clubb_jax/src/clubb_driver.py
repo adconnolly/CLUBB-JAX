@@ -296,10 +296,12 @@ def _check_unsupported_features(cfg: dict, flags, microphys_scheme: str,
     # 'none', 'khairoutdinov_kogan' (KK), and 'morrison' (M2005 2-moment) are supported. The Morrison
     # rate library + driver + CLUBB interface (morrison_microphys_driver) are ported and validated on
     # nov11_altocu fields; the per-step call is wired in advance_clubb_to_end (gated by the scheme).
-    if microphys_scheme not in ("none", "khairoutdinov_kogan", "morrison"):
+    # 'coamps' is a BOOTSTRAP port (COAMPS_PORT.md): the driver flow runs but the master
+    # adjtq process routine is a no-op stub, so tendencies are 0 (no microphysics applied).
+    if microphys_scheme not in ("none", "khairoutdinov_kogan", "morrison", "coamps"):
         errors.append(
             f"microphys_scheme = '{microphys_scheme}' is not supported "
-            "(only 'none', 'khairoutdinov_kogan', and 'morrison' are implemented)."
+            "(only 'none', 'khairoutdinov_kogan', 'morrison', and 'coamps' are implemented)."
         )
 
     # (NB: the JAX Morrison is a COMPLETE M2005 port — warm-rain + the full ice/snow/graupel block; the driver
@@ -924,6 +926,12 @@ def init_clubb_case(namelist_path: str) -> dict:
         from clubb_jax.src.CLUBB_core.corr_varnce_module import morrison_hm_metadata
         hm_metadata = morrison_hm_metadata()
         hydromet_dim = hm_metadata.hydromet_dim   # = 8 (rr/Nr/ri/Ni/rs/Ns/rg/Ng)
+    elif microphys_scheme == "coamps":
+        # BOOTSTRAP: reuse the Morrison 8-field hydrometeor layout (rr/Nr/ri/Ni/rs/Ns/rg/Ng).
+        # COAMPS predicts a subset (rr/Nr/ri/Ni/rs/rg); Ns/Ng stay 0. See COAMPS_PORT.md.
+        from clubb_jax.src.CLUBB_core.corr_varnce_module import morrison_hm_metadata
+        hm_metadata = morrison_hm_metadata()
+        hydromet_dim = hm_metadata.hydromet_dim   # = 8
     else:
         hydromet_dim = 0
     hm_dim_transport = max(hydromet_dim, 1)

@@ -32,3 +32,12 @@ def calc_microphys_scheme_tendcies(state: dict, time_current: float) -> None:
     elif scheme == 'morrison' and time_current >= state.get('microphys_start_time', 0.0):
         from clubb_jax.src.Microphys.morrison_microphys_step import advance_morrison_microphysics
         advance_morrison_microphysics(state)
+
+    # ── COAMPS (Rutledge-Hobbs / NRL bulk) microphysics ─────────────────────
+    # BOOTSTRAP: the ported driver runs its full top-level flow but the master `adjtq`
+    # process routine is still a no-op stub, so the *_mc tendencies are 0 (no microphysics
+    # applied yet). This exercises the CLUBB<->COAMPS wiring end-to-end. See COAMPS_PORT.md.
+    elif scheme == 'coamps' and time_current >= state.get('microphys_start_time', 0.0):
+        state['time_current'] = time_current
+        from clubb_jax.src.Microphys.coamps_microphys_step import advance_coamps_microphysics
+        advance_coamps_microphysics(state)

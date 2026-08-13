@@ -150,7 +150,11 @@ def pdf_closure(
     ):
         raise NotImplementedError(_unsupported_pdf_type_message(iiPDF_type))
 
-    sqrt_wp2 = jnp.sqrt(wp2)
+    # _safe_sqrt (not bare jnp.sqrt): wp2 (w-variance) is >=0 but exactly 0 in quiescent
+    # layers (e.g. the free troposphere above a stratocumulus inversion) where sqrt(0) has
+    # an inf reverse-mode gradient — this poisoned multi-step jax.grad at those levels.
+    # Forward-identical; the varnce sqrts below already use _safe_sqrt — this one was missed.
+    sqrt_wp2 = _safe_sqrt(wp2)
     half = jnp.full_like(wp2, 0.5)
     sclr1 = None
     sclr2 = None
@@ -1529,7 +1533,7 @@ def calc_w_up_in_cloud(mixt_frac, cloud_frac_1, cloud_frac_2,
     """
     def _component(w, varnce):
         w = jnp.asarray(w, dtype=jnp.float64)
-        stdev = jnp.sqrt(jnp.asarray(varnce, dtype=jnp.float64))
+        stdev = _safe_sqrt(jnp.asarray(varnce, dtype=jnp.float64))
         all_up = w > max_num_stdevs * stdev
         all_down = w < -max_num_stdevs * stdev
         ratio = w / (sqrt_2 * jnp.maximum(eps, stdev))

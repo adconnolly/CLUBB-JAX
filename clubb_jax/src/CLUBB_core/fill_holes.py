@@ -372,8 +372,12 @@ def fill_holes_wp2_from_horz_tke(
     case_enough = do_fill & (missing_wp2 < up2_vp2_avail)
     no_up2_avail = jnp.abs(up2_avail) < _F64_EPS * 1000.0
     no_vp2_avail = jnp.abs(vp2_avail) < _F64_EPS * 1000.0
-    # Calculate portion of up2/vp2 that we want to take away
-    ratio = jnp.where(up2_vp2_avail > zero, missing_wp2 / up2_vp2_avail, zero)
+    # Calculate portion of up2/vp2 that we want to take away.
+    # Use a safe (nonzero) denominator on the masked-out branch so the division's
+    # reverse-mode cotangent stays finite where up2_vp2_avail == 0 (the bare
+    # `missing_wp2 / up2_vp2_avail` has an inf grad at the clip). Forward-identical.
+    up2_vp2_denom = jnp.where(up2_vp2_avail > zero, up2_vp2_avail, one)
+    ratio = jnp.where(up2_vp2_avail > zero, missing_wp2 / up2_vp2_denom, zero)
 
     up2_enough = jnp.where(
         no_up2_avail,

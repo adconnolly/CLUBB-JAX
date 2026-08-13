@@ -16,7 +16,11 @@ ported — they compute a radar-reflectivity (dBZ) DIAGNOSTIC for the WRF post-p
 coupling (they don't feed any prognostic tendency) and no oracle path. The prognostic microphysics rates +
 sedimentation + the CLUBB interface ARE all mirrored.
 """
+import jax
 import jax.numpy as jnp
+from jax.scipy.special import digamma as _digamma
+
+from clubb_jax.src.CLUBB_core.tracer_numpy import _safe_pow, _safe_sqrt
 
 # ── POLYSVP — saturation vapor pressure, Flatau et al. 1992 Table 4 (RHS column) ──────
 # module_mp_graupel.F90:5423. Distinct from the CLUBB-core saturation.py Flatau fit
@@ -173,10 +177,15 @@ _GAMMA_C = (-1.910444077728e-3, 8.4171387781295e-4, -5.952379913043012e-4,
 _GAMMA_NMAX = 11   # INT(Y)-1 for Y<12 is at most 10
 
 
+@jax.custom_jvp
 def gamma(x):
     """Complete gamma function Γ(x), faithful to module_mp_graupel.F90:GAMMA (Cody).
     Array-capable; all argument-range branches masked with jnp.where. Negative integers
     (poles) and overflow return XINF=3.4e38, as in the Fortran.
+
+    custom_jvp: the Cody rational approx (floor/where/sin branches) has a NaN reverse-mode
+    gradient; supply the analytic Γ'(x)=Γ(x)·ψ(x) instead (forward value unchanged). Valid
+    for the x>0 args Morrison uses (pgam+k); ψ has poles at x<=0 which Morrison never hits.
     """
     x = jnp.asarray(x, dtype=jnp.float64)
 
@@ -232,6 +241,13 @@ def gamma(x):
     res = jnp.where(fact != 1.0, fact / res, res)
     res = jnp.where(neg_singular, _GAMMA_XINF, res)
     return res
+
+
+@gamma.defjvp
+def _gamma_jvp(primals, tangents):
+    (x,), (dx,) = primals, tangents
+    y = gamma(x)
+    return y, y * _digamma(x) * dx
 
 
 # ── Warm-rain process rates (Khairoutdinov-Kogan 2000 bulk, IRAIN=0 default) ──────────
@@ -301,7 +317,7 @@ def _gamma_slope(q, n, cons, lammin, lammax, d=_M_D):
     q = jnp.asarray(q, dtype=jnp.float64); n = jnp.asarray(n, dtype=jnp.float64)
     on = q >= _M_QSMALL
     q_s = jnp.where(on, q, 1.0)
-    lam = (cons * n / q_s) ** (1.0 / d)
+    lam = _safe_pow(cons * n / q_s, 1.0 / d)   # base 0 in clear air (n=0): safe fractional power
     n0 = n * lam
     lo = lam < lammin; hi = lam > lammax
     lam_c = jnp.where(lo, lammin, jnp.where(hi, lammax, lam))
@@ -345,7 +361,9 @@ def cloud_slope(qc, nc, rho, dofix_pgam=False, pgam_fixed=5.0):
         pgam = 1.0 / (pgam ** 2) - 1.0
         pgam = jnp.clip(pgam, 2.0, 10.0)
     qc_s = jnp.where(on, qc, 1.0)
-    lamc = (_M_CONS26 * nc * gamma(pgam + 4.0) / (qc_s * gamma(pgam + 1.0))) ** (1.0 / 3.0)
+    # _safe_pow: the base is 0 in clear air (nc=0), where bare **(1/3) has an inf
+    # reverse-mode cotangent that NaNs grads. Forward-identical (base >= 0).
+    lamc = _safe_pow(_M_CONS26 * nc * gamma(pgam + 4.0) / (qc_s * gamma(pgam + 1.0)), 1.0 / 3.0)
     lammin = (pgam + 1.0) / 60.0e-6
     lammax = (pgam + 1.0) / 1.0e-6
     lamc = jnp.clip(lamc, lammin, lammax)
@@ -799,7 +817,15 @@ def _sediment(dum0, fr, dzq, dt, nstep):
         top = (-falout[..., -1] / dzq[..., -1])[..., None]
         tend = jnp.concatenate([interior, top], axis=-1)
         return d + tend * dt / nstep
-    return lax.fori_loop(0, nstep, _body, dum0)
+    # Static Python unroll (nstep is a concrete int) instead of lax.fori_loop: the fori_loop
+    # lowers to a scan whose reverse-mode transpose hits a jaxlib 0.10.2 XLA CPU codegen bug
+    # ("failed to materialize symbols") during gradient-based tuning. Unrolling is numerically
+    # identical and plain reverse-mode differentiable; nstep is small (CFL sub-steps) so the
+    # graph stays modest. _body is index-independent, so the loop var is unused.
+    d = dum0
+    for _ in range(nstep):
+        d = _body(0, d)
+    return d
 
 
 def rain_sedimentation(qr, nr, rho, dzq, dt):
@@ -812,7 +838,14 @@ def rain_sedimentation(qr, nr, rho, dzq, dt):
     fmr = _fall_speed_propagate(umr)
     fnr = _fall_speed_propagate(unr)
     rgvm = jnp.maximum(jnp.max(fmr * dt / dzq), jnp.max(fnr * dt / dzq))
-    nstep = int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
+    # nstep (sedimentation sub-steps) is a data-dependent Python int (materialized, not traced)
+    # so the fori_loop below lowers to a reverse-differentiable scan, not a non-diff while_loop.
+    # The cost: during gradient-based tuning, as fall speeds shift nstep changes and the backward
+    # RECOMPILES each new value — repeated CPU JIT compiles that eventually fail ("failed to
+    # materialize symbols"). MORR_FIXED_NSTEP pins it to one value → a single compile, no churn
+    # (self-consistent for synthetic recovery; leave unset for the CFL-faithful default path).
+    _fixed_nstep = int(__import__("os").environ.get("MORR_FIXED_NSTEP", "0"))
+    nstep = _fixed_nstep if _fixed_nstep > 0 else int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
     qr_f = _sediment(qr * rho, fmr, dzq, dt, nstep) / rho
     nr_f = _sediment(nr * rho, fnr, dzq, dt, nstep) / rho
     return (qr_f - qr) / dt, (nr_f - nr) / dt
@@ -1268,7 +1301,14 @@ def morrison_sedimentation(qr, nr, qi, ni, qs, ns, rho, dzq, dt, qc=None, nc=Non
         falls += [fmc, fnc]
     speeds = [_fall_speed_propagate(f) for f in falls]
     rgvm = jnp.max(jnp.stack([jnp.max(f * dt / dzq) for f in speeds]))
-    nstep = int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
+    # nstep (sedimentation sub-steps) is a data-dependent Python int (materialized, not traced)
+    # so the fori_loop below lowers to a reverse-differentiable scan, not a non-diff while_loop.
+    # The cost: during gradient-based tuning, as fall speeds shift nstep changes and the backward
+    # RECOMPILES each new value — repeated CPU JIT compiles that eventually fail ("failed to
+    # materialize symbols"). MORR_FIXED_NSTEP pins it to one value → a single compile, no churn
+    # (self-consistent for synthetic recovery; leave unset for the CFL-faithful default path).
+    _fixed_nstep = int(__import__("os").environ.get("MORR_FIXED_NSTEP", "0"))
+    nstep = _fixed_nstep if _fixed_nstep > 0 else int(jnp.maximum(jnp.floor(rgvm + 1.0), 1.0))
 
     def sed(q, fall):
         return (_sediment(q * rho, fall, dzq, dt, nstep) / rho - q) / dt
@@ -1296,7 +1336,7 @@ def _sizefix_exp_number(q, n, cons, lammin, lammax):
     (module_mp_graupel.F90:1881 rain / 1966 snow / 1991 graupel / 2816 ice). N=LAM_clamped³·q/cons."""
     q = jnp.asarray(q, dtype=jnp.float64); n = jnp.asarray(n, dtype=jnp.float64)
     on = q >= _M_QSMALL
-    lam = jnp.where(on, (cons * n / jnp.where(on, q, 1.0)) ** (1.0 / 3.0), 0.0)
+    lam = jnp.where(on, _safe_pow(cons * n / jnp.where(on, q, 1.0), 1.0 / 3.0), 0.0)
     oob = on & ((lam > lammax) | (lam < lammin))
     lam_c = jnp.clip(lam, lammin, lammax)
     return jnp.where(oob, lam_c ** 3 * q / cons, n)
@@ -1315,7 +1355,7 @@ def _sizefix_cloud_number(qc, nc, rho, dofix_pgam=False, pgam_fixed=5.0):
         pgam = jnp.clip(1.0 / (pgam ** 2) - 1.0, 2.0, 10.0)
     g1, g4 = gamma(pgam + 1.0), gamma(pgam + 4.0)
     qc_s = jnp.where(on, qc, 1.0)
-    lamc = (_M_CONS26 * nc * g4 / (qc_s * g1)) ** (1.0 / 3.0)
+    lamc = _safe_pow(_M_CONS26 * nc * g4 / (qc_s * g1), 1.0 / 3.0)
     lammin, lammax = (pgam + 1.0) / 60.0e-6, (pgam + 1.0) / 1.0e-6
     oob = on & ((lamc > lammax) | (lamc < lammin))
     lamc_c = jnp.clip(lamc, lammin, lammax)

@@ -626,6 +626,9 @@ def _advance_radiation(
     l_sample: bool = False,
 ):
     """Advance radiation tendencies for currently supported schemes."""
-    from clubb_jax.src.Radiation.radiation import advance_radiation
+    # Use the full radiation_module mirror (supports none/simplified/
+    # simplified_bomex/bugsrad + interactive soil_veg), not the limited
+    # radiation.py (none/simplified only), so bugsrad cases (mc3e, gabls3) run.
+    from clubb_jax.src.Radiation.radiation_module import advance_clubb_radiation
 
-    advance_radiation(state=state, time_current=time_current, l_sample=l_sample)
+    advance_clubb_radiation(state=state, time_current=time_current, l_sample=l_sample)

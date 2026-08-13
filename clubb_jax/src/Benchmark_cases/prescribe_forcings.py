@@ -449,13 +449,13 @@ def prescribe_forcings_generic(state: dict, time_current: float,
     l_ignore_forcings = state.get('l_ignore_forcings', False)
 
     # ── 1. Zero all forcing arrays ──────────────────────────────────────────
-    state['thlm_forcing'][:] = 0.0
-    state['rtm_forcing'][:] = 0.0
-    state['wprtp_forcing'][:] = 0.0
-    state['wpthlp_forcing'][:] = 0.0
-    state['rtp2_forcing'][:] = 0.0
-    state['thlp2_forcing'][:] = 0.0
-    state['rtpthlp_forcing'][:] = 0.0
+    # _iset (not in-place `[:] = 0.0`) so this is trace-safe: under a jax.grad
+    # trace a forcing array can be a tracer (e.g. l_calc_thlp2_rad routes a
+    # radiative thlp2 forcing through the traced state), which in-place item
+    # assignment can't mutate. Concrete path still mutates in place (bit-identical).
+    for _fk in ('thlm_forcing', 'rtm_forcing', 'wprtp_forcing', 'wpthlp_forcing',
+                'rtp2_forcing', 'thlp2_forcing', 'rtpthlp_forcing'):
+        state[_fk] = _iset(state[_fk], np.s_[:], 0.0)
 
     # ── 2. Large-scale tendencies ───────────────────────────────────────────
     if runtype == 'mpace_a':
@@ -477,9 +477,11 @@ def prescribe_forcings_generic(state: dict, time_current: float,
             rico_tndcy(state)   # analytic thlm/qtm→rtm forcing; wm is init-set (untouched)
         elif runtype == 'dycoms2_rf01':
             dycoms2_rf01_tndcy(state)      # dycoms2_rf01.F90:dycoms2_rf01_tndcy (zero thlm/rtm; wm init-set)
-        elif runtype in ('fire', 'generic', 'neutral', 'coriolis_test', 'ekman'):
+        elif runtype in ('fire', 'generic', 'neutral', 'coriolis_test', 'ekman', 'mpace_b'):
             # No per-case Fortran tndcy — prescribe_forcings zeros the LS forcing generically.
             # (dycoms2_rf01_fixed_sst stays on the fallback — its fixed-SST sfclyr has a latent bug.)
+            # mpace_b sets l_ignore_forcings=.true. → no large-scale forcing (surface-flux + COAMPS
+            # microphysics driven); wm subsidence stays at its init value (untouched).
             _zero_forcings(state)
         elif runtype == 'dycoms2_rf02':       # all rf02 variants (nd/so/do/ds) share this runtype
             dycoms2_rf02_tndcy(state)      # dycoms2_rf02.F90:dycoms2_rf02_tndcy (zero thlm/rtm + wm top)
@@ -625,6 +627,18 @@ def prescribe_forcings_generic(state: dict, time_current: float,
             thlm_bot, rtm_bot, z_bot, ubar, state['p_sfc'], T_sfc_val,
             state['flags'].saturation_formula)
 
+    elif runtype == 'comble':
+        # COMBLE 13 Mar 2020 marine cold-air outbreak: ocean bulk fluxes from the
+        # prescribed SST (sfctype=1), via the generic cloud_feedback bulk routine
+        # (mirrors the comble branch in prescribe_forcings.F90).
+        l_compute_momentum_flux = True
+        l_set_sclr = True
+        T_sfc_val = _interp_sfc_t_sfc(state, time_current)
+        T_sfc = np.full(ngrdcol, T_sfc_val)
+        wpthlp_sfc, wprtp_sfc, ustar = cloud_feedback_sfclyr(
+            thlm_bot, rtm_bot, z_bot, ubar, state['p_sfc'], T_sfc_val,
+            state['flags'].saturation_formula)
+
     elif runtype == 'astex_a209':
         l_compute_momentum_flux = True
         l_set_sclr = True
@@ -705,7 +719,10 @@ def prescribe_forcings_generic(state: dict, time_current: float,
         l_set_sclr = True
         sfc = state.get('_forcings_data', {}).get('sfc') or {}
         times = sfc.get('time', np.array([0.0, 1e9]))
-        if 'wpthlp_sfc' in sfc:
+        # The surface reader always inserts a 'wpthlp_sfc' key, but for files that only
+        # carry sens_ht/latent_ht columns (e.g. mpace_b) it is a degenerate 0-d scalar,
+        # which np.interp cannot use — require a real time series before taking this path.
+        if np.ndim(sfc.get('wpthlp_sfc', 0.0)) >= 1 and np.size(sfc.get('wpthlp_sfc', 0.0)) > 1:
             wpthlp_sfc = np.full(ngrdcol, float(np.interp(time_current,
                                                             times, sfc['wpthlp_sfc'])))
             wpqtp_sfc  = np.full(ngrdcol, float(np.interp(time_current,

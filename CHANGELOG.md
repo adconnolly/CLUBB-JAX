@@ -259,3 +259,81 @@ DESIGN.md "Performance, GPU, and …"; the per-iteration commits are in git (`58
   comparison/test scripts (`compare_runs`/`compare_cases`/`compare_grad`/`benchmark_backends`/`run_all_tests` flags +
   `FORTRAN_EXE`/`FORTRAN_OUT_ROOT`/`JAX_OUT_ROOT`). Env-var semantics confirmed by grepping the actual
   `os.environ` reads. CLAUDE.md and DESIGN.md now point to it.
+
+### 2026-07-30 — New case: COMBLE (marine cold-air outbreak), added to both drivers + compared
+- **Added `comble` as a genuinely new case** (13 Mar 2020 Norwegian Sea cold-air outbreak, from the ARM COMBLE-MIP
+  DEPHY-SCM forcing V2.4 — not one of the existing benchmarks). Converter `make_comble_case.py` translates the DEPHY
+  netCDF → `comble_{sounding,forcings,sfc,model}.in`: geostrophic `ug/vg` forcing (time+height), no subsidence/adv
+  tendencies (`forc_wap=forc_wa=0`), SST time series (247→279 K) driving `sfctype=1` ocean bulk fluxes, Morrison
+  mixed-phase (fixed Nc=20 cm⁻³, like mpace_a), 74.5 °N, 50 m grid to 6 km.
+- **Both drivers now dispatch `comble`.** Surface fluxes routed to the generic bulk-ocean routine
+  `cloud_feedback_sfclyr` (sfctype=1) via a new `comble` branch in **both** `prescribe_forcings.F90` (surface select)
+  and `prescribe_forcings.py`; large-scale forcing goes through the generic `l_t_dependent` file path. Note the two
+  runtype selects: the LS-forcing select (1) is skipped when `l_t_dependent .and. .not. l_ignore_forcings`, so only
+  the surface select needed a branch; the TKE-init select default (`em=em_min`) is used on both sides. The Fortran
+  oracle was **incrementally recompiled** with Intel `ifx` (ninja, LD_LIBRARY_PATH `libimf`/`libifcore` fix).
+- **JAX vs Fortran agree** (in-process `clubb_driver.run_clubb`, morrison-capable path — NOT the standalone
+  `run_scm.py`, whose `clubb_case_initalization` init supports only microphys `none`). After 20 steps: max|Δthlm|=8e-4 K
+  over 248–286 K, |Δrtm|=6e-8, |Δwp2|=3e-4 over 0–0.16; rcm/cloud_frac exactly 0 (pre-cloud spin-up). Nonzero-but-tiny
+  = genuine JAX↔Fortran FP divergence, within the tiered "faithful" standard.
+- Env note: the machine-specific `jaxenv` was wiped; rebuilt a CPU venv (jax 0.10.2 + netCDF4 + ninja/cmake) off
+  anaconda3-2023.09. COMBLE case files + the two-driver `comble` branches are uncommitted (submodule + JAX src).
+
+### 2026-07-31 — tune-to-obs: differentiable core hardened for coefficient gradients (branch tune-to-obs)
+- **De-risk found the whole-driver `jax.grad` w.r.t. tunable coefficients was broken** (NaN for c_K/gamma_coef,
+  detached zero for C1/C11) through a multi-step trajectory — a pre-existing gap (stock `probe_driver_grad` fails on
+  `thlm` at 1 step too; `um`/momentum path was fine). Coeffs enter via a traced `state['clubb_params']` array
+  (`clubb_params[:, i<name>]`), so no plumbing was needed — only the singular/detaching ops.
+- **Four root-cause fixes, all forward-bit-identical at default params** (arm stays `Result[bit]` PASS vs Fortran,
+  0 prognostic failures): `sfc_varnce_module` `_safe_sqrt`×3 + `_safe_pow` (wstar cube-root); `fill_holes`
+  `fill_holes_wp2_from_horz_tke` safe division denominator; `advance_wp2_wp3_module` drop the `C1_varying`/
+  `C11_varying` compute-shortcut where (it zeroed dC1/dC11 at C==Cb) for the smooth Skw form; `Skx_module` same for
+  `gamma_coef`. Result: `probe_coeff_grad.py` (new) shows all 5 coeffs finite + FD-correct through 30 steps
+  (worst rel 8e-3, C11 FD-step noise).
+- **Route-around:** grad uses `fill_holes_type=global_fill` (1); the default `sliding_window` (2) has a
+  non-differentiable dynamic-bound `fori_loop` — a separate follow-up. Next: the Adam tuning loop + obs target.
+
+### 2026-08-03 — tune-to-obs: end-to-end tuning to REAL ARM VARANAL observations (mc3e)
+- **Real-obs pipeline complete.** `tune_coeffs.py --obs` + `obs_target.py` (loads ARM VARANAL netCDF observed
+  T/q/u/v onto the model grid; round-trips to ~1e-16). Downloaded the MC3E VARANAL (`sgp180iopsndgv3varanaC1.c1`,
+  2011-04-22 IOP, public ARM FTP order) — the obs and the CLUBB `mc3e` case share the exact start time. The tuner
+  runs end-to-end on the real obs: loads, forward loss finite (4.79e-2), grad flows, Adam updates (no NaN/crash).
+- **BUGSrad now runs in the JAX driver.** It was ported (Radiation/BUGSrad/) but unreachable: `advance_clubb_to_end`
+  used the limited `radiation.py`. Repointed to `radiation_module.advance_clubb_radiation`
+  (none/simplified/simplified_bomex/bugsrad + soil_veg). arm stays `Result[bit]` PASS; mc3e runs faithful radiation.
+  SILHS stays disabled (unported); mc3e config: morrison + bugsrad, `lh_microphys_type=disabled`.
+- **Deep-convection grad hardening (mc3e, all forward-bit-identical, arm unaffected):** `_iset` (not in-place) for
+  the generic forcing resets (trace-safe when `l_calc_thlp2_rad` routes a traced thlp2 forcing); `_safe_sqrt` for
+  the wp2/wp3-splat N² (`advance_helper_module`) and the mixing-length Brunt-Väisälä sqrt (`mixing_length`) — both
+  `sqrt(clipped N²)` that hit 0 in unstable layers (inf cotangent). mc3e grad now finite 5/5.
+- **Caveat:** over a short deep-convection window the mean-profile loss is nearly flat in the coeff directions
+  (forcing/IC-dominated), so coeffs drift (c_K→2.7×) with tiny loss change — needs box constraints + longer horizon
+  + regularization for meaningful science. The pipeline/faithfulness is the deliverable here.
+- **COAMPS microphysics port — BOOTSTRAP (2026-08-04).** Started the COAMPS (NRL Rutledge & Hobbs bulk mixed-phase)
+  microphysics port so the cloudy MPACE-B case can run its native scheme in the JAX driver. Created the JAX mirror
+  `clubb_jax/src/Microphys/COAMPS_microphys/` (gamma/slope/esat_new/esatv/esati/qsatvi leaf utilities PORTED +
+  verified; `adjtq.py` is a documented no-op STUB with the full ~40-routine call graph) + `coamps_microphys_driver_module.py`
+  (top-level CLUBB<->COAMPS flow ported and running) + JAX-only `coamps_microphys_step.py`. Wired the dispatch
+  (`microphys_driver.py` `elif scheme=='coamps'`, `clubb_driver.py` supports 'coamps' with Morrison's 8-field
+  hydromet metadata, `prescribe_forcings.py` mpace_b = zero LS forcing + generic sens_ht surface). MPACE-B now
+  **inits and runs 20 steps stably via the driver path** with all `*_mc` tendencies = 0 (adjtq stubbed). Finding:
+  unlike clear mpace_a, **mpace_b is genuinely cloudy** (rcm_max≈5.4e-4 from the PDF closure) — the right target for
+  a future cloudy microphysics/tuning demo. No oracle (COAMPS is compiled-out + fatal-errors on l_predict_Nc=F) →
+  validate vs source logic + conservation. Runbook + file-by-file checklist + next steps in `COAMPS_PORT.md`.
+- **dycoms2 + WARM Morrison — cloudy Nc-leverage case for tuning (2026-08-04).** Created `dycoms2_morr`
+  (`clubb_jax/output/dycoms2_morr_compare_jax/dycoms2_morr.in`, copy of dycoms2_rf01 with
+  `microphys_scheme="morrison"`, `l_ice_microphys=.false.`, mpace_a-style hmp2/aerosol block; `runtype`
+  kept `dycoms2_rf01` so sounding/forcing files resolve). Morrison hydromet+Nc arrays are triggered purely by
+  the namelist scheme. Driver-path run (init_clubb_case+advance_clubb_to_end, warm 90): **cloud persists**
+  (rcm_max 3.5e-4, no NaN), **warm-rain autoconversion fires** (rrm 1.7e-6, Nrm>0), Ncm=8.8e7. **Nc leverage is
+  strong and physical**: Nc×0.3 → sum|rrm| +727% / rcm −1.1%; Nc×3 → rrm −86% / rcm +0.23% — the drizzle-vs-Nc
+  leverage mc3e/mpace_a lacked (they never cloud). Fixed `Benchmark_cases/dycoms2_rf01.py:dycoms2_rf01_tndcy`
+  in-place forcing reset → `_iset` (trace-safe; the Morrison *_mc makes thlm/rtm_forcing a tracer; concrete
+  path bit-identical). **Tuner (`tune_coeffs.py` MORR mode) loss is now Nc-sensitive** (~3e-5, not the flat
+  8.6e-7 mc3e floor) and Adam recovers the synthetic Nc×1.5 target (err% −27.9→−6.1 by it5, ends θ≈1.73) at N=2.
+  **Blocker for longer trajectories: a PRE-EXISTING core reverse-mode NaN.** Multi-step grad is finite at K≤2 but
+  NaN at K≥4 — and **plain dycoms2_rf01 (microphys none) grad w.r.t. c_K also NaNs at K=6**, so it is a CLUBB-core
+  (mixing_length Richardson Ri=N²/S² divide-by-shear `ddzt_umvm_sqd`) differentiability gap, not Morrison. The
+  single-step compare_grad gate stays green; the dycoms2 multi-step Lscale/Ri path needs a `_safe_` guard to
+  enable long-horizon tuning. Morrison rate/sed/conservation tests all PASS (only the known pre-existing
+  `test_morrison_hm_metadata` pdf_dim==4 assertion fails).
